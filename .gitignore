@@ -1,0 +1,19 @@
+# macOS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Rust
+target/
+
+# Runtime state
+.omx/
+.light-terminal/
+*.sock
+*.log
+
+# Local env
+.env
+.env.*

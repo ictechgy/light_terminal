@@ -1,0 +1,343 @@
+use crate::paths;
+use crate::protocol::{Request, Response, SessionInfo};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::de::DeserializeOwned;
+use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::raw::c_int;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub fn ensure_server() -> Result<()> {
+    if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let log = paths::log_path()?;
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .with_context(|| format!("open daemon log {}", log.display()))?;
+    let log_file_err = log_file.try_clone().context("clone daemon log")?;
+
+    Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .context("spawn lterm daemon")?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match rpc::<serde_json::Value>(&Request::Ping) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready")))
+}
+
+pub fn rpc<T: DeserializeOwned>(request: &Request) -> Result<T> {
+    let path = paths::socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+    let payload = serde_json::to_vec(request).context("serialize request")?;
+    stream.write_all(&payload).context("write request")?;
+    stream.write_all(b"\n").context("write request newline")?;
+    stream.shutdown(std::net::Shutdown::Write).ok();
+
+    let mut bytes = Vec::new();
+    let mut limited = stream.take(MAX_RPC_RESPONSE_BYTES + 1);
+    limited.read_to_end(&mut bytes).context("read response")?;
+    if bytes.len() as u64 > MAX_RPC_RESPONSE_BYTES {
+        bail!(
+            "lterm daemon response exceeded {} bytes",
+            MAX_RPC_RESPONSE_BYTES
+        );
+    }
+    let response: Response = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse response: {}", String::from_utf8_lossy(&bytes)))?;
+    if !response.ok {
+        bail!(
+            response
+                .error
+                .unwrap_or_else(|| "lterm daemon error".to_string())
+        );
+    }
+    let value = response.result.unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(value).context("decode response result")
+}
+
+pub fn new_session(
+    name: Option<String>,
+    command: Option<String>,
+    cwd: Option<String>,
+    env: std::collections::HashMap<String, String>,
+    tmux: bool,
+) -> Result<SessionInfo> {
+    ensure_server()?;
+    rpc(&Request::New {
+        name,
+        command,
+        cwd,
+        rows: terminal_rows(),
+        cols: terminal_cols(),
+        env,
+        tmux,
+    })
+}
+
+pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
+    ensure_server()?;
+    rpc(&Request::AttachOrNew {
+        target: target.to_string(),
+    })
+}
+
+pub fn list_sessions() -> Result<Vec<SessionInfo>> {
+    ensure_server()?;
+    rpc(&Request::List)
+}
+
+pub fn info(target: &str) -> Result<SessionInfo> {
+    ensure_server()?;
+    rpc(&Request::Info {
+        target: target.to_string(),
+    })
+}
+
+pub fn kill(target: &str) -> Result<()> {
+    ensure_server()?;
+    rpc::<serde_json::Value>(&Request::Kill {
+        target: target.to_string(),
+    })?;
+    Ok(())
+}
+
+pub fn send(target: &str, data: Vec<u8>) -> Result<()> {
+    ensure_server()?;
+    rpc::<serde_json::Value>(&Request::Send {
+        target: target.to_string(),
+        data,
+    })?;
+    Ok(())
+}
+
+pub fn capture(target: &str, start: Option<i32>) -> Result<String> {
+    ensure_server()?;
+    rpc(&Request::Capture {
+        target: target.to_string(),
+        start,
+    })
+}
+
+pub fn resize(target: &str, rows: u16, cols: u16) -> Result<()> {
+    ensure_server()?;
+    rpc::<serde_json::Value>(&Request::Resize {
+        target: target.to_string(),
+        rows,
+        cols,
+    })?;
+    Ok(())
+}
+
+pub fn shutdown() -> Result<()> {
+    ensure_server()?;
+    rpc::<serde_json::Value>(&Request::Shutdown)?;
+    Ok(())
+}
+
+pub fn attach(target: &str) -> Result<()> {
+    ensure_server()?;
+    let (cols, rows) = terminal_size();
+    let _ = resize(target, rows, cols);
+
+    let path = paths::socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+    let request = Request::Attach {
+        target: target.to_string(),
+    };
+    stream.write_all(&serde_json::to_vec(&request)?)?;
+    stream.write_all(b"\n")?;
+
+    let mut header = Vec::new();
+    let mut one = [0_u8; 1];
+    loop {
+        let n = stream.read(&mut one).context("read attach header")?;
+        if n == 0 {
+            bail!("daemon closed attach before header");
+        }
+        header.push(one[0]);
+        if one[0] == b'\n' {
+            break;
+        }
+        if header.len() > 64 * 1024 {
+            bail!("attach header too large");
+        }
+    }
+    let response: Response = serde_json::from_slice(&header).context("parse attach header")?;
+    if !response.ok {
+        bail!(
+            response
+                .error
+                .unwrap_or_else(|| "attach failed".to_string())
+        );
+    }
+
+    let _raw = RawModeGuard::enter()?;
+    let _nonblocking = NonBlockingStdinGuard::enter()?;
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut writer = stream.try_clone().context("clone attach stream writer")?;
+    let input_running = Arc::clone(&running);
+    let input_thread = thread::spawn(move || -> Result<()> {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0_u8; 8192];
+        while input_running.load(Ordering::SeqCst) {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => writer.write_all(&buf[..n]).context("write pty input")?,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(err) => return Err(err).context("read stdin"),
+            }
+        }
+        let _ = writer.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    });
+
+    let resize_running = Arc::clone(&running);
+    let resize_target = target.to_string();
+    let resize_thread = thread::spawn(move || {
+        let mut last = terminal_size();
+        while resize_running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
+            let current = terminal_size();
+            if current != last {
+                let _ = resize(&resize_target, current.1, current.0);
+                last = current;
+            }
+        }
+    });
+
+    let mut stdout = std::io::stdout();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = stream.read(&mut buf).context("read pty output")?;
+        if n == 0 {
+            break;
+        }
+        stdout.write_all(&buf[..n]).context("write stdout")?;
+        stdout.flush().ok();
+    }
+
+    running.store(false, Ordering::SeqCst);
+    let _ = input_thread.join();
+    let _ = resize_thread.join();
+    Ok(())
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+struct NonBlockingStdinGuard {
+    fd: c_int,
+    old_flags: c_int,
+}
+
+impl NonBlockingStdinGuard {
+    fn enter() -> Result<Self> {
+        let fd = std::io::stdin().as_raw_fd();
+        let old_flags = unsafe { fcntl(fd, F_GETFL, 0) };
+        if old_flags < 0 {
+            bail!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+        }
+        if unsafe { fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) } < 0 {
+            bail!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, old_flags })
+    }
+}
+
+impl Drop for NonBlockingStdinGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { fcntl(self.fd, F_SETFL, self.old_flags) };
+    }
+}
+
+pub fn terminal_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
+}
+
+pub fn terminal_cols() -> Option<u16> {
+    Some(terminal_size().0)
+}
+
+pub fn terminal_rows() -> Option<u16> {
+    Some(terminal_size().1)
+}
+
+pub fn shell_join(args: &[String]) -> Result<String> {
+    shlex::try_join(args.iter().map(String::as_str)).context("quote shell command")
+}
+
+pub fn command_exists(name: &str) -> bool {
+    if name.contains('/') {
+        return Path::new(name).exists();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| json!(value).to_string())
+}
+
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NONBLOCK: c_int = 0x0004;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: c_int = 0o4000;
+
+unsafe extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
+}
