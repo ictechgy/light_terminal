@@ -1,6 +1,7 @@
 use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs::OpenOptions;
@@ -176,6 +177,163 @@ pub fn shutdown() -> Result<()> {
     ensure_server()?;
     rpc::<serde_json::Value>(&Request::Shutdown)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessInfo {
+    pub session: String,
+    pub pane_id: String,
+    pub depth: usize,
+    pub pid: u32,
+    pub ppid: u32,
+    pub stat: String,
+    pub cpu_percent: f32,
+    pub mem_percent: f32,
+    pub rss_kib: u64,
+    pub elapsed: String,
+    pub command: String,
+}
+
+pub fn process_tree(target: Option<&str>) -> Result<Vec<ProcessInfo>> {
+    let sessions = if let Some(target) = target {
+        vec![info(target)?]
+    } else {
+        list_sessions()?
+    };
+    let processes = read_process_table()?;
+    let mut by_parent: std::collections::HashMap<u32, Vec<ProcessRow>> =
+        std::collections::HashMap::new();
+    let mut by_pid = std::collections::HashMap::new();
+    for process in processes {
+        by_pid.insert(process.pid, process.clone());
+        by_parent.entry(process.ppid).or_default().push(process);
+    }
+    for children in by_parent.values_mut() {
+        children.sort_by_key(|p| p.pid);
+    }
+
+    let mut builder = ProcessTreeBuilder::new(&by_parent, &by_pid);
+    for session in sessions {
+        let Some(root) = session.process_id else {
+            continue;
+        };
+        builder.append(&session.name, &session.pane_id, root, 0);
+    }
+    Ok(builder.into_processes())
+}
+
+struct ProcessTreeBuilder<'a> {
+    by_parent: &'a std::collections::HashMap<u32, Vec<ProcessRow>>,
+    by_pid: &'a std::collections::HashMap<u32, ProcessRow>,
+    seen: std::collections::HashSet<u32>,
+    processes: Vec<ProcessInfo>,
+}
+
+impl<'a> ProcessTreeBuilder<'a> {
+    fn new(
+        by_parent: &'a std::collections::HashMap<u32, Vec<ProcessRow>>,
+        by_pid: &'a std::collections::HashMap<u32, ProcessRow>,
+    ) -> Self {
+        Self {
+            by_parent,
+            by_pid,
+            seen: std::collections::HashSet::new(),
+            processes: Vec::new(),
+        }
+    }
+
+    fn append(&mut self, session: &str, pane_id: &str, pid: u32, depth: usize) {
+        if !self.seen.insert(pid) {
+            return;
+        }
+        if let Some(row) = self.by_pid.get(&pid) {
+            self.processes.push(ProcessInfo {
+                session: session.to_string(),
+                pane_id: pane_id.to_string(),
+                depth,
+                pid: row.pid,
+                ppid: row.ppid,
+                stat: row.stat.clone(),
+                cpu_percent: row.cpu_percent,
+                mem_percent: row.mem_percent,
+                rss_kib: row.rss_kib,
+                elapsed: row.elapsed.clone(),
+                command: row.command.clone(),
+            });
+        }
+        if let Some(children) = self.by_parent.get(&pid) {
+            for child in children {
+                self.append(session, pane_id, child.pid, depth + 1);
+            }
+        }
+    }
+
+    fn into_processes(self) -> Vec<ProcessInfo> {
+        self.processes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProcessRow {
+    pid: u32,
+    ppid: u32,
+    stat: String,
+    cpu_percent: f32,
+    mem_percent: f32,
+    rss_kib: u64,
+    elapsed: String,
+    command: String,
+}
+
+fn read_process_table() -> Result<Vec<ProcessRow>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat=,%cpu=,%mem=,rss=,etime=,command="])
+        .output()
+        .context("run ps")?;
+    if !output.status.success() {
+        bail!("ps exited with {}", output.status);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().take(7).collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Some(command_start) = nth_field_start(line, 7) else {
+            continue;
+        };
+        rows.push(ProcessRow {
+            pid: fields[0].parse().unwrap_or(0),
+            ppid: fields[1].parse().unwrap_or(0),
+            stat: fields[2].to_string(),
+            cpu_percent: fields[3].parse().unwrap_or(0.0),
+            mem_percent: fields[4].parse().unwrap_or(0.0),
+            rss_kib: fields[5].parse().unwrap_or(0),
+            elapsed: fields[6].to_string(),
+            command: line[command_start..].to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+fn nth_field_start(line: &str, field_index: usize) -> Option<usize> {
+    let mut in_field = false;
+    let mut field = 0;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            in_field = false;
+            continue;
+        }
+        if !in_field {
+            if field == field_index {
+                return Some(idx);
+            }
+            field += 1;
+            in_field = true;
+        }
+    }
+    None
 }
 
 pub fn attach(target: &str) -> Result<()> {

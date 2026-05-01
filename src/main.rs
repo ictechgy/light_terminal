@@ -63,6 +63,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show child process trees for lterm sessions.
+    Ps {
+        target: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a session or pane.
     Kill { target: String },
     /// Send text to a session or pane.
@@ -173,6 +179,31 @@ fn run() -> Result<()> {
                         if s.alive { "alive" } else { "dead" },
                         sanitize::terminal_text(&s.cwd),
                         sanitize::terminal_text(&s.command)
+                    );
+                }
+            }
+            Ok(())
+        }
+        Commands::Ps { target, json } => {
+            let processes = client::process_tree(target.as_deref())?;
+            if json {
+                println!("{}", client::json_pretty(&processes));
+            } else {
+                println!("SESSION\tPANE\tPID\tPPID\tCPU\tMEM\tRSS_KIB\tETIME\tCOMMAND");
+                for process in processes {
+                    let indent = "  ".repeat(process.depth);
+                    println!(
+                        "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}{}",
+                        sanitize::terminal_text(&process.session),
+                        sanitize::terminal_text(&process.pane_id),
+                        process.pid,
+                        process.ppid,
+                        process.cpu_percent,
+                        process.mem_percent,
+                        process.rss_kib,
+                        sanitize::terminal_text(&process.elapsed),
+                        indent,
+                        sanitize::terminal_text(&process.command)
                     );
                 }
             }

@@ -486,6 +486,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
     }
 
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
+    let mut sleep_for = Duration::from_millis(100);
     while Instant::now() < deadline {
         let signaled = update_store(|store| {
             let signaled = store.waits.remove(&channel);
@@ -494,7 +495,8 @@ fn wait_for(args: &[String]) -> Result<i32> {
         if signaled {
             return Ok(0);
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(sleep_for);
+        sleep_for = (sleep_for + Duration::from_millis(100)).min(Duration::from_secs(1));
     }
     Ok(1)
 }
@@ -906,6 +908,8 @@ mod tests {
             exit_code: None,
             rows: 24,
             cols: 80,
+            process_id: None,
+            process_group_id: None,
         };
         assert_eq!(
             expand_format("#{pane_id} #S #{pane_current_command}", &info),

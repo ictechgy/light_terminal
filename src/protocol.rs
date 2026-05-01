@@ -13,6 +13,8 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
     pub rows: u16,
     pub cols: u16,
+    pub process_id: Option<u32>,
+    pub process_group_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

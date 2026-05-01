@@ -26,6 +26,9 @@ const MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
 const SUBSCRIBER_QUEUE_LIMIT: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+type OutputChunk = Arc<[u8]>;
+type Subscriber = (u64, SyncSender<OutputChunk>);
+
 pub fn serve_forever() -> Result<()> {
     let socket = paths::socket_path()?;
     prepare_socket_path(&socket)?;
@@ -116,12 +119,14 @@ struct Session {
     command: String,
     cwd: String,
     created_unix_ms: u128,
+    process_id: Option<u32>,
+    process_group_id: Option<i32>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Mutex<VecDeque<u8>>,
-    subscribers: Mutex<Vec<(u64, SyncSender<Vec<u8>>)>>,
+    subscribers: Mutex<Vec<Subscriber>>,
     next_subscriber_id: AtomicU64,
     alive: AtomicBool,
     exit_code: AtomicI32,
@@ -143,6 +148,8 @@ impl Session {
             exit_code: if exit == i32::MIN { None } else { Some(exit) },
             rows: *lock(&self.rows),
             cols: *lock(&self.cols),
+            process_id: self.process_id,
+            process_group_id: self.process_group_id,
         }
     }
 
@@ -158,9 +165,17 @@ impl Session {
         }
 
         let subscribers = lock(&self.subscribers).clone();
+        let chunk: Option<OutputChunk> = if subscribers.is_empty() {
+            None
+        } else {
+            Some(Arc::from(bytes))
+        };
         let mut disconnected = Vec::new();
         for (id, tx) in subscribers {
-            match tx.try_send(bytes.to_vec()) {
+            let Some(chunk) = &chunk else {
+                break;
+            };
+            match tx.try_send(Arc::clone(chunk)) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Disconnected(_)) => disconnected.push(id),
             }
@@ -198,7 +213,7 @@ impl Session {
         bytes[spans[first].0..].to_vec()
     }
 
-    fn subscribe(&self) -> Result<(u64, Receiver<Vec<u8>>)> {
+    fn subscribe(&self) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
@@ -340,10 +355,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Kill { target } => {
             let session = resolve_session(state, &target)?;
-            let _ = lock(&session.killer).kill();
-            session.alive.store(false, Ordering::SeqCst);
-            remove_session(state, &session);
-            session.close_subscribers();
+            terminate_session(state, &session);
             Ok(Response::empty())
         }
         Request::Send { target, data } => {
@@ -378,9 +390,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             state.shutting_down.store(true, Ordering::SeqCst);
             let sessions: Vec<_> = lock(&state.sessions).by_pane.values().cloned().collect();
             for session in sessions {
-                let _ = lock(&session.killer).kill();
-                session.alive.store(false, Ordering::SeqCst);
-                session.close_subscribers();
+                terminate_session(state, &session);
             }
             Ok(Response::empty())
         }
@@ -453,6 +463,14 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .slave
         .spawn_command(cmd)
         .context("spawn command in pty")?;
+    let process_id = child.process_id();
+    #[cfg(unix)]
+    let process_group_id = pair
+        .master
+        .process_group_leader()
+        .or_else(|| process_id.and_then(|pid| i32::try_from(pid).ok()));
+    #[cfg(not(unix))]
+    let process_group_id = None;
     let killer = child.clone_killer();
     drop(pair.slave);
 
@@ -466,6 +484,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         command,
         cwd,
         created_unix_ms: now_unix_ms(),
+        process_id,
+        process_group_id,
         child: Mutex::new(child),
         killer: Mutex::new(killer),
         master: Mutex::new(pair.master),
@@ -541,7 +561,7 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
     let mut output = stream.try_clone().context("clone output stream")?;
     let output_thread = thread::spawn(move || {
         for bytes in rx {
-            if output.write_all(&bytes).is_err() {
+            if output.write_all(bytes.as_ref()).is_err() {
                 break;
             }
             let _ = output.flush();
@@ -609,6 +629,49 @@ fn remove_session(state: &Arc<State>, session: &Session) {
         .is_some_and(|s| s.id == session.id)
     {
         sessions.by_id.remove(&session.id);
+    }
+}
+
+fn terminate_session(state: &Arc<State>, session: &Session) {
+    signal_process_group(session, SIGHUP);
+    wait_for_process_group_exit(session.process_group_id, Duration::from_millis(150));
+    signal_process_group(session, SIGTERM);
+    wait_for_process_group_exit(session.process_group_id, Duration::from_millis(350));
+    signal_process_group(session, SIGKILL);
+    session.alive.store(false, Ordering::SeqCst);
+    remove_session(state, session);
+    session.close_subscribers();
+}
+
+fn signal_process_group(session: &Session, signal: c_int) {
+    if let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) {
+        let rc = unsafe { kill(-pgid, signal) };
+        if rc == 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(ESRCH) {
+            eprintln!(
+                "failed to signal process group {} for {}: {}",
+                pgid, session.name, err
+            );
+        }
+    }
+    let _ = lock(&session.killer).kill();
+}
+
+fn wait_for_process_group_exit(pgid: Option<i32>, timeout: Duration) {
+    let Some(pgid) = pgid.filter(|pgid| *pgid > 1) else {
+        thread::sleep(timeout);
+        return;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let rc = unsafe { kill(-pgid, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -893,6 +956,15 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
 )))]
 fn verify_peer_owner(_stream: &UnixStream) -> Result<()> {
     bail!("peer credential verification is not implemented for this platform")
+}
+
+const SIGHUP: c_int = 1;
+const SIGTERM: c_int = 15;
+const SIGKILL: c_int = 9;
+const ESRCH: i32 = 3;
+
+unsafe extern "C" {
+    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 #[cfg(any(

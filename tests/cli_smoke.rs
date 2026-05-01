@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,16 @@ impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = self.cmd().arg("shutdown").status();
     }
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> TestResult<bool> {
+    Ok(Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success())
 }
 
 #[test]
@@ -269,4 +279,53 @@ fn custom_socket_requires_private_parent() -> TestResult {
         "{stderr}"
     );
     Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_reaps_session_process_group_children() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--name",
+            "pgrp",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30 & echo CHILD:$!; wait",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("pgrp", "CHILD:")?;
+    let child_pid = captured
+        .split("CHILD:")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .ok_or("missing child pid")?;
+    assert!(
+        pid_alive(child_pid)?,
+        "child process should be alive before lterm kill"
+    );
+
+    let ps_output = env.cmd().args(["ps", "pgrp", "--json"]).output()?;
+    assert!(ps_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&ps_output.stdout).contains(child_pid),
+        "lterm ps should include child process tree"
+    );
+
+    let status = env.cmd().args(["kill", "pgrp"]).status()?;
+    assert!(status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !pid_alive(child_pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("child process {child_pid} survived lterm kill").into())
 }
