@@ -40,7 +40,9 @@ pub fn data_dir() -> Result<PathBuf> {
 
 pub fn socket_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("LTERM_SOCKET") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        validate_socket_parent(&path)?;
+        return Ok(path);
     }
     Ok(runtime_dir()?.join("lterm.sock"))
 }
@@ -67,16 +69,28 @@ pub fn buffer_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("tmux-buffer.txt"))
 }
 
-fn ensure_private_dir(path: &Path) -> Result<()> {
-    if !path.exists() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .with_context(|| format!("create private directory {}", path.display()))?;
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => validate_private_dir_metadata(path, &meta)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .with_context(|| format!("create private directory {}", path.display()))?;
+            let meta =
+                fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+            validate_private_dir_metadata(path, &meta)?;
+        }
+        Err(err) => return Err(err).with_context(|| format!("lstat {}", path.display())),
     }
+    Ok(())
+}
 
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+fn validate_private_dir_metadata(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        bail!("{} must not be a symlink", path.display());
+    }
     if !meta.is_dir() {
         bail!("{} is not a directory", path.display());
     }
@@ -95,11 +109,30 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
         perms.set_mode(mode & !0o077);
         fs::set_permissions(path, perms)
             .with_context(|| format!("tighten permissions on {}", path.display()))?;
+        let tightened =
+            fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+        if tightened.file_type().is_symlink() {
+            bail!(
+                "{} became a symlink while tightening permissions",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
 
-fn current_euid() -> u32 {
+fn validate_socket_parent(socket: &Path) -> Result<()> {
+    if socket.as_os_str().is_empty() {
+        bail!("LTERM_SOCKET cannot be empty");
+    }
+    let parent = socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("LTERM_SOCKET must include a parent directory")?;
+    ensure_private_dir(parent)
+}
+
+pub(crate) fn current_euid() -> u32 {
     unsafe { geteuid() }
 }
 

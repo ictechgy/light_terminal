@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 pub fn ensure_server() -> Result<()> {
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
@@ -24,6 +25,7 @@ pub fn ensure_server() -> Result<()> {
 
     let exe = std::env::current_exe().context("resolve current executable")?;
     let log = paths::log_path()?;
+    rotate_log_if_large(&log)?;
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -51,6 +53,19 @@ pub fn ensure_server() -> Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready")))
+}
+
+fn rotate_log_if_large(log: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(log) {
+        if meta.len() > MAX_DAEMON_LOG_BYTES {
+            let rotated = log.with_extension("log.1");
+            let _ = std::fs::remove_file(&rotated);
+            std::fs::rename(log, &rotated)
+                .or_else(|_| std::fs::write(log, b""))
+                .with_context(|| format!("rotate daemon log {}", log.display()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn rpc<T: DeserializeOwned>(request: &Request) -> Result<T> {

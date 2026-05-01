@@ -1,12 +1,16 @@
 use crate::client;
 use crate::paths;
 use crate::protocol::SessionInfo;
+use crate::sanitize;
 use crate::server;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::raw::c_int;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -567,12 +571,20 @@ fn open_cmux_split(direction: &str, info: &SessionInfo) -> Result<Option<String>
 }
 
 fn inside_cmux() -> bool {
-    std::env::var_os("CMUX_WORKSPACE_ID").is_some()
+    if std::env::var_os("CMUX_WORKSPACE_ID").is_some()
         || std::env::var_os("CMUX_SURFACE_ID").is_some()
-        || std::path::Path::new(
-            &std::env::var("CMUX_SOCKET_PATH").unwrap_or_else(|_| "/tmp/cmux.sock".to_string()),
-        )
-        .exists()
+    {
+        return true;
+    }
+    let Some(path) = std::env::var_os("CMUX_SOCKET_PATH").map(PathBuf::from) else {
+        return false;
+    };
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    !meta.file_type().is_symlink()
+        && meta.file_type().is_socket()
+        && meta.uid() == paths::current_euid()
 }
 
 fn cmux_identify_surface() -> Result<Option<String>> {
@@ -651,31 +663,40 @@ fn update_store<T>(f: impl FnOnce(&mut CompatStore) -> Result<T>) -> Result<T> {
 }
 
 struct StoreLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl StoreLock {
     fn acquire() -> Result<Self> {
         let path = paths::store_lock_path()?;
         let deadline = Instant::now() + Duration::from_secs(5);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Instant::now() >= deadline {
-                        bail!("timed out waiting for {}", path.display());
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),
+            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if rc == 0 {
+                return Ok(Self { file });
             }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for {}", path.display());
+                }
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            return Err(err).with_context(|| format!("lock {}", path.display()));
         }
     }
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
     }
 }
 
@@ -754,27 +775,66 @@ pub fn quote(value: &str) -> String {
 }
 
 pub fn expand_format(format: &str, info: &SessionInfo) -> String {
-    let mut out = format.to_string();
     let current_command = current_command(&info.command);
-    let replacements = [
-        ("#{pane_id}", info.pane_id.as_str()),
-        ("#D", info.pane_id.as_str()),
-        ("#{session_name}", info.name.as_str()),
-        ("#S", info.name.as_str()),
-        ("#{pane_current_command}", current_command.as_str()),
-        ("#{pane_start_command}", info.command.as_str()),
-        ("#{pane_current_path}", info.cwd.as_str()),
-        ("#{pane_active}", "1"),
-        ("#{pane_in_mode}", "0"),
-        ("#{window_width}", "80"),
-        ("#{window_height}", "24"),
-    ];
-    for (needle, value) in replacements {
-        out = out.replace(needle, value);
+    let mut out = String::new();
+    let mut i = 0;
+    while i < format.len() {
+        let rest = &format[i..];
+        if rest.starts_with("#{pane_width}") {
+            out.push_str(&info.cols.to_string());
+            i += "#{pane_width}".len();
+        } else if rest.starts_with("#{pane_height}") {
+            out.push_str(&info.rows.to_string());
+            i += "#{pane_height}".len();
+        } else if let Some((needle, value)) = format_replacement(rest, info, &current_command) {
+            out.push_str(&sanitize::terminal_text(value));
+            i += needle.len();
+        } else {
+            let ch = rest
+                .chars()
+                .next()
+                .expect("format index should be on a char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
-    out = out.replace("#{pane_width}", &info.cols.to_string());
-    out = out.replace("#{pane_height}", &info.rows.to_string());
     out
+}
+
+fn format_replacement<'a>(
+    rest: &str,
+    info: &'a SessionInfo,
+    current_command: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    const ACTIVE: &str = "1";
+    const IN_MODE: &str = "0";
+    const WIDTH: &str = "80";
+    const HEIGHT: &str = "24";
+    if rest.starts_with("#{pane_id}") {
+        Some(("#{pane_id}", info.pane_id.as_str()))
+    } else if rest.starts_with("#D") {
+        Some(("#D", info.pane_id.as_str()))
+    } else if rest.starts_with("#{session_name}") {
+        Some(("#{session_name}", info.name.as_str()))
+    } else if rest.starts_with("#S") {
+        Some(("#S", info.name.as_str()))
+    } else if rest.starts_with("#{pane_current_command}") {
+        Some(("#{pane_current_command}", current_command))
+    } else if rest.starts_with("#{pane_start_command}") {
+        Some(("#{pane_start_command}", info.command.as_str()))
+    } else if rest.starts_with("#{pane_current_path}") {
+        Some(("#{pane_current_path}", info.cwd.as_str()))
+    } else if rest.starts_with("#{pane_active}") {
+        Some(("#{pane_active}", ACTIVE))
+    } else if rest.starts_with("#{pane_in_mode}") {
+        Some(("#{pane_in_mode}", IN_MODE))
+    } else if rest.starts_with("#{window_width}") {
+        Some(("#{window_width}", WIDTH))
+    } else if rest.starts_with("#{window_height}") {
+        Some(("#{window_height}", HEIGHT))
+    } else {
+        None
+    }
 }
 
 fn current_command(command: &str) -> String {
@@ -783,6 +843,14 @@ fn current_command(command: &str) -> String {
         .next()
         .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
         .unwrap_or_else(|| "sh".to_string())
+}
+
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
+
+unsafe extern "C" {
+    fn flock(fd: c_int, operation: c_int) -> c_int;
 }
 
 pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {

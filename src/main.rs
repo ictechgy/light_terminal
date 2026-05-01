@@ -1,6 +1,7 @@
 mod client;
 mod paths;
 mod protocol;
+mod sanitize;
 mod server;
 mod tmux_compat;
 
@@ -167,11 +168,11 @@ fn run() -> Result<()> {
                 for s in collapse_aliases(sessions) {
                     println!(
                         "{}\t{}\t{}\t{}\t{}",
-                        s.name,
-                        s.pane_id,
+                        sanitize::terminal_text(&s.name),
+                        sanitize::terminal_text(&s.pane_id),
                         if s.alive { "alive" } else { "dead" },
-                        s.cwd,
-                        s.command
+                        sanitize::terminal_text(&s.cwd),
+                        sanitize::terminal_text(&s.command)
                     );
                 }
             }
@@ -272,30 +273,20 @@ fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {
     // written to stdout so it passes through lterm attach unchanged.
     print!(
         "\x1b]777;notify;{};{}\x07",
-        sanitize_osc_field(title),
-        sanitize_osc_field(body)
+        sanitize::osc_field(title),
+        sanitize::osc_field(body)
     );
     std::io::stdout().flush().ok();
     Ok(())
 }
 
-fn sanitize_osc_field(value: &str) -> String {
-    value
-        .chars()
-        .filter_map(|ch| match ch {
-            '\u{00}'..='\u{1f}' | '\u{7f}' => None,
-            ';' => Some(' '),
-            _ => Some(ch),
-        })
-        .collect()
-}
-
 fn ssh_attach(host: &str, target: &str, ssh_args: Vec<String>) -> Result<()> {
+    validate_ssh_host(host)?;
     let mut command = Command::new("ssh");
     for arg in ssh_args {
         command.arg(arg);
     }
-    command.arg("-t").arg(host).arg(format!(
+    command.arg("-t").arg("--").arg(host).arg(format!(
         "lterm attach-or-new {}",
         tmux_compat::quote(target)
     ));
@@ -305,4 +296,17 @@ fn ssh_attach(host: &str, target: &str, ssh_args: Vec<String>) -> Result<()> {
     } else {
         bail!("ssh exited with {status}")
     }
+}
+
+fn validate_ssh_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!("ssh host cannot be empty");
+    }
+    if host.starts_with('-') {
+        bail!("ssh host cannot start with '-'");
+    }
+    if host.chars().any(|ch| ch.is_control()) {
+        bail!("ssh host cannot contain control characters");
+    }
+    Ok(())
 }

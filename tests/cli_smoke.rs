@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -174,5 +174,99 @@ fn runtime_and_data_dirs_are_private() -> TestResult {
         & 0o777;
     assert_eq!(runtime_mode, 0o700);
     assert_eq!(data_mode, 0o700);
+    Ok(())
+}
+
+#[test]
+fn rejects_control_characters_in_session_names() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args(["new", "--name", "bad\u{1b}name", "--", "true"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session name"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn capture_strips_terminal_escape_sequences() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--name",
+            "escaped",
+            "--",
+            "sh",
+            "-lc",
+            "printf '\\033]52;c;secret\\aSAFE\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("escaped", "SAFE")?;
+    assert!(captured.contains("SAFE"), "{captured}");
+    assert!(!captured.contains("secret"), "{captured}");
+    assert!(!captured.contains('\u{1b}'), "{captured:?}");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let tmp = temp.path().join("tmp");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&tmp)?;
+
+    let mut list = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    list.env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &tmp)
+        .env("LTERM_DATA_DIR", &data)
+        .arg("list");
+    let output = list.output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let uid = std::fs::metadata(&tmp)?.uid();
+    let runtime = tmp.join(format!("light-terminal-{uid}"));
+    let meta = std::fs::symlink_metadata(&runtime)?;
+    assert!(!meta.file_type().is_symlink());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+    let mut shutdown = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    let _ = shutdown
+        .env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &tmp)
+        .env("LTERM_DATA_DIR", &data)
+        .arg("shutdown")
+        .status();
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn custom_socket_requires_private_parent() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    let output = daemon
+        .env("LTERM_SOCKET", "/tmp/lterm-insecure-test.sock")
+        .env("LTERM_DATA_DIR", temp.path().join("data"))
+        .arg("daemon")
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("owned by uid")
+            || stderr.contains("must not be a symlink")
+            || stderr.contains("not a directory"),
+        "{stderr}"
+    );
     Ok(())
 }

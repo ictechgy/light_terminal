@@ -4,6 +4,8 @@
 
 > Status: alpha MVP. It is usable for local detached sessions and compatibility testing, but it is not a full tmux replacement yet.
 
+> Security model: `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process that can run as your OS user should be treated as capable of controlling your sessions.
+
 ## Why this exists
 
 The project targets three constraints:
@@ -108,7 +110,7 @@ Notifications:
 lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
-`lterm notify` first tries `cmux notify`; if that is unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. PTY output is forwarded byte-for-byte, so notifications emitted by child processes are not filtered.
+`lterm notify` first tries `cmux notify`; if that is unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields strip terminal control characters before emitting fallback OSC.
 
 ## Remote access
 
@@ -126,11 +128,19 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## Architecture
 
-- **Daemon:** one Unix socket per user under `$XDG_RUNTIME_DIR` or `/tmp`.
+- **Daemon:** one Unix socket per user under `$XDG_RUNTIME_DIR` or an owner-only fallback under `/tmp`.
 - **PTY sessions:** spawned via `portable-pty`, with ring-buffer scrollback.
 - **Attach protocol:** the CLI sends JSON over the Unix socket, then streams raw PTY bytes.
 - **tmux shim:** a small shell script named `tmux` forwards commands to `lterm tmux-compat`.
 - **cmux bridge:** optional; uses cmux CLI when detected.
+
+## Security notes
+
+- `lterm attach` intentionally forwards raw PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. Do not use `lterm` as an escape-sequence sanitizer or sandbox.
+- `lterm capture` and `tmux capture-pane` strip common terminal control sequences by default before printing captured scrollback for humans or AI tools.
+- Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
+- `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior; do not pass untrusted popup commands.
+- Release builds should use the committed lockfile: `cargo build --release --locked`. The current lockfile includes `serde_json 1.0.149`; its `zmij` dependency is listed by the official serde_json package metadata on docs.rs/crates.io.
 
 ## Current limitations
 
@@ -138,13 +148,14 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - Outside cmux, `split-window` creates additional managed PTY sessions but does not draw a tiled in-terminal UI.
 - This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats/options may need more shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
+- The daemon currently authenticates local clients by OS peer credentials and owner-only socket paths, not by per-session ACLs.
 
 ## Development
 
 ```bash
 cargo fmt
 cargo test
-cargo build
+cargo build --locked
 ```
 
 Use isolated runtime directories for manual tests:

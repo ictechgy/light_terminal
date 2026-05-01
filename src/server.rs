@@ -1,5 +1,6 @@
 use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
+use crate::sanitize;
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
@@ -7,10 +8,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -18,7 +19,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const RING_LIMIT: usize = 2 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 64;
+const MAX_SESSIONS: usize = 256;
+const MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
 const SUBSCRIBER_QUEUE_LIMIT: usize = 128;
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn serve_forever() -> Result<()> {
     let socket = paths::socket_path()?;
@@ -36,8 +42,13 @@ pub fn serve_forever() -> Result<()> {
         }
         match stream {
             Ok(stream) => {
+                let Some(connection_guard) = state.try_acquire_connection() else {
+                    drop(stream);
+                    continue;
+                };
                 let state = Arc::clone(&state);
                 thread::spawn(move || {
+                    let _connection_guard = connection_guard;
                     if let Err(err) = handle_connection(state, stream) {
                         eprintln!("connection error: {err:#}");
                     }
@@ -54,6 +65,41 @@ struct State {
     sessions: Mutex<SessionMaps>,
     pane_index: AtomicU64,
     shutting_down: AtomicBool,
+    active_connections: AtomicUsize,
+}
+
+impl State {
+    fn try_acquire_connection(self: &Arc<Self>) -> Option<ConnectionGuard> {
+        let mut current = self.active_connections.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_CONNECTIONS {
+                return None;
+            }
+            match self.active_connections.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionGuard {
+                        state: Arc::clone(self),
+                    });
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+struct ConnectionGuard {
+    state: Arc<State>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -126,7 +172,7 @@ impl Session {
     }
 
     fn capture(&self, start: Option<i32>) -> String {
-        String::from_utf8_lossy(&self.capture_bytes(start)).to_string()
+        sanitize::terminal_capture(&self.capture_bytes(start))
     }
 
     fn capture_bytes(&self, start: Option<i32>) -> Vec<u8> {
@@ -152,11 +198,15 @@ impl Session {
         bytes[spans[first].0..].to_vec()
     }
 
-    fn subscribe(&self) -> (u64, Receiver<Vec<u8>>) {
+    fn subscribe(&self) -> Result<(u64, Receiver<Vec<u8>>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
-        lock(&self.subscribers).push((id, tx));
-        (id, rx)
+        let mut subscribers = lock(&self.subscribers);
+        if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
+            bail!("too many attached subscribers for session {}", self.name);
+        }
+        subscribers.push((id, tx));
+        Ok((id, rx))
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
@@ -170,14 +220,16 @@ impl Session {
 
 fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     verify_peer_owner(&stream)?;
-    let mut reader = BufReader::new(stream.try_clone().context("clone request stream")?);
-    let mut line = String::new();
-    reader.read_line(&mut line).context("read request line")?;
+    stream
+        .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
+        .context("set request read timeout")?;
+    let line = read_request_line(&stream)?;
+    stream.set_read_timeout(None).ok();
     if line.trim().is_empty() {
         return Ok(());
     }
-    let request: Request =
-        serde_json::from_str(&line).with_context(|| format!("parse request: {line}"))?;
+    let request: Request = serde_json::from_str(&line)
+        .with_context(|| format!("parse request: {}", sanitized_preview(&line)))?;
 
     if let Request::Attach { target } = request {
         return handle_attach(state, stream, &target);
@@ -197,6 +249,38 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         std::process::exit(0);
     }
     Ok(())
+}
+
+fn read_request_line(stream: &UnixStream) -> Result<String> {
+    let clone = stream.try_clone().context("clone request stream")?;
+    let mut reader = BufReader::new(clone.take((MAX_REQUEST_BYTES + 1) as u64));
+    let mut bytes = Vec::new();
+    reader
+        .read_until(b'\n', &mut bytes)
+        .context("read request line")?;
+    if bytes.len() > MAX_REQUEST_BYTES {
+        bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+    }
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bail!("request missing newline before EOF");
+    }
+    String::from_utf8(bytes).context("request is not valid UTF-8")
+}
+
+fn sanitized_preview(value: &str) -> String {
+    const LIMIT: usize = 256;
+    let mut preview = String::new();
+    for ch in value.chars().take(LIMIT) {
+        match ch {
+            '\t' | '\n' | '\r' => preview.push(' '),
+            ch if ch.is_control() => preview.push('�'),
+            ch => preview.push(ch),
+        }
+    }
+    if value.chars().count() > LIMIT {
+        preview.push('…');
+    }
+    preview
 }
 
 fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
@@ -315,6 +399,9 @@ struct NewSessionParams {
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
+    if lock(&state.sessions).by_pane.len() >= MAX_SESSIONS {
+        bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
+    }
     let pty_system = native_pty_system();
     let rows = params.rows.unwrap_or(24).max(1);
     let cols = params.cols.unwrap_or(80).max(1);
@@ -346,7 +433,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     cmd.arg("-lc");
     cmd.arg(&command);
     cmd.cwd(PathBuf::from(&cwd));
-    for (key, value) in params.env {
+    for (key, value) in sanitize_child_env(params.env)? {
         cmd.env(key, value);
     }
     cmd.env("LTERM_SESSION", &name);
@@ -450,7 +537,7 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
         stream.write_all(&initial).ok();
     }
 
-    let (subscriber_id, rx) = session.subscribe();
+    let (subscriber_id, rx) = session.subscribe()?;
     let mut output = stream.try_clone().context("clone output stream")?;
     let output_thread = thread::spawn(move || {
         for bytes in rx {
@@ -481,6 +568,9 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
 
 fn insert_session(state: &Arc<State>, session: Arc<Session>) -> Result<()> {
     let mut sessions = lock(&state.sessions);
+    if sessions.by_pane.len() >= MAX_SESSIONS {
+        bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
+    }
     if sessions.by_name.contains_key(&session.name) {
         bail!("session name already exists: {}", session.name);
     }
@@ -549,17 +639,88 @@ fn validate_session_name(state: &Arc<State>, name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("session name cannot be empty");
     }
+    if name.len() > 128 {
+        bail!("session name cannot exceed 128 bytes");
+    }
     if name.starts_with('%') {
         bail!("session name cannot look like a pane id: {name}");
     }
     if Uuid::parse_str(name).is_ok() {
         bail!("session name cannot look like a UUID: {name}");
     }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!("session name may only contain ASCII letters, numbers, '.', '_' and '-'");
+    }
     let sessions = lock(&state.sessions);
     if sessions.by_name.contains_key(name) {
         bail!("session name already exists: {name}");
     }
     Ok(())
+}
+
+fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, String>> {
+    let mut safe = HashMap::with_capacity(env.len());
+    for (key, value) in env {
+        validate_env_key(&key)?;
+        validate_env_value(&key, &value)?;
+        if is_dangerous_env_key(&key) {
+            bail!("refusing dangerous child environment variable: {key}");
+        }
+        safe.insert(key, value);
+    }
+    Ok(safe)
+}
+
+fn validate_env_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 {
+        bail!("invalid child environment variable name length");
+    }
+    if key.contains('=') || key.contains('\0') {
+        bail!("invalid child environment variable name: {key:?}");
+    }
+    let mut chars = key.chars();
+    let first = chars.next().expect("checked non-empty");
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("invalid child environment variable name: {key}");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        bail!("invalid child environment variable name: {key}");
+    }
+    Ok(())
+}
+
+fn validate_env_value(key: &str, value: &str) -> Result<()> {
+    if value.contains('\0') {
+        bail!("child environment variable {key} contains NUL");
+    }
+    if value.len() > 32 * 1024 {
+        bail!("child environment variable {key} is too large");
+    }
+    Ok(())
+}
+
+fn is_dangerous_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper == "LD_PRELOAD"
+        || upper == "LD_LIBRARY_PATH"
+        || upper == "LD_AUDIT"
+        || upper == "PATH"
+        || upper == "BASH_ENV"
+        || upper == "ENV"
+        || upper == "PROMPT_COMMAND"
+        || upper == "IFS"
+        || upper == "BASHOPTS"
+        || upper == "SHELLOPTS"
+        || upper == "GLOBIGNORE"
+        || upper == "TERMINFO"
+        || upper == "TERMINFO_DIRS"
+        || upper == "TMPDIR"
+        || matches!(upper.as_str(), "PS0" | "PS1" | "PS2" | "PS3" | "PS4")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("BASH_FUNC_")
 }
 
 fn normalize_target(target: &str) -> String {
@@ -629,12 +790,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn prepare_socket_path(socket: &Path) -> Result<()> {
-    if socket.exists() {
-        if ping_socket(socket).unwrap_or(false) {
-            bail!("lterm daemon already running at {}", socket.display());
+    let parent = socket
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("socket path must include a parent directory")?;
+    paths::ensure_private_dir(parent)?;
+
+    match fs::symlink_metadata(socket) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("refusing symlink socket path {}", socket.display());
+            }
+            if meta.file_type().is_socket() && ping_socket(socket).unwrap_or(false) {
+                bail!("lterm daemon already running at {}", socket.display());
+            }
+            fs::remove_file(socket)
+                .with_context(|| format!("remove stale socket {}", socket.display()))?;
         }
-        fs::remove_file(socket)
-            .with_context(|| format!("remove stale socket {}", socket.display()))?;
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("lstat {}", socket.display())),
     }
     Ok(())
 }
@@ -718,7 +892,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     target_os = "linux"
 )))]
 fn verify_peer_owner(_stream: &UnixStream) -> Result<()> {
-    Ok(())
+    bail!("peer credential verification is not implemented for this platform")
 }
 
 #[cfg(any(
