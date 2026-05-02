@@ -2,6 +2,15 @@
 
 한국어 | [English](README.md)
 
+## TL;DR
+
+- **무엇** — Rust로 만든 PTY 세션 데몬 + tmux 호환 shim. 이름이나 pane id로 detach·reattach할 수 있는 영속 세션을 제공합니다.
+- **대상** — tmux를 전제하는 AI 에이전트 도구(`oh-my-codex`, `oh-my-claude`)와, 그것을 `cmux` 안에서 돌리는 사용자.
+- **사용법** — `lterm new`로 만들고 `lterm attach`로 (재)접속, shim이 적용된 실행에는 `lterm omx` / `lterm omc`. 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
+- **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도 escape-sequence sanitizer도 완전한 tmux 대체품도 아닙니다.**
+
+---
+
 AI 에이전트 워크플로를 위해 만든 가벼운 터미널 세션 데몬입니다. tmux 호환 shim을 함께 제공합니다.
 
 `lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, oh-my-codex / oh-my-claude 계열 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.

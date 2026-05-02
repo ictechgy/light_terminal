@@ -2,6 +2,15 @@
 
 [한국어](README.ko.md) | English
 
+## TL;DR
+
+- **What** — A Rust-based PTY session daemon with a tmux-compatible shim. Persistent sessions you can detach and reattach by name or pane id.
+- **Who it's for** — AI-agent tooling that expects tmux (`oh-my-codex`, `oh-my-claude`) and users running it inside `cmux`.
+- **How** — `lterm new` to start, `lterm attach` to (re)connect, `lterm omx` / `lterm omc` for shimmed runs. Inside a session, the `tmux` command resolves to `lterm tmux-compat`.
+- **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
+
+---
+
 A lightweight terminal session daemon with a tmux-compatible shim, built for AI-agent workflows.
 
 `lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by oh-my-codex and oh-my-claude tooling.
