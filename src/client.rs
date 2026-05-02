@@ -457,7 +457,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         let stdin_fd = stdin.as_raw_fd();
         let mut buf = [0_u8; 8192];
         while input_running.load(Ordering::SeqCst) {
-            if !stdin_has_input(stdin_fd, Duration::from_millis(10))? {
+            if !stdin_has_input(stdin_fd, Duration::from_millis(100))? {
                 continue;
             }
             match stdin.read(&mut buf) {
@@ -691,8 +691,17 @@ fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
     loop {
         let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
         if rc > 0 {
-            let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-            return Ok((pollfd.revents & ready) != 0);
+            if pollfd.revents & libc::POLLERR != 0 {
+                bail!("stdin poll reported error events: {:#x}", pollfd.revents);
+            }
+            if pollfd.revents & libc::POLLNVAL != 0 {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags < 0 {
+                    bail!("stdin poll reported invalid fd: {:#x}", pollfd.revents);
+                }
+                return Ok(true);
+            }
+            return Ok((pollfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0);
         }
         if rc == 0 {
             return Ok(false);

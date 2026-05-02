@@ -527,12 +527,12 @@ fn tmux_mode_list_shows_user_command_not_internal_path_prefix() -> TestResult {
 }
 
 #[test]
-fn agent_command_reattaches_existing_named_session() -> TestResult {
+fn agent_command_uses_unique_name_when_base_is_occupied() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
     std::fs::create_dir(&fake_bin)?;
     let fake_omx = fake_bin.join("omx");
-    std::fs::write(&fake_omx, "#!/bin/sh\necho FAKE_OMX_NEW\n")?;
+    std::fs::write(&fake_omx, "#!/bin/sh\necho FAKE_OMX_NEW\nsleep 0.1\n")?;
     #[cfg(unix)]
     {
         let mut perms = std::fs::metadata(&fake_omx)?.permissions();
@@ -540,8 +540,10 @@ fn agent_command_reattaches_existing_named_session() -> TestResult {
         std::fs::set_permissions(&fake_omx, perms)?;
     }
     let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{old_path}", fake_bin.display());
     let status = env
         .cmd()
+        .env("PATH", &path)
         .args([
             "new",
             "--detach",
@@ -550,24 +552,23 @@ fn agent_command_reattaches_existing_named_session() -> TestResult {
             "--",
             "sh",
             "-lc",
-            "echo EXISTING_AGENT; sleep 0.2; echo EXISTING_DONE",
+            "echo EXISTING_AGENT; sleep 5",
         ])
         .status()?;
     assert!(status.success());
 
     let output = env
         .cmd()
-        .env("PATH", format!("{}:{old_path}", fake_bin.display()))
+        .env("PATH", &path)
         .stdin(Stdio::null())
         .arg("omx")
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("EXISTING_AGENT"), "{stdout:?}");
-    assert!(stdout.contains("EXISTING_DONE"), "{stdout:?}");
+    assert!(stdout.contains("FAKE_OMX_NEW"), "{stdout:?}");
     assert!(
-        !stdout.contains("FAKE_OMX_NEW"),
-        "should attach existing session instead of starting a new omx command: {stdout:?}"
+        !stdout.contains("EXISTING_AGENT"),
+        "should start a new uniquely named agent session instead of attaching the occupied base name: {stdout:?}"
     );
     Ok(())
 }

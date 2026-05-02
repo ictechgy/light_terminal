@@ -8,7 +8,7 @@ mod tmux_compat;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use client::AttachStdinEof;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Command;
 
@@ -297,23 +297,50 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
     if !client::command_exists(binary) {
         bail!("{binary} not found in PATH");
     }
-    let session_name = format!("{binary}-lterm");
-    if client::info(&session_name).is_ok_and(|info| info.alive) {
-        return client::attach(&session_name, true, AttachStdinEof::KeepAttached);
-    }
     tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
     cmd.push(binary.to_string());
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
-    let info = client::new_session(
-        Some(session_name),
-        Some(command),
-        None,
-        HashMap::new(),
-        true,
-    )?;
-    client::attach(&info.pane_id, true, AttachStdinEof::KeepAttached)
+    let base_name = format!("{binary}-lterm");
+    let mut last_conflict = None;
+    for _ in 0..32 {
+        let session_name = next_agent_session_name(&base_name)?;
+        match client::new_session(
+            Some(session_name),
+            Some(command.clone()),
+            None,
+            HashMap::new(),
+            true,
+        ) {
+            Ok(info) => return client::attach(&info.pane_id, true, AttachStdinEof::KeepAttached),
+            Err(err) if is_session_name_conflict(&err) => last_conflict = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_conflict
+        .unwrap_or_else(|| anyhow::anyhow!("could not allocate session name for {base_name}")))
+}
+
+fn is_session_name_conflict(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("session name already exists:")
+}
+
+fn next_agent_session_name(base_name: &str) -> Result<String> {
+    let used: HashSet<_> = client::list_sessions()?
+        .into_iter()
+        .map(|session| session.name)
+        .collect();
+    if !used.contains(base_name) {
+        return Ok(base_name.to_string());
+    }
+    for index in 1..=999 {
+        let candidate = format!("{base_name}-{index}");
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("no available session name for {base_name}");
 }
 
 fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {
