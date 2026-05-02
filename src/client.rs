@@ -7,8 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::raw::c_int;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -448,7 +447,6 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     }
 
     let _raw = RawModeGuard::enter()?;
-    let _nonblocking = NonBlockingStdinGuard::enter()?;
     let running = Arc::new(AtomicBool::new(true));
 
     let mut writer = stream.try_clone().context("clone attach stream writer")?;
@@ -456,8 +454,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let detach_on_stdin_eof = matches!(stdin_eof, AttachStdinEof::Detach);
     let input_thread = thread::spawn(move || -> Result<()> {
         let mut stdin = std::io::stdin();
+        let stdin_fd = stdin.as_raw_fd();
         let mut buf = [0_u8; 8192];
         while input_running.load(Ordering::SeqCst) {
+            if !stdin_has_input(stdin_fd, Duration::from_millis(10))? {
+                continue;
+            }
             match stdin.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => writer.write_all(&buf[..n]).context("write pty input")?,
@@ -679,28 +681,27 @@ impl Drop for RawModeGuard {
     }
 }
 
-struct NonBlockingStdinGuard {
-    fd: c_int,
-    old_flags: c_int,
-}
-
-impl NonBlockingStdinGuard {
-    fn enter() -> Result<Self> {
-        let fd = std::io::stdin().as_raw_fd();
-        let old_flags = unsafe { fcntl(fd, F_GETFL, 0) };
-        if old_flags < 0 {
-            bail!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc > 0 {
+            let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+            return Ok((pollfd.revents & ready) != 0);
         }
-        if unsafe { fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) } < 0 {
-            bail!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+        if rc == 0 {
+            return Ok(false);
         }
-        Ok(Self { fd, old_flags })
-    }
-}
-
-impl Drop for NonBlockingStdinGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { fcntl(self.fd, F_SETFL, self.old_flags) };
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err).context("poll stdin");
     }
 }
 
@@ -750,21 +751,4 @@ mod tests {
         assert_eq!(format_status_line("api", "%1", 16), " lterm  api  %1 ");
         assert_eq!(format_status_line("api", "%1", 18), " lterm  api  %1   ");
     }
-}
-
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-const O_NONBLOCK: c_int = 0x0004;
-#[cfg(target_os = "linux")]
-const O_NONBLOCK: c_int = 0o4000;
-
-unsafe extern "C" {
-    fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
 }
