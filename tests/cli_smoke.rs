@@ -450,6 +450,83 @@ fn tmux_compat_quotes_multi_arg_commands() -> TestResult {
 }
 
 #[test]
+fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let fake_tmux = fake_bin.join("tmux");
+    std::fs::write(
+        &fake_tmux,
+        "#!/bin/sh\necho FAKE_TMUX_SHOULD_NOT_RUN\nexit 99\n",
+    )?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&fake_tmux)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, perms)?;
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let output = env
+        .cmd()
+        .env("PATH", format!("{}:{old_path}", fake_bin.display()))
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'TMUX_BIN:%s\\n' \"$(command -v tmux)\"; tmux list-panes -t \"$TMUX_PANE\" -F '#{pane_id}'",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("FAKE_TMUX_SHOULD_NOT_RUN"),
+        "fake tmux won PATH precedence: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(&fake_tmux.display().to_string()),
+        "command -v tmux resolved fake tmux: {stdout:?}"
+    );
+    assert!(stdout.contains("data/shims/tmux"), "{stdout:?}");
+    assert!(stdout.contains("%0"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_mode_list_shows_user_command_not_internal_path_prefix() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--tmux",
+            "-n",
+            "clean-command",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env.cmd().arg("list").output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("clean-command"), "{stdout:?}");
+    assert!(stdout.contains("sh -lc"), "{stdout:?}");
+    assert!(
+        !stdout.contains("PATH="),
+        "internal PATH prefix leaked into list output: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
     let env = TestEnv::new()?;
     let status = env

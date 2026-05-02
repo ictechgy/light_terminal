@@ -506,7 +506,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     loop {
         while resize_rx.try_recv().is_ok() {
             status_bar.refresh(&mut stdout)?;
-            stdout.flush().ok();
+            stdout.flush().context("flush stdout")?;
             status_dirty = false;
         }
         let n = match stream.read(&mut buf) {
@@ -520,7 +520,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             {
                 if status_dirty {
                     status_bar.refresh(&mut stdout)?;
-                    stdout.flush().ok();
+                    stdout.flush().context("flush stdout")?;
                     status_dirty = false;
                 }
                 continue;
@@ -528,14 +528,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             Err(err) => return Err(err).context("read pty output"),
         };
         stdout.write_all(&buf[..n]).context("write stdout")?;
-        stdout.flush().ok();
+        stdout.flush().context("flush stdout")?;
         if status_enabled {
             status_dirty = true;
         }
     }
     if status_dirty {
         status_bar.refresh(&mut stdout)?;
-        stdout.flush().ok();
+        stdout.flush().context("flush stdout")?;
     }
 
     running.store(false, Ordering::SeqCst);
@@ -585,7 +585,7 @@ impl StatusBar {
         };
         status.reserve_terminal_area(stdout)?;
         status.draw(stdout)?;
-        stdout.flush().ok();
+        stdout.flush().context("flush stdout")?;
         Ok(status)
     }
 

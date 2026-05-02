@@ -11,6 +11,7 @@ target/
 
 # Runtime state
 .omx/
+.omc/
 .light-terminal/
 *.sock
 *.log

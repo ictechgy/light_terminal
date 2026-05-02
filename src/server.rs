@@ -435,10 +435,20 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         })
         .unwrap_or_else(|| ".".to_string());
     let command = params.command.unwrap_or_else(default_shell_command);
+    let mut spawn_command = command.clone();
+    let tmux_shim = if params.tmux {
+        let shim = paths::shim_dir()?;
+        let shim_path = shim.display().to_string();
+        let quoted_shim = shlex::try_quote(&shim_path).unwrap_or_default();
+        spawn_command = format!("PATH={quoted_shim}${{PATH:+:$PATH}}; export PATH; {command}");
+        Some(shim)
+    } else {
+        None
+    };
 
     let mut cmd = CommandBuilder::new(default_shell());
     cmd.arg("-lc");
-    cmd.arg(&command);
+    cmd.arg(&spawn_command);
     cmd.cwd(PathBuf::from(&cwd));
     for (key, value) in sanitize_child_env(params.env)? {
         cmd.env(key, value);
@@ -451,7 +461,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cmd.env("TMUX", fake_tmux_value()?);
         cmd.env("TMUX_PANE", &pane_id);
         cmd.env("TERM_PROGRAM", "lterm");
-        let shim = paths::shim_dir()?;
+        let shim = tmux_shim.context("missing tmux shim path")?;
         let old_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{old_path}", shim.display()));
     }
