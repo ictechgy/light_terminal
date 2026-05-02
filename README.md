@@ -1,5 +1,7 @@
 # Light Terminal (`lterm`)
 
+[한국어](README.ko.md) | English
+
 `lterm` is a lightweight terminal session daemon with a tmux-compatible shim for AI-agent workflows. It is intentionally smaller than tmux: it keeps long-running PTY sessions alive, lets clients detach/reattach, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by oh-my-codex / oh-my-claude style tooling.
 
 > Status: alpha MVP. It is usable for local detached sessions and compatibility testing, but it is not a full tmux replacement yet.
@@ -150,12 +152,12 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## Security notes
 
-- `lterm attach` intentionally forwards PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is only a client-side terminal decoration; use `--no-status` for a full raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. Do not use `lterm` as an escape-sequence sanitizer or sandbox.
+- `lterm attach` intentionally forwards PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is only a client-side terminal decoration; use `--no-status` for a full raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 - `lterm capture` and `tmux capture-pane` strip common terminal control sequences by default before printing captured scrollback for humans or AI tools.
 - `lterm ps [session]` shows the process tree rooted at each session child so long-running Codex/OMX/MCP subprocess buildup is visible before it becomes a memory leak surprise. It invokes the system `ps` by absolute path and skips malformed process rows rather than guessing.
 - Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
-- `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior; do not pass untrusted popup commands.
-- Release builds should use the committed lockfile: `cargo build --release --locked`. The current lockfile includes `serde_json 1.0.149`; its `zmij` dependency is listed by the official serde_json package metadata on docs.rs/crates.io.
+- `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior; **do not pass untrusted popup commands.**
+- Release builds should use the committed lockfile: `cargo build --release --locked`. The current lockfile includes `serde_json 1.0.149`. Its transitive `zmij` dependency is part of the official serde_json package metadata on docs.rs/crates.io, not a local vendored crate.
 
 ## Current limitations
 
@@ -182,3 +184,12 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- new --name 
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- capture test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
