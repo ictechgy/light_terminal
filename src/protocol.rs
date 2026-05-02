@@ -13,7 +13,9 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
     pub rows: u16,
     pub cols: u16,
+    #[serde(default)]
     pub process_id: Option<u32>,
+    #[serde(default)]
     pub process_group_id: Option<i32>,
 }
 
@@ -91,5 +93,32 @@ impl Response {
             error: Some(message.into()),
             result: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionInfo;
+
+    #[test]
+    fn session_info_accepts_pre_process_metadata_json() {
+        let info: SessionInfo = serde_json::from_str(
+            r#"{
+                "id": "session-id",
+                "name": "api",
+                "pane_id": "%0",
+                "command": "sh",
+                "cwd": "/tmp",
+                "created_unix_ms": 1,
+                "alive": true,
+                "exit_code": null,
+                "rows": 24,
+                "cols": 80
+            }"#,
+        )
+        .expect("deserialize legacy SessionInfo without process metadata");
+
+        assert_eq!(info.process_id, None);
+        assert_eq!(info.process_group_id, None);
     }
 }

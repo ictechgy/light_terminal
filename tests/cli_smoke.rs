@@ -1,4 +1,5 @@
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,12 +51,23 @@ impl Drop for TestEnv {
 
 #[cfg(unix)]
 fn pid_alive(pid: &str) -> TestResult<bool> {
-    Ok(Command::new("kill")
-        .args(["-0", pid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .success())
+    let output = Command::new(ps_path())
+        .args(["-o", "stat=", "-p", pid])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim();
+    Ok(!stat.is_empty() && !stat.starts_with('Z'))
+}
+
+#[cfg(unix)]
+fn ps_path() -> &'static str {
+    ["/bin/ps", "/usr/bin/ps"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or("/bin/ps")
 }
 
 #[test]

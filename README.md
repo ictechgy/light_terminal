@@ -139,7 +139,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 - `lterm attach` intentionally forwards raw PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. Do not use `lterm` as an escape-sequence sanitizer or sandbox.
 - `lterm capture` and `tmux capture-pane` strip common terminal control sequences by default before printing captured scrollback for humans or AI tools.
-- `lterm ps [session]` shows the process tree rooted at each session child so long-running Codex/OMX/MCP subprocess buildup is visible before it becomes a memory leak surprise.
+- `lterm ps [session]` shows the process tree rooted at each session child so long-running Codex/OMX/MCP subprocess buildup is visible before it becomes a memory leak surprise. It invokes the system `ps` by absolute path and skips malformed process rows rather than guessing.
 - Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
 - `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior; do not pass untrusted popup commands.
 - Release builds should use the committed lockfile: `cargo build --release --locked`. The current lockfile includes `serde_json 1.0.149`; its `zmij` dependency is listed by the official serde_json package metadata on docs.rs/crates.io.
@@ -151,7 +151,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats/options may need more shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
 - The daemon currently authenticates local clients by OS peer credentials and owner-only socket paths, not by per-session ACLs.
-- Session shutdown uses process-group signaling so child trees such as shells -> OMX -> Codex -> MCP servers are cleaned up together when possible.
+- Session shutdown uses verified process-group signaling so child trees such as shells -> OMX -> Codex -> MCP servers are cleaned up together when possible. Processes that intentionally detach into a different session/process group can still outlive `lterm kill` and should be inspected with `lterm ps` or OS process tools.
 
 ## Development
 

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
 pub fn ensure_server() -> Result<()> {
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
@@ -286,7 +287,7 @@ struct ProcessRow {
 }
 
 fn read_process_table() -> Result<Vec<ProcessRow>> {
-    let output = Command::new("ps")
+    let output = Command::new(ps_path())
         .args(["-axo", "pid=,ppid=,stat=,%cpu=,%mem=,rss=,etime=,command="])
         .output()
         .context("run ps")?;
@@ -303,18 +304,57 @@ fn read_process_table() -> Result<Vec<ProcessRow>> {
         let Some(command_start) = nth_field_start(line, 7) else {
             continue;
         };
+        let Some(pid) = parse_nonzero_u32(fields[0]) else {
+            continue;
+        };
+        let Some(ppid) = parse_u32(fields[1]) else {
+            continue;
+        };
+        let Some(cpu_percent) = parse_f32(fields[3]) else {
+            continue;
+        };
+        let Some(mem_percent) = parse_f32(fields[4]) else {
+            continue;
+        };
+        let Some(rss_kib) = parse_u64(fields[5]) else {
+            continue;
+        };
         rows.push(ProcessRow {
-            pid: fields[0].parse().unwrap_or(0),
-            ppid: fields[1].parse().unwrap_or(0),
+            pid,
+            ppid,
             stat: fields[2].to_string(),
-            cpu_percent: fields[3].parse().unwrap_or(0.0),
-            mem_percent: fields[4].parse().unwrap_or(0.0),
-            rss_kib: fields[5].parse().unwrap_or(0),
+            cpu_percent,
+            mem_percent,
+            rss_kib,
             elapsed: fields[6].to_string(),
             command: line[command_start..].to_string(),
         });
     }
     Ok(rows)
+}
+
+fn ps_path() -> &'static str {
+    PS_CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or(PS_CANDIDATES[0])
+}
+
+fn parse_nonzero_u32(value: &str) -> Option<u32> {
+    parse_u32(value).filter(|value| *value != 0)
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value.parse().ok()
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse().ok()
+}
+
+fn parse_f32(value: &str) -> Option<f32> {
+    value.parse().ok()
 }
 
 fn nth_field_start(line: &str, field_index: usize) -> Option<usize> {

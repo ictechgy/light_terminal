@@ -2,12 +2,12 @@ use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::sanitize;
 use anyhow::{Context, Result, bail};
+use libc::c_int;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::raw::c_int;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -464,13 +464,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .spawn_command(cmd)
         .context("spawn command in pty")?;
     let process_id = child.process_id();
-    #[cfg(unix)]
-    let process_group_id = pair
-        .master
-        .process_group_leader()
-        .or_else(|| process_id.and_then(|pid| i32::try_from(pid).ok()));
-    #[cfg(not(unix))]
-    let process_group_id = None;
+    let process_group_id =
+        verified_process_group_id(pair.master.process_group_leader(), process_id, &name);
     let killer = child.clone_killer();
     drop(pair.slave);
 
@@ -632,25 +627,50 @@ fn remove_session(state: &Arc<State>, session: &Session) {
     }
 }
 
+fn verified_process_group_id(
+    candidate: Option<libc::pid_t>,
+    process_id: Option<u32>,
+    session_name: &str,
+) -> Option<i32> {
+    let pgid = candidate.filter(|pgid| *pgid > 1)?;
+    let Some(pid) = process_id.and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        eprintln!("session {session_name} has no verifiable child pid for process group cleanup");
+        return None;
+    };
+    let actual = unsafe { libc::getpgid(pid) };
+    if actual == pgid {
+        return Some(pgid);
+    }
+    let err = std::io::Error::last_os_error();
+    if actual < 0 {
+        eprintln!("failed to verify process group for session {session_name}: {err}");
+    } else {
+        eprintln!(
+            "not using process group {pgid} for session {session_name}: child {pid} is in group {actual}"
+        );
+    }
+    None
+}
+
 fn terminate_session(state: &Arc<State>, session: &Session) {
-    signal_process_group(session, SIGHUP);
+    signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session.process_group_id, Duration::from_millis(150));
-    signal_process_group(session, SIGTERM);
+    signal_process_group(session, libc::SIGTERM);
     wait_for_process_group_exit(session.process_group_id, Duration::from_millis(350));
-    signal_process_group(session, SIGKILL);
+    signal_process_group(session, libc::SIGKILL);
     session.alive.store(false, Ordering::SeqCst);
     remove_session(state, session);
     session.close_subscribers();
 }
 
-fn signal_process_group(session: &Session, signal: c_int) {
+fn signal_process_group(session: &Session, signal: libc::c_int) {
     if let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) {
-        let rc = unsafe { kill(-pgid, signal) };
+        let rc = unsafe { libc::kill(-pgid, signal) };
         if rc == 0 {
             return;
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(ESRCH) {
+        if err.raw_os_error() != Some(libc::ESRCH) {
             eprintln!(
                 "failed to signal process group {} for {}: {}",
                 pgid, session.name, err
@@ -667,8 +687,8 @@ fn wait_for_process_group_exit(pgid: Option<i32>, timeout: Duration) {
     };
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        let rc = unsafe { kill(-pgid, 0) };
-        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return;
         }
         thread::sleep(Duration::from_millis(25));
@@ -956,15 +976,6 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
 )))]
 fn verify_peer_owner(_stream: &UnixStream) -> Result<()> {
     bail!("peer credential verification is not implemented for this platform")
-}
-
-const SIGHUP: c_int = 1;
-const SIGTERM: c_int = 15;
-const SIGKILL: c_int = 9;
-const ESRCH: i32 = 3;
-
-unsafe extern "C" {
-    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 #[cfg(any(
