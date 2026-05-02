@@ -1,4 +1,5 @@
 use crate::client;
+use crate::client::AttachStdinEof;
 use crate::paths;
 use crate::protocol::SessionInfo;
 use crate::sanitize;
@@ -166,14 +167,14 @@ fn new_session(args: &[String]) -> Result<i32> {
     if detached {
         Ok(0)
     } else {
-        client::attach(&info.name, true)?;
+        client::attach(&info.name, true, AttachStdinEof::KeepAttached)?;
         Ok(0)
     }
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args).unwrap_or_else(default_target);
-    client::attach(&target, true)?;
+    client::attach(&target, true, AttachStdinEof::Detach)?;
     Ok(0)
 }
 

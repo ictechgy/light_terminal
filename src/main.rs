@@ -7,6 +7,7 @@ mod tmux_compat;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use client::AttachStdinEof;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::Command;
@@ -168,7 +169,7 @@ fn run() -> Result<()> {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())
             } else {
-                client::attach(&info.pane_id, !no_status)
+                client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
             }
         }
         Commands::Run {
@@ -183,12 +184,16 @@ fn run() -> Result<()> {
             }
             let command = normalize_command(command)?.context("run requires a command")?;
             let info = client::new_session(name, Some(command), cwd, HashMap::new(), tmux)?;
-            client::attach(&info.pane_id, !no_status)
+            client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
         }
-        Commands::Attach { target, no_status } => client::attach(&target, !no_status),
-        Commands::AttachOrNew { target, no_status } => {
-            client::attach(&client::attach_or_new(&target)?.pane_id, !no_status)
+        Commands::Attach { target, no_status } => {
+            client::attach(&target, !no_status, AttachStdinEof::Detach)
         }
+        Commands::AttachOrNew { target, no_status } => client::attach(
+            &client::attach_or_new(&target)?.pane_id,
+            !no_status,
+            AttachStdinEof::Detach,
+        ),
         Commands::List { json } => {
             let sessions = client::list_sessions()?;
             if json {
@@ -304,7 +309,7 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
         HashMap::new(),
         true,
     )?;
-    client::attach(&info.pane_id, true)
+    client::attach(&info.pane_id, true, AttachStdinEof::KeepAttached)
 }
 
 fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {

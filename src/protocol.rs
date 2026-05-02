@@ -26,6 +26,7 @@ pub enum Request {
     New {
         name: Option<String>,
         command: Option<String>,
+        #[serde(default)]
         cwd: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,

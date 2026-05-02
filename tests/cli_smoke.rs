@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,7 @@ fn new_attaches_by_default() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
         .cmd()
+        .stdin(Stdio::null())
         .args([
             "new",
             "-n",
@@ -144,14 +145,117 @@ fn new_attaches_by_default() -> TestResult {
             "--",
             "sh",
             "-lc",
-            "echo ATTACHED_BY_DEFAULT; sleep 1",
+            "echo ATTACHED_BY_DEFAULT; sleep 0.2; echo STILL_ATTACHED",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ATTACHED_BY_DEFAULT"), "{output:?}");
+    assert!(stdout.contains("STILL_ATTACHED"), "{output:?}");
+    Ok(())
+}
+
+#[test]
+fn explicit_attach_detaches_on_stdin_eof() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "eof-attach",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let mut attach = env
+        .cmd()
+        .args(["attach", "eof-attach", "--no-status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = attach.try_wait()? {
+            assert!(status.success(), "{status:?}");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Err("explicit attach did not detach after stdin EOF".into())
+}
+
+#[test]
+fn attached_client_exits_when_session_kills_itself() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env.cmd().arg("list").status()?;
+    assert!(status.success());
+
+    let started = Instant::now();
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "new",
+            "--no-status",
+            "-n",
+            "self-kill",
+            "--",
+            "sh",
+            "-lc",
+            "trap '' HUP TERM; echo READY; \"$LTERM_BIN\" kill self-kill; echo AFTER; sleep 30",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("ATTACHED_BY_DEFAULT"),
-        "{output:?}"
+        started.elapsed() < Duration::from_secs(2),
+        "self-kill attach did not exit promptly: {output:?}"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("READY"), "{output:?}");
+    assert!(
+        !stdout.contains("AFTER"),
+        "attach kept streaming after self-kill began: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_new_sessions_get_unique_default_panes() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut children = Vec::new();
+    for _ in 0..24 {
+        children.push(
+            env.cmd()
+                .args(["new", "--detach", "--", "sh", "-lc", "sleep 2"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+    }
+
+    let mut panes = std::collections::HashSet::new();
+    for child in children {
+        let output = child.wait_with_output()?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pane = stdout
+            .split('\t')
+            .nth(1)
+            .ok_or_else(|| format!("missing pane id in output: {stdout:?}"))?
+            .trim()
+            .to_string();
+        assert!(panes.insert(pane.clone()), "duplicate pane id: {pane}");
+    }
+    assert_eq!(panes.len(), 24);
     Ok(())
 }
 
@@ -259,6 +363,35 @@ fn new_uses_callers_current_directory_by_default() -> TestResult {
         String::from_utf8_lossy(&listed.stdout).contains(&cwd.display().to_string()),
         "{listed:?}"
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn explicit_cwd_works_when_callers_current_directory_was_removed() -> TestResult {
+    let env = TestEnv::new()?;
+    let removed = env.temp.path().join("removed-cwd");
+    let target = env.temp.path().join("explicit-cwd");
+    std::fs::create_dir(&removed)?;
+    std::fs::create_dir(&target)?;
+
+    let output = Command::new("sh")
+        .env("LTERM_RUNTIME_DIR", env.temp.path().join("run"))
+        .env("LTERM_DATA_DIR", env.temp.path().join("data"))
+        .env("LTERM_BIN", env!("CARGO_BIN_EXE_lterm"))
+        .env("REMOVED_CWD", &removed)
+        .env("TARGET_CWD", &target)
+        .arg("-c")
+        .arg(
+            "cd \"$REMOVED_CWD\" && rmdir \"$REMOVED_CWD\" && \
+             exec \"$LTERM_BIN\" new --detach -n explicit-cwd --cwd \"$TARGET_CWD\" -- sh -lc 'pwd; sleep 2'",
+        )
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let target = target.display().to_string();
+    let captured = env.capture_until("explicit-cwd", &target)?;
+    assert!(captured.contains(&target), "{captured}");
     Ok(())
 }
 

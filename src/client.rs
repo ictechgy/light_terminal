@@ -132,9 +132,10 @@ pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
 }
 
 fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
-    let cwd = cwd
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir().context("resolve current working directory")?);
+    let cwd = match cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
     let cwd = if cwd.is_absolute() {
         cwd
     } else {
@@ -142,7 +143,9 @@ fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
             .context("resolve current working directory")?
             .join(cwd)
     };
-    Ok(cwd.display().to_string())
+    cwd.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("lterm cwd must be valid UTF-8"))
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
@@ -394,7 +397,13 @@ fn nth_field_start(line: &str, field_index: usize) -> Option<usize> {
     None
 }
 
-pub fn attach(target: &str, show_status: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub enum AttachStdinEof {
+    Detach,
+    KeepAttached,
+}
+
+pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
     ensure_server()?;
     let status_enabled = status_bar_supported(show_status);
     let status_info = if status_enabled {
@@ -444,6 +453,7 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
 
     let mut writer = stream.try_clone().context("clone attach stream writer")?;
     let input_running = Arc::clone(&running);
+    let detach_on_stdin_eof = matches!(stdin_eof, AttachStdinEof::Detach);
     let input_thread = thread::spawn(move || -> Result<()> {
         let mut stdin = std::io::stdin();
         let mut buf = [0_u8; 8192];
@@ -457,6 +467,9 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 Err(err) => return Err(err).context("read stdin"),
             }
+        }
+        if detach_on_stdin_eof {
+            let _ = writer.shutdown(std::net::Shutdown::Write);
         }
         Ok(())
     });
@@ -483,17 +496,46 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
 
     let mut stdout = std::io::stdout();
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_enabled, &mut stdout)?;
+    if status_enabled {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(30)))
+            .context("set attach output read timeout")?;
+    }
     let mut buf = [0_u8; 8192];
+    let mut status_dirty = false;
     loop {
         while resize_rx.try_recv().is_ok() {
-            status_bar.resize(&mut stdout)?;
+            status_bar.refresh(&mut stdout)?;
+            stdout.flush().ok();
+            status_dirty = false;
+        }
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err)
+                if status_enabled
+                    && (err.kind() == ErrorKind::WouldBlock
+                        || err.kind() == ErrorKind::TimedOut) =>
+            {
+                if status_dirty {
+                    status_bar.refresh(&mut stdout)?;
+                    stdout.flush().ok();
+                    status_dirty = false;
+                }
+                continue;
+            }
+            Err(err) => return Err(err).context("read pty output"),
+        };
+        stdout.write_all(&buf[..n]).context("write stdout")?;
+        if status_enabled {
+            status_dirty = true;
+        } else {
             stdout.flush().ok();
         }
-        let n = stream.read(&mut buf).context("read pty output")?;
-        if n == 0 {
-            break;
-        }
-        stdout.write_all(&buf[..n]).context("write stdout")?;
+    }
+    if status_dirty {
+        status_bar.refresh(&mut stdout)?;
         stdout.flush().ok();
     }
 
@@ -548,7 +590,7 @@ impl StatusBar {
         Ok(status)
     }
 
-    fn resize(&mut self, stdout: &mut impl Write) -> Result<()> {
+    fn refresh(&mut self, stdout: &mut impl Write) -> Result<()> {
         self.reserve_terminal_area(stdout)?;
         self.draw(stdout)
     }
@@ -562,7 +604,8 @@ impl StatusBar {
             return Ok(());
         }
         let scroll_bottom = rows - 1;
-        write!(stdout, "\x1b[1;{scroll_bottom}r").context("reserve lterm status bar row")?;
+        write!(stdout, "\x1b7\x1b[1;{scroll_bottom}r\x1b8")
+            .context("reserve lterm status bar row")?;
         Ok(())
     }
 

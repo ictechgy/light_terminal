@@ -4,7 +4,7 @@ use crate::sanitize;
 use anyhow::{Context, Result, bail};
 use libc::c_int;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
@@ -109,6 +109,8 @@ struct SessionMaps {
     by_name: HashMap<String, Arc<Session>>,
     by_pane: HashMap<String, Arc<Session>>,
     by_id: HashMap<String, Arc<Session>>,
+    reserved_names: HashSet<String>,
+    reserved_panes: HashSet<String>,
 }
 
 struct Session {
@@ -408,6 +410,7 @@ struct NewSessionParams {
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
+    let reservation = reserve_session_identity(state, params.name)?;
     let pty_system = native_pty_system();
     let rows = params.rows.unwrap_or(24).max(1);
     let cols = params.cols.unwrap_or(80).max(1);
@@ -421,10 +424,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .context("open pty")?;
 
     let id = Uuid::new_v4().to_string();
-    let pane_num = next_available_pane_num(state)?;
-    let pane_id = format!("%{pane_num}");
-    let name = params.name.unwrap_or_else(|| format!("lterm-{pane_num}"));
-    validate_session_name(state, &name)?;
+    let pane_id = reservation.pane_id().to_string();
+    let name = reservation.name().to_string();
     let cwd = params
         .cwd
         .or_else(|| {
@@ -490,7 +491,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cols: Mutex::new(cols),
     });
 
-    insert_session(state, Arc::clone(&session))?;
+    reservation.commit(Arc::clone(&session))?;
 
     let state_for_reader = Arc::clone(state);
     let session_for_reader = Arc::clone(&session);
@@ -529,14 +530,105 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     Ok(session)
 }
 
-fn next_available_pane_num(state: &Arc<State>) -> Result<usize> {
-    let sessions = lock(&state.sessions);
-    if sessions.by_pane.len() >= MAX_SESSIONS {
+struct SessionReservation {
+    state: Arc<State>,
+    name: String,
+    pane_id: String,
+    active: bool,
+}
+
+impl SessionReservation {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    fn commit(mut self, session: Arc<Session>) -> Result<()> {
+        let mut sessions = lock(&self.state.sessions);
+        if !sessions.reserved_names.contains(&self.name)
+            || !sessions.reserved_panes.contains(&self.pane_id)
+        {
+            bail!("internal session reservation missing");
+        }
+        if sessions.by_name.contains_key(&session.name)
+            || sessions.by_pane.contains_key(&session.pane_id)
+            || sessions.by_id.contains_key(&session.id)
+        {
+            bail!("internal session id collision");
+        }
+        sessions.reserved_names.remove(&self.name);
+        sessions.reserved_panes.remove(&self.pane_id);
+        sessions
+            .by_name
+            .insert(session.name.clone(), Arc::clone(&session));
+        sessions
+            .by_pane
+            .insert(session.pane_id.clone(), Arc::clone(&session));
+        sessions.by_id.insert(session.id.clone(), session);
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut sessions = lock(&self.state.sessions);
+        sessions.reserved_names.remove(&self.name);
+        sessions.reserved_panes.remove(&self.pane_id);
+    }
+}
+
+fn reserve_session_identity(
+    state: &Arc<State>,
+    requested_name: Option<String>,
+) -> Result<SessionReservation> {
+    if let Some(name) = &requested_name {
+        validate_session_name_syntax(name)?;
+    }
+
+    let mut sessions = lock(&state.sessions);
+    if sessions.by_pane.len() + sessions.reserved_panes.len() >= MAX_SESSIONS {
         bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
     }
-    (0..MAX_SESSIONS)
-        .find(|pane_num| !sessions.by_pane.contains_key(&format!("%{pane_num}")))
-        .context("no available lterm pane id")
+    if let Some(name) = &requested_name
+        && (sessions.by_name.contains_key(name) || sessions.reserved_names.contains(name))
+    {
+        bail!("session name already exists: {name}");
+    }
+
+    let mut selected = None;
+    for pane_num in 0..MAX_SESSIONS {
+        let pane_id = format!("%{pane_num}");
+        if sessions.by_pane.contains_key(&pane_id) || sessions.reserved_panes.contains(&pane_id) {
+            continue;
+        }
+        let name = requested_name
+            .clone()
+            .unwrap_or_else(|| format!("lterm-{pane_num}"));
+        if requested_name.is_none()
+            && (sessions.by_name.contains_key(&name) || sessions.reserved_names.contains(&name))
+        {
+            continue;
+        }
+        selected = Some((pane_id, name));
+        break;
+    }
+
+    let (pane_id, name) = selected.context("no available lterm pane id")?;
+    sessions.reserved_panes.insert(pane_id.clone());
+    sessions.reserved_names.insert(name.clone());
+    Ok(SessionReservation {
+        state: Arc::clone(state),
+        name,
+        pane_id,
+        active: true,
+    })
 }
 
 fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Result<()> {
@@ -595,27 +687,6 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
     Ok(())
 }
 
-fn insert_session(state: &Arc<State>, session: Arc<Session>) -> Result<()> {
-    let mut sessions = lock(&state.sessions);
-    if sessions.by_pane.len() >= MAX_SESSIONS {
-        bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
-    }
-    if sessions.by_name.contains_key(&session.name) {
-        bail!("session name already exists: {}", session.name);
-    }
-    if sessions.by_pane.contains_key(&session.pane_id) || sessions.by_id.contains_key(&session.id) {
-        bail!("internal session id collision");
-    }
-    sessions
-        .by_name
-        .insert(session.name.clone(), Arc::clone(&session));
-    sessions
-        .by_pane
-        .insert(session.pane_id.clone(), Arc::clone(&session));
-    sessions.by_id.insert(session.id.clone(), session);
-    Ok(())
-}
-
 fn remove_session(state: &Arc<State>, session: &Session) {
     let mut sessions = lock(&state.sessions);
     if sessions
@@ -667,13 +738,18 @@ fn verified_process_group_id(
 }
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
+    if !session.alive.swap(false, Ordering::SeqCst) {
+        remove_session(state, session);
+        session.close_subscribers();
+        return;
+    }
+    remove_session(state, session);
+    session.close_subscribers();
     signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);
     wait_for_process_group_exit(session, Duration::from_millis(350));
     signal_process_group(session, libc::SIGKILL);
-    session.alive.store(false, Ordering::SeqCst);
-    remove_session(state, session);
     session.close_subscribers();
 }
 
@@ -751,7 +827,7 @@ fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
     bail!("no such lterm session or pane: {target}")
 }
 
-fn validate_session_name(state: &Arc<State>, name: &str) -> Result<()> {
+fn validate_session_name_syntax(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("session name cannot be empty");
     }
@@ -769,10 +845,6 @@ fn validate_session_name(state: &Arc<State>, name: &str) -> Result<()> {
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
     {
         bail!("session name may only contain ASCII letters, numbers, '.', '_' and '-'");
-    }
-    let sessions = lock(&state.sessions);
-    if sessions.by_name.contains_key(name) {
-        bail!("session name already exists: {name}");
     }
     Ok(())
 }
