@@ -9,12 +9,14 @@ pub const APP_DIR_NAME: &str = "light-terminal";
 pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(dir) = env::var("LTERM_RUNTIME_DIR") {
         let path = PathBuf::from(dir);
-        ensure_private_dir(&path)?;
+        require_absolute_env_path("LTERM_RUNTIME_DIR", &path)?;
+        ensure_user_private_dir(&path)?;
         return Ok(path);
     }
 
     if let Some(base) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        ensure_private_dir(&base)?;
+        require_absolute_env_path("XDG_RUNTIME_DIR", &base)?;
+        validate_existing_private_dir(&base)?;
         let path = base.join(APP_DIR_NAME);
         ensure_private_dir(&path)?;
         return Ok(path);
@@ -28,7 +30,8 @@ pub fn runtime_dir() -> Result<PathBuf> {
 pub fn data_dir() -> Result<PathBuf> {
     if let Ok(dir) = env::var("LTERM_DATA_DIR") {
         let path = PathBuf::from(dir);
-        ensure_private_dir(&path)?;
+        require_absolute_env_path("LTERM_DATA_DIR", &path)?;
+        ensure_user_private_dir(&path)?;
         return Ok(path);
     }
 
@@ -41,6 +44,7 @@ pub fn data_dir() -> Result<PathBuf> {
 pub fn socket_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("LTERM_SOCKET") {
         let path = PathBuf::from(path);
+        require_absolute_env_path("LTERM_SOCKET", &path)?;
         validate_socket_parent(&path)?;
         return Ok(path);
     }
@@ -87,22 +91,30 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_user_private_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => validate_private_dir_metadata_without_chmod(path, &meta),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .with_context(|| format!("create private directory {}", path.display()))?;
+            let meta =
+                fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+            validate_private_dir_metadata_without_chmod(path, &meta)
+        }
+        Err(err) => Err(err).with_context(|| format!("lstat {}", path.display())),
+    }
+}
+
+fn validate_existing_private_dir(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+    validate_private_dir_metadata_without_chmod(path, &meta)
+}
+
 fn validate_private_dir_metadata(path: &Path, meta: &fs::Metadata) -> Result<()> {
-    if meta.file_type().is_symlink() {
-        bail!("{} must not be a symlink", path.display());
-    }
-    if !meta.is_dir() {
-        bail!("{} is not a directory", path.display());
-    }
-    let uid = current_euid();
-    if meta.uid() != uid {
-        bail!(
-            "{} is owned by uid {}, expected uid {}",
-            path.display(),
-            meta.uid(),
-            uid
-        );
-    }
+    validate_private_dir_base_metadata(path, meta)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         let mut perms = meta.permissions();
@@ -121,6 +133,38 @@ fn validate_private_dir_metadata(path: &Path, meta: &fs::Metadata) -> Result<()>
     Ok(())
 }
 
+fn validate_private_dir_metadata_without_chmod(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    validate_private_dir_base_metadata(path, meta)?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} must be private (mode 0700 or stricter), found {:03o}",
+            path.display(),
+            mode
+        );
+    }
+    Ok(())
+}
+
+fn validate_private_dir_base_metadata(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        bail!("{} must not be a symlink", path.display());
+    }
+    if !meta.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let uid = current_euid();
+    if meta.uid() != uid {
+        bail!(
+            "{} is owned by uid {}, expected uid {}",
+            path.display(),
+            meta.uid(),
+            uid
+        );
+    }
+    Ok(())
+}
+
 fn validate_socket_parent(socket: &Path) -> Result<()> {
     if socket.as_os_str().is_empty() {
         bail!("LTERM_SOCKET cannot be empty");
@@ -129,13 +173,16 @@ fn validate_socket_parent(socket: &Path) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .context("LTERM_SOCKET must include a parent directory")?;
-    ensure_private_dir(parent)
+    ensure_user_private_dir(parent)
+}
+
+fn require_absolute_env_path(name: &str, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{name} must be an absolute path: {}", path.display());
+    }
+    Ok(())
 }
 
 pub(crate) fn current_euid() -> u32 {
-    unsafe { geteuid() }
-}
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
+    unsafe { libc::geteuid() }
 }

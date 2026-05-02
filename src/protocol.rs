@@ -30,6 +30,7 @@ pub enum Request {
         cwd: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        #[serde(default)]
         env: HashMap<String, String>,
         tmux: bool,
     },
@@ -78,7 +79,10 @@ impl Response {
         Self {
             ok: true,
             error: None,
-            result: Some(serde_json::to_value(result).unwrap_or(serde_json::Value::Null)),
+            result: Some(
+                serde_json::to_value(result)
+                    .expect("serializing lterm protocol response should be infallible"),
+            ),
         }
     }
 

@@ -34,10 +34,11 @@ pub fn ensure_shim() -> Result<PathBuf> {
     let shim_dir = paths::shim_dir()?;
     let tmux_path = shim_dir.join("tmux");
     let lterm = std::env::current_exe().context("resolve current executable")?;
-    let script = format!(
-        "#!/bin/sh\nexec {} tmux-compat \"$@\"\n",
-        shlex::try_quote(&lterm.display().to_string()).unwrap_or_default()
-    );
+    let lterm = lterm
+        .to_str()
+        .context("lterm executable path must be valid UTF-8")?;
+    let quoted_lterm = shlex::try_quote(lterm).context("quote lterm executable path")?;
+    let script = format!("#!/bin/sh\nexec {quoted_lterm} tmux-compat \"$@\"\n");
     fs::write(&tmux_path, script).with_context(|| format!("write {}", tmux_path.display()))?;
     #[cfg(unix)]
     {
@@ -122,6 +123,9 @@ fn strip_global_flags(raw_args: Vec<String>) -> Result<Vec<String>> {
             "-L" | "-S" | "-f" => {
                 if i + 1 >= raw_args.len() {
                     bail!("missing value for global tmux flag {arg}");
+                }
+                if matches!(arg.as_str(), "-L" | "-S") {
+                    bail!("global tmux server selection flag {arg} is not supported by lterm");
                 }
                 i += 2;
             }
@@ -279,6 +283,11 @@ fn split_window(args: &[String]) -> Result<i32> {
 
 fn list_panes(args: &[String]) -> Result<i32> {
     let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
+    if let Some(target) = parse_target(args) {
+        let pane = client::info(&target)?;
+        println!("{}", expand_format(&format, &pane));
+        return Ok(0);
+    }
     let mut seen = HashSet::new();
     for pane in client::list_sessions()? {
         if !seen.insert(pane.pane_id.clone()) {
@@ -292,6 +301,7 @@ fn list_panes(args: &[String]) -> Result<i32> {
 fn display_message(args: &[String]) -> Result<i32> {
     let mut print = false;
     let mut target = None;
+    let mut explicit_target = false;
     let mut message = None;
     let mut i = 0;
     while i < args.len() {
@@ -302,6 +312,11 @@ fn display_message(args: &[String]) -> Result<i32> {
             }
             "-t" => {
                 target = args.get(i + 1).cloned();
+                explicit_target = true;
+                i += 2;
+            }
+            "-F" => {
+                message = args.get(i + 1).cloned();
                 i += 2;
             }
             "--" => {
@@ -316,10 +331,12 @@ fn display_message(args: &[String]) -> Result<i32> {
         }
     }
     let target = target.unwrap_or_else(default_target);
-    let info = client::info(&target).or_else(|_| {
-        client::list_sessions()
-            .and_then(|v| v.into_iter().next().ok_or_else(|| anyhow!("no panes")))
-    })?;
+    let info = match client::info(&target) {
+        Ok(info) => info,
+        Err(err) if explicit_target => return Err(err),
+        Err(_) => client::list_sessions()
+            .and_then(|v| v.into_iter().next().ok_or_else(|| anyhow!("no panes")))?,
+    };
     let msg = message.unwrap_or_default();
     let expanded = expand_format(&msg, &info);
     if print {
@@ -423,8 +440,18 @@ fn resize_pane(args: &[String]) -> Result<i32> {
             _ => i += 1,
         }
     }
-    if let (Some(rows), Some(cols)) = (rows, cols) {
-        client::resize(&target, rows, cols)?;
+    match (rows, cols) {
+        (Some(0), _) | (_, Some(0)) => bail!("resize dimensions must be at least 1"),
+        (Some(rows), Some(cols)) => client::resize(&target, rows, cols)?,
+        (Some(rows), None) => {
+            let info = client::info(&target)?;
+            client::resize(&target, rows, info.cols)?;
+        }
+        (None, Some(cols)) => {
+            let info = client::info(&target)?;
+            client::resize(&target, info.rows, cols)?;
+        }
+        (None, None) => {}
     }
     Ok(0)
 }
@@ -443,11 +470,11 @@ fn display_popup(args: &[String]) -> Result<i32> {
     while i < args.len() {
         match args[i].as_str() {
             "-E" => {
-                command = Some(args[i + 1..].join(" "));
+                command = tmux_shell_command(&args[i + 1..])?;
                 break;
             }
             "--" => {
-                command = Some(args[i + 1..].join(" "));
+                command = tmux_shell_command(&args[i + 1..])?;
                 break;
             }
             _ => i += 1,
@@ -475,7 +502,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
                 channel = args.get(i + 1).cloned();
                 i += 2;
             }
-            "-L" | "-U" => i += 2,
+            "-L" | "-U" => bail!("tmux wait-for {} is not supported by lterm", args[i]),
             other => {
                 channel = Some(other.to_string());
                 i += 1;
@@ -524,7 +551,7 @@ fn load_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn save_buffer(args: &[String]) -> Result<i32> {
-    let data = fs::read(paths::buffer_path()?).unwrap_or_default();
+    let data = read_buffer_or_empty()?;
     let dest = args.iter().find(|a| !a.starts_with('-')).cloned();
     if let Some(path) = dest {
         if path == "-" {
@@ -540,9 +567,17 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
     let target = parse_target(args).unwrap_or_else(default_target);
-    let data = fs::read(paths::buffer_path()?).unwrap_or_default();
+    let data = read_buffer_or_empty()?;
     client::send(&target, data)?;
     Ok(0)
+}
+
+fn read_buffer_or_empty() -> Result<Vec<u8>> {
+    match fs::read(paths::buffer_path()?) {
+        Ok(data) => Ok(data),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err).context("read tmux buffer"),
+    }
 }
 
 fn open_cmux_split(direction: &str, info: &SessionInfo) -> Result<Option<String>> {
@@ -778,7 +813,7 @@ fn tmux_shell_command(args: &[String]) -> Result<Option<String>> {
 
 pub fn quote(value: &str) -> String {
     shlex::try_quote(value)
-        .unwrap_or(std::borrow::Cow::Borrowed("''"))
+        .expect("shell quote should be infallible for NUL-free Rust strings")
         .into_owned()
 }
 
@@ -863,12 +898,13 @@ unsafe extern "C" {
 
 pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {
     if literal {
-        return keys.join(" ").into_bytes();
+        return keys.concat().into_bytes();
     }
     let mut out = Vec::new();
     for key in keys {
         match key.as_str() {
-            "C-m" | "Enter" | "enter" | "Return" => out.push(b'\n'),
+            "C-m" | "Enter" | "enter" | "Return" => out.push(b'\r'),
+            "C-j" => out.push(b'\n'),
             "C-c" => out.push(0x03),
             "C-d" => out.push(0x04),
             "C-z" => out.push(0x1a),
@@ -898,7 +934,9 @@ mod tests {
             "ok".to_string(),
             "C-m".to_string(),
         ];
-        assert_eq!(keys_to_bytes(&keys, false), b"echo ok\n");
+        assert_eq!(keys_to_bytes(&keys, false), b"echo ok\r");
+        assert_eq!(keys_to_bytes(&["a".into(), "b".into()], true), b"ab");
+        assert_eq!(keys_to_bytes(&["C-j".into()], false), b"\n");
     }
 
     #[test]

@@ -25,23 +25,32 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
         match state {
             EscapeState::Ground => match *byte {
                 0x1b => state = EscapeState::Esc,
+                0x9b => state = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
+                0x80..=0x9f => {}
                 b'\t' | b'\n' | b'\r' => out.push(*byte),
                 0x00..=0x1f | 0x7f => {}
                 _ => out.push(*byte),
             },
             EscapeState::Esc => match *byte {
+                0x18 | 0x1a => state = EscapeState::Ground,
+                0x1b => state = EscapeState::Esc,
                 b'[' => state = EscapeState::Csi,
                 b']' | b'P' | b'_' | b'^' | b'X' => state = EscapeState::String,
                 b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state = EscapeState::Charset,
+                0x9b => state = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
                 0x20..=0x2f => {}
                 _ => state = EscapeState::Ground,
             },
-            EscapeState::Csi => {
-                if (0x40..=0x7e).contains(byte) {
-                    state = EscapeState::Ground;
-                }
-            }
+            EscapeState::Csi => match *byte {
+                0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
+                0x1b => state = EscapeState::Esc,
+                byte if (0x40..=0x7e).contains(&byte) => state = EscapeState::Ground,
+                _ => {}
+            },
             EscapeState::String => match *byte {
+                0x18 | 0x1a => state = EscapeState::Ground,
                 0x07 | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::StringEsc,
                 _ => {}
@@ -87,5 +96,17 @@ mod tests {
     fn terminal_capture_strips_escape_sequences() {
         let text = terminal_capture(b"ok \x1b[31mred\x1b[0m \x1b]52;c;secret\x07done\n");
         assert_eq!(text, "ok red done\n");
+    }
+
+    #[test]
+    fn terminal_capture_strips_raw_c1_sequences() {
+        let text = terminal_capture(b"ok \x9b31mred\x9b0m \x9d52;c;secret\x9cdone\n");
+        assert_eq!(text, "ok red done\n");
+    }
+
+    #[test]
+    fn terminal_capture_resynchronizes_escape_sequences() {
+        let text = terminal_capture(b"ok \x1b[\x1b]52;c;secret\x07done\n");
+        assert_eq!(text, "ok done\n");
     }
 }

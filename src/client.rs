@@ -8,7 +8,9 @@ use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
 pub fn ensure_server() -> Result<()> {
@@ -36,13 +39,21 @@ pub fn ensure_server() -> Result<()> {
         .with_context(|| format!("open daemon log {}", log.display()))?;
     let log_file_err = log_file.try_clone().context("clone daemon log")?;
 
-    Command::new(exe)
+    let mut daemon = Command::new(exe);
+    daemon
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()
-        .context("spawn lterm daemon")?;
+        .stderr(Stdio::from(log_file_err));
+    unsafe {
+        daemon.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    daemon.spawn().context("spawn lterm daemon")?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut last_err = None;
@@ -75,6 +86,12 @@ pub fn rpc<T: DeserializeOwned>(request: &Request) -> Result<T> {
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .context("set rpc read timeout")?;
+    stream
+        .set_write_timeout(Some(RPC_TIMEOUT))
+        .context("set rpc write timeout")?;
     let payload = serde_json::to_vec(request).context("serialize request")?;
     stream.write_all(&payload).context("write request")?;
     stream.write_all(b"\n").context("write request newline")?;
@@ -453,27 +470,30 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let input_running = Arc::clone(&running);
     let detach_on_stdin_eof = matches!(stdin_eof, AttachStdinEof::Detach);
     let input_thread = thread::spawn(move || -> Result<()> {
-        let mut stdin = std::io::stdin();
-        let stdin_fd = stdin.as_raw_fd();
-        let mut buf = [0_u8; 8192];
-        while input_running.load(Ordering::SeqCst) {
-            if !stdin_has_input(stdin_fd, Duration::from_millis(100))? {
-                continue;
-            }
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => writer.write_all(&buf[..n]).context("write pty input")?,
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+        let result = (|| -> Result<()> {
+            let mut stdin = std::io::stdin();
+            let stdin_fd = stdin.as_raw_fd();
+            let mut buf = [0_u8; 8192];
+            while input_running.load(Ordering::SeqCst) {
+                if !stdin_has_input(stdin_fd, Duration::from_millis(100))? {
+                    continue;
                 }
-                Err(err) if err.kind() == ErrorKind::Interrupted => {}
-                Err(err) => return Err(err).context("read stdin"),
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => writer.write_all(&buf[..n]).context("write pty input")?,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err).context("read stdin"),
+                }
             }
-        }
+            Ok(())
+        })();
         if detach_on_stdin_eof {
             let _ = writer.shutdown(std::net::Shutdown::Write);
         }
-        Ok(())
+        result
     });
 
     let resize_running = Arc::clone(&running);
@@ -505,45 +525,58 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     }
     let mut buf = [0_u8; 8192];
     let mut status_dirty = false;
-    loop {
-        while resize_rx.try_recv().is_ok() {
+    let output_result = (|| -> Result<()> {
+        loop {
+            while resize_rx.try_recv().is_ok() {
+                status_bar.refresh(&mut stdout)?;
+                stdout.flush().context("flush stdout")?;
+                status_dirty = false;
+            }
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err)
+                    if status_enabled
+                        && (err.kind() == ErrorKind::WouldBlock
+                            || err.kind() == ErrorKind::TimedOut) =>
+                {
+                    if status_dirty {
+                        status_bar.refresh(&mut stdout)?;
+                        stdout.flush().context("flush stdout")?;
+                        status_dirty = false;
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err).context("read pty output"),
+            };
+            if let Err(err) = stdout.write_all(&buf[..n]) {
+                if err.kind() == ErrorKind::BrokenPipe {
+                    break;
+                }
+                return Err(err).context("write stdout");
+            }
+            if let Err(err) = stdout.flush() {
+                if err.kind() == ErrorKind::BrokenPipe {
+                    break;
+                }
+                return Err(err).context("flush stdout");
+            }
+            if status_enabled {
+                status_dirty = true;
+            }
+        }
+        if status_dirty {
             status_bar.refresh(&mut stdout)?;
             stdout.flush().context("flush stdout")?;
-            status_dirty = false;
         }
-        let n = match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err)
-                if status_enabled
-                    && (err.kind() == ErrorKind::WouldBlock
-                        || err.kind() == ErrorKind::TimedOut) =>
-            {
-                if status_dirty {
-                    status_bar.refresh(&mut stdout)?;
-                    stdout.flush().context("flush stdout")?;
-                    status_dirty = false;
-                }
-                continue;
-            }
-            Err(err) => return Err(err).context("read pty output"),
-        };
-        stdout.write_all(&buf[..n]).context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
-        if status_enabled {
-            status_dirty = true;
-        }
-    }
-    if status_dirty {
-        status_bar.refresh(&mut stdout)?;
-        stdout.flush().context("flush stdout")?;
-    }
+        Ok(())
+    })();
 
     running.store(false, Ordering::SeqCst);
     let _ = input_thread.join();
     let _ = resize_thread.join();
-    Ok(())
+    output_result
 }
 
 fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
@@ -556,7 +589,11 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
 
 fn status_bar_supported(show_status: bool) -> bool {
     let (cols, rows) = terminal_size();
-    show_status && rows > 1 && cols > 0 && std::io::stdout().is_terminal()
+    show_status
+        && rows > 1
+        && cols > 0
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
 }
 
 struct StatusBar {
@@ -695,11 +732,7 @@ fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
                 bail!("stdin poll reported error events: {:#x}", pollfd.revents);
             }
             if pollfd.revents & libc::POLLNVAL != 0 {
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if flags < 0 {
-                    bail!("stdin poll reported invalid fd: {:#x}", pollfd.revents);
-                }
-                return Ok(true);
+                bail!("stdin poll reported invalid fd: {:#x}", pollfd.revents);
             }
             return Ok((pollfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0);
         }
@@ -732,10 +765,16 @@ pub fn shell_join(args: &[String]) -> Result<String> {
 
 pub fn command_exists(name: &str) -> bool {
     if name.contains('/') {
-        return Path::new(name).exists();
+        return is_executable_file(Path::new(name));
     }
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|p| is_executable_file(&p.join(name))))
+        .unwrap_or(false)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 

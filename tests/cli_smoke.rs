@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -472,6 +473,44 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_display_message_honors_format_flag() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "display-format",
+            "sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "display-message",
+            "-p",
+            "-t",
+            "display-format",
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with('%'),
+        "{output:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_quotes_multi_arg_commands() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -669,6 +708,49 @@ fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
 }
 
 #[test]
+fn attach_stdout_broken_pipe_detaches_cleanly() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "pipe-detach",
+            "--",
+            "sh",
+            "-lc",
+            "yes PIPE | head -c 200000; sleep 1",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let mut attach = env
+        .cmd()
+        .args(["attach", "pipe-detach", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _stdin = attach.stdin.take().ok_or("missing attach stdin")?;
+    let mut stdout = attach.stdout.take().ok_or("missing attach stdout")?;
+    let mut byte = [0_u8; 1];
+    stdout.read_exact(&mut byte)?;
+    drop(stdout);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(status) = attach.try_wait()? {
+            assert!(status.success(), "{status:?}");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Err("attach did not exit cleanly after stdout pipe closed".into())
+}
+
+#[test]
 #[cfg(unix)]
 fn runtime_and_data_dirs_are_private() -> TestResult {
     let env = TestEnv::new()?;
@@ -781,6 +863,85 @@ fn custom_socket_requires_private_parent() -> TestResult {
         "{stderr}"
     );
     Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn custom_socket_parent_permissions_are_not_silently_changed() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let parent = temp.path().join("shared");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&parent)?;
+    let mut perms = std::fs::metadata(&parent)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&parent, perms)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .env("LTERM_SOCKET", parent.join("lterm.sock"))
+        .env("LTERM_DATA_DIR", &data)
+        .arg("list")
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let mode = std::fs::metadata(&parent)?.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "lterm should reject, not chmod, socket parents"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn custom_socket_refuses_existing_regular_file() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let parent = temp.path().join("run");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&parent)?;
+    let mut perms = std::fs::metadata(&parent)?.permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&parent, perms)?;
+    let socket = parent.join("lterm.sock");
+    std::fs::write(&socket, b"do not delete")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .env("LTERM_SOCKET", &socket)
+        .env("LTERM_DATA_DIR", &data)
+        .arg("daemon")
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(&socket)?, b"do not delete");
+    Ok(())
+}
+
+#[test]
+fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "leader-reap",
+            "--",
+            "sh",
+            "-lc",
+            "trap '' HUP; sleep 3 & echo LEADER_DONE",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        let output = env.cmd().arg("list").output()?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.lines().any(|line| line.starts_with("leader-reap	")) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("session leader exited but lterm kept the pane until background PTY holder exited".into())
 }
 
 #[test]

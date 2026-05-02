@@ -6,7 +6,7 @@ use libc::c_int;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -128,6 +128,7 @@ struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Mutex<VecDeque<u8>>,
     subscribers: Mutex<Vec<Subscriber>>,
+    output_state: Mutex<()>,
     next_subscriber_id: AtomicU64,
     alive: AtomicBool,
     exit_code: AtomicI32,
@@ -155,6 +156,7 @@ impl Session {
     }
 
     fn append_output(&self, bytes: &[u8]) {
+        let _output_guard = lock(&self.output_state);
         {
             let mut ring = lock(&self.ring);
             for byte in bytes {
@@ -177,8 +179,10 @@ impl Session {
                 break;
             };
             match tx.try_send(Arc::clone(chunk)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => disconnected.push(id),
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    disconnected.push(id);
+                }
             }
         }
         if !disconnected.is_empty() {
@@ -214,7 +218,17 @@ impl Session {
         bytes[spans[first].0..].to_vec()
     }
 
-    fn subscribe(&self) -> Result<(u64, Receiver<OutputChunk>)> {
+    fn subscribe_with_snapshot(&self) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
+        let _output_guard = lock(&self.output_state);
+        let initial = {
+            let ring = lock(&self.ring);
+            ring.iter().copied().collect()
+        };
+        let (id, rx) = self.subscribe_locked()?;
+        Ok((id, rx, initial))
+    }
+
+    fn subscribe_locked(&self) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
@@ -226,10 +240,12 @@ impl Session {
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
+        let _output_guard = lock(&self.output_state);
         lock(&self.subscribers).retain(|(id, _)| *id != subscriber_id);
     }
 
     fn close_subscribers(&self) {
+        let _output_guard = lock(&self.output_state);
         lock(&self.subscribers).clear();
     }
 }
@@ -239,7 +255,7 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     stream
         .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
         .context("set request read timeout")?;
-    let line = read_request_line(&stream)?;
+    let line = read_request_line(&mut stream)?;
     stream.set_read_timeout(None).ok();
     if line.trim().is_empty() {
         return Ok(());
@@ -267,15 +283,21 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn read_request_line(stream: &UnixStream) -> Result<String> {
-    let clone = stream.try_clone().context("clone request stream")?;
-    let mut reader = BufReader::new(clone.take((MAX_REQUEST_BYTES + 1) as u64));
+fn read_request_line(stream: &mut UnixStream) -> Result<String> {
     let mut bytes = Vec::new();
-    reader
-        .read_until(b'\n', &mut bytes)
-        .context("read request line")?;
-    if bytes.len() > MAX_REQUEST_BYTES {
-        bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+    let mut byte = [0_u8; 1];
+    loop {
+        let n = stream.read(&mut byte).context("read request line")?;
+        if n == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+        if bytes.len() > MAX_REQUEST_BYTES {
+            bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
     }
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         bail!("request missing newline before EOF");
@@ -374,6 +396,9 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::ok(session.capture(start)))
         }
         Request::Resize { target, rows, cols } => {
+            if rows == 0 || cols == 0 {
+                bail!("resize dimensions must be at least 1 row and 1 column");
+            }
             let session = resolve_session(state, &target)?;
             lock(&session.master)
                 .resize(PtySize {
@@ -439,7 +464,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let tmux_shim = if params.tmux {
         let shim = paths::shim_dir()?;
         let shim_path = shim.display().to_string();
-        let quoted_shim = shlex::try_quote(&shim_path).unwrap_or_default();
+        let quoted_shim = shlex::try_quote(&shim_path).context("quote tmux shim path")?;
         spawn_command = format!("PATH={quoted_shim}${{PATH:+:$PATH}}; export PATH; {command}");
         Some(shim)
     } else {
@@ -470,14 +495,18 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .slave
         .spawn_command(cmd)
         .context("spawn command in pty")?;
-    let process_id = child.process_id();
+    let child_guard = SpawnedChildGuard::new(child);
+    let process_id = child_guard
+        .child_ref()
+        .process_id()
+        .context("spawned child did not report a process id")?;
     let process_group_id =
-        verified_process_group_id(pair.master.process_group_leader(), process_id, &name);
-    let killer = child.clone_killer();
+        verified_process_group_id(pair.master.process_group_leader(), Some(process_id), &name);
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let writer = pair.master.take_writer().context("take pty writer")?;
+    let (child, killer) = child_guard.into_parts();
 
     let session = Arc::new(Session {
         id,
@@ -486,7 +515,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         command,
         cwd,
         created_unix_ms: now_unix_ms(),
-        process_id,
+        process_id: Some(process_id),
         process_group_id,
         child: Mutex::new(child),
         killer: Mutex::new(killer),
@@ -494,6 +523,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         writer: Mutex::new(writer),
         ring: Mutex::new(VecDeque::new()),
         subscribers: Mutex::new(Vec::new()),
+        output_state: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
         exit_code: AtomicI32::new(i32::MIN),
@@ -501,9 +531,11 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cols: Mutex::new(cols),
     });
 
-    reservation.commit(Arc::clone(&session))?;
+    if let Err(err) = reservation.commit(Arc::clone(&session)) {
+        cleanup_uncommitted_session(&session);
+        return Err(err);
+    }
 
-    let state_for_reader = Arc::clone(state);
     let session_for_reader = Arc::clone(&session);
     thread::spawn(move || {
         let mut buf = [0_u8; 8192];
@@ -521,23 +553,77 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                 }
             }
         }
+        session_for_reader.close_subscribers();
+    });
 
-        let exit_code = match lock(&session_for_reader.child).wait() {
+    let state_for_waiter = Arc::clone(state);
+    let session_for_waiter = Arc::clone(&session);
+    thread::spawn(move || {
+        let exit_code = match lock(&session_for_waiter.child).wait() {
             Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
             Err(err) => {
-                eprintln!("wait error for {}: {err}", session_for_reader.name);
+                eprintln!("wait error for {}: {err}", session_for_waiter.name);
                 1
             }
         };
-        session_for_reader
+        session_for_waiter
             .exit_code
             .store(exit_code, Ordering::SeqCst);
-        session_for_reader.alive.store(false, Ordering::SeqCst);
-        session_for_reader.close_subscribers();
-        remove_session(&state_for_reader, &session_for_reader);
+        session_for_waiter.alive.store(false, Ordering::SeqCst);
+        session_for_waiter.close_subscribers();
+        remove_session(&state_for_waiter, &session_for_waiter);
     });
 
     Ok(session)
+}
+
+struct SpawnedChildGuard {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        let killer = child.clone_killer();
+        Self {
+            child: Some(child),
+            killer: Some(killer),
+        }
+    }
+
+    fn child_ref(&self) -> &(dyn Child + Send + Sync) {
+        self.child
+            .as_deref()
+            .expect("spawned child guard owns child")
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> (
+        Box<dyn Child + Send + Sync>,
+        Box<dyn ChildKiller + Send + Sync>,
+    ) {
+        let child = self.child.take().expect("spawned child guard owns child");
+        let killer = self.killer.take().expect("spawned child guard owns killer");
+        (child, killer)
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(killer) = self.killer.as_mut() {
+            let _ = killer.kill();
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+        }
+    }
+}
+
+fn cleanup_uncommitted_session(session: &Session) {
+    let _ = lock(&session.killer).kill();
+    let _ = lock(&session.child).wait();
+    session.close_subscribers();
 }
 
 struct SessionReservation {
@@ -652,15 +738,20 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
         }
     };
 
+    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot() {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let response = Response::err(format!("{err:#}"));
+            serde_json::to_writer(&mut stream, &response).ok();
+            stream.write_all(b"\n").ok();
+            return Ok(());
+        }
+    };
     serde_json::to_writer(&mut stream, &Response::empty()).context("write attach ok")?;
     stream.write_all(b"\n").context("write attach ok newline")?;
-
-    let initial = session.capture_bytes(None);
     if !initial.is_empty() {
         stream.write_all(&initial).ok();
     }
-
-    let (subscriber_id, rx) = session.subscribe()?;
     let mut output = stream.try_clone().context("clone output stream")?;
     let output_thread = thread::spawn(move || {
         for bytes in rx {
@@ -749,18 +840,19 @@ fn verified_process_group_id(
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
     if !session.alive.swap(false, Ordering::SeqCst) {
-        remove_session(state, session);
         session.close_subscribers();
+        remove_session(state, session);
         return;
     }
-    remove_session(state, session);
     session.close_subscribers();
     signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);
     wait_for_process_group_exit(session, Duration::from_millis(350));
     signal_process_group(session, libc::SIGKILL);
+    wait_for_process_group_exit(session, Duration::from_millis(150));
     session.close_subscribers();
+    remove_session(state, session);
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
@@ -777,7 +869,23 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
             );
         }
     }
-    let _ = lock(&session.killer).kill();
+    if signal == libc::SIGKILL {
+        let _ = lock(&session.killer).kill();
+    } else if let Some(pid) = session
+        .process_id
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+    {
+        let rc = unsafe { libc::kill(pid, signal) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!(
+                    "failed to signal child process {} for {}: {}",
+                    pid, session.name, err
+                );
+            }
+        }
+    }
 }
 
 fn verified_session_process_group_id(session: &Session) -> Option<i32> {
@@ -937,7 +1045,7 @@ fn default_shell() -> String {
 fn default_shell_command() -> String {
     format!(
         "exec {} -l",
-        shlex::try_quote(&default_shell()).unwrap_or_default()
+        shlex::try_quote(&default_shell()).expect("default shell path should be shell-quotable")
     )
 }
 
@@ -999,7 +1107,13 @@ fn prepare_socket_path(socket: &Path) -> Result<()> {
             if meta.file_type().is_symlink() {
                 bail!("refusing symlink socket path {}", socket.display());
             }
-            if meta.file_type().is_socket() && ping_socket(socket).unwrap_or(false) {
+            if !meta.file_type().is_socket() {
+                bail!(
+                    "refusing to remove non-socket path {} while preparing lterm socket",
+                    socket.display()
+                );
+            }
+            if ping_socket(socket).unwrap_or(false) {
                 bail!("lterm daemon already running at {}", socket.display());
             }
             fs::remove_file(socket)
@@ -1013,6 +1127,8 @@ fn prepare_socket_path(socket: &Path) -> Result<()> {
 
 fn ping_socket(socket: &Path) -> Result<bool> {
     let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
     serde_json::to_writer(&mut stream, &Request::Ping)?;
     stream.write_all(b"\n")?;
     stream.shutdown(std::net::Shutdown::Write).ok();

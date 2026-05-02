@@ -247,7 +247,7 @@ fn run() -> Result<()> {
         } => {
             let mut bytes = text.into_bytes();
             if enter {
-                bytes.push(b'\n');
+                bytes.push(b'\r');
             }
             client::send(&target, bytes)
         }
@@ -302,9 +302,9 @@ fn normalize_command(mut command: Vec<String>) -> Result<Option<String>> {
 }
 
 fn collapse_aliases(mut sessions: Vec<protocol::SessionInfo>) -> Vec<protocol::SessionInfo> {
+    sessions.sort_by(|a, b| a.created_unix_ms.cmp(&b.created_unix_ms));
     let mut seen = std::collections::HashSet::new();
     sessions.retain(|s| seen.insert(s.pane_id.clone()));
-    sessions.sort_by(|a, b| a.created_unix_ms.cmp(&b.created_unix_ms));
     sessions
 }
 
@@ -376,10 +376,14 @@ fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {
 
     // cmux and several terminals understand OSC 777. This is intentionally
     // written to stdout so it passes through lterm attach unchanged.
+    let fallback_body = subtitle
+        .filter(|subtitle| !subtitle.is_empty())
+        .map(|subtitle| format!("{subtitle}\n{body}"))
+        .unwrap_or_else(|| body.to_string());
     print!(
         "\x1b]777;notify;{};{}\x07",
         sanitize::osc_field(title),
-        sanitize::osc_field(body)
+        sanitize::osc_field(&fallback_body)
     );
     std::io::stdout().flush().ok();
     Ok(())
