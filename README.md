@@ -44,7 +44,7 @@ eval "$(lterm env)"
 Create and detach a persistent session:
 
 ```bash
-lterm new --name api -- npm run dev
+lterm new -n api -- npm run dev
 ```
 
 Attach later:
@@ -60,7 +60,7 @@ session and pane, while the PTY is resized to the remaining rows. Use
 Inspect or send input:
 
 ```bash
-lterm list
+lterm ls
 lterm ps api
 lterm capture api -S=-80
 lterm send api 'echo hello' --enter

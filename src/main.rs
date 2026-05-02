@@ -68,6 +68,7 @@ enum Commands {
         no_status: bool,
     },
     /// List sessions.
+    #[command(alias = "ls")]
     List {
         #[arg(long)]
         json: bool,

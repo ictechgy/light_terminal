@@ -132,6 +132,33 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
+fn new_short_name_and_ls_alias_work() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "-n",
+            "shorty",
+            "--",
+            "sh",
+            "-lc",
+            "echo SHORTY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("shorty"), "{stdout}");
+
+    let captured = env.capture_until("shorty", "SHORTY")?;
+    assert!(captured.contains("SHORTY"));
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_send_keys_reaches_pty() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
