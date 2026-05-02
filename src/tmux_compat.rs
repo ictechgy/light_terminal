@@ -30,7 +30,7 @@ struct CompatPane {
     cmux_surface_id: Option<String>,
 }
 
-pub fn install_shim() -> Result<()> {
+pub fn ensure_shim() -> Result<PathBuf> {
     let shim_dir = paths::shim_dir()?;
     let tmux_path = shim_dir.join("tmux");
     let lterm = std::env::current_exe().context("resolve current executable")?;
@@ -46,12 +46,17 @@ pub fn install_shim() -> Result<()> {
         perms.set_mode(0o755);
         fs::set_permissions(&tmux_path, perms)?;
     }
+    Ok(shim_dir)
+}
+
+pub fn install_shim() -> Result<()> {
+    let shim_dir = ensure_shim()?;
     println!("{}", shim_dir.display());
     Ok(())
 }
 
 pub fn print_env_exports() -> Result<()> {
-    install_shim()?;
+    ensure_shim()?;
     let shim = paths::shim_dir()?;
     let socket = paths::socket_path()?;
     let tmux = server::fake_tmux_value()?;

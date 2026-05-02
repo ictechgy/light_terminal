@@ -161,7 +161,7 @@ fn run() -> Result<()> {
             command,
         } => {
             if tmux {
-                tmux_compat::install_shim()?;
+                tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?;
             let info = client::new_session(name, command, cwd, HashMap::new(), tmux)?;
@@ -180,7 +180,7 @@ fn run() -> Result<()> {
             command,
         } => {
             if tmux {
-                tmux_compat::install_shim()?;
+                tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?.context("run requires a command")?;
             let info = client::new_session(name, Some(command), cwd, HashMap::new(), tmux)?;
@@ -297,7 +297,7 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
     if !client::command_exists(binary) {
         bail!("{binary} not found in PATH");
     }
-    tmux_compat::install_shim()?;
+    tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
     cmd.push(binary.to_string());
     cmd.extend(args);

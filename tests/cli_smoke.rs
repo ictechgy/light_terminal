@@ -527,6 +527,21 @@ fn tmux_mode_list_shows_user_command_not_internal_path_prefix() -> TestResult {
 }
 
 #[test]
+fn env_outputs_only_shell_exports() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().arg("env").output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().all(|line| line.starts_with("export ")),
+        "env output should be eval-safe exports only: {stdout:?}"
+    );
+    assert!(stdout.contains("export PATH="), "{stdout:?}");
+    assert!(!stdout.contains("\n/"), "bare shim path leaked: {stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
