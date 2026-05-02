@@ -82,12 +82,17 @@ Run Oh My Codex inside a shimmed session:
 
 ```bash
 lterm omx team
+# Extra omx flags are passed through, for example:
+lterm omx --madmax --xhigh
 ```
 
 Run Oh My Claude similarly:
 
 ```bash
 lterm omc team
+# Current OMC builds tested here reject --xhigh; use --madmax without --xhigh
+# unless your installed `omc --help` explicitly lists that flag.
+lterm omc --madmax
 ```
 
 Or run any command with tmux compatibility enabled:
