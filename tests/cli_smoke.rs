@@ -194,6 +194,40 @@ fn explicit_attach_detaches_on_stdin_eof() -> TestResult {
 }
 
 #[test]
+fn attach_short_aliases_detach_on_stdin_eof() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "alias-attach",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    for alias in ["a", "-a"] {
+        let started = Instant::now();
+        let output = env
+            .cmd()
+            .args([alias, "alias-attach", "--no-status"])
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(output.status.success(), "{alias}: {output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{alias} did not detach promptly after stdin EOF: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn attached_client_exits_when_session_kills_itself() -> TestResult {
     let env = TestEnv::new()?;
     let status = env.cmd().arg("list").status()?;

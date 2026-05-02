@@ -52,6 +52,9 @@ Create without attaching, then attach later:
 ```bash
 lterm new -d -n api -- npm run dev
 lterm attach api
+# Short aliases:
+lterm a api
+lterm -a api
 ```
 
 Attached clients draw a small blue status bar on the bottom row with the current

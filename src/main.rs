@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use client::AttachStdinEof;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::Write;
 use std::process::Command;
 
@@ -59,6 +60,7 @@ enum Commands {
         command: Vec<String>,
     },
     /// Attach to a persistent session or pane.
+    #[command(alias = "a")]
     Attach {
         #[arg(default_value = "%0")]
         target: String,
@@ -149,7 +151,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
     match cli.command {
         Commands::Daemon => server::serve_forever(),
         Commands::New {
@@ -273,6 +275,17 @@ fn run() -> Result<()> {
             ssh_args,
         } => ssh_attach(&host, &target, ssh_args),
     }
+}
+
+fn expand_attach_short_flag<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args: Vec<_> = args.into_iter().collect();
+    if args.get(1).is_some_and(|arg| arg == "-a") {
+        args[1] = OsString::from("attach");
+    }
+    args
 }
 
 fn normalize_command(mut command: Vec<String>) -> Result<Option<String>> {
