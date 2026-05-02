@@ -2,21 +2,23 @@
 
 [한국어](README.ko.md) | English
 
-`lterm` is a lightweight terminal session daemon with a tmux-compatible shim for AI-agent workflows. It is intentionally smaller than tmux: it keeps long-running PTY sessions alive, lets clients detach/reattach, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by oh-my-codex / oh-my-claude style tooling.
+A lightweight terminal session daemon with a tmux-compatible shim, built for AI-agent workflows.
 
-> Status: alpha MVP. It is usable for local detached sessions and compatibility testing, but it is not a full tmux replacement yet.
+`lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by oh-my-codex and oh-my-claude tooling.
 
-> Security model: `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process that can run as your OS user should be treated as capable of controlling your sessions.
+> **Status:** alpha MVP. Usable for local detached sessions and compatibility testing — not yet a full tmux replacement.
+>
+> **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
 
 ## Why this exists
 
-The project targets three constraints:
+The project addresses three constraints:
 
-1. **tmux-like persistence and remote access** — sessions run in a background daemon and can be attached/detached by name or pane id. Remote access is available through `lterm ssh`, assuming `lterm` is installed on the remote host.
+1. **tmux-like persistence and remote access** — sessions run inside a background daemon and can be attached or detached by name or pane id. Remote access is available through `lterm ssh`, provided `lterm` is installed on the remote host.
 2. **cmux compatibility** — when running inside cmux, `lterm` preserves OSC notifications, exposes `lterm notify`, and the tmux shim opens worker panes as native cmux splits when possible.
-3. **AI tooling support** — `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command plus `TMUX` / `TMUX_PANE` environment variables for tools that expect tmux.
+3. **AI tooling support** — `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that AI tools expect.
 
-cmux compatibility is based on cmux's documented behavior: cmux supports notifications through `cmux notify` and OSC 777 / OSC 99, exposes a Unix-socket/CLI API for workspaces and splits, and its own oh-my-codex integration uses a tmux shim that maps tmux commands into cmux-native panes.
+cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and a tmux shim that maps tmux commands into native cmux panes.
 
 ## Install from this checkout
 
@@ -37,33 +39,32 @@ To expose the tmux shim:
 
 ```bash
 lterm install-shim
-# Add the printed directory to PATH before the real tmux, or eval:
+# Add the printed directory to PATH ahead of the real tmux, or eval the helper:
 eval "$(lterm env)"
 ```
 
 ## Quick start
 
-Create a persistent session and attach immediately:
+**Create a persistent session and attach immediately:**
 
 ```bash
 lterm new -n api -- npm run dev
 ```
 
-Create without attaching, then attach later:
+**Create detached, attach later:**
 
 ```bash
 lterm new -d -n api -- npm run dev
 lterm attach api
-# Short aliases (use `-a` immediately after `lterm`, with a space before the target):
+
+# Short aliases — `-a` goes right after `lterm`, separated from the target by a space:
 lterm a api
 lterm -a api
 ```
 
-Attached clients draw a small blue status bar on the bottom row with the current
-session and pane, while the PTY is resized to the remaining rows. Use
-`lterm attach --no-status api` when you need the older raw full-terminal attach.
+Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`.
 
-Inspect or send input:
+**Inspect or send input:**
 
 ```bash
 lterm ls
@@ -72,7 +73,7 @@ lterm capture api -S=-80
 lterm send api 'echo hello' --enter
 ```
 
-Stop it:
+**Stop a session:**
 
 ```bash
 lterm kill api
@@ -80,53 +81,53 @@ lterm kill api
 
 ## AI workflows
 
-Run Oh My Codex inside a shimmed session:
+**Run Oh My Codex inside a shimmed session:**
 
 ```bash
 lterm omx team
-# Extra omx flags are passed through, for example:
+# Extra omx flags are passed through, e.g.:
 lterm omx --madmax --xhigh
 ```
 
-Run Oh My Claude similarly:
+**Run Oh My Claude similarly:**
 
 ```bash
 lterm omc team
-# Current OMC builds tested here reject --xhigh; use --madmax without --xhigh
-# unless your installed `omc --help` explicitly lists that flag.
+# The OMC builds tested here reject --xhigh — use --madmax alone unless your
+# installed `omc --help` explicitly lists --xhigh.
 lterm omc --madmax
 ```
 
-Or run any command with tmux compatibility enabled:
+**Run any command with tmux compatibility enabled:**
 
 ```bash
 lterm run --tmux -- omx hud --tmux
 ```
 
-Inside that session, `tmux` resolves to an `lterm tmux-compat` shim. The shim currently implements the common command subset used by AI orchestration scripts:
+Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. The shim implements the command subset most AI orchestration scripts rely on:
 
-- `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
-- `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
-- no-op compatibility for `select-pane`, `select-layout`, `set-option`, `show-option`
-- `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
+- **Sessions** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
+- **Panes** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
+- **Buffers / popups** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
+- **No-op compatibility** — `select-pane`, `select-layout`, `set-option`, `show-option`
 
 ## cmux behavior
 
-When `lterm tmux-compat split-window` detects cmux (`CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, or a cmux socket), it:
+When `lterm tmux-compat split-window` detects cmux (via `CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, or a cmux socket), it:
 
-1. starts a new `lterm` PTY session for the worker command,
-2. asks cmux to create a native split (`cmux new-split right/down`), and
-3. sends `lterm attach <pane>` into that split.
+1. Starts a new `lterm` PTY session for the worker command.
+2. Asks cmux to create a native split (`cmux new-split right/down`).
+3. Sends `lterm attach <pane>` into that split.
 
-That gives cmux a real pane to decorate, while `lterm` still owns scrollback capture and `send-keys` for compatibility.
+This gives cmux a real pane to decorate while `lterm` retains scrollback capture and `send-keys` compatibility.
 
-Notifications:
+**Notifications:**
 
 ```bash
 lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
-`lterm notify` first tries `cmux notify`; if that is unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields strip terminal control characters before emitting fallback OSC.
+`lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC.
 
 ## Remote access
 
@@ -136,7 +137,7 @@ If `lterm` is installed on a remote machine:
 lterm ssh user@host main
 ```
 
-This runs `ssh -t user@host 'lterm attach-or-new main'`. SSH flags can be passed after `--`:
+This expands to `ssh -t user@host 'lterm attach-or-new main'`. Pass SSH flags after `--`:
 
 ```bash
 lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
@@ -144,29 +145,34 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## Architecture
 
-- **Daemon:** one Unix socket per user under `$XDG_RUNTIME_DIR` or an owner-only fallback under `/tmp`.
-- **PTY sessions:** spawned via `portable-pty`, with ring-buffer scrollback.
-- **Attach protocol:** the CLI sends JSON over the Unix socket, reserves the bottom row for an optional local status bar, then streams PTY bytes.
-- **tmux shim:** a small shell script named `tmux` forwards commands to `lterm tmux-compat`.
-- **cmux bridge:** optional; uses cmux CLI when detected.
+- **Daemon** — one Unix socket per user under `$XDG_RUNTIME_DIR`, with an owner-only fallback under `/tmp`.
+- **PTY sessions** — spawned via `portable-pty`, backed by ring-buffer scrollback.
+- **Attach protocol** — the CLI sends JSON over the Unix socket, optionally reserves the bottom row for a local status bar, then streams PTY bytes.
+- **tmux shim** — a small shell script named `tmux` forwards commands to `lterm tmux-compat`.
+- **cmux bridge** — optional; uses the cmux CLI when detected.
 
 ## Security notes
 
-- `lterm attach` intentionally forwards PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is only a client-side terminal decoration; use `--no-status` for a full raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
-- `lterm capture` and `tmux capture-pane` strip common terminal control sequences by default before printing captured scrollback for humans or AI tools.
-- `lterm ps [session]` shows the process tree rooted at each session child so long-running Codex/OMX/MCP subprocess buildup is visible before it becomes a memory leak surprise. It invokes the system `ps` by absolute path and skips malformed process rows rather than guessing.
-- Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
-- `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior; **do not pass untrusted popup commands.**
-- Release builds should use the committed lockfile: `cargo build --release --locked`. The current lockfile includes `serde_json 1.0.149`. Its transitive `zmij` dependency is part of the official serde_json package metadata on docs.rs/crates.io, not a local vendored crate.
+**Terminal output is forwarded as-is.** `lterm attach` passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
+
+**Capture output is sanitized for human/AI consumption.** `lterm capture` and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
+
+**Process visibility.** `lterm ps [session]` shows the process tree rooted at each session child, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
+
+**Socket location.** Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
+
+**Popup commands.** `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior. **Do not pass untrusted popup commands.**
+
+**Build reproducibility.** Use the committed lockfile for release builds: `cargo build --release --locked`. The current lockfile pins `serde_json 1.0.149`. Its transitive `zmij` dependency is part of the official serde_json package metadata on docs.rs/crates.io — not a local vendored crate.
 
 ## Current limitations
 
-- Session persistence lasts while the daemon and host are alive. Reboot/process-state restore is not implemented yet.
+- Session persistence lasts only while the daemon and host are alive — reboot/process-state restore is not implemented.
 - Outside cmux, `split-window` creates additional managed PTY sessions but does not draw a tiled in-terminal UI.
-- This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats/options may need more shim commands.
+- This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats or options may need additional shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
-- The daemon currently authenticates local clients by OS peer credentials and owner-only socket paths, not by per-session ACLs.
-- Session shutdown uses verified process-group signaling so child trees such as shells -> OMX -> Codex -> MCP servers are cleaned up together when possible. Processes that intentionally detach into a different session/process group can still outlive `lterm kill` and should be inspected with `lterm ps` or OS process tools.
+- The daemon authenticates local clients via OS peer credentials and owner-only socket paths — there are no per-session ACLs yet.
+- Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm kill`; inspect them with `lterm ps` or OS process tools.
 
 ## Development
 
@@ -176,7 +182,7 @@ cargo test
 cargo build --locked
 ```
 
-Use isolated runtime directories for manual tests:
+Use isolated runtime directories for manual testing:
 
 ```bash
 TMP=$(mktemp -d)
