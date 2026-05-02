@@ -228,6 +228,19 @@ fn attach_short_aliases_detach_on_stdin_eof() -> TestResult {
 }
 
 #[test]
+fn help_shows_short_attach_alias() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().arg("--help").output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[aliases: a]"),
+        "attach alias was not visible in help:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn attached_client_exits_when_session_kills_itself() -> TestResult {
     let env = TestEnv::new()?;
     let status = env.cmd().arg("list").status()?;

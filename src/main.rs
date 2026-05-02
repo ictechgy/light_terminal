@@ -60,7 +60,7 @@ enum Commands {
         command: Vec<String>,
     },
     /// Attach to a persistent session or pane.
-    #[command(alias = "a")]
+    #[command(visible_alias = "a")]
     Attach {
         #[arg(default_value = "%0")]
         target: String,
@@ -281,11 +281,13 @@ fn expand_attach_short_flag<I>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut args: Vec<_> = args.into_iter().collect();
-    if args.get(1).is_some_and(|arg| arg == "-a") {
-        args[1] = OsString::from("attach");
+    let mut argv: Vec<_> = args.into_iter().collect();
+    // `-a` is a thin, pre-clap shortcut for `attach`. Keep it exact and in
+    // argv[1] only so later attach parsing remains the single source of truth.
+    if argv.get(1).is_some_and(|arg| arg == "-a") {
+        argv[1] = OsString::from("attach");
     }
-    args
+    argv
 }
 
 fn normalize_command(mut command: Vec<String>) -> Result<Option<String>> {
@@ -412,4 +414,37 @@ fn validate_ssh_host(host: &str) -> Result<()> {
         bail!("ssh host cannot contain control characters");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn expand_attach_short_flag_rewrites_only_first_exact_dash_a() {
+        assert_eq!(
+            expand_attach_short_flag(os_args(&["lterm", "-a", "api"])),
+            os_args(&["lterm", "attach", "api"])
+        );
+        assert_eq!(
+            expand_attach_short_flag(os_args(&["lterm", "a", "api"])),
+            os_args(&["lterm", "a", "api"])
+        );
+        assert_eq!(
+            expand_attach_short_flag(os_args(&["lterm", "new", "-a", "api"])),
+            os_args(&["lterm", "new", "-a", "api"])
+        );
+        assert_eq!(
+            expand_attach_short_flag(os_args(&["lterm", "-a=api"])),
+            os_args(&["lterm", "-a=api"])
+        );
+        assert_eq!(
+            expand_attach_short_flag(os_args(&["lterm"])),
+            os_args(&["lterm"])
+        );
+    }
 }

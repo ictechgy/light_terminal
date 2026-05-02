@@ -52,7 +52,7 @@ Create without attaching, then attach later:
 ```bash
 lterm new -d -n api -- npm run dev
 lterm attach api
-# Short aliases:
+# Short aliases (use `-a` immediately after `lterm`, with a space before the target):
 lterm a api
 lterm -a api
 ```
