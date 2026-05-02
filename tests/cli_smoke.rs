@@ -527,6 +527,52 @@ fn tmux_mode_list_shows_user_command_not_internal_path_prefix() -> TestResult {
 }
 
 #[test]
+fn agent_command_reattaches_existing_named_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let fake_omx = fake_bin.join("omx");
+    std::fs::write(&fake_omx, "#!/bin/sh\necho FAKE_OMX_NEW\n")?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&fake_omx)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_omx, perms)?;
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "omx-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "echo EXISTING_AGENT; sleep 0.2; echo EXISTING_DONE",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env
+        .cmd()
+        .env("PATH", format!("{}:{old_path}", fake_bin.display()))
+        .stdin(Stdio::null())
+        .arg("omx")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("EXISTING_AGENT"), "{stdout:?}");
+    assert!(stdout.contains("EXISTING_DONE"), "{stdout:?}");
+    assert!(
+        !stdout.contains("FAKE_OMX_NEW"),
+        "should attach existing session instead of starting a new omx command: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn env_outputs_only_shell_exports() -> TestResult {
     let env = TestEnv::new()?;
     let output = env.cmd().arg("env").output()?;

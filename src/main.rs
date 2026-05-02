@@ -297,13 +297,17 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
     if !client::command_exists(binary) {
         bail!("{binary} not found in PATH");
     }
+    let session_name = format!("{binary}-lterm");
+    if client::info(&session_name).is_ok_and(|info| info.alive) {
+        return client::attach(&session_name, true, AttachStdinEof::KeepAttached);
+    }
     tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
     cmd.push(binary.to_string());
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
     let info = client::new_session(
-        Some(format!("{binary}-lterm")),
+        Some(session_name),
         Some(command),
         None,
         HashMap::new(),
