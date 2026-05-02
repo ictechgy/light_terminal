@@ -1,11 +1,12 @@
 use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
+use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
@@ -376,10 +377,16 @@ fn nth_field_start(line: &str, field_index: usize) -> Option<usize> {
     None
 }
 
-pub fn attach(target: &str) -> Result<()> {
+pub fn attach(target: &str, show_status: bool) -> Result<()> {
     ensure_server()?;
+    let status_enabled = status_bar_supported(show_status);
+    let status_info = if status_enabled {
+        Some(info(target)?)
+    } else {
+        None
+    };
     let (cols, rows) = terminal_size();
-    let _ = resize(target, rows, cols);
+    let _ = resize(target, attach_pty_rows(rows, status_enabled), cols);
 
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
@@ -446,13 +453,18 @@ pub fn attach(target: &str) -> Result<()> {
             thread::sleep(Duration::from_millis(250));
             let current = terminal_size();
             if current != last {
-                let _ = resize(&resize_target, current.1, current.0);
+                let _ = resize(
+                    &resize_target,
+                    attach_pty_rows(current.1, status_enabled),
+                    current.0,
+                );
                 last = current;
             }
         }
     });
 
     let mut stdout = std::io::stdout();
+    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_enabled, &mut stdout)?;
     let mut buf = [0_u8; 8192];
     loop {
         let n = stream.read(&mut buf).context("read pty output")?;
@@ -460,6 +472,7 @@ pub fn attach(target: &str) -> Result<()> {
             break;
         }
         stdout.write_all(&buf[..n]).context("write stdout")?;
+        status_bar.draw(&mut stdout)?;
         stdout.flush().ok();
     }
 
@@ -467,6 +480,99 @@ pub fn attach(target: &str) -> Result<()> {
     let _ = input_thread.join();
     let _ = resize_thread.join();
     Ok(())
+}
+
+fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
+    if show_status && rows > 1 {
+        rows - 1
+    } else {
+        rows.max(1)
+    }
+}
+
+fn status_bar_supported(show_status: bool) -> bool {
+    let (cols, rows) = terminal_size();
+    show_status && rows > 1 && cols > 0 && std::io::stdout().is_terminal()
+}
+
+struct StatusBar {
+    active: bool,
+    session_name: String,
+    pane_id: String,
+}
+
+impl StatusBar {
+    fn enter(
+        info: Option<&SessionInfo>,
+        show_status: bool,
+        stdout: &mut impl Write,
+    ) -> Result<Self> {
+        let active = show_status;
+        let (session_name, pane_id) = info
+            .map(|info| {
+                (
+                    sanitize::terminal_text(&info.name),
+                    sanitize::terminal_text(&info.pane_id),
+                )
+            })
+            .unwrap_or_else(|| ("unknown".to_string(), "?".to_string()));
+        let mut status = Self {
+            active,
+            session_name,
+            pane_id,
+        };
+        status.draw(stdout)?;
+        Ok(status)
+    }
+
+    fn draw(&mut self, stdout: &mut impl Write) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let (cols, rows) = terminal_size();
+        if rows <= 1 || cols == 0 {
+            return Ok(());
+        }
+        let scroll_bottom = rows - 1;
+        let line = format_status_line(&self.session_name, &self.pane_id, cols);
+        write!(
+            stdout,
+            "\x1b7\x1b[1;{scroll_bottom}r\x1b[{rows};1H\x1b[44;37m{line}\x1b[0m\x1b8"
+        )
+        .context("draw lterm status bar")?;
+        Ok(())
+    }
+
+    fn restore(&self, stdout: &mut impl Write) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let (_, rows) = terminal_size();
+        write!(stdout, "\x1b7\x1b[r\x1b[{rows};1H\x1b[0m\x1b[2K\x1b8")
+            .context("restore terminal after lterm status bar")?;
+        stdout.flush().ok();
+        Ok(())
+    }
+}
+
+impl Drop for StatusBar {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = self.restore(&mut stdout);
+    }
+}
+
+fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
+    let width = cols as usize;
+    let mut line = format!(" lterm  {session_name}  {pane_id} ");
+    if line.chars().count() > width {
+        line = line.chars().take(width).collect();
+    }
+    let len = line.chars().count();
+    if len < width {
+        line.push_str(&" ".repeat(width - len));
+    }
+    line
 }
 
 struct RawModeGuard;
@@ -536,6 +642,25 @@ pub fn command_exists(name: &str) -> bool {
 
 pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| json!(value).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attach_pty_rows, format_status_line};
+
+    #[test]
+    fn status_bar_reserves_one_terminal_row_when_possible() {
+        assert_eq!(attach_pty_rows(24, true), 23);
+        assert_eq!(attach_pty_rows(1, true), 1);
+        assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    #[test]
+    fn status_line_is_exact_terminal_width() {
+        assert_eq!(format_status_line("recovery", "%0", 12), " lterm  reco");
+        assert_eq!(format_status_line("api", "%1", 16), " lterm  api  %1 ");
+        assert_eq!(format_status_line("api", "%1", 18), " lterm  api  %1   ");
+    }
 }
 
 const F_GETFL: c_int = 3;

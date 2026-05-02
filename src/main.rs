@@ -45,6 +45,9 @@ enum Commands {
         cwd: Option<String>,
         #[arg(long, default_value_t = true)]
         tmux: bool,
+        /// Disable the blue lterm status bar while attached.
+        #[arg(long)]
+        no_status: bool,
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
@@ -52,11 +55,17 @@ enum Commands {
     Attach {
         #[arg(default_value = "%0")]
         target: String,
+        /// Disable the blue lterm status bar while attached.
+        #[arg(long)]
+        no_status: bool,
     },
     /// Attach to a session, creating it first when missing.
     AttachOrNew {
         #[arg(default_value = "main")]
         target: String,
+        /// Disable the blue lterm status bar while attached.
+        #[arg(long)]
+        no_status: bool,
     },
     /// List sessions.
     List {
@@ -153,6 +162,7 @@ fn run() -> Result<()> {
             name,
             cwd,
             tmux,
+            no_status,
             command,
         } => {
             if tmux {
@@ -160,11 +170,11 @@ fn run() -> Result<()> {
             }
             let command = normalize_command(command)?.context("run requires a command")?;
             let info = client::new_session(name, Some(command), cwd, HashMap::new(), tmux)?;
-            client::attach(&info.pane_id)
+            client::attach(&info.pane_id, !no_status)
         }
-        Commands::Attach { target } => client::attach(&target),
-        Commands::AttachOrNew { target } => {
-            client::attach(&client::attach_or_new(&target)?.pane_id)
+        Commands::Attach { target, no_status } => client::attach(&target, !no_status),
+        Commands::AttachOrNew { target, no_status } => {
+            client::attach(&client::attach_or_new(&target)?.pane_id, !no_status)
         }
         Commands::List { json } => {
             let sessions = client::list_sessions()?;
@@ -281,7 +291,7 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
         HashMap::new(),
         true,
     )?;
-    client::attach(&info.pane_id)
+    client::attach(&info.pane_id, true)
 }
 
 fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {

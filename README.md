@@ -53,6 +53,10 @@ Attach later:
 lterm attach api
 ```
 
+Attached clients draw a small blue status bar on the bottom row with the current
+session and pane, while the PTY is resized to the remaining rows. Use
+`lterm attach --no-status api` when you need the older raw full-terminal attach.
+
 Inspect or send input:
 
 ```bash
@@ -131,13 +135,13 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 - **Daemon:** one Unix socket per user under `$XDG_RUNTIME_DIR` or an owner-only fallback under `/tmp`.
 - **PTY sessions:** spawned via `portable-pty`, with ring-buffer scrollback.
-- **Attach protocol:** the CLI sends JSON over the Unix socket, then streams raw PTY bytes.
+- **Attach protocol:** the CLI sends JSON over the Unix socket, reserves the bottom row for an optional local status bar, then streams PTY bytes.
 - **tmux shim:** a small shell script named `tmux` forwards commands to `lterm tmux-compat`.
 - **cmux bridge:** optional; uses cmux CLI when detected.
 
 ## Security notes
 
-- `lterm attach` intentionally forwards raw PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. Do not use `lterm` as an escape-sequence sanitizer or sandbox.
+- `lterm attach` intentionally forwards PTY bytes so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is only a client-side terminal decoration; use `--no-status` for a full raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal, just like under tmux/screen. Do not use `lterm` as an escape-sequence sanitizer or sandbox.
 - `lterm capture` and `tmux capture-pane` strip common terminal control sequences by default before printing captured scrollback for humans or AI tools.
 - `lterm ps [session]` shows the process tree rooted at each session child so long-running Codex/OMX/MCP subprocess buildup is visible before it becomes a memory leak surprise. It invokes the system `ps` by absolute path and skips malformed process rows rather than guessing.
 - Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.

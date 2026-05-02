@@ -166,14 +166,14 @@ fn new_session(args: &[String]) -> Result<i32> {
     if detached {
         Ok(0)
     } else {
-        client::attach(&info.name)?;
+        client::attach(&info.name, true)?;
         Ok(0)
     }
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args).unwrap_or_else(default_target);
-    client::attach(&target)?;
+    client::attach(&target, true)?;
     Ok(0)
 }
 
