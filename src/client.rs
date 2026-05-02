@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -447,6 +448,7 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
 
     let resize_running = Arc::clone(&running);
     let resize_target = target.to_string();
+    let (resize_tx, resize_rx) = mpsc::sync_channel(1);
     let resize_thread = thread::spawn(move || {
         let mut last = terminal_size();
         while resize_running.load(Ordering::SeqCst) {
@@ -458,6 +460,7 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
                     attach_pty_rows(current.1, status_enabled),
                     current.0,
                 );
+                let _ = resize_tx.try_send(());
                 last = current;
             }
         }
@@ -467,12 +470,15 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_enabled, &mut stdout)?;
     let mut buf = [0_u8; 8192];
     loop {
+        while resize_rx.try_recv().is_ok() {
+            status_bar.draw(&mut stdout)?;
+            stdout.flush().ok();
+        }
         let n = stream.read(&mut buf).context("read pty output")?;
         if n == 0 {
             break;
         }
         stdout.write_all(&buf[..n]).context("write stdout")?;
-        status_bar.draw(&mut stdout)?;
         stdout.flush().ok();
     }
 
@@ -522,6 +528,7 @@ impl StatusBar {
             pane_id,
         };
         status.draw(stdout)?;
+        stdout.flush().ok();
         Ok(status)
     }
 
@@ -533,13 +540,9 @@ impl StatusBar {
         if rows <= 1 || cols == 0 {
             return Ok(());
         }
-        let scroll_bottom = rows - 1;
         let line = format_status_line(&self.session_name, &self.pane_id, cols);
-        write!(
-            stdout,
-            "\x1b7\x1b[1;{scroll_bottom}r\x1b[{rows};1H\x1b[44;37m{line}\x1b[0m\x1b8"
-        )
-        .context("draw lterm status bar")?;
+        write!(stdout, "\x1b7\x1b[{rows};1H\x1b[44;37m{line}\x1b[0m\x1b8")
+            .context("draw lterm status bar")?;
         Ok(())
     }
 
