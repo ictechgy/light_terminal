@@ -57,6 +57,8 @@ pub enum Request {
     },
     AttachOrNew {
         target: String,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     Shutdown,
 }

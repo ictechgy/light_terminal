@@ -41,15 +41,16 @@ eval "$(lterm env)"
 
 ## Quick start
 
-Create and detach a persistent session:
+Create a persistent session and attach immediately:
 
 ```bash
 lterm new -n api -- npm run dev
 ```
 
-Attach later:
+Create without attaching, then attach later:
 
 ```bash
+lterm new -d -n api -- npm run dev
 lterm attach api
 ```
 

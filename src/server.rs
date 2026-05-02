@@ -66,7 +66,6 @@ pub fn serve_forever() -> Result<()> {
 #[derive(Default)]
 struct State {
     sessions: Mutex<SessionMaps>,
-    pane_index: AtomicU64,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
 }
@@ -324,7 +323,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             )?;
             Ok(Response::ok(session.info()))
         }
-        Request::AttachOrNew { target } => {
+        Request::AttachOrNew { target, cwd } => {
             let target = normalize_target(&target);
             if let Ok(session) = resolve_session(state, &target) {
                 return Ok(Response::ok(session.info()));
@@ -337,7 +336,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 NewSessionParams {
                     name: Some(target),
                     command: None,
-                    cwd: None,
+                    cwd,
                     rows: None,
                     cols: None,
                     env: HashMap::new(),
@@ -409,9 +408,6 @@ struct NewSessionParams {
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
-    if lock(&state.sessions).by_pane.len() >= MAX_SESSIONS {
-        bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
-    }
     let pty_system = native_pty_system();
     let rows = params.rows.unwrap_or(24).max(1);
     let cols = params.cols.unwrap_or(80).max(1);
@@ -425,7 +421,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .context("open pty")?;
 
     let id = Uuid::new_v4().to_string();
-    let pane_num = state.pane_index.fetch_add(1, Ordering::SeqCst);
+    let pane_num = next_available_pane_num(state)?;
     let pane_id = format!("%{pane_num}");
     let name = params.name.unwrap_or_else(|| format!("lterm-{pane_num}"));
     validate_session_name(state, &name)?;
@@ -533,6 +529,16 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     Ok(session)
 }
 
+fn next_available_pane_num(state: &Arc<State>) -> Result<usize> {
+    let sessions = lock(&state.sessions);
+    if sessions.by_pane.len() >= MAX_SESSIONS {
+        bail!("too many lterm sessions; limit is {MAX_SESSIONS}");
+    }
+    (0..MAX_SESSIONS)
+        .find(|pane_num| !sessions.by_pane.contains_key(&format!("%{pane_num}")))
+        .context("no available lterm pane id")
+}
+
 fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Result<()> {
     let session = match resolve_session(&state, target) {
         Ok(session) => session,
@@ -564,12 +570,20 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
     });
 
     let mut input = stream;
+    input
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .context("set attach input read timeout")?;
     let mut buf = [0_u8; 8192];
     while session.alive.load(Ordering::SeqCst) {
         let n = match input.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(_) => break,
         };
         if lock(&session.writer).write_all(&buf[..n]).is_err() {

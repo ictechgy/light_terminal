@@ -10,7 +10,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,7 @@ pub fn new_session(
     tmux: bool,
 ) -> Result<SessionInfo> {
     ensure_server()?;
+    let cwd = Some(resolve_client_cwd(cwd)?);
     rpc(&Request::New {
         name,
         command,
@@ -126,7 +127,22 @@ pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
     ensure_server()?;
     rpc(&Request::AttachOrNew {
         target: target.to_string(),
+        cwd: Some(resolve_client_cwd(None)?),
     })
+}
+
+fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
+    let cwd = cwd
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().context("resolve current working directory")?);
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        std::env::current_dir()
+            .context("resolve current working directory")?
+            .join(cwd)
+    };
+    Ok(cwd.display().to_string())
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
@@ -442,7 +458,6 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
                 Err(err) => return Err(err).context("read stdin"),
             }
         }
-        let _ = writer.shutdown(std::net::Shutdown::Write);
         Ok(())
     });
 
@@ -471,7 +486,7 @@ pub fn attach(target: &str, show_status: bool) -> Result<()> {
     let mut buf = [0_u8; 8192];
     loop {
         while resize_rx.try_recv().is_ok() {
-            status_bar.draw(&mut stdout)?;
+            status_bar.resize(&mut stdout)?;
             stdout.flush().ok();
         }
         let n = stream.read(&mut buf).context("read pty output")?;
@@ -527,9 +542,28 @@ impl StatusBar {
             session_name,
             pane_id,
         };
+        status.reserve_terminal_area(stdout)?;
         status.draw(stdout)?;
         stdout.flush().ok();
         Ok(status)
+    }
+
+    fn resize(&mut self, stdout: &mut impl Write) -> Result<()> {
+        self.reserve_terminal_area(stdout)?;
+        self.draw(stdout)
+    }
+
+    fn reserve_terminal_area(&self, stdout: &mut impl Write) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let (_, rows) = terminal_size();
+        if rows <= 1 {
+            return Ok(());
+        }
+        let scroll_bottom = rows - 1;
+        write!(stdout, "\x1b[1;{scroll_bottom}r").context("reserve lterm status bar row")?;
+        Ok(())
     }
 
     fn draw(&mut self, stdout: &mut impl Write) -> Result<()> {
@@ -541,8 +575,11 @@ impl StatusBar {
             return Ok(());
         }
         let line = format_status_line(&self.session_name, &self.pane_id, cols);
-        write!(stdout, "\x1b7\x1b[{rows};1H\x1b[44;37m{line}\x1b[0m\x1b8")
-            .context("draw lterm status bar")?;
+        write!(
+            stdout,
+            "\x1b7\x1b[{rows};1H\x1b[1;30;104m{line}\x1b[0m\x1b8"
+        )
+        .context("draw lterm status bar")?;
         Ok(())
     }
 
@@ -578,18 +615,25 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     line
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    active: bool,
+}
 
 impl RawModeGuard {
     fn enter() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
-        Ok(Self)
+        let active = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if active {
+            crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
+        }
+        Ok(Self { active })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
     }
 }
 

@@ -26,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Run the background PTY session daemon.
     Daemon,
-    /// Create a detached persistent session.
+    /// Create a persistent session and attach to it.
     New {
         #[arg(short, long)]
         name: Option<String>,
@@ -34,6 +34,12 @@ enum Commands {
         cwd: Option<String>,
         #[arg(long)]
         tmux: bool,
+        /// Create the session without attaching to it.
+        #[arg(short = 'd', long)]
+        detach: bool,
+        /// Disable the blue lterm status bar while attached.
+        #[arg(long)]
+        no_status: bool,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -149,6 +155,8 @@ fn run() -> Result<()> {
             name,
             cwd,
             tmux,
+            detach,
+            no_status,
             command,
         } => {
             if tmux {
@@ -156,8 +164,12 @@ fn run() -> Result<()> {
             }
             let command = normalize_command(command)?;
             let info = client::new_session(name, command, cwd, HashMap::new(), tmux)?;
-            println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
-            Ok(())
+            if detach {
+                println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
+                Ok(())
+            } else {
+                client::attach(&info.pane_id, !no_status)
+            }
         }
         Commands::Run {
             name,

@@ -116,6 +116,7 @@ fn keeps_session_and_captures_output() -> TestResult {
         .cmd()
         .args([
             "new",
+            "--detach",
             "--name",
             "smoke",
             "--",
@@ -132,12 +133,36 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
+fn new_attaches_by_default() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "new",
+            "-n",
+            "attached",
+            "--",
+            "sh",
+            "-lc",
+            "echo ATTACHED_BY_DEFAULT; sleep 1",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ATTACHED_BY_DEFAULT"),
+        "{output:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn new_short_name_and_ls_alias_work() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
         .args([
             "new",
+            "--detach",
             "-n",
             "shorty",
             "--",
@@ -155,6 +180,85 @@ fn new_short_name_and_ls_alias_work() -> TestResult {
 
     let captured = env.capture_until("shorty", "SHORTY")?;
     assert!(captured.contains("SHORTY"));
+    Ok(())
+}
+
+#[test]
+fn pane_ids_reuse_lowest_available_after_kill() -> TestResult {
+    let env = TestEnv::new()?;
+    let first = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "first-pane",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(first.status.success(), "{first:?}");
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("first-pane\t%0\t"),
+        "{first:?}"
+    );
+
+    let status = env.cmd().args(["kill", "first-pane"]).status()?;
+    assert!(status.success());
+
+    let second = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "second-pane",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(second.status.success(), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("second-pane\t%0\t"),
+        "{second:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn new_uses_callers_current_directory_by_default() -> TestResult {
+    let env = TestEnv::new()?;
+    let cwd = env.temp.path().join("caller-cwd");
+    std::fs::create_dir(&cwd)?;
+    let status = env
+        .cmd()
+        .current_dir(&cwd)
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "cwdtest",
+            "--",
+            "sh",
+            "-lc",
+            "pwd; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("cwdtest", &cwd.display().to_string())?;
+    assert!(captured.contains(&cwd.display().to_string()), "{captured}");
+
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains(&cwd.display().to_string()),
+        "{listed:?}"
+    );
     Ok(())
 }
 
@@ -285,6 +389,7 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
         .cmd()
         .args([
             "new",
+            "--detach",
             "--name",
             "escaped",
             "--",
@@ -367,6 +472,7 @@ fn kill_reaps_session_process_group_children() -> TestResult {
         .cmd()
         .args([
             "new",
+            "--detach",
             "--name",
             "pgrp",
             "--",
