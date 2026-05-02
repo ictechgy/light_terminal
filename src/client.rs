@@ -528,10 +528,9 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             Err(err) => return Err(err).context("read pty output"),
         };
         stdout.write_all(&buf[..n]).context("write stdout")?;
+        stdout.flush().ok();
         if status_enabled {
             status_dirty = true;
-        } else {
-            stdout.flush().ok();
         }
     }
     if status_dirty {
