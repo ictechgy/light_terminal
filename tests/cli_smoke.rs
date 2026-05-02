@@ -51,23 +51,62 @@ impl Drop for TestEnv {
 
 #[cfg(unix)]
 fn pid_alive(pid: &str) -> TestResult<bool> {
-    let output = Command::new(ps_path())
+    let output = match Command::new(ps_path()?)
         .args(["-o", "stat=", "-p", pid])
-        .output()?;
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return pid_exists_by_signal(pid);
+        }
+        Err(err) => return Err(err.into()),
+    };
     if !output.status.success() {
-        return Ok(false);
+        if output.stdout.is_empty() && output.stderr.is_empty() {
+            return Ok(false);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Operation not permitted") || stderr.contains("Permission denied") {
+            return pid_exists_by_signal(pid);
+        }
+        return Err(format!(
+            "ps failed while checking pid {pid}: status={:?}, stderr={}",
+            output.status.code(),
+            stderr
+        )
+        .into());
     }
     let stat = String::from_utf8_lossy(&output.stdout);
     let stat = stat.trim();
+    // For cleanup tests, a zombie has already stopped executing and only awaits
+    // parent reap, so treat it as terminated rather than as a surviving child.
     Ok(!stat.is_empty() && !stat.starts_with('Z'))
 }
 
 #[cfg(unix)]
-fn ps_path() -> &'static str {
+fn ps_path() -> TestResult<&'static str> {
     ["/bin/ps", "/usr/bin/ps"]
         .into_iter()
         .find(|path| Path::new(path).is_file())
-        .unwrap_or("/bin/ps")
+        .ok_or_else(|| "ps binary not found in /bin/ps or /usr/bin/ps".into())
+}
+
+#[cfg(unix)]
+fn pid_exists_by_signal(pid: &str) -> TestResult<bool> {
+    let pid: libc::pid_t = pid.parse()?;
+    if pid <= 0 {
+        return Ok(false);
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(err.into()),
+    }
 }
 
 #[test]

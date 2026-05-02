@@ -654,9 +654,9 @@ fn verified_process_group_id(
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
     signal_process_group(session, libc::SIGHUP);
-    wait_for_process_group_exit(session.process_group_id, Duration::from_millis(150));
+    wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);
-    wait_for_process_group_exit(session.process_group_id, Duration::from_millis(350));
+    wait_for_process_group_exit(session, Duration::from_millis(350));
     signal_process_group(session, libc::SIGKILL);
     session.alive.store(false, Ordering::SeqCst);
     remove_session(state, session);
@@ -664,7 +664,7 @@ fn terminate_session(state: &Arc<State>, session: &Session) {
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
-    if let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) {
+    if let Some(pgid) = verified_session_process_group_id(session) {
         let rc = unsafe { libc::kill(-pgid, signal) };
         if rc == 0 {
             return;
@@ -680,8 +680,27 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
     let _ = lock(&session.killer).kill();
 }
 
-fn wait_for_process_group_exit(pgid: Option<i32>, timeout: Duration) {
-    let Some(pgid) = pgid.filter(|pgid| *pgid > 1) else {
+fn verified_session_process_group_id(session: &Session) -> Option<i32> {
+    let pgid = session.process_group_id.filter(|pgid| *pgid > 1)?;
+    if process_group_still_owns_child(session.process_id, pgid) {
+        return Some(pgid);
+    }
+    eprintln!(
+        "not signaling process group {} for {}: child pid {:?} no longer verifies that group",
+        pgid, session.name, session.process_id
+    );
+    None
+}
+
+fn process_group_still_owns_child(process_id: Option<u32>, pgid: i32) -> bool {
+    let Some(pid) = process_id.and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return false;
+    };
+    unsafe { libc::getpgid(pid) == pgid }
+}
+
+fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
+    let Some(pgid) = verified_session_process_group_id(session) else {
         thread::sleep(timeout);
         return;
     };
@@ -1000,4 +1019,21 @@ unsafe extern "C" {
         option_len: *mut u32,
     ) -> c_int;
     fn geteuid() -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_group_still_owns_child;
+
+    #[test]
+    fn process_group_check_requires_current_child_group_match() {
+        let pid = std::process::id();
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert!(pgid > 1, "current process should have a real process group");
+
+        assert!(process_group_still_owns_child(Some(pid), pgid));
+        assert!(!process_group_still_owns_child(None, pgid));
+        let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
+        assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
 }

@@ -287,7 +287,7 @@ struct ProcessRow {
 }
 
 fn read_process_table() -> Result<Vec<ProcessRow>> {
-    let output = Command::new(ps_path())
+    let output = Command::new(ps_path()?)
         .args(["-axo", "pid=,ppid=,stat=,%cpu=,%mem=,rss=,etime=,command="])
         .output()
         .context("run ps")?;
@@ -333,12 +333,12 @@ fn read_process_table() -> Result<Vec<ProcessRow>> {
     Ok(rows)
 }
 
-fn ps_path() -> &'static str {
+fn ps_path() -> Result<&'static str> {
     PS_CANDIDATES
         .iter()
         .copied()
         .find(|path| Path::new(path).is_file())
-        .unwrap_or(PS_CANDIDATES[0])
+        .with_context(|| format!("find ps binary in {}", PS_CANDIDATES.join(", ")))
 }
 
 fn parse_nonzero_u32(value: &str) -> Option<u32> {
@@ -346,15 +346,15 @@ fn parse_nonzero_u32(value: &str) -> Option<u32> {
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
-    value.parse().ok()
+    value.trim().parse().ok()
 }
 
 fn parse_u64(value: &str) -> Option<u64> {
-    value.parse().ok()
+    value.trim().parse().ok()
 }
 
 fn parse_f32(value: &str) -> Option<f32> {
-    value.parse().ok()
+    value.trim().parse().ok()
 }
 
 fn nth_field_start(line: &str, field_index: usize) -> Option<usize> {
