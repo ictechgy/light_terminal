@@ -220,10 +220,10 @@ fn run() -> Result<()> {
                         sanitize::terminal_text(&s.name),
                         sanitize::terminal_text(&s.pane_id),
                         if s.alive { "alive" } else { "dead" },
-                        format_attach_state(s.attached_clients),
-                        sanitize::terminal_text(parent_pane_display(&s)),
                         sanitize::terminal_text(&s.cwd),
-                        sanitize::terminal_text(&s.command)
+                        sanitize::terminal_text(&s.command),
+                        format_attach_state(s.attached_clients),
+                        sanitize::terminal_text(parent_pane_display(&s))
                     );
                 }
             }
@@ -373,7 +373,12 @@ fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
         client::find_command(binary).with_context(|| format!("{binary} not found in PATH"))?;
     tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
-    cmd.push(binary_path.display().to_string());
+    cmd.push(
+        binary_path
+            .to_str()
+            .with_context(|| format!("{binary} resolved to a non-UTF-8 path"))?
+            .to_string(),
+    );
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
     let base_name = format!("{binary}-lterm");

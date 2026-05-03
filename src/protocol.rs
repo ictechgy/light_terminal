@@ -39,6 +39,8 @@ pub enum Request {
         #[serde(default)]
         parent_pane_id: Option<String>,
         #[serde(default)]
+        parent_token: Option<String>,
+        #[serde(default)]
         env: HashMap<String, String>,
         tmux: bool,
     },
@@ -71,6 +73,8 @@ pub enum Request {
         cwd: Option<String>,
         #[serde(default)]
         parent_pane_id: Option<String>,
+        #[serde(default)]
+        parent_token: Option<String>,
     },
     Shutdown,
 }

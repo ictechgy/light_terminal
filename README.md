@@ -71,7 +71,7 @@ lterm a api
 lterm -a api
 ```
 
-`lterm ls` hides child panes by default, marks sessions as `attached` or `detached`, and shows `-` or the parent pane id in the parent column. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`, or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
+`lterm ls` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`, or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
 
 When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
