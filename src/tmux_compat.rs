@@ -199,7 +199,7 @@ fn list_sessions(args: &[String]) -> Result<i32> {
     let format = parse_format(args).unwrap_or_else(|| "#{session_name}".to_string());
     for pane in client::list_sessions()? {
         // The daemon stores aliases; collapse by pane id.
-        if pane.name.starts_with('%') || pane.name == pane.id {
+        if pane.parent_pane_id.is_some() || pane.name.starts_with('%') || pane.name == pane.id {
             continue;
         }
         println!("{}", expand_format(&format, &pane));
@@ -952,6 +952,9 @@ mod tests {
             exit_code: None,
             rows: 24,
             cols: 80,
+            parent_pane_id: None,
+            parent_session_id: None,
+            attached_clients: 0,
             process_id: None,
             process_group_id: None,
         };

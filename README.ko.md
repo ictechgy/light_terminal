@@ -71,12 +71,14 @@ lterm a api
 lterm -a api
 ```
 
-attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 사용하려면 `lterm attach --no-status api`를 쓰세요.
+`lterm ls`는 기본적으로 하위 pane을 숨기고, 세션을 `attached` 또는 `detached`로 표시하며, parent 열에는 `-` 또는 부모 pane id를 보여줍니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 사용하려면 `lterm attach --no-status api`를 쓰세요.
 
 **세션 확인 및 입력 전송:**
 
 ```bash
 lterm ls
+lterm ls --children
+lterm ls --all
 lterm ps api
 lterm capture api -S=-80
 lterm send api 'echo hello' --enter

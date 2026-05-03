@@ -336,6 +336,202 @@ fn new_short_name_and_ls_alias_work() -> TestResult {
 }
 
 #[test]
+fn child_sessions_are_hidden_from_default_list() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "parent-pane",
+            "--",
+            "sh",
+            "-lc",
+            "\"$LTERM_BIN\" new --detach -n child-pane -- sh -lc 'sleep 10' && echo CHILD_READY; sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-pane", "CHILD_READY")?;
+
+    let default_list = env.cmd().arg("ls").output()?;
+    assert!(default_list.status.success(), "{default_list:?}");
+    let stdout = String::from_utf8_lossy(&default_list.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "child pane should be hidden from default list: {stdout:?}"
+    );
+
+    let children = env.cmd().args(["ls", "--children"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let stdout = String::from_utf8_lossy(&children.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "children list should not include root sessions: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("\t%0\t"),
+        "child list should show parent pane id: {stdout:?}"
+    );
+
+    let all = env.cmd().args(["ls", "--all"]).output()?;
+    assert!(all.status.success(), "{all:?}");
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "{stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn terminating_parent_session_terminates_child_sessions() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "parent-kill",
+            "--",
+            "sh",
+            "-lc",
+            "\"$LTERM_BIN\" new --detach -n child-kill -- sh -lc 'sleep 30' && echo CHILD_READY; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-kill", "CHILD_READY")?;
+
+    let status = env.cmd().args(["kill", "parent-kill"]).status()?;
+    assert!(status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().args(["ls", "--all"]).output()?;
+        assert!(output.status.success(), "{output:?}");
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if !last.lines().any(|line| line.starts_with("child-kill\t")) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!("child session survived parent termination: {last:?}").into())
+}
+
+#[test]
+fn child_sessions_end_when_parent_exits_naturally() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "parent-exit",
+            "--",
+            "sh",
+            "-lc",
+            "\"$LTERM_BIN\" new --detach -n child-exit -- sh -lc 'sleep 30' && echo CHILD_READY; sleep 0.2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-exit", "CHILD_READY")?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().args(["ls", "--all"]).output()?;
+        assert!(output.status.success(), "{output:?}");
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if !last.lines().any(|line| line.starts_with("parent-exit\t"))
+            && !last.lines().any(|line| line.starts_with("child-exit\t"))
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!("child session survived natural parent exit: {last:?}").into())
+}
+
+#[test]
+fn list_shows_attached_state() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "attach-state",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let detached = env.cmd().arg("ls").output()?;
+    assert!(detached.status.success(), "{detached:?}");
+    let stdout = String::from_utf8_lossy(&detached.stdout);
+    assert!(
+        stdout.contains("attach-state\t%0\talive\tdetached\t-"),
+        "new detached session should list as detached: {stdout:?}"
+    );
+
+    let mut attach = env
+        .cmd()
+        .args(["attach", "attach-state", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let attach_stdin = attach.stdin.take().ok_or("missing attach stdin")?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let listed = env.cmd().arg("ls").output()?;
+        assert!(listed.status.success(), "{listed:?}");
+        last = String::from_utf8_lossy(&listed.stdout).to_string();
+        if last.contains("attach-state\t%0\talive\tattached\t-") {
+            drop(attach_stdin);
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < wait_deadline {
+                if let Some(status) = attach.try_wait()? {
+                    assert!(status.success(), "{status:?}");
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            let _ = attach.kill();
+            let _ = attach.wait();
+            return Err("attach did not detach after stdin was closed".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Err(format!("timed out waiting for attached state; last list: {last:?}").into())
+}
+
+#[test]
 fn pane_ids_reuse_lowest_available_after_kill() -> TestResult {
     let env = TestEnv::new()?;
     let first = env

@@ -14,6 +14,12 @@ pub struct SessionInfo {
     pub rows: u16,
     pub cols: u16,
     #[serde(default)]
+    pub parent_pane_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub attached_clients: usize,
+    #[serde(default)]
     pub process_id: Option<u32>,
     #[serde(default)]
     pub process_group_id: Option<i32>,
@@ -30,6 +36,8 @@ pub enum Request {
         cwd: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        #[serde(default)]
+        parent_pane_id: Option<String>,
         #[serde(default)]
         env: HashMap<String, String>,
         tmux: bool,
@@ -61,6 +69,8 @@ pub enum Request {
         target: String,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        parent_pane_id: Option<String>,
     },
     Shutdown,
 }
@@ -127,5 +137,8 @@ mod tests {
 
         assert_eq!(info.process_id, None);
         assert_eq!(info.process_group_id, None);
+        assert_eq!(info.parent_pane_id, None);
+        assert_eq!(info.parent_session_id, None);
+        assert_eq!(info.attached_clients, 0);
     }
 }

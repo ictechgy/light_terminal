@@ -134,6 +134,7 @@ pub fn new_session(
         cwd,
         rows: terminal_rows(),
         cols: terminal_cols(),
+        parent_pane_id: current_parent_pane_id(),
         env,
         tmux,
     })
@@ -144,7 +145,20 @@ pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
     rpc(&Request::AttachOrNew {
         target: target.to_string(),
         cwd: Some(resolve_client_cwd(None)?),
+        parent_pane_id: current_parent_pane_id(),
     })
+}
+
+fn current_parent_pane_id() -> Option<String> {
+    std::env::var("LTERM_PANE")
+        .ok()
+        .filter(|pane_id| is_lterm_pane_id(pane_id))
+}
+
+fn is_lterm_pane_id(value: &str) -> bool {
+    value
+        .strip_prefix('%')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {

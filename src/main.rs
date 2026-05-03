@@ -81,6 +81,12 @@ enum Commands {
     List {
         #[arg(long)]
         json: bool,
+        /// Include child panes created from inside another lterm session.
+        #[arg(long, conflicts_with = "children")]
+        all: bool,
+        /// Show only child panes created from inside another lterm session.
+        #[arg(long, conflicts_with = "all")]
+        children: bool,
     },
     /// Show child process trees for lterm sessions.
     Ps {
@@ -196,17 +202,26 @@ fn run() -> Result<()> {
             !no_status,
             AttachStdinEof::Detach,
         ),
-        Commands::List { json } => {
-            let sessions = client::list_sessions()?;
+        Commands::List {
+            json,
+            all,
+            children,
+        } => {
+            let sessions = filter_list_sessions(
+                collapse_aliases(client::list_sessions()?),
+                ListScope::from_flags(all, children),
+            );
             if json {
                 println!("{}", client::json_pretty(&sessions));
             } else {
-                for s in collapse_aliases(sessions) {
+                for s in sessions {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         sanitize::terminal_text(&s.name),
                         sanitize::terminal_text(&s.pane_id),
                         if s.alive { "alive" } else { "dead" },
+                        format_attach_state(s.attached_clients),
+                        sanitize::terminal_text(parent_pane_display(&s)),
                         sanitize::terminal_text(&s.cwd),
                         sanitize::terminal_text(&s.command)
                     );
@@ -306,6 +321,51 @@ fn collapse_aliases(mut sessions: Vec<protocol::SessionInfo>) -> Vec<protocol::S
     let mut seen = std::collections::HashSet::new();
     sessions.retain(|s| seen.insert(s.pane_id.clone()));
     sessions
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ListScope {
+    Roots,
+    Children,
+    All,
+}
+
+impl ListScope {
+    fn from_flags(all: bool, children: bool) -> Self {
+        if all {
+            Self::All
+        } else if children {
+            Self::Children
+        } else {
+            Self::Roots
+        }
+    }
+}
+
+fn filter_list_sessions(
+    sessions: Vec<protocol::SessionInfo>,
+    scope: ListScope,
+) -> Vec<protocol::SessionInfo> {
+    sessions
+        .into_iter()
+        .filter(|session| match scope {
+            ListScope::Roots => session.parent_pane_id.is_none(),
+            ListScope::Children => session.parent_pane_id.is_some(),
+            ListScope::All => true,
+        })
+        .collect()
+}
+
+fn format_attach_state(attached_clients: usize) -> String {
+    match attached_clients {
+        0 => "detached".to_string(),
+        1 => "attached".to_string(),
+        count => format!("attached:{count}"),
+    }
+}
+
+fn parent_pane_display(session: &protocol::SessionInfo) -> &str {
+    session.parent_pane_id.as_deref().unwrap_or("-")
 }
 
 fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {

@@ -117,6 +117,8 @@ struct Session {
     id: String,
     name: String,
     pane_id: String,
+    parent_pane_id: Option<String>,
+    parent_session_id: Option<String>,
     command: String,
     cwd: String,
     created_unix_ms: u128,
@@ -143,6 +145,8 @@ impl Session {
             id: self.id.clone(),
             name: self.name.clone(),
             pane_id: self.pane_id.clone(),
+            parent_pane_id: self.parent_pane_id.clone(),
+            parent_session_id: self.parent_session_id.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             created_unix_ms: self.created_unix_ms,
@@ -150,6 +154,7 @@ impl Session {
             exit_code: if exit == i32::MIN { None } else { Some(exit) },
             rows: *lock(&self.rows),
             cols: *lock(&self.cols),
+            attached_clients: lock(&self.subscribers).len(),
             process_id: self.process_id,
             process_group_id: self.process_group_id,
         }
@@ -330,6 +335,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cwd,
             rows,
             cols,
+            parent_pane_id,
             env,
             tmux,
         } => {
@@ -341,13 +347,18 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cwd,
                     rows,
                     cols,
+                    parent_pane_id,
                     env,
                     tmux,
                 },
             )?;
             Ok(Response::ok(session.info()))
         }
-        Request::AttachOrNew { target, cwd } => {
+        Request::AttachOrNew {
+            target,
+            cwd,
+            parent_pane_id,
+        } => {
             let target = normalize_target(&target);
             if let Ok(session) = resolve_session(state, &target) {
                 return Ok(Response::ok(session.info()));
@@ -363,6 +374,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cwd,
                     rows: None,
                     cols: None,
+                    parent_pane_id,
                     env: HashMap::new(),
                     tmux: false,
                 },
@@ -424,17 +436,41 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
     }
 }
 
+struct ParentSession {
+    id: String,
+    pane_id: String,
+}
+
+fn canonical_parent_session(
+    state: &Arc<State>,
+    parent_pane_id: Option<&str>,
+) -> Option<ParentSession> {
+    let parent_pane_id = normalize_target(parent_pane_id?);
+    if !parent_pane_id.starts_with('%') {
+        return None;
+    }
+    lock(&state.sessions)
+        .by_pane
+        .get(&parent_pane_id)
+        .map(|session| ParentSession {
+            id: session.id.clone(),
+            pane_id: session.pane_id.clone(),
+        })
+}
+
 struct NewSessionParams {
     name: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    parent_pane_id: Option<String>,
     env: HashMap<String, String>,
     tmux: bool,
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
+    let parent_session = canonical_parent_session(state, params.parent_pane_id.as_deref());
     let reservation = reserve_session_identity(state, params.name)?;
     let pty_system = native_pty_system();
     let rows = params.rows.unwrap_or(24).max(1);
@@ -512,6 +548,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         id,
         name: name.clone(),
         pane_id,
+        parent_pane_id: parent_session.as_ref().map(|parent| parent.pane_id.clone()),
+        parent_session_id: parent_session.map(|parent| parent.id),
         command,
         cwd,
         created_unix_ms: now_unix_ms(),
@@ -571,6 +609,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
             .store(exit_code, Ordering::SeqCst);
         session_for_waiter.alive.store(false, Ordering::SeqCst);
         session_for_waiter.close_subscribers();
+        terminate_child_sessions(&state_for_waiter, &session_for_waiter.id);
         remove_session(&state_for_waiter, &session_for_waiter);
     });
 
@@ -813,6 +852,26 @@ fn remove_session(state: &Arc<State>, session: &Session) {
     }
 }
 
+fn terminate_child_sessions(state: &Arc<State>, parent_session_id: &str) {
+    let children: Vec<_> = {
+        let sessions = lock(&state.sessions);
+        sessions
+            .by_pane
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .parent_session_id
+                    .as_deref()
+                    .is_some_and(|id| id == parent_session_id)
+            })
+            .cloned()
+            .collect()
+    };
+    for child in children {
+        terminate_session(state, &child);
+    }
+}
+
 fn verified_process_group_id(
     candidate: Option<libc::pid_t>,
     process_id: Option<u32>,
@@ -841,10 +900,12 @@ fn verified_process_group_id(
 fn terminate_session(state: &Arc<State>, session: &Session) {
     if !session.alive.swap(false, Ordering::SeqCst) {
         session.close_subscribers();
+        terminate_child_sessions(state, &session.id);
         remove_session(state, session);
         return;
     }
     session.close_subscribers();
+    terminate_child_sessions(state, &session.id);
     signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);

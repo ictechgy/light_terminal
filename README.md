@@ -71,12 +71,14 @@ lterm a api
 lterm -a api
 ```
 
-Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`.
+`lterm ls` hides child panes by default, marks sessions as `attached` or `detached`, and shows `-` or the parent pane id in the parent column. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`.
 
 **Inspect or send input:**
 
 ```bash
 lterm ls
+lterm ls --children
+lterm ls --all
 lterm ps api
 lterm capture api -S=-80
 lterm send api 'echo hello' --enter
