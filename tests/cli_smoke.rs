@@ -532,6 +532,37 @@ fn list_shows_attached_state() -> TestResult {
 }
 
 #[test]
+fn attached_new_forwards_utf8_input_bytes() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut child = env
+        .cmd()
+        .args([
+            "new",
+            "--no-status",
+            "-n",
+            "utf8-input",
+            "--",
+            "sh",
+            "-lc",
+            "IFS= read -r line; printf 'GOT:%s\\n' \"$line\"",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
+        stdin.write_all("한글 입력\n".as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("GOT:한글 입력"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn pane_ids_reuse_lowest_available_after_kill() -> TestResult {
     let env = TestEnv::new()?;
     let first = env
