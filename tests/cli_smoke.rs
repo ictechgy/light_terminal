@@ -50,6 +50,43 @@ impl Drop for TestEnv {
     }
 }
 
+fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("{name}\t")))
+        .map(|line| line.split('\t').collect())
+}
+
+fn wait_for_pid_exit(pid: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !pid_alive(pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("pid {pid} still alive after timeout").into())
+}
+
+fn wait_for_file_contents(path: &Path) -> TestResult<String> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(path) {
+            Ok(contents) if !contents.trim().is_empty() => return Ok(contents),
+            Ok(_) => {}
+            Err(err) => last_err = Some(err),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "timed out waiting for file {}; last error: {:?}",
+        path.display(),
+        last_err
+    )
+    .into())
+}
+
 #[cfg(unix)]
 fn pid_alive(pid: &str) -> TestResult<bool> {
     let output = match Command::new(ps_path()?)
@@ -332,6 +369,392 @@ fn new_short_name_and_ls_alias_work() -> TestResult {
 
     let captured = env.capture_until("shorty", "SHORTY")?;
     assert!(captured.contains("SHORTY"));
+    Ok(())
+}
+
+#[test]
+fn child_sessions_are_hidden_from_default_list() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "parent-pane",
+            "--",
+            "sh",
+            "-lc",
+            "\"$LTERM_BIN\" new --detach -n child-pane -- sh -lc 'sleep 10' && echo CHILD_READY; sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-pane", "CHILD_READY")?;
+
+    let default_list = env.cmd().arg("ls").output()?;
+    assert!(default_list.status.success(), "{default_list:?}");
+    let stdout = String::from_utf8_lossy(&default_list.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "child pane should be hidden from default list: {stdout:?}"
+    );
+    let parent = list_row(&stdout, "parent-pane")
+        .ok_or_else(|| format!("parent row missing from default list: {stdout:?}"))?;
+    let parent_pane_id = parent
+        .get(1)
+        .ok_or_else(|| format!("parent row missing pane id: {parent:?}"))?
+        .to_string();
+
+    let children = env.cmd().args(["ls", "--children"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let stdout = String::from_utf8_lossy(&children.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "children list should not include root sessions: {stdout:?}"
+    );
+    let child = list_row(&stdout, "child-pane")
+        .ok_or_else(|| format!("child row missing from children list: {stdout:?}"))?;
+    assert_eq!(child.len(), 7, "unexpected child list columns: {child:?}");
+    assert_eq!(
+        child[6], parent_pane_id,
+        "child list should show parent pane id"
+    );
+
+    let all = env.cmd().args(["ls", "--all"]).output()?;
+    assert!(all.status.success(), "{all:?}");
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("parent-pane\t")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("child-pane\t")),
+        "{stdout:?}"
+    );
+
+    let tmux_list = env.cmd().args(["tmux-compat", "list-sessions"]).output()?;
+    assert!(tmux_list.status.success(), "{tmux_list:?}");
+    let stdout = String::from_utf8_lossy(&tmux_list.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "parent-pane"),
+        "tmux compat should include root sessions: {stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line == "child-pane"),
+        "tmux compat should hide child sessions by default: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn terminating_parent_session_terminates_child_sessions() -> TestResult {
+    let env = TestEnv::new()?;
+    let child_pid_file = env.temp.path().join("child-kill.pid");
+    let child_script = env.temp.path().join("child-kill.sh");
+    std::fs::write(
+        &child_script,
+        format!(
+            "echo $$ > {}\nsleep 30\n",
+            shlex::try_quote(&child_pid_file.display().to_string())?
+        ),
+    )?;
+    let parent_command = format!(
+        "\"$LTERM_BIN\" new --detach -n child-kill -- sh {} && echo CHILD_READY; sleep 30",
+        shlex::try_quote(&child_script.display().to_string())?
+    );
+    let status = env
+        .cmd()
+        .args(["new", "--detach", "-n", "parent-kill", "--", "sh", "-lc"])
+        .arg(parent_command)
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-kill", "CHILD_READY")?;
+    let child_pid = wait_for_file_contents(&child_pid_file)?.trim().to_string();
+
+    let status = env.cmd().args(["kill", "parent-kill"]).status()?;
+    assert!(status.success());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().args(["ls", "--all"]).output()?;
+        assert!(output.status.success(), "{output:?}");
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if !last.lines().any(|line| line.starts_with("child-kill\t")) {
+            wait_for_pid_exit(&child_pid)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!("child session survived parent termination: {last:?}").into())
+}
+
+#[test]
+fn child_sessions_end_when_parent_exits_naturally() -> TestResult {
+    let env = TestEnv::new()?;
+    let child_pid_file = env.temp.path().join("child-exit.pid");
+    let child_script = env.temp.path().join("child-exit.sh");
+    std::fs::write(
+        &child_script,
+        format!(
+            "echo $$ > {}\nsleep 30\n",
+            shlex::try_quote(&child_pid_file.display().to_string())?
+        ),
+    )?;
+    let parent_command = format!(
+        "\"$LTERM_BIN\" new --detach -n child-exit -- sh {} && echo CHILD_READY; sleep 0.2",
+        shlex::try_quote(&child_script.display().to_string())?
+    );
+    let status = env
+        .cmd()
+        .args(["new", "--detach", "-n", "parent-exit", "--", "sh", "-lc"])
+        .arg(parent_command)
+        .status()?;
+    assert!(status.success());
+    env.capture_until("parent-exit", "CHILD_READY")?;
+    let child_pid = wait_for_file_contents(&child_pid_file)?.trim().to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().args(["ls", "--all"]).output()?;
+        assert!(output.status.success(), "{output:?}");
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if !last.lines().any(|line| line.starts_with("parent-exit\t"))
+            && !last.lines().any(|line| line.starts_with("child-exit\t"))
+        {
+            wait_for_pid_exit(&child_pid)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!("child session survived natural parent exit: {last:?}").into())
+}
+
+#[test]
+fn forged_lterm_pane_without_token_is_not_parented() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "victim-parent",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let victim = list_row(&stdout, "victim-parent")
+        .ok_or_else(|| format!("victim parent row missing: {stdout:?}"))?;
+    let victim_pane = victim
+        .get(1)
+        .ok_or_else(|| format!("victim row missing pane id: {victim:?}"))?;
+
+    let status = env
+        .cmd()
+        .env("LTERM_PANE", victim_pane)
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "spoof-child",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let default_list = env.cmd().arg("ls").output()?;
+    assert!(default_list.status.success(), "{default_list:?}");
+    let stdout = String::from_utf8_lossy(&default_list.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("spoof-child\t")),
+        "spoofed child without token should remain a root session: {stdout:?}"
+    );
+
+    let children = env.cmd().args(["ls", "--children"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let stdout = String::from_utf8_lossy(&children.stdout);
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("spoof-child\t")),
+        "spoofed child without token should not be parented: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn forged_lterm_parent_token_is_rejected_before_hiding_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "token-victim",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let victim = list_row(&stdout, "token-victim")
+        .ok_or_else(|| format!("token victim row missing: {stdout:?}"))?;
+    let victim_pane = victim
+        .get(1)
+        .ok_or_else(|| format!("victim row missing pane id: {victim:?}"))?;
+
+    let output = env
+        .cmd()
+        .env("LTERM_PANE", victim_pane)
+        .env("LTERM_PARENT_TOKEN", "not-the-parent-token")
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "fake-token-child",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "fake parent token should be rejected: {output:?}"
+    );
+
+    let all = env.cmd().args(["ls", "--all"]).output()?;
+    assert!(all.status.success(), "{all:?}");
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("fake-token-child\t")),
+        "failed fake-token child should not be listed: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn list_shows_attached_state() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "attach-state",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 10",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let detached = env.cmd().arg("ls").output()?;
+    assert!(detached.status.success(), "{detached:?}");
+    let stdout = String::from_utf8_lossy(&detached.stdout);
+    let row = list_row(&stdout, "attach-state")
+        .ok_or_else(|| format!("attach-state row missing: {stdout:?}"))?;
+    assert_eq!(row.len(), 7, "unexpected list columns: {row:?}");
+    assert_eq!(
+        row[5], "detached",
+        "new detached session should list as detached"
+    );
+    assert_eq!(row[6], "-", "root session should have no parent");
+
+    let mut attach = env
+        .cmd()
+        .args(["attach", "attach-state", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let attach_stdin = attach.stdin.take().ok_or("missing attach stdin")?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let listed = env.cmd().arg("ls").output()?;
+        assert!(listed.status.success(), "{listed:?}");
+        last = String::from_utf8_lossy(&listed.stdout).to_string();
+        if list_row(&last, "attach-state")
+            .is_some_and(|row| row.len() == 7 && row[5] == "attached" && row[6] == "-")
+        {
+            drop(attach_stdin);
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < wait_deadline {
+                if let Some(status) = attach.try_wait()? {
+                    assert!(status.success(), "{status:?}");
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            let _ = attach.kill();
+            let _ = attach.wait();
+            return Err("attach did not detach after stdin was closed".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Err(format!("timed out waiting for attached state; last list: {last:?}").into())
+}
+
+#[test]
+fn attached_new_forwards_utf8_input_bytes() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut child = env
+        .cmd()
+        .args([
+            "new",
+            "--no-status",
+            "-n",
+            "utf8-input",
+            "--",
+            "sh",
+            "-lc",
+            "IFS= read -r line; printf 'GOT:%s\\n' \"$line\"",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
+        stdin.write_all("한글 입력\n".as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("GOT:한글 입력"), "{stdout:?}");
     Ok(())
 }
 

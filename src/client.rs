@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -128,12 +128,15 @@ pub fn new_session(
 ) -> Result<SessionInfo> {
     ensure_server()?;
     let cwd = Some(resolve_client_cwd(cwd)?);
+    let parent = current_parent_request();
     rpc(&Request::New {
         name,
         command,
         cwd,
         rows: terminal_rows(),
         cols: terminal_cols(),
+        parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
+        parent_token: parent.map(|parent| parent.token),
         env,
         tmux,
     })
@@ -141,10 +144,34 @@ pub fn new_session(
 
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
     ensure_server()?;
+    let parent = current_parent_request();
     rpc(&Request::AttachOrNew {
         target: target.to_string(),
         cwd: Some(resolve_client_cwd(None)?),
+        parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
+        parent_token: parent.map(|parent| parent.token),
     })
+}
+
+struct ParentRequest {
+    pane_id: String,
+    token: String,
+}
+
+fn current_parent_request() -> Option<ParentRequest> {
+    let pane_id = std::env::var("LTERM_PANE")
+        .ok()
+        .filter(|pane_id| is_lterm_pane_id(pane_id))?;
+    let token = std::env::var("LTERM_PARENT_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())?;
+    Some(ParentRequest { pane_id, token })
+}
+
+fn is_lterm_pane_id(value: &str) -> bool {
+    value
+        .strip_prefix('%')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
@@ -464,6 +491,8 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     }
 
     let _raw = RawModeGuard::enter()?;
+    let mut terminal_output_tracker =
+        TerminalOutputTracker::new(_raw.keyboard_protocol_restore_state());
     let running = Arc::new(AtomicBool::new(true));
 
     let mut writer = stream.try_clone().context("clone attach stream writer")?;
@@ -550,6 +579,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
+            terminal_output_tracker.observe(&buf[..n]);
             if let Err(err) = stdout.write_all(&buf[..n]) {
                 if err.kind() == ErrorKind::BrokenPipe {
                     break;
@@ -590,10 +620,36 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
 fn status_bar_supported(show_status: bool) -> bool {
     let (cols, rows) = terminal_size();
     show_status
+        && !status_bar_disabled_by_env()
         && rows > 1
         && cols > 0
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
+}
+
+fn status_bar_disabled_by_env() -> bool {
+    env_flag_enabled("LTERM_NO_STATUS") || env_flag_disabled("LTERM_STATUS")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| matches_env_bool(&value, true))
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| matches_env_bool(&value, false))
+}
+
+fn matches_env_bool(value: &str, expected: bool) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => expected,
+        "0" | "false" | "no" | "off" => !expected,
+        _ => false,
+    }
 }
 
 struct StatusBar {
@@ -696,8 +752,191 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     line
 }
 
+#[derive(Default)]
+struct KeyboardProtocolRestoreState {
+    kitty_push_depth: AtomicI32,
+    kitty_direct_flags: AtomicU32,
+}
+
+struct TerminalOutputTracker {
+    restore_state: Arc<KeyboardProtocolRestoreState>,
+    tail: Vec<u8>,
+}
+
+impl TerminalOutputTracker {
+    fn new(restore_state: Arc<KeyboardProtocolRestoreState>) -> Self {
+        Self {
+            restore_state,
+            tail: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        const TAIL_LIMIT: usize = 64;
+        let old_tail = std::mem::take(&mut self.tail);
+        if !old_tail.is_empty() && !bytes.is_empty() {
+            let prefix_len = bytes.len().min(TAIL_LIMIT);
+            let mut boundary = Vec::with_capacity(old_tail.len() + prefix_len);
+            boundary.extend_from_slice(&old_tail);
+            boundary.extend_from_slice(&bytes[..prefix_len]);
+            observe_keyboard_protocol_sequences_after(
+                &boundary,
+                old_tail.len(),
+                &self.restore_state,
+            );
+        }
+
+        observe_keyboard_protocol_sequences(bytes, &self.restore_state);
+
+        if bytes.len() >= TAIL_LIMIT {
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - TAIL_LIMIT..]);
+        } else {
+            let old_keep = old_tail.len().min(TAIL_LIMIT - bytes.len());
+            self.tail
+                .extend_from_slice(&old_tail[old_tail.len() - old_keep..]);
+            self.tail.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn observe_keyboard_protocol_sequences(bytes: &[u8], state: &KeyboardProtocolRestoreState) {
+    observe_keyboard_protocol_sequences_after(bytes, 0, state);
+}
+
+fn observe_keyboard_protocol_sequences_after(
+    bytes: &[u8],
+    min_final_index: usize,
+    state: &KeyboardProtocolRestoreState,
+) {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if min_final_index > 0 && i >= min_final_index {
+            break;
+        }
+        if bytes[i] != 0x1b || bytes[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let kind = bytes[i + 2];
+        if kind != b'>' && kind != b'<' && kind != b'=' {
+            i += 1;
+            continue;
+        }
+
+        let scan_end = bytes.len().min(i + 64);
+        let mut j = i + 3;
+        while j < scan_end {
+            let byte = bytes[j];
+            if (0x40..=0x7e).contains(&byte) {
+                if byte == b'u' && j >= min_final_index {
+                    let params = &bytes[i + 3..j];
+                    match kind {
+                        b'>' => observe_kitty_push(state),
+                        b'<' => {
+                            if let Some(count) = keyboard_protocol_pop_count(params) {
+                                observe_kitty_pop(state, count);
+                            }
+                        }
+                        b'=' => {
+                            if let Some(change) = keyboard_protocol_direct_change(params) {
+                                observe_kitty_direct(state, change);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+const MAX_KEYBOARD_PROTOCOL_RESTORE_POPS: i32 = 16;
+
+fn observe_kitty_push(state: &KeyboardProtocolRestoreState) {
+    let _ = state
+        .kitty_push_depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            Some((depth + 1).min(MAX_KEYBOARD_PROTOCOL_RESTORE_POPS))
+        });
+}
+
+fn observe_kitty_pop(state: &KeyboardProtocolRestoreState, count: i32) {
+    if count <= 0 {
+        return;
+    }
+    let _ = state
+        .kitty_push_depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            Some(depth.saturating_sub(count))
+        });
+}
+
+fn observe_kitty_direct(
+    state: &KeyboardProtocolRestoreState,
+    change: KeyboardProtocolDirectChange,
+) {
+    if state.kitty_push_depth.load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    let _ =
+        state
+            .kitty_direct_flags
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(match change.mode {
+                    1 => change.flags,
+                    2 => current | change.flags,
+                    3 => current & !change.flags,
+                    _ => current,
+                })
+            });
+}
+
+struct KeyboardProtocolDirectChange {
+    flags: u32,
+    mode: u8,
+}
+
+fn keyboard_protocol_pop_count(params: &[u8]) -> Option<i32> {
+    if params.is_empty() {
+        return Some(1);
+    }
+    if !params.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let count = std::str::from_utf8(params).ok()?.parse::<i32>().ok()?;
+    Some(count.clamp(0, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS))
+}
+
+fn keyboard_protocol_direct_change(params: &[u8]) -> Option<KeyboardProtocolDirectChange> {
+    let mut parts = params.split(|byte| *byte == b';');
+    let flags = parse_csi_u_number(parts.next().unwrap_or_default())?;
+    let mode = match parts.next() {
+        Some(part) => parse_csi_u_number(part)?,
+        None => 1,
+    };
+    if !(1..=3).contains(&mode) {
+        return None;
+    }
+    Some(KeyboardProtocolDirectChange {
+        flags,
+        mode: mode as u8,
+    })
+}
+
+fn parse_csi_u_number(params: &[u8]) -> Option<u32> {
+    if params.is_empty() || !params.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(params).ok()?.parse::<u32>().ok()
+}
+
 struct RawModeGuard {
     active: bool,
+    keyboard_protocol_restore_state: Arc<KeyboardProtocolRestoreState>,
 }
 
 impl RawModeGuard {
@@ -706,16 +945,51 @@ impl RawModeGuard {
         if active {
             crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
         }
-        Ok(Self { active })
+        Ok(Self {
+            active,
+            keyboard_protocol_restore_state: Arc::new(KeyboardProtocolRestoreState::default()),
+        })
+    }
+
+    fn keyboard_protocol_restore_state(&self) -> Arc<KeyboardProtocolRestoreState> {
+        Arc::clone(&self.keyboard_protocol_restore_state)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if self.active {
+            restore_keyboard_protocols(&self.keyboard_protocol_restore_state);
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
+}
+
+fn restore_keyboard_protocols(state: &KeyboardProtocolRestoreState) {
+    let restore = keyboard_protocol_restore_bytes(state);
+    if restore.is_empty() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&restore);
+    let _ = stdout.flush();
+}
+
+fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<u8> {
+    let push_depth = state
+        .kitty_push_depth
+        .load(Ordering::Relaxed)
+        .clamp(0, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS);
+    let direct_flags = state.kitty_direct_flags.load(Ordering::Relaxed);
+    let mut restore = Vec::new();
+    for _ in 0..push_depth {
+        restore.extend_from_slice(b"\x1b[<u");
+    }
+    if direct_flags != 0 {
+        restore.extend_from_slice(b"\x1b[=0u");
+    }
+    restore
 }
 
 fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
@@ -764,12 +1038,29 @@ pub fn shell_join(args: &[String]) -> Result<String> {
 }
 
 pub fn command_exists(name: &str) -> bool {
+    find_command(name).is_some()
+}
+
+pub fn find_command(name: &str) -> Option<PathBuf> {
     if name.contains('/') {
-        return is_executable_file(Path::new(name));
+        return executable_command_path(PathBuf::from(name));
     }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| is_executable_file(&p.join(name))))
-        .unwrap_or(false)
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join(name))
+            .find_map(executable_command_path)
+    })
+}
+
+fn executable_command_path(path: PathBuf) -> Option<PathBuf> {
+    if !is_executable_file(&path) {
+        return None;
+    }
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -784,7 +1075,11 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_pty_rows, format_status_line};
+    use super::{
+        KeyboardProtocolRestoreState, TerminalOutputTracker, attach_pty_rows, format_status_line,
+        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+    };
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn status_bar_reserves_one_terminal_row_when_possible() {
@@ -798,5 +1093,115 @@ mod tests {
         assert_eq!(format_status_line("recovery", "%0", 12), " lterm  reco");
         assert_eq!(format_status_line("api", "%1", 16), " lterm  api  %1 ");
         assert_eq!(format_status_line("api", "%1", 18), " lterm  api  %1   ");
+    }
+
+    #[test]
+    fn status_env_bool_parser_accepts_common_values() {
+        assert!(matches_env_bool("1", true));
+        assert!(matches_env_bool("true", true));
+        assert!(matches_env_bool("YES", true));
+        assert!(matches_env_bool("off", false));
+        assert!(!matches_env_bool("maybe", true));
+    }
+
+    #[test]
+    fn observes_kitty_keyboard_protocol_enable_sequences() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"before\x1b[>1uafter", &state);
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[<u");
+
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[=3;1u", &state);
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 3);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[=0u");
+    }
+
+    #[test]
+    fn balances_kitty_keyboard_protocol_push_pop_sequences() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[>1uinside\x1b[<u", &state);
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
+        assert!(keyboard_protocol_restore_bytes(&state).is_empty());
+    }
+
+    #[test]
+    fn observes_kitty_keyboard_protocol_disable_sequences() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[=3u\x1b[=0u", &state);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+        assert!(keyboard_protocol_restore_bytes(&state).is_empty());
+    }
+
+    #[test]
+    fn restores_push_without_clobbering_direct_mode() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[>1u\x1b[=3u", &state);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[<u");
+    }
+
+    #[test]
+    fn restores_direct_mode_after_unmatched_push_pop() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[=3u\x1b[>1u", &state);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[<u\x1b[=0u");
+    }
+
+    #[test]
+    fn direct_disable_inside_push_does_not_clear_outer_restore() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[=3u\x1b[>1u\x1b[=0u", &state);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[<u\x1b[=0u");
+    }
+
+    #[test]
+    fn observes_kitty_keyboard_protocol_pop_counts() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[>1u\x1b[>1u\x1b[<2u", &state);
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
+        assert!(keyboard_protocol_restore_bytes(&state).is_empty());
+    }
+
+    #[test]
+    fn observes_kitty_keyboard_protocol_direct_modes() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[=1;3u", &state);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+        assert!(keyboard_protocol_restore_bytes(&state).is_empty());
+
+        observe_keyboard_protocol_sequences(b"\x1b[=1;2u", &state);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 1);
+        observe_keyboard_protocol_sequences(b"\x1b[=1;3u", &state);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn observes_keyboard_protocol_sequences_split_across_chunks_once() {
+        let state = std::sync::Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(std::sync::Arc::clone(&state));
+        tracker.observe(b"\x1b[>");
+        tracker.observe(b"1u");
+        tracker.observe(b"plain output");
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(keyboard_protocol_restore_bytes(&state), b"\x1b[<u");
+    }
+
+    #[test]
+    fn observes_whole_keyboard_protocol_sequences_once_after_tail() {
+        let state = std::sync::Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(std::sync::Arc::clone(&state));
+        tracker.observe(b"plain output");
+        tracker.observe(b"\x1b[>1u");
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ignores_non_keyboard_csi_sequences() {
+        let state = KeyboardProtocolRestoreState::default();
+        observe_keyboard_protocol_sequences(b"\x1b[?25l\x1b[>4;1m\x1b[31m", &state);
+        assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
     }
 }

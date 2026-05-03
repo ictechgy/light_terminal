@@ -117,6 +117,9 @@ struct Session {
     id: String,
     name: String,
     pane_id: String,
+    parent_pane_id: Mutex<Option<String>>,
+    parent_session_id: Mutex<Option<String>>,
+    parent_token: String,
     command: String,
     cwd: String,
     created_unix_ms: u128,
@@ -143,6 +146,8 @@ impl Session {
             id: self.id.clone(),
             name: self.name.clone(),
             pane_id: self.pane_id.clone(),
+            parent_pane_id: lock(&self.parent_pane_id).clone(),
+            parent_session_id: lock(&self.parent_session_id).clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             created_unix_ms: self.created_unix_ms,
@@ -150,6 +155,7 @@ impl Session {
             exit_code: if exit == i32::MIN { None } else { Some(exit) },
             rows: *lock(&self.rows),
             cols: *lock(&self.cols),
+            attached_clients: lock(&self.subscribers).len(),
             process_id: self.process_id,
             process_group_id: self.process_group_id,
         }
@@ -330,6 +336,8 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cwd,
             rows,
             cols,
+            parent_pane_id,
+            parent_token,
             env,
             tmux,
         } => {
@@ -341,13 +349,20 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cwd,
                     rows,
                     cols,
+                    parent_pane_id,
+                    parent_token,
                     env,
                     tmux,
                 },
             )?;
             Ok(Response::ok(session.info()))
         }
-        Request::AttachOrNew { target, cwd } => {
+        Request::AttachOrNew {
+            target,
+            cwd,
+            parent_pane_id,
+            parent_token,
+        } => {
             let target = normalize_target(&target);
             if let Ok(session) = resolve_session(state, &target) {
                 return Ok(Response::ok(session.info()));
@@ -363,6 +378,8 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cwd,
                     rows: None,
                     cols: None,
+                    parent_pane_id,
+                    parent_token,
                     env: HashMap::new(),
                     tmux: false,
                 },
@@ -424,17 +441,70 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
     }
 }
 
+struct ParentSession {
+    id: String,
+    pane_id: String,
+}
+
+struct ParentRequest {
+    pane_id: String,
+    token: String,
+}
+
+fn parent_request(
+    parent_pane_id: Option<String>,
+    parent_token: Option<String>,
+) -> Option<ParentRequest> {
+    let parent_pane_id = parent_pane_id?;
+    let parent_pane_id = normalize_target(&parent_pane_id);
+    if !parent_pane_id.starts_with('%') {
+        return None;
+    }
+    let token = parent_token.filter(|token| !token.is_empty())?;
+    Some(ParentRequest {
+        pane_id: parent_pane_id,
+        token,
+    })
+}
+
+fn resolve_parent_session_locked(
+    sessions: &SessionMaps,
+    request: &ParentRequest,
+) -> Option<ParentSession> {
+    let session = sessions.by_pane.get(&request.pane_id)?;
+    if !session.alive.load(Ordering::SeqCst) || session.parent_token != request.token {
+        return None;
+    }
+    Some(ParentSession {
+        id: session.id.clone(),
+        pane_id: session.pane_id.clone(),
+    })
+}
+
+fn validate_parent_request(state: &Arc<State>, request: &ParentRequest) -> Result<()> {
+    let sessions = lock(&state.sessions);
+    resolve_parent_session_locked(&sessions, request)
+        .map(|_| ())
+        .with_context(|| format!("parent session no longer available: {}", request.pane_id))
+}
+
 struct NewSessionParams {
     name: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    parent_pane_id: Option<String>,
+    parent_token: Option<String>,
     env: HashMap<String, String>,
     tmux: bool,
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
+    let parent_request = parent_request(params.parent_pane_id, params.parent_token);
+    if let Some(parent_request) = parent_request.as_ref() {
+        validate_parent_request(state, parent_request)?;
+    }
     let reservation = reserve_session_identity(state, params.name)?;
     let pty_system = native_pty_system();
     let rows = params.rows.unwrap_or(24).max(1);
@@ -449,6 +519,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .context("open pty")?;
 
     let id = Uuid::new_v4().to_string();
+    let parent_token = Uuid::new_v4().to_string();
     let pane_id = reservation.pane_id().to_string();
     let name = reservation.name().to_string();
     let cwd = params
@@ -480,6 +551,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     }
     cmd.env("LTERM_SESSION", &name);
     cmd.env("LTERM_PANE", &pane_id);
+    cmd.env("LTERM_PARENT_TOKEN", &parent_token);
     cmd.env("LTERM_SOCKET", paths::socket_path()?.display().to_string());
     cmd.env("LTERM_BIN", std::env::current_exe()?.display().to_string());
     if params.tmux {
@@ -512,6 +584,9 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         id,
         name: name.clone(),
         pane_id,
+        parent_pane_id: Mutex::new(None),
+        parent_session_id: Mutex::new(None),
+        parent_token,
         command,
         cwd,
         created_unix_ms: now_unix_ms(),
@@ -531,7 +606,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cols: Mutex::new(cols),
     });
 
-    if let Err(err) = reservation.commit(Arc::clone(&session)) {
+    if let Err(err) = reservation.commit(Arc::clone(&session), parent_request.as_ref()) {
         cleanup_uncommitted_session(&session);
         return Err(err);
     }
@@ -571,6 +646,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
             .store(exit_code, Ordering::SeqCst);
         session_for_waiter.alive.store(false, Ordering::SeqCst);
         session_for_waiter.close_subscribers();
+        terminate_child_sessions(&state_for_waiter, &session_for_waiter.id);
         remove_session(&state_for_waiter, &session_for_waiter);
     });
 
@@ -642,7 +718,11 @@ impl SessionReservation {
         &self.pane_id
     }
 
-    fn commit(mut self, session: Arc<Session>) -> Result<()> {
+    fn commit(
+        mut self,
+        session: Arc<Session>,
+        parent_request: Option<&ParentRequest>,
+    ) -> Result<()> {
         let mut sessions = lock(&self.state.sessions);
         if !sessions.reserved_names.contains(&self.name)
             || !sessions.reserved_panes.contains(&self.pane_id)
@@ -655,6 +735,17 @@ impl SessionReservation {
         {
             bail!("internal session id collision");
         }
+        let parent_session = match parent_request {
+            Some(request) => Some(
+                resolve_parent_session_locked(&sessions, request).with_context(|| {
+                    format!("parent session no longer available: {}", request.pane_id)
+                })?,
+            ),
+            None => None,
+        };
+        *lock(&session.parent_pane_id) =
+            parent_session.as_ref().map(|parent| parent.pane_id.clone());
+        *lock(&session.parent_session_id) = parent_session.map(|parent| parent.id);
         sessions.reserved_names.remove(&self.name);
         sessions.reserved_panes.remove(&self.pane_id);
         sessions
@@ -813,6 +904,25 @@ fn remove_session(state: &Arc<State>, session: &Session) {
     }
 }
 
+fn terminate_child_sessions(state: &Arc<State>, parent_session_id: &str) {
+    let children: Vec<_> = {
+        let sessions = lock(&state.sessions);
+        sessions
+            .by_pane
+            .values()
+            .filter(|candidate| {
+                lock(&candidate.parent_session_id)
+                    .as_deref()
+                    .is_some_and(|id| id == parent_session_id)
+            })
+            .cloned()
+            .collect()
+    };
+    for child in children {
+        terminate_session(state, &child);
+    }
+}
+
 fn verified_process_group_id(
     candidate: Option<libc::pid_t>,
     process_id: Option<u32>,
@@ -841,10 +951,12 @@ fn verified_process_group_id(
 fn terminate_session(state: &Arc<State>, session: &Session) {
     if !session.alive.swap(false, Ordering::SeqCst) {
         session.close_subscribers();
+        terminate_child_sessions(state, &session.id);
         remove_session(state, session);
         return;
     }
     session.close_subscribers();
+    terminate_child_sessions(state, &session.id);
     signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);
