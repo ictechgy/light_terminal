@@ -900,12 +900,19 @@ pub fn shell_join(args: &[String]) -> Result<String> {
 }
 
 pub fn command_exists(name: &str) -> bool {
+    find_command(name).is_some()
+}
+
+pub fn find_command(name: &str) -> Option<PathBuf> {
     if name.contains('/') {
-        return is_executable_file(Path::new(name));
+        let path = PathBuf::from(name);
+        return is_executable_file(&path).then_some(path);
     }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| is_executable_file(&p.join(name))))
-        .unwrap_or(false)
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join(name))
+            .find(|p| is_executable_file(p))
+    })
 }
 
 fn is_executable_file(path: &Path) -> bool {

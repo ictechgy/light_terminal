@@ -369,12 +369,11 @@ fn parent_pane_display(session: &protocol::SessionInfo) -> &str {
 }
 
 fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
-    if !client::command_exists(binary) {
-        bail!("{binary} not found in PATH");
-    }
+    let binary_path =
+        client::find_command(binary).with_context(|| format!("{binary} not found in PATH"))?;
     tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
-    cmd.push(binary.to_string());
+    cmd.push(binary_path.display().to_string());
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
     let base_name = format!("{binary}-lterm");
