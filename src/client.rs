@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
+/// 리셋되어도 사용자 인지 한계(약 100~300ms) 안에 scroll region을 재확립하고 status를
+/// 재그린다. PTY가 활발히 출력 중이면 status_dirty 경로가 즉시 처리하므로 heartbeat는
+/// idle 상태에만 발화한다.
 const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
@@ -564,10 +568,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 status_dirty = false;
                 last_status_refresh = Instant::now();
             }
-            if status_enabled && last_status_refresh.elapsed() >= STATUS_HEARTBEAT {
+            // status_dirty == true 상황은 WouldBlock 경로가 곧바로 처리한다.
+            // heartbeat는 idle 상태(외부 앱 백그라운드 등)에서만 self-heal 한다.
+            if status_enabled && !status_dirty && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
+            {
                 status_bar.refresh(&mut stdout)?;
                 stdout.flush().context("flush stdout")?;
-                status_dirty = false;
                 last_status_refresh = Instant::now();
             }
             let n = match stream.read(&mut buf) {
@@ -718,7 +724,8 @@ impl StatusBar {
             return Ok(());
         }
         let (cols, rows) = terminal_size();
-        if rows <= 1 || cols == 0 {
+        // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
+        if rows <= 1 || cols <= 1 {
             return Ok(());
         }
         // 마지막 칸까지 채우면 일부 모바일 터미널(예: Termius)에서 deferred-wrap 미구현으로
