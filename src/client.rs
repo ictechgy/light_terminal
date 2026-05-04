@@ -22,6 +22,11 @@ use std::time::{Duration, Instant};
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
+/// 리셋되어도 사용자 인지 한계(약 100~300ms) 안에 scroll region을 재확립하고 status를
+/// 재그린다. PTY가 활발히 출력 중이면 status_dirty 경로가 즉시 처리하므로 heartbeat는
+/// idle 상태에만 발화한다.
+const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
 pub fn ensure_server() -> Result<()> {
@@ -554,12 +559,22 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     }
     let mut buf = [0_u8; 8192];
     let mut status_dirty = false;
+    let mut last_status_refresh = Instant::now();
     let output_result = (|| -> Result<()> {
         loop {
             while resize_rx.try_recv().is_ok() {
                 status_bar.refresh(&mut stdout)?;
                 stdout.flush().context("flush stdout")?;
                 status_dirty = false;
+                last_status_refresh = Instant::now();
+            }
+            // status_dirty == true 상황은 WouldBlock 경로가 곧바로 처리한다.
+            // heartbeat는 idle 상태(외부 앱 백그라운드 등)에서만 self-heal 한다.
+            if status_enabled && !status_dirty && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
+            {
+                status_bar.refresh(&mut stdout)?;
+                stdout.flush().context("flush stdout")?;
+                last_status_refresh = Instant::now();
             }
             let n = match stream.read(&mut buf) {
                 Ok(0) => break,
@@ -574,6 +589,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                         status_bar.refresh(&mut stdout)?;
                         stdout.flush().context("flush stdout")?;
                         status_dirty = false;
+                        last_status_refresh = Instant::now();
                     }
                     continue;
                 }
@@ -708,13 +724,19 @@ impl StatusBar {
             return Ok(());
         }
         let (cols, rows) = terminal_size();
-        if rows <= 1 || cols == 0 {
+        // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
+        if rows <= 1 || cols <= 1 {
             return Ok(());
         }
-        let line = format_status_line(&self.session_name, &self.pane_id, cols);
+        // 마지막 칸까지 채우면 일부 모바일 터미널(예: Termius)에서 deferred-wrap 미구현으로
+        // 즉시 스크롤이 발생해 status line이 본문으로 밀려 올라간다. cols-1만 그린다.
+        let safe_width = cols.saturating_sub(1).max(1);
+        let line = format_status_line(&self.session_name, &self.pane_id, safe_width);
+        // \x1b[2K로 행을 먼저 비워야 옛 상태(긴 세션명 잔재)가 남지 않는다.
+        // SGR에서 bold(1)을 제거: bold+black을 일부 터미널이 흰색으로 렌더해 가독성 깨진다.
         write!(
             stdout,
-            "\x1b7\x1b[{rows};1H\x1b[1;30;104m{line}\x1b[0m\x1b8"
+            "\x1b7\x1b[{rows};1H\x1b[2K\x1b[30;104m{line}\x1b[0m\x1b8"
         )
         .context("draw lterm status bar")?;
         Ok(())
