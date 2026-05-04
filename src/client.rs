@@ -551,7 +551,17 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     });
 
     let mut stdout = std::io::stdout();
-    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_enabled, &mut stdout)?;
+    let status_style = if status_enabled {
+        resolve_status_style()
+    } else {
+        StatusStyle::Full // 사용되지 않음 (status disabled). Full을 기본으로 명시.
+    };
+    let mut status_bar = StatusBar::enter(
+        status_info.as_ref(),
+        status_enabled,
+        status_style,
+        &mut stdout,
+    )?;
     if status_enabled {
         stream
             .set_read_timeout(Some(Duration::from_millis(30)))
@@ -668,16 +678,53 @@ fn matches_env_bool(value: &str, expected: bool) -> bool {
     }
 }
 
+/// Status bar 시각 스타일. cmux/iTerm처럼 SGR을 잘 처리하는 데스크톱 환경에서는
+/// Full(검정 글자 + bright-blue 배경)로 강조하고, Termius 같은 모바일 SSH에서는
+/// Minimal(plain text)로 폴백해 색 매핑 충돌과 시각 노이즈를 줄인다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusStyle {
+    Full,
+    Minimal,
+}
+
+fn resolve_status_style() -> StatusStyle {
+    if let Ok(value) = std::env::var("LTERM_STATUS_STYLE") {
+        if let Some(style) = parse_status_style(&value) {
+            return style;
+        }
+    }
+    if is_ssh_session() {
+        return StatusStyle::Minimal;
+    }
+    StatusStyle::Full
+}
+
+fn parse_status_style(value: &str) -> Option<StatusStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(StatusStyle::Full),
+        "minimal" => Some(StatusStyle::Minimal),
+        _ => None,
+    }
+}
+
+fn is_ssh_session() -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
+}
+
 struct StatusBar {
     active: bool,
     session_name: String,
     pane_id: String,
+    style: StatusStyle,
 }
 
 impl StatusBar {
     fn enter(
         info: Option<&SessionInfo>,
         show_status: bool,
+        style: StatusStyle,
         stdout: &mut impl Write,
     ) -> Result<Self> {
         let active = show_status;
@@ -693,6 +740,7 @@ impl StatusBar {
             active,
             session_name,
             pane_id,
+            style,
         };
         status.reserve_terminal_area(stdout)?;
         status.draw(stdout)?;
@@ -733,12 +781,15 @@ impl StatusBar {
         let safe_width = cols.saturating_sub(1).max(1);
         let line = format_status_line(&self.session_name, &self.pane_id, safe_width);
         // \x1b[2K로 행을 먼저 비워야 옛 상태(긴 세션명 잔재)가 남지 않는다.
-        // SGR에서 bold(1)을 제거: bold+black을 일부 터미널이 흰색으로 렌더해 가독성 깨진다.
-        write!(
-            stdout,
-            "\x1b7\x1b[{rows};1H\x1b[2K\x1b[30;104m{line}\x1b[0m\x1b8"
-        )
-        .context("draw lterm status bar")?;
+        // Full은 검정 글자 + bright-blue 배경, Minimal은 SGR 색을 아예 생략해
+        // Termius 같은 모바일 SSH 클라이언트의 색 충돌/노이즈를 피한다.
+        // (bold(1)은 두 모드 모두에서 사용하지 않는다: bold+black을 흰색으로 렌더하는 터미널이 있다.)
+        let sgr = match self.style {
+            StatusStyle::Full => "\x1b[30;104m",
+            StatusStyle::Minimal => "",
+        };
+        write!(stdout, "\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8")
+            .context("draw lterm status bar")?;
         Ok(())
     }
 
@@ -1098,8 +1149,9 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardProtocolRestoreState, TerminalOutputTracker, attach_pty_rows, format_status_line,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        KeyboardProtocolRestoreState, StatusStyle, TerminalOutputTracker, attach_pty_rows,
+        format_status_line, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, parse_status_style, resolve_status_style,
     };
     use std::sync::atomic::Ordering;
 
@@ -1225,5 +1277,52 @@ mod tests {
         observe_keyboard_protocol_sequences(b"\x1b[?25l\x1b[>4;1m\x1b[31m", &state);
         assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
         assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn status_style_env_takes_precedence_over_ssh() {
+        // 단, 다른 테스트와 env가 충돌하지 않도록 SSH 변수를 명시적으로 정리한 뒤 테스트한다.
+        // (Rust 테스트는 같은 프로세스에서 병렬 실행되므로 ENV_LOCK으로 직렬화한다.)
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // SAFETY: env mutation is gated by ENV_LOCK above.
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+            std::env::remove_var("SSH_CONNECTION");
+            std::env::remove_var("SSH_CLIENT");
+            std::env::remove_var("SSH_TTY");
+
+            std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
+            std::env::set_var("LTERM_STATUS_STYLE", "full");
+        }
+        assert_eq!(resolve_status_style(), StatusStyle::Full);
+
+        unsafe {
+            std::env::set_var("LTERM_STATUS_STYLE", "minimal");
+        }
+        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+        }
+        // SSH only → Minimal
+        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("SSH_CONNECTION");
+        }
+        // No SSH, no style → Full
+        assert_eq!(resolve_status_style(), StatusStyle::Full);
+    }
+
+    #[test]
+    fn parse_status_style_accepts_known_values() {
+        assert_eq!(parse_status_style("full"), Some(StatusStyle::Full));
+        assert_eq!(parse_status_style("Minimal"), Some(StatusStyle::Minimal));
+        assert_eq!(parse_status_style(" full "), Some(StatusStyle::Full));
+        assert_eq!(parse_status_style("off"), None);
+        assert_eq!(parse_status_style(""), None);
     }
 }
