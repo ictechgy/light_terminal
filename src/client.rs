@@ -453,6 +453,8 @@ pub enum AttachStdinEof {
 
 pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
     ensure_server()?;
+    ensure_panic_terminal_cleanup_hook();
+    let _attach_active = AttachActiveGuard::enter();
     let status_enabled = status_bar_supported(show_status);
     let status_info = if status_enabled {
         Some(info(target)?)
@@ -1219,6 +1221,68 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
     restore
 }
 
+/// Panic context에서 터미널을 안전한 상태로 되돌리기 위한 최소 byte sequence.
+/// - `\x1b[r`     : DECSTBM 리셋 (scroll region 전체 화면)
+/// - `\x1b[?25h`  : DECTCEM 커서 보이기
+/// - `\x1b[?1049l`: alt-screen 버퍼 종료 (켜져 있지 않아도 무해)
+/// - `\x1b[0m`    : SGR 리셋
+/// - `\n`         : 새 줄 (셸 prompt가 안전한 위치에 그려지도록)
+fn panic_terminal_cleanup_bytes() -> &'static [u8] {
+    b"\x1b[r\x1b[?25h\x1b[?1049l\x1b[0m\n"
+}
+
+/// Panic 발생 시 호출되는 cleanup. Rust stdio mutex를 우회하기 위해 libc::write 직접 호출.
+/// stdio mutex는 panic context에서 poison 되어 있을 수 있어 println!/eprint! 가 재패닉을 일으킬 수 있다.
+fn emit_panic_terminal_cleanup() {
+    let bytes = panic_terminal_cleanup_bytes();
+    // SAFETY: STDOUT_FILENO은 정적 file descriptor. write(2)는 async-signal-safe.
+    // 부분 write/실패는 panic context에서 복구 불가능하므로 결과 무시.
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
+        );
+    }
+}
+
+/// `lterm attach` 가 활성화된 동안에만 panic hook이 cleanup을 emit 하도록 게이팅한다.
+/// 비-attach 명령(`lterm ls`, `lterm capture` 등)이 패닉할 때 stdout으로 escape sequence가
+/// 새지 않도록 한다.
+static ATTACH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 첫 attach() 호출 시 한 번만 panic hook을 설치한다. 이후 호출은 no-op.
+/// hook은 process 종료까지 유지되고, ATTACH_ACTIVE 플래그가 true일 때만 cleanup byte를 emit.
+fn ensure_panic_terminal_cleanup_hook() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if ATTACH_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                emit_panic_terminal_cleanup();
+            }
+            previous(info);
+        }));
+    });
+}
+
+/// attach() 시작 시 ATTACH_ACTIVE를 true로 세팅하고, Drop 시 false로 복원한다.
+/// panic으로 unwind 시에도 Drop이 호출되어 안전. abort/SIGKILL은 hook이 처리한다.
+struct AttachActiveGuard;
+
+impl AttachActiveGuard {
+    fn enter() -> Self {
+        ATTACH_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for AttachActiveGuard {
+    fn drop(&mut self) {
+        ATTACH_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
     let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let mut pollfd = libc::pollfd {
@@ -1303,9 +1367,10 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AltScreenState, KeyboardProtocolRestoreState, StatusStyle, TerminalOutputTracker,
-        alt_screen_param_matches, attach_pty_rows, format_status_line,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
+        StatusStyle, TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
+        ensure_panic_terminal_cleanup_hook, format_status_line, keyboard_protocol_restore_bytes,
+        matches_env_bool, observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_style, resolve_status_style,
     };
     use std::sync::Arc;
@@ -1494,6 +1559,43 @@ mod tests {
         assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 1);
         observe_keyboard_protocol_sequences(b"\x1b[=1;3u", &state);
         assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn panic_terminal_cleanup_bytes_emits_safe_recovery_sequence() {
+        let bytes = panic_terminal_cleanup_bytes();
+        // 정확한 sequence: scroll region 리셋 + 커서 visible + alt-screen 종료 + SGR 리셋 + newline
+        assert_eq!(bytes, b"\x1b[r\x1b[?25h\x1b[?1049l\x1b[0m\n");
+        // 모든 escape sequence는 ESC([)로 시작
+        assert!(bytes.starts_with(b"\x1b["));
+        // 마지막은 newline (셸 prompt 위치 안전)
+        assert_eq!(*bytes.last().unwrap(), b'\n');
+    }
+
+    #[test]
+    fn ensure_panic_terminal_cleanup_hook_is_idempotent() {
+        // OnceLock 으로 보호되어 다회 호출이 안전해야 한다
+        ensure_panic_terminal_cleanup_hook();
+        ensure_panic_terminal_cleanup_hook();
+        ensure_panic_terminal_cleanup_hook();
+        // 도달 = no panic. 추가 검증은 panic을 실제로 발생시켜야 하므로 통합 테스트로 미룸.
+    }
+
+    #[test]
+    fn attach_active_guard_toggles_flag() {
+        // 초기 상태 보존을 위한 사전 capture (다른 테스트가 이미 set 했을 수 있음)
+        let prior = ATTACH_ACTIVE.load(Ordering::Relaxed);
+        ATTACH_ACTIVE.store(false, Ordering::Relaxed);
+
+        assert!(!ATTACH_ACTIVE.load(Ordering::Relaxed));
+        {
+            let _g = AttachActiveGuard::enter();
+            assert!(ATTACH_ACTIVE.load(Ordering::Relaxed));
+        }
+        assert!(!ATTACH_ACTIVE.load(Ordering::Relaxed));
+
+        // 원래 상태 복원
+        ATTACH_ACTIVE.store(prior, Ordering::Relaxed);
     }
 
     #[test]
