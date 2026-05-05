@@ -569,7 +569,10 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         loop {
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
 
-            // Alt-screen exit edge → 즉시 status 재그리기 (alt buffer로 들어갔던 status는 폐기됨).
+            // alt-screen 종료 즉시 refresh: alt buffer로 흘러갔던 status는 폐기되었으므로
+            // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
+            // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
+            // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
             if status_enabled && prev_alt_screen_active && !alt_screen_active {
                 status_bar.refresh(&mut stdout)?;
                 stdout.flush().context("flush stdout")?;
@@ -847,6 +850,11 @@ struct KeyboardProtocolRestoreState {
 /// PTY가 alternate screen buffer에 진입했는지 추적한다. true 동안에는 host-side
 /// status bar 그리기를 일시 중단해 vim/htop 같은 alt-screen 앱과 화면 충돌을 피한다.
 /// PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h` (enter) 와 대응하는 `l` (exit)을 관찰.
+///
+/// `Arc<AtomicBool>` + `Ordering::Relaxed` 사용 근거: 현재 단일 attach 스레드에서
+/// observe(write)와 attach 루프(read)가 모두 일어나므로 ordering 요구는 없다.
+/// `Arc`는 향후 PTY reader/observer 분리를 대비한 형태이며, 그 때에는 publishing
+/// data가 동반되지 않으면 Relaxed로 충분하다.
 #[derive(Default)]
 struct AltScreenState {
     active: AtomicBool,
@@ -1039,6 +1047,18 @@ fn observe_alt_screen_sequences(bytes: &[u8], alt_screen: &AltScreenState) {
     observe_alt_screen_sequences_after(bytes, 0, alt_screen);
 }
 
+/// PTY 출력 바이트를 byte-pattern 으로 스캔해 alt-screen mode set/reset
+/// (`\x1b[?47h/l`, `\x1b[?1047h/l`, `\x1b[?1049h/l`)을 추적한다.
+///
+/// 알려진 한계 (실용적으로 무시 가능):
+/// - CSI intermediate byte (`0x20..=0x2f`)는 파싱하지 않음. 드물게 등장하는 private
+///   mode + intermediate 조합은 매치되지 않는다 (alt-screen에서는 사용 사례 없음).
+/// - OSC/DCS/PM/APC string-control payload 안의 bytes 가 우연히 `\x1b[?1049h` 같이
+///   보이면 false-toggle 가능. 단, 정상 OSC payload는 \x1b를 거의 포함하지 않으며
+///   포함하더라도 alt-screen 모드 토글은 사용자가 즉시 인지할 수 있는 상태이므로
+///   현 구현 수용.
+/// - chunk 경계 분할은 [`TerminalOutputTracker`]가 tail buffer 로 처리한다.
+///
 /// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)를
 /// 관찰해 `alt_screen.active`를 갱신한다. 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를
 /// 합쳐서 다시 부르며, 그 경우 `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를
@@ -1077,7 +1097,11 @@ fn observe_alt_screen_sequences_after(
 }
 
 fn alt_screen_param_matches(params: &[u8]) -> bool {
-    matches!(params, b"47" | b"1047" | b"1049")
+    // xterm은 `?47;1049h` 처럼 여러 private mode를 한 CSI에 묶어 보낼 수 있다.
+    // `;` (그리고 colon 변형 `:`)로 split 후 한 파라미터라도 alt-screen 모드면 매치한다.
+    params
+        .split(|byte| *byte == b';' || *byte == b':')
+        .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
 }
 
 struct RawModeGuard {
@@ -1432,6 +1456,25 @@ mod tests {
         assert!(alt_screen_param_matches(b"47"));
         assert!(alt_screen_param_matches(b"1047"));
         assert!(alt_screen_param_matches(b"1049"));
+    }
+
+    #[test]
+    fn alt_screen_tracker_handles_semicolon_grouped_params() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        // xterm 그룹 set: ?47;1049h → 1049 매치 → enter
+        tracker.observe(b"\x1b[?47;1049h");
+        assert!(state.active.load(Ordering::Relaxed));
+
+        // 그룹 reset: ?1049;25l → 1049 매치 → exit
+        tracker.observe(b"\x1b[?1049;25l");
+        assert!(!state.active.load(Ordering::Relaxed));
+
+        // 첫번째 파라미터가 무관해도 두번째가 alt-screen이면 매치
+        tracker.observe(b"\x1b[?25;1049h");
+        assert!(state.active.load(Ordering::Relaxed));
     }
 
     #[test]
