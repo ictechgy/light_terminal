@@ -454,7 +454,6 @@ pub enum AttachStdinEof {
 pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
-    let _attach_active = AttachActiveGuard::enter();
     let status_enabled = status_bar_supported(show_status);
     let status_info = if status_enabled {
         Some(info(target)?)
@@ -497,7 +496,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         );
     }
 
+    // RawModeGuard 먼저 → AttachActiveGuard 가 raw mode가 실제 세팅된 이후에만 활성.
+    // Drop 역순: status_bar → _attach_active(flag false) → _raw(raw mode 복원).
+    // 정상 종료 시 hook이 raw mode 복원 *후* 에 fire 되어 escape sequence를 emit
+    // 하는 의미 없는 window를 제거한다.
     let _raw = RawModeGuard::enter()?;
+    let _attach_active = AttachActiveGuard::enter();
     let alt_screen_state = Arc::new(AltScreenState::default());
     let mut terminal_output_tracker = TerminalOutputTracker::new(
         _raw.keyboard_protocol_restore_state(),
@@ -1233,16 +1237,42 @@ fn panic_terminal_cleanup_bytes() -> &'static [u8] {
 
 /// Panic 발생 시 호출되는 cleanup. Rust stdio mutex를 우회하기 위해 libc::write 직접 호출.
 /// stdio mutex는 panic context에서 poison 되어 있을 수 있어 println!/eprint! 가 재패닉을 일으킬 수 있다.
+///
+/// EINTR / partial-write 시 재시도하여 cleanup sequence 절단을 막는다.
+/// panic context이므로 무한 루프를 피하기 위해 최대 8회로 제한 — sequence가
+/// 12 bytes라 단일 write 통상 1회로 충분하고, 8회는 시그널 폭주에도 보수적.
 fn emit_panic_terminal_cleanup() {
     let bytes = panic_terminal_cleanup_bytes();
-    // SAFETY: STDOUT_FILENO은 정적 file descriptor. write(2)는 async-signal-safe.
-    // 부분 write/실패는 panic context에서 복구 불가능하므로 결과 무시.
-    unsafe {
-        libc::write(
-            libc::STDOUT_FILENO,
-            bytes.as_ptr() as *const libc::c_void,
-            bytes.len(),
-        );
+    let mut written = 0usize;
+    let mut attempts = 0;
+    while written < bytes.len() && attempts < 8 {
+        // SAFETY: STDOUT_FILENO은 정적 fd. write(2)는 async-signal-safe.
+        let n = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr().add(written) as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n > 0 {
+            written += n as usize;
+            attempts = 0; // 진행 시 재시도 카운터 리셋
+        } else if n == 0 {
+            // EOF or fd closed → 더 시도 무의미
+            break;
+        } else {
+            // 음수 → errno 검사. EINTR/EAGAIN 만 재시도.
+            // SAFETY: errno_location() / __error() 는 async-signal-safe.
+            #[cfg(target_os = "macos")]
+            let err = unsafe { *libc::__error() };
+            #[cfg(not(target_os = "macos"))]
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EINTR || err == libc::EAGAIN {
+                attempts += 1;
+                continue;
+            }
+            break;
+        }
     }
 }
 
@@ -1258,10 +1288,14 @@ fn ensure_panic_terminal_cleanup_hook() {
     INSTALLED.get_or_init(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if ATTACH_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            // cleanup을 가장 먼저 실행 — previous hook이 stdio mutex poison 등으로
+            // 재패닉/abort 하더라도 터미널 복구는 보장된다.
+            if ATTACH_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
                 emit_panic_terminal_cleanup();
             }
-            previous(info);
+            // previous hook을 catch_unwind 로 감싸 chain 단계 panic을 흡수.
+            // double-panic → abort 회피로 process가 정상적으로 default 종료 흐름을 따름.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| previous(info)));
         }));
     });
 }
@@ -1272,14 +1306,14 @@ struct AttachActiveGuard;
 
 impl AttachActiveGuard {
     fn enter() -> Self {
-        ATTACH_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        ATTACH_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
         Self
     }
 }
 
 impl Drop for AttachActiveGuard {
     fn drop(&mut self) {
-        ATTACH_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        ATTACH_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1381,6 +1415,10 @@ mod tests {
     /// race를 막기 위해 env-touching 테스트는 반드시 이 lock을 잡고, 종료 시 EnvGuard로
     /// 원본 값을 복원해 다른 테스트로 누설되지 않게 한다.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// ATTACH_ACTIVE 플래그를 만지는 테스트가 공유하는 직렬화 잠금.
+    /// process-global static AtomicBool 이므로 병렬 테스트 race를 막아야 한다.
+    static ATTACH_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
     /// ENV_LOCK을 잡은 상태에서만 사용해야 한다.
@@ -1583,19 +1621,23 @@ mod tests {
 
     #[test]
     fn attach_active_guard_toggles_flag() {
-        // 초기 상태 보존을 위한 사전 capture (다른 테스트가 이미 set 했을 수 있음)
-        let prior = ATTACH_ACTIVE.load(Ordering::Relaxed);
-        ATTACH_ACTIVE.store(false, Ordering::Relaxed);
+        let _guard = ATTACH_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
-        assert!(!ATTACH_ACTIVE.load(Ordering::Relaxed));
+        // 사전 capture (다른 코드 경로에서 set 했을 수 있음)
+        let prior = ATTACH_ACTIVE.load(Ordering::Acquire);
+        ATTACH_ACTIVE.store(false, Ordering::Release);
+
+        assert!(!ATTACH_ACTIVE.load(Ordering::Acquire));
         {
             let _g = AttachActiveGuard::enter();
-            assert!(ATTACH_ACTIVE.load(Ordering::Relaxed));
+            assert!(ATTACH_ACTIVE.load(Ordering::Acquire));
         }
-        assert!(!ATTACH_ACTIVE.load(Ordering::Relaxed));
+        assert!(!ATTACH_ACTIVE.load(Ordering::Acquire));
 
         // 원래 상태 복원
-        ATTACH_ACTIVE.store(prior, Ordering::Relaxed);
+        ATTACH_ACTIVE.store(prior, Ordering::Release);
     }
 
     #[test]
