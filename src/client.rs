@@ -832,9 +832,11 @@ impl StatusBar {
             Some(StatusStyle::Minimal) => "\x1b[0m",
             None => return Ok(()),
         };
-        // SGR + 본문을 한번에 buffer 후 write_all로 부분 실패를 줄인다.
-        // 부분 실패 자체는 막을 수 없지만, 실패 시 caller가 best-effort restore를 시도할 수 있도록
-        // 한 호출 단위로 묶는다.
+        // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
+        // 이는 strict atomicity 보장은 아니다 (write_all은 내부적으로 여러 syscall 가능).
+        // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
+        // 그러나 write! 매크로는 placeholder 마다 write_fmt 가 분할 syscall을 일으켜 SGR sequence
+        // 중간이 다른 출력과 interleave 될 위험이 컸다 — buffered write 로 그 위험을 줄인다.
         let payload = format!("\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8");
         stdout
             .write_all(payload.as_bytes())
@@ -864,34 +866,36 @@ impl Drop for StatusBar {
 }
 
 fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     let width = cols as usize;
-    let mut line = format!(" lterm  {session_name}  {pane_id} ");
+    let line = format!(" lterm  {session_name}  {pane_id} ");
 
-    // 한글/CJK/이모지 등 wide character는 char.count()와 display width가 다르다.
-    // truncate는 display width 누적이 width를 초과하기 직전까지의 chars만 유지.
-    if line.width() > width {
+    // 한글/CJK/이모지(ZWJ family, 국기 regional indicator pair, variation selector,
+    // 결합 문자 등)를 grapheme cluster 단위로 truncate해 부분 cluster 잔존을 막는다.
+    // 폭 계산도 cluster 단위 UnicodeWidthStr::width로 누적해 wide char가 잘리지 않게 한다.
+    let mut truncated = if line.width() > width {
         let mut acc = 0_usize;
-        let truncated: String = line
-            .chars()
-            .take_while(|ch| {
-                let w = ch.width().unwrap_or(0);
-                if acc + w > width {
-                    false
-                } else {
-                    acc += w;
-                    true
-                }
-            })
-            .collect();
-        line = truncated;
-    }
-    let display_len = line.width();
+        let mut buf = String::new();
+        for cluster in line.graphemes(true) {
+            let w = cluster.width();
+            if acc + w > width {
+                break;
+            }
+            buf.push_str(cluster);
+            acc += w;
+        }
+        buf
+    } else {
+        line
+    };
+
+    let display_len = truncated.width();
     if display_len < width {
-        line.push_str(&" ".repeat(width - display_len));
+        truncated.push_str(&" ".repeat(width - display_len));
     }
-    line
+    truncated
 }
 
 #[derive(Default)]
@@ -1375,6 +1379,39 @@ mod tests {
         // 이모지는 보통 폭 2.
         let line = format_status_line("🚀ok", "%2", 24);
         assert_eq!(line.width(), 24);
+    }
+
+    #[test]
+    fn status_line_keeps_zwj_emoji_family_intact() {
+        use unicode_width::UnicodeWidthStr;
+        // 👨‍👩‍👧 = 5 codepoints, 1 grapheme cluster, display width 2.
+        let line = format_status_line("👨\u{200d}👩\u{200d}👧", "%1", 24);
+        assert_eq!(line.width(), 24);
+        // ZWJ가 잘려서 단독 👨 가 결과에 남는 일이 없어야 한다.
+        // (truncate가 char 단위였다면 발생) — 본 case는 width 24 > 콘텐츠 폭이라 truncate 없음.
+        assert!(line.contains("👨\u{200d}👩\u{200d}👧"));
+    }
+
+    #[test]
+    fn status_line_keeps_regional_indicator_flag_intact() {
+        use unicode_width::UnicodeWidthStr;
+        // 🇰🇷 = 2 regional indicators, 1 grapheme cluster, display width 2.
+        let line = format_status_line("🇰🇷", "%1", 16);
+        assert_eq!(line.width(), 16);
+        assert!(line.contains("🇰🇷"));
+    }
+
+    #[test]
+    fn status_line_truncate_does_not_split_grapheme_cluster() {
+        use unicode_width::UnicodeWidthStr;
+        // 한글 4자 (각 width 2 = 8) + " lterm  " prefix(8) + "  %1 "(5) = 21 cells.
+        // width 14 로 자르면 " lterm  " (8) + "사" (2) = 10 또는 " lterm  사" (10) 까지만 들어가고
+        // 결합 base + 변형 selector 케이스에서도 부분 cluster가 남지 않아야 한다.
+        let combining = "e\u{301}"; // é = 1 grapheme, width 1
+        let line = format_status_line(combining, "%1", 24);
+        assert_eq!(line.width(), 24);
+        // 결합 마크가 base 와 떨어지면 안 됨
+        assert!(line.contains("e\u{301}"));
     }
 
     #[test]

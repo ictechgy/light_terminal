@@ -77,6 +77,8 @@ Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visu
 
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
 
+Session names containing CJK characters or emoji (including ZWJ families, country flags, and combining marks) are aligned by display width using `unicode-width` and `unicode-segmentation`, so the status bar stays correctly padded across mixed-width content.
+
 When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
 **Inspect or send input:**

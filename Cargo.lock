@@ -377,6 +377,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "tempfile",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]
