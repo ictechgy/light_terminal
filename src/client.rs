@@ -551,7 +551,8 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     });
 
     let mut stdout = std::io::stdout();
-    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_enabled, &mut stdout)?;
+    let status_style = status_enabled.then(resolve_status_style);
+    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
     if status_enabled {
         stream
             .set_read_timeout(Some(Duration::from_millis(30)))
@@ -668,19 +669,54 @@ fn matches_env_bool(value: &str, expected: bool) -> bool {
     }
 }
 
+/// Status bar 시각 스타일. cmux/iTerm처럼 SGR을 잘 처리하는 데스크톱 환경에서는
+/// Full(검정 글자 + bright-blue 배경)로 강조하고, Termius 같은 모바일 SSH에서는
+/// Minimal(plain text)로 폴백해 색 매핑 충돌과 시각 노이즈를 줄인다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusStyle {
+    Full,
+    Minimal,
+}
+
+fn resolve_status_style() -> StatusStyle {
+    if let Ok(value) = std::env::var("LTERM_STATUS_STYLE") {
+        if let Some(style) = parse_status_style(&value) {
+            return style;
+        }
+    }
+    if is_ssh_session() {
+        return StatusStyle::Minimal;
+    }
+    StatusStyle::Full
+}
+
+fn parse_status_style(value: &str) -> Option<StatusStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(StatusStyle::Full),
+        "minimal" => Some(StatusStyle::Minimal),
+        _ => None,
+    }
+}
+
+fn is_ssh_session() -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
+}
+
 struct StatusBar {
-    active: bool,
     session_name: String,
     pane_id: String,
+    /// None 이면 status bar를 그리지 않는다 (--no-status / LTERM_NO_STATUS=1 등).
+    style: Option<StatusStyle>,
 }
 
 impl StatusBar {
     fn enter(
         info: Option<&SessionInfo>,
-        show_status: bool,
+        style: Option<StatusStyle>,
         stdout: &mut impl Write,
     ) -> Result<Self> {
-        let active = show_status;
         let (session_name, pane_id) = info
             .map(|info| {
                 (
@@ -690,9 +726,9 @@ impl StatusBar {
             })
             .unwrap_or_else(|| ("unknown".to_string(), "?".to_string()));
         let mut status = Self {
-            active,
             session_name,
             pane_id,
+            style,
         };
         status.reserve_terminal_area(stdout)?;
         status.draw(stdout)?;
@@ -706,7 +742,7 @@ impl StatusBar {
     }
 
     fn reserve_terminal_area(&self, stdout: &mut impl Write) -> Result<()> {
-        if !self.active {
+        if self.style.is_none() {
             return Ok(());
         }
         let (_, rows) = terminal_size();
@@ -720,9 +756,6 @@ impl StatusBar {
     }
 
     fn draw(&mut self, stdout: &mut impl Write) -> Result<()> {
-        if !self.active {
-            return Ok(());
-        }
         let (cols, rows) = terminal_size();
         // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
         if rows <= 1 || cols <= 1 {
@@ -733,17 +766,22 @@ impl StatusBar {
         let safe_width = cols.saturating_sub(1).max(1);
         let line = format_status_line(&self.session_name, &self.pane_id, safe_width);
         // \x1b[2K로 행을 먼저 비워야 옛 상태(긴 세션명 잔재)가 남지 않는다.
-        // SGR에서 bold(1)을 제거: bold+black을 일부 터미널이 흰색으로 렌더해 가독성 깨진다.
-        write!(
-            stdout,
-            "\x1b7\x1b[{rows};1H\x1b[2K\x1b[30;104m{line}\x1b[0m\x1b8"
-        )
-        .context("draw lterm status bar")?;
+        // 두 모드 모두 \x1b[0m로 시작해 이전 PTY rendition(bold/italic/inverse 등)이
+        // status line으로 새는 것을 차단한다. Full은 reset 뒤 검정 글자 + bright-blue
+        // 배경을 단일 CSI(\x1b[0;30;104m)로 적용해 바이트를 줄인다.
+        // (bold(1)은 두 모드 모두에서 사용하지 않는다: bold+black을 흰색으로 렌더하는 터미널이 있다.)
+        let sgr = match self.style {
+            Some(StatusStyle::Full) => "\x1b[0;30;104m",
+            Some(StatusStyle::Minimal) => "\x1b[0m",
+            None => return Ok(()),
+        };
+        write!(stdout, "\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8")
+            .context("draw lterm status bar")?;
         Ok(())
     }
 
     fn restore(&self, stdout: &mut impl Write) -> Result<()> {
-        if !self.active {
+        if self.style.is_none() {
             return Ok(());
         }
         let (_, rows) = terminal_size();
@@ -756,8 +794,10 @@ impl StatusBar {
 
 impl Drop for StatusBar {
     fn drop(&mut self) {
-        let mut stdout = std::io::stdout();
-        let _ = self.restore(&mut stdout);
+        if self.style.is_some() {
+            let mut stdout = std::io::stdout();
+            let _ = self.restore(&mut stdout);
+        }
     }
 }
 
@@ -1098,10 +1138,47 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardProtocolRestoreState, TerminalOutputTracker, attach_pty_rows, format_status_line,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        KeyboardProtocolRestoreState, StatusStyle, TerminalOutputTracker, attach_pty_rows,
+        format_status_line, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, parse_status_style, resolve_status_style,
     };
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+
+    /// 환경 변수를 변경하는 모든 테스트가 공유하는 직렬화 잠금. process-global env에 대한
+    /// race를 막기 위해 env-touching 테스트는 반드시 이 lock을 잡고, 종료 시 EnvGuard로
+    /// 원본 값을 복원해 다른 테스트로 누설되지 않게 한다.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
+    /// ENV_LOCK을 잡은 상태에서만 사용해야 한다.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 호출자는 ENV_LOCK을 잡고 있어야 한다 (테스트 컨벤션).
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn status_bar_reserves_one_terminal_row_when_possible() {
@@ -1225,5 +1302,58 @@ mod tests {
         observe_keyboard_protocol_sequences(b"\x1b[?25l\x1b[>4;1m\x1b[31m", &state);
         assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 0);
         assert_eq!(state.kitty_direct_flags.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn status_style_env_takes_precedence_over_ssh() {
+        // 다른 env-touching 테스트와 충돌하지 않도록 모듈 공유 ENV_LOCK으로 직렬화한 뒤,
+        // EnvGuard로 테스트가 끝나면 원래 환경 변수를 복원한다.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_STATUS_STYLE",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+        ]);
+
+        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+            std::env::remove_var("SSH_CONNECTION");
+            std::env::remove_var("SSH_CLIENT");
+            std::env::remove_var("SSH_TTY");
+
+            std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
+            std::env::set_var("LTERM_STATUS_STYLE", "full");
+        }
+        assert_eq!(resolve_status_style(), StatusStyle::Full);
+
+        unsafe {
+            std::env::set_var("LTERM_STATUS_STYLE", "minimal");
+        }
+        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+        }
+        // SSH only → Minimal
+        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("SSH_CONNECTION");
+        }
+        // No SSH, no style → Full
+        assert_eq!(resolve_status_style(), StatusStyle::Full);
+
+        // EnvGuard 가 drop 되면서 원래 환경 변수 값을 복원한다.
+    }
+
+    #[test]
+    fn parse_status_style_accepts_known_values() {
+        assert_eq!(parse_status_style("full"), Some(StatusStyle::Full));
+        assert_eq!(parse_status_style("Minimal"), Some(StatusStyle::Minimal));
+        assert_eq!(parse_status_style(" full "), Some(StatusStyle::Full));
+        assert_eq!(parse_status_style("off"), None);
+        assert_eq!(parse_status_style(""), None);
     }
 }

@@ -73,6 +73,8 @@ lterm -a api
 
 `lterm ls`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 사용하려면 `lterm attach --no-status api`를 쓰거나, 상태줄 처리가 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0`을 설정하세요.
 
+`LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 검정 글자 + bright-blue 배경, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄입니다.
+
 child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard protocol을 켜면, lterm은 이를 추적했다가 attach 종료 시 terminal keyboard mode를 best-effort로 복원합니다. 그래서 child가 비정상 종료된 뒤 shell 입력이 `1;1:3u` 같은 escape 조각으로 보이는 상황을 줄입니다.
 
 **세션 확인 및 입력 전송:**
