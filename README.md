@@ -75,6 +75,8 @@ lterm -a api
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) shows black text on a bright-blue background; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius.
 
+When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
+
 When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
 **Inspect or send input:**

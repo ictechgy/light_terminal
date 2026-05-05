@@ -496,8 +496,11 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     }
 
     let _raw = RawModeGuard::enter()?;
-    let mut terminal_output_tracker =
-        TerminalOutputTracker::new(_raw.keyboard_protocol_restore_state());
+    let alt_screen_state = Arc::new(AltScreenState::default());
+    let mut terminal_output_tracker = TerminalOutputTracker::new(
+        _raw.keyboard_protocol_restore_state(),
+        Arc::clone(&alt_screen_state),
+    );
     let running = Arc::new(AtomicBool::new(true));
 
     let mut writer = stream.try_clone().context("clone attach stream writer")?;
@@ -561,17 +564,37 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut buf = [0_u8; 8192];
     let mut status_dirty = false;
     let mut last_status_refresh = Instant::now();
+    let mut prev_alt_screen_active = false;
     let output_result = (|| -> Result<()> {
         loop {
-            while resize_rx.try_recv().is_ok() {
+            let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
+
+            // Alt-screen exit edge → 즉시 status 재그리기 (alt buffer로 들어갔던 status는 폐기됨).
+            if status_enabled && prev_alt_screen_active && !alt_screen_active {
                 status_bar.refresh(&mut stdout)?;
                 stdout.flush().context("flush stdout")?;
                 status_dirty = false;
                 last_status_refresh = Instant::now();
             }
+            prev_alt_screen_active = alt_screen_active;
+
+            while resize_rx.try_recv().is_ok() {
+                // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
+                // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
+                // 종료 후 edge refresh가 새 크기로 다시 그린다.
+                if !alt_screen_active {
+                    status_bar.refresh(&mut stdout)?;
+                    stdout.flush().context("flush stdout")?;
+                    status_dirty = false;
+                    last_status_refresh = Instant::now();
+                }
+            }
             // status_dirty == true 상황은 WouldBlock 경로가 곧바로 처리한다.
             // heartbeat는 idle 상태(외부 앱 백그라운드 등)에서만 self-heal 한다.
-            if status_enabled && !status_dirty && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
+            if status_enabled
+                && !status_dirty
+                && !alt_screen_active
+                && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
             {
                 status_bar.refresh(&mut stdout)?;
                 stdout.flush().context("flush stdout")?;
@@ -586,7 +609,8 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                         && (err.kind() == ErrorKind::WouldBlock
                             || err.kind() == ErrorKind::TimedOut) =>
                 {
-                    if status_dirty {
+                    // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
+                    if status_dirty && !alt_screen_active {
                         status_bar.refresh(&mut stdout)?;
                         stdout.flush().context("flush stdout")?;
                         status_dirty = false;
@@ -613,7 +637,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 status_dirty = true;
             }
         }
-        if status_dirty {
+        if status_dirty && !prev_alt_screen_active {
             status_bar.refresh(&mut stdout)?;
             stdout.flush().context("flush stdout")?;
         }
@@ -820,15 +844,28 @@ struct KeyboardProtocolRestoreState {
     kitty_direct_flags: AtomicU32,
 }
 
+/// PTY가 alternate screen buffer에 진입했는지 추적한다. true 동안에는 host-side
+/// status bar 그리기를 일시 중단해 vim/htop 같은 alt-screen 앱과 화면 충돌을 피한다.
+/// PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h` (enter) 와 대응하는 `l` (exit)을 관찰.
+#[derive(Default)]
+struct AltScreenState {
+    active: AtomicBool,
+}
+
 struct TerminalOutputTracker {
     restore_state: Arc<KeyboardProtocolRestoreState>,
+    alt_screen: Arc<AltScreenState>,
     tail: Vec<u8>,
 }
 
 impl TerminalOutputTracker {
-    fn new(restore_state: Arc<KeyboardProtocolRestoreState>) -> Self {
+    fn new(
+        restore_state: Arc<KeyboardProtocolRestoreState>,
+        alt_screen: Arc<AltScreenState>,
+    ) -> Self {
         Self {
             restore_state,
+            alt_screen,
             tail: Vec::new(),
         }
     }
@@ -846,9 +883,11 @@ impl TerminalOutputTracker {
                 old_tail.len(),
                 &self.restore_state,
             );
+            observe_alt_screen_sequences_after(&boundary, old_tail.len(), &self.alt_screen);
         }
 
         observe_keyboard_protocol_sequences(bytes, &self.restore_state);
+        observe_alt_screen_sequences(bytes, &self.alt_screen);
 
         if bytes.len() >= TAIL_LIMIT {
             self.tail
@@ -996,6 +1035,51 @@ fn parse_csi_u_number(params: &[u8]) -> Option<u32> {
     std::str::from_utf8(params).ok()?.parse::<u32>().ok()
 }
 
+fn observe_alt_screen_sequences(bytes: &[u8], alt_screen: &AltScreenState) {
+    observe_alt_screen_sequences_after(bytes, 0, alt_screen);
+}
+
+/// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)를
+/// 관찰해 `alt_screen.active`를 갱신한다. 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를
+/// 합쳐서 다시 부르며, 그 경우 `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를
+/// 다시 처리하지 않게 막는다.
+fn observe_alt_screen_sequences_after(
+    bytes: &[u8],
+    min_final_index: usize,
+    alt_screen: &AltScreenState,
+) {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if min_final_index > 0 && i >= min_final_index {
+            break;
+        }
+        if bytes[i] != 0x1b || bytes[i + 1] != b'[' || bytes[i + 2] != b'?' {
+            i += 1;
+            continue;
+        }
+        let scan_end = bytes.len().min(i + 32);
+        let mut j = i + 3;
+        while j < scan_end {
+            let byte = bytes[j];
+            if (0x40..=0x7e).contains(&byte) {
+                if (byte == b'h' || byte == b'l') && j >= min_final_index {
+                    let params = &bytes[i + 3..j];
+                    if alt_screen_param_matches(params) {
+                        alt_screen.active.store(byte == b'h', Ordering::Relaxed);
+                    }
+                }
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+fn alt_screen_param_matches(params: &[u8]) -> bool {
+    matches!(params, b"47" | b"1047" | b"1049")
+}
+
 struct RawModeGuard {
     active: bool,
     keyboard_protocol_restore_state: Arc<KeyboardProtocolRestoreState>,
@@ -1138,10 +1222,12 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardProtocolRestoreState, StatusStyle, TerminalOutputTracker, attach_pty_rows,
-        format_status_line, keyboard_protocol_restore_bytes, matches_env_bool,
-        observe_keyboard_protocol_sequences, parse_status_style, resolve_status_style,
+        AltScreenState, KeyboardProtocolRestoreState, StatusStyle, TerminalOutputTracker,
+        alt_screen_param_matches, attach_pty_rows, format_status_line,
+        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        parse_status_style, resolve_status_style,
     };
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
@@ -1278,8 +1364,9 @@ mod tests {
 
     #[test]
     fn observes_keyboard_protocol_sequences_split_across_chunks_once() {
-        let state = std::sync::Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(std::sync::Arc::clone(&state));
+        let state = Arc::new(KeyboardProtocolRestoreState::default());
+        let alt = Arc::new(AltScreenState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
         tracker.observe(b"\x1b[>");
         tracker.observe(b"1u");
         tracker.observe(b"plain output");
@@ -1289,11 +1376,73 @@ mod tests {
 
     #[test]
     fn observes_whole_keyboard_protocol_sequences_once_after_tail() {
-        let state = std::sync::Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(std::sync::Arc::clone(&state));
+        let state = Arc::new(KeyboardProtocolRestoreState::default());
+        let alt = Arc::new(AltScreenState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
         tracker.observe(b"plain output");
         tracker.observe(b"\x1b[>1u");
         assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn alt_screen_tracker_observes_enter_and_exit() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        assert!(!state.active.load(Ordering::Relaxed));
+        tracker.observe(b"plain\x1b[?1049hinside vim");
+        assert!(state.active.load(Ordering::Relaxed));
+        tracker.observe(b"more vim output");
+        assert!(state.active.load(Ordering::Relaxed));
+        tracker.observe(b"\x1b[?1049lback to shell");
+        assert!(!state.active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn alt_screen_tracker_handles_47_and_1047() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        tracker.observe(b"\x1b[?47h");
+        assert!(state.active.load(Ordering::Relaxed));
+        tracker.observe(b"\x1b[?47l");
+        assert!(!state.active.load(Ordering::Relaxed));
+
+        tracker.observe(b"\x1b[?1047h");
+        assert!(state.active.load(Ordering::Relaxed));
+        tracker.observe(b"\x1b[?1047l");
+        assert!(!state.active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn alt_screen_tracker_ignores_unrelated_private_modes() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        // ?25l (cursor hide), ?2004h (bracketed paste), ?1004h (focus events) → 무시
+        tracker.observe(b"\x1b[?25l\x1b[?2004h\x1b[?1004h");
+        assert!(!state.active.load(Ordering::Relaxed));
+        // 그리고 alt_screen_param_matches가 비-alt 매개변수를 거부하는지 한 번 더 확인
+        assert!(!alt_screen_param_matches(b"25"));
+        assert!(!alt_screen_param_matches(b"2004"));
+        assert!(!alt_screen_param_matches(b"1004"));
+        assert!(alt_screen_param_matches(b"47"));
+        assert!(alt_screen_param_matches(b"1047"));
+        assert!(alt_screen_param_matches(b"1049"));
+    }
+
+    #[test]
+    fn alt_screen_sequence_split_across_chunks_observed_once() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        tracker.observe(b"prefix\x1b[?10");
+        tracker.observe(b"49h");
+        assert!(state.active.load(Ordering::Relaxed));
     }
 
     #[test]
