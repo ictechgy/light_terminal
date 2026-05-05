@@ -574,10 +574,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
             // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
             if status_enabled && prev_alt_screen_active && !alt_screen_active {
-                status_bar.refresh(&mut stdout)?;
-                stdout.flush().context("flush stdout")?;
-                status_dirty = false;
-                last_status_refresh = Instant::now();
+                refresh_status(
+                    &mut status_bar,
+                    &mut stdout,
+                    &mut status_dirty,
+                    &mut last_status_refresh,
+                )?;
             }
             prev_alt_screen_active = alt_screen_active;
 
@@ -586,10 +588,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
                 if !alt_screen_active {
-                    status_bar.refresh(&mut stdout)?;
-                    stdout.flush().context("flush stdout")?;
-                    status_dirty = false;
-                    last_status_refresh = Instant::now();
+                    refresh_status(
+                        &mut status_bar,
+                        &mut stdout,
+                        &mut status_dirty,
+                        &mut last_status_refresh,
+                    )?;
                 }
             }
             // status_dirty == true 상황은 WouldBlock 경로가 곧바로 처리한다.
@@ -599,9 +603,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 && !alt_screen_active
                 && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
             {
-                status_bar.refresh(&mut stdout)?;
-                stdout.flush().context("flush stdout")?;
-                last_status_refresh = Instant::now();
+                refresh_status(
+                    &mut status_bar,
+                    &mut stdout,
+                    &mut status_dirty,
+                    &mut last_status_refresh,
+                )?;
             }
             let n = match stream.read(&mut buf) {
                 Ok(0) => break,
@@ -614,10 +621,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 {
                     // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                     if status_dirty && !alt_screen_active {
-                        status_bar.refresh(&mut stdout)?;
-                        stdout.flush().context("flush stdout")?;
-                        status_dirty = false;
-                        last_status_refresh = Instant::now();
+                        refresh_status(
+                            &mut status_bar,
+                            &mut stdout,
+                            &mut status_dirty,
+                            &mut last_status_refresh,
+                        )?;
                     }
                     continue;
                 }
@@ -641,8 +650,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             }
         }
         if status_dirty && !prev_alt_screen_active {
-            status_bar.refresh(&mut stdout)?;
-            stdout.flush().context("flush stdout")?;
+            refresh_status(
+                &mut status_bar,
+                &mut stdout,
+                &mut status_dirty,
+                &mut last_status_refresh,
+            )?;
         }
         Ok(())
     })();
@@ -659,6 +672,23 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
     } else {
         rows.max(1)
     }
+}
+
+/// status bar refresh + flush + dirty/last-refresh 플래그 동기화를 한 곳에 묶는다.
+/// 호출자는 stdout, status_dirty, last_status_refresh 의 mutable 참조를 넘긴다.
+/// (4개 호출 지점이 동일 4줄을 반복하던 것을 한 곳으로 모아, 향후 새 경로 추가 시
+///  플래그 갱신 누락을 방지한다.)
+fn refresh_status(
+    status_bar: &mut StatusBar,
+    stdout: &mut std::io::Stdout,
+    status_dirty: &mut bool,
+    last_status_refresh: &mut Instant,
+) -> Result<()> {
+    status_bar.refresh(stdout)?;
+    stdout.flush().context("flush stdout")?;
+    *status_dirty = false;
+    *last_status_refresh = Instant::now();
+    Ok(())
 }
 
 fn status_bar_supported(show_status: bool) -> bool {
@@ -802,7 +832,14 @@ impl StatusBar {
             Some(StatusStyle::Minimal) => "\x1b[0m",
             None => return Ok(()),
         };
-        write!(stdout, "\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8")
+        // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
+        // 이는 strict atomicity 보장은 아니다 (write_all은 내부적으로 여러 syscall 가능).
+        // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
+        // 그러나 write! 매크로는 placeholder 마다 write_fmt 가 분할 syscall을 일으켜 SGR sequence
+        // 중간이 다른 출력과 interleave 될 위험이 컸다 — buffered write 로 그 위험을 줄인다.
+        let payload = format!("\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8");
+        stdout
+            .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
         Ok(())
     }
@@ -829,16 +866,36 @@ impl Drop for StatusBar {
 }
 
 fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
     let width = cols as usize;
-    let mut line = format!(" lterm  {session_name}  {pane_id} ");
-    if line.chars().count() > width {
-        line = line.chars().take(width).collect();
+    let line = format!(" lterm  {session_name}  {pane_id} ");
+
+    // 한글/CJK/이모지(ZWJ family, 국기 regional indicator pair, variation selector,
+    // 결합 문자 등)를 grapheme cluster 단위로 truncate해 부분 cluster 잔존을 막는다.
+    // 폭 계산도 cluster 단위 UnicodeWidthStr::width로 누적해 wide char가 잘리지 않게 한다.
+    let mut truncated = if line.width() > width {
+        let mut acc = 0_usize;
+        let mut buf = String::new();
+        for cluster in line.graphemes(true) {
+            let w = cluster.width();
+            if acc + w > width {
+                break;
+            }
+            buf.push_str(cluster);
+            acc += w;
+        }
+        buf
+    } else {
+        line
+    };
+
+    let display_len = truncated.width();
+    if display_len < width {
+        truncated.push_str(&" ".repeat(width - display_len));
     }
-    let len = line.chars().count();
-    if len < width {
-        line.push_str(&" ".repeat(width - len));
-    }
-    line
+    truncated
 }
 
 #[derive(Default)]
@@ -1302,6 +1359,59 @@ mod tests {
         assert_eq!(format_status_line("recovery", "%0", 12), " lterm  reco");
         assert_eq!(format_status_line("api", "%1", 16), " lterm  api  %1 ");
         assert_eq!(format_status_line("api", "%1", 18), " lterm  api  %1   ");
+    }
+
+    #[test]
+    fn status_line_handles_cjk_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        // 한글 4글자 = 디스플레이 폭 8 cells.
+        // " lterm  사용자명  %1 " = 7 + 8 + 2 + 2 + 1 = 20 cells.
+        let line = format_status_line("사용자명", "%1", 24);
+        assert_eq!(line.width(), 24);
+        // 너비 16에 맞추면 일부 한글이 잘려야 한다.
+        let truncated = format_status_line("사용자명", "%1", 16);
+        assert!(truncated.width() <= 16);
+    }
+
+    #[test]
+    fn status_line_handles_emoji_width() {
+        use unicode_width::UnicodeWidthStr;
+        // 이모지는 보통 폭 2.
+        let line = format_status_line("🚀ok", "%2", 24);
+        assert_eq!(line.width(), 24);
+    }
+
+    #[test]
+    fn status_line_keeps_zwj_emoji_family_intact() {
+        use unicode_width::UnicodeWidthStr;
+        // 👨‍👩‍👧 = 5 codepoints, 1 grapheme cluster, display width 2.
+        let line = format_status_line("👨\u{200d}👩\u{200d}👧", "%1", 24);
+        assert_eq!(line.width(), 24);
+        // ZWJ가 잘려서 단독 👨 가 결과에 남는 일이 없어야 한다.
+        // (truncate가 char 단위였다면 발생) — 본 case는 width 24 > 콘텐츠 폭이라 truncate 없음.
+        assert!(line.contains("👨\u{200d}👩\u{200d}👧"));
+    }
+
+    #[test]
+    fn status_line_keeps_regional_indicator_flag_intact() {
+        use unicode_width::UnicodeWidthStr;
+        // 🇰🇷 = 2 regional indicators, 1 grapheme cluster, display width 2.
+        let line = format_status_line("🇰🇷", "%1", 16);
+        assert_eq!(line.width(), 16);
+        assert!(line.contains("🇰🇷"));
+    }
+
+    #[test]
+    fn status_line_truncate_does_not_split_grapheme_cluster() {
+        use unicode_width::UnicodeWidthStr;
+        // 한글 4자 (각 width 2 = 8) + " lterm  " prefix(8) + "  %1 "(5) = 21 cells.
+        // width 14 로 자르면 " lterm  " (8) + "사" (2) = 10 또는 " lterm  사" (10) 까지만 들어가고
+        // 결합 base + 변형 selector 케이스에서도 부분 cluster가 남지 않아야 한다.
+        let combining = "e\u{301}"; // é = 1 grapheme, width 1
+        let line = format_status_line(combining, "%1", 24);
+        assert_eq!(line.width(), 24);
+        // 결합 마크가 base 와 떨어지면 안 됨
+        assert!(line.contains("e\u{301}"));
     }
 
     #[test]
