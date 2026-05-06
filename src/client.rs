@@ -1394,7 +1394,14 @@ impl AttachActiveGuard {
 
 impl Drop for AttachActiveGuard {
     fn drop(&mut self) {
-        ATTACH_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        let prev = ATTACH_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        // refcount underflow는 unique-owner 계약 위반(생성 경로 외에서 Drop이 발생).
+        // wrapping으로 usize::MAX가 되면 panic hook이 영구히 cleanup을 emit해 디버깅이
+        // 어려워지므로 dev/test 단계에서 즉시 잡는다. release 빌드는 no-op.
+        debug_assert!(
+            prev > 0,
+            "AttachActiveGuard underflow: refcount went below 0"
+        );
     }
 }
 
