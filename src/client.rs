@@ -1772,6 +1772,29 @@ mod tests {
     }
 
     #[test]
+    fn alt_screen_tracker_handles_long_grouped_params_across_chunks() {
+        // Quad-review LOW finding (Claude + Codex): scan-window 회귀가 boundary
+        // 모드(`TerminalOutputTracker::observe`가 tail+new chunk를 합성하는 경로)에서도
+        // 잡히는지 검증. tail에 `\x1b[?25;47;1047;1049;1004;2004;1` 까지 들어오고
+        // 다음 청크가 `006h`로 끝나는 시나리오 — 종결자 위치가 boundary 윈도우의
+        // 후반(>32바이트) 영역에 떨어지는 케이스.
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        tracker.observe(b"\x1b[?25;47;1047;1049;1004;2004;1");
+        assert!(
+            !state.active.load(Ordering::Relaxed),
+            "no terminator yet — must not toggle"
+        );
+        tracker.observe(b"006h");
+        assert!(
+            state.active.load(Ordering::Relaxed),
+            "terminator arrived in next chunk — boundary path must catch it"
+        );
+    }
+
+    #[test]
     fn alt_screen_param_matches_rejects_colon_subparameter() {
         // ECMA-48상 `:`는 sub-parameter separator라 `?47:5h`는 mode 47의 subparameter 5
         // 의미이지 mode 47과 5를 동시에 set하는 의미가 아니다. 과거 구현은 `:`도
