@@ -1353,13 +1353,15 @@ fn emit_panic_terminal_cleanup() {
     }
 }
 
-/// `lterm attach` 가 활성화된 동안에만 panic hook이 cleanup을 emit 하도록 게이팅한다.
-/// 비-attach 명령(`lterm ls`, `lterm capture` 등)이 패닉할 때 stdout으로 escape sequence가
-/// 새지 않도록 한다.
-static ATTACH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 활성 `lterm attach` 깊이(refcount). 0이면 비활성, >=1이면 panic hook이 cleanup byte를 emit.
+/// AtomicBool이었을 때는 nested attach (cmux/Claude Code 안에서 다시 `lterm omx` 등으로 attach
+/// 하는 경우)에서 inner Drop이 outer 활성 상태를 false로 덮어써 panic 시 cleanup이 누락되는
+/// 버그가 있었다. refcount로 바꿔 nested 시점에 깊이가 누적되고 outer 종료 전에는 0으로
+/// 떨어지지 않도록 한다 (quad-review MEDIUM 합의 — Claude C2, Codex 2, Forge 2).
+static ATTACH_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 첫 attach() 호출 시 한 번만 panic hook을 설치한다. 이후 호출은 no-op.
-/// hook은 process 종료까지 유지되고, ATTACH_ACTIVE 플래그가 true일 때만 cleanup byte를 emit.
+/// hook은 process 종료까지 유지되고, ATTACH_ACTIVE 깊이가 1 이상일 때만 cleanup byte를 emit.
 fn ensure_panic_terminal_cleanup_hook() {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -1367,7 +1369,7 @@ fn ensure_panic_terminal_cleanup_hook() {
         std::panic::set_hook(Box::new(move |info| {
             // cleanup을 가장 먼저 실행 — previous hook이 stdio mutex poison 등으로
             // 재패닉/abort 하더라도 터미널 복구는 보장된다.
-            if ATTACH_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+            if ATTACH_ACTIVE.load(std::sync::atomic::Ordering::Acquire) > 0 {
                 emit_panic_terminal_cleanup();
             }
             // previous hook을 catch_unwind 로 감싸 chain 단계 panic을 흡수.
@@ -1377,20 +1379,29 @@ fn ensure_panic_terminal_cleanup_hook() {
     });
 }
 
-/// attach() 시작 시 ATTACH_ACTIVE를 true로 세팅하고, Drop 시 false로 복원한다.
-/// panic으로 unwind 시에도 Drop이 호출되어 안전. abort/SIGKILL은 hook이 처리한다.
+/// attach() 시작 시 ATTACH_ACTIVE 깊이를 1 증가시키고, Drop 시 1 감소시킨다.
+/// nested attach에서도 outer가 살아있는 동안에는 깊이가 0으로 떨어지지 않으므로 panic hook의
+/// cleanup gate가 일관되게 동작한다. panic으로 unwind 시에도 Drop이 호출되어 안전.
+/// abort/SIGKILL은 panic hook이 처리한다.
 struct AttachActiveGuard;
 
 impl AttachActiveGuard {
     fn enter() -> Self {
-        ATTACH_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+        ATTACH_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Release);
         Self
     }
 }
 
 impl Drop for AttachActiveGuard {
     fn drop(&mut self) {
-        ATTACH_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        let prev = ATTACH_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        // refcount underflow는 unique-owner 계약 위반(생성 경로 외에서 Drop이 발생).
+        // wrapping으로 usize::MAX가 되면 panic hook이 영구히 cleanup을 emit해 디버깅이
+        // 어려워지므로 dev/test 단계에서 즉시 잡는다. release 빌드는 no-op.
+        debug_assert!(
+            prev > 0,
+            "AttachActiveGuard underflow: refcount went below 0"
+        );
     }
 }
 
@@ -1763,23 +1774,48 @@ mod tests {
     }
 
     #[test]
-    fn attach_active_guard_toggles_flag() {
+    fn attach_active_guard_increments_and_decrements_depth() {
         let _guard = ATTACH_FLAG_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
 
         // 사전 capture (다른 코드 경로에서 set 했을 수 있음)
         let prior = ATTACH_ACTIVE.load(Ordering::Acquire);
-        ATTACH_ACTIVE.store(false, Ordering::Release);
+        ATTACH_ACTIVE.store(0, Ordering::Release);
 
-        assert!(!ATTACH_ACTIVE.load(Ordering::Acquire));
+        assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
         {
             let _g = AttachActiveGuard::enter();
-            assert!(ATTACH_ACTIVE.load(Ordering::Acquire));
+            assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
         }
-        assert!(!ATTACH_ACTIVE.load(Ordering::Acquire));
+        assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
 
         // 원래 상태 복원
+        ATTACH_ACTIVE.store(prior, Ordering::Release);
+    }
+
+    #[test]
+    fn attach_active_guard_supports_nested_attach() {
+        // nested attach (예: cmux 안에서 lterm omx로 attach 후 그 안에서 다시 lterm attach)
+        // 시 inner Drop이 outer의 활성 상태를 무효화하지 않아야 한다. AtomicBool이었을 때의
+        // 회귀를 회귀 테스트로 잡는다 (quad-review MEDIUM 합의).
+        let _guard = ATTACH_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let prior = ATTACH_ACTIVE.load(Ordering::Acquire);
+        ATTACH_ACTIVE.store(0, Ordering::Release);
+
+        let outer = AttachActiveGuard::enter();
+        assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
+        {
+            let _inner = AttachActiveGuard::enter();
+            assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 2);
+        }
+        // inner Drop 후에도 outer는 살아있어 깊이는 1 유지 — panic hook이 cleanup 발화 가능.
+        assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
+        drop(outer);
+        assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
+
         ATTACH_ACTIVE.store(prior, Ordering::Release);
     }
 
