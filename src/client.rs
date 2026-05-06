@@ -1314,8 +1314,11 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// - `\x1b[?1047l`: xterm alt-screen (1047) 종료 — clear 변종
 /// - `\x1b[r`     : DECSTBM 리셋 (scroll region 전체 화면) — alt 종료 이후 메인 버퍼에 적용
 /// - `\x1b[?25h`  : DECTCEM 커서 보이기
-/// - `\x1b[<u` ×4 : kitty keyboard protocol stack pop (best-effort: 사용자 push depth를
-///   panic context에서 알 수 없으므로 보수적으로 4회. 스택 바닥 이상은 no-op)
+/// - `\x1b[<u` ×16: kitty keyboard protocol stack pop. 정상 경로의
+///   [`MAX_KEYBOARD_PROTOCOL_RESTORE_POPS`] 와 동일한 상한으로 정렬 — panic context에서
+///   user push depth를 알 수 없으므로 tracked path가 허용한 최대치까지 시도한다.
+///   스택 바닥 이상은 no-op이므로 추가 비용은 byte 수만(~36 bytes)이며, 단일 libc::write
+///   범위 안에 머문다 (총 ~93 bytes).
 /// - `\x1b[=0u`   : kitty direct mode 비활성 — push 스택을 비운 다음 적용해야 의미 있음
 /// - `\x1b[0m`    : SGR 리셋
 /// - `\r\n`       : CR + LF (raw mode에서 ONLCR이 꺼져 있어 `\n`만으로는 column 1로 안 감)
@@ -1324,14 +1327,18 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// kitty keyboard protocol을 복원하지 못해 패닉 후 셸 입력이 모바일 SSH에서 변형되어 들어오는
 /// 증상의 직접 원인이었다.
 fn panic_terminal_cleanup_bytes() -> &'static [u8] {
-    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[=0u\x1b[0m\r\n"
+    // 16 kitty pops = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (정상 경로와 동일 상한).
+    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+      \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
+      \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
+      \x1b[=0u\x1b[0m\r\n"
 }
 
 /// Panic 발생 시 호출되는 cleanup. Rust stdio mutex를 우회하기 위해 libc::write 직접 호출.
 /// stdio mutex는 panic context에서 poison 되어 있을 수 있어 println!/eprint! 가 재패닉을 일으킬 수 있다.
 ///
 /// EINTR / partial-write 시 재시도하여 cleanup sequence 절단을 막는다.
-/// panic context이므로 무한 루프를 피하기 위해 최대 8회로 제한 — sequence가 ~57 bytes라
+/// panic context이므로 무한 루프를 피하기 위해 최대 8회로 제한 — sequence가 ~93 bytes라
 /// 단일 write 통상 1회로 충분하고, 8회는 시그널 폭주에도 보수적.
 fn emit_panic_terminal_cleanup() {
     let bytes = panic_terminal_cleanup_bytes();
@@ -1772,11 +1779,19 @@ mod tests {
     fn panic_terminal_cleanup_bytes_emits_safe_recovery_sequence() {
         let bytes = panic_terminal_cleanup_bytes();
         // 정확한 sequence (순서 중요): alt-screen(1049/47/1047) 종료 → scroll region 리셋 →
-        // 커서 visible → kitty pop ×4 → kitty direct disable → SGR 리셋 → CR+LF.
+        // 커서 visible → kitty pop ×16 → kitty direct disable → SGR 리셋 → CR+LF.
         // alt-screen 종료가 \x1b[r 보다 먼저 와서 reset이 메인 버퍼에 적용되어야 한다.
+        // pop 16회 = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (스택 바닥 이상은 no-op).
+        let expected = b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+                         \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
+                         \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
+                         \x1b[=0u\x1b[0m\r\n";
+        assert_eq!(bytes, expected);
+        // pop 시퀀스가 정확히 16번 등장하는지 검증 (회귀 시 즉시 catch)
+        let pop_count = bytes.windows(4).filter(|w| *w == b"\x1b[<u").count();
         assert_eq!(
-            bytes,
-            b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[=0u\x1b[0m\r\n"
+            pop_count, 16,
+            "kitty pop은 MAX_KEYBOARD_PROTOCOL_RESTORE_POPS=16과 일치"
         );
         // alt-screen 종료가 scroll region reset보다 먼저 위치하는지 명시 검증
         let pos_alt = bytes
