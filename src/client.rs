@@ -815,18 +815,25 @@ impl StatusBar {
             pane_id,
             style,
         };
-        status.reserve_terminal_area(stdout)?;
-        // attach 시작 시점에 한 번만 cursor를 scroll region 안쪽 마지막 row로 clamp한다.
+        // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
+        // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
+        // 호출해 둘 사이에 SIGWINCH가 끼면 scroll bottom과 clamp target이 어긋날 수 있는
+        // 좁은 race window가 있었다 (Codex quad-review LOW). 또한 `rows-1`이 두 곳에
+        // 독립적으로 하드코딩돼 향후 drift 위험도 있었다 (Claude quad-review MEDIUM).
+        let (_, rows) = terminal_size();
+        status.reserve_terminal_area(stdout, rows)?;
         // reserve_terminal_area의 `\x1b7...\x1b8` cursor save/restore wrap은 사용자의
         // pre-attach cursor 위치를 그대로 복원하는데, 만약 그 위치가 row=rows(=status row)였다면
         // 복원 직후 PTY raw output(셸 echo 등)이 status row를 덮어써 quad-review에서 보고된
         // "커서가 status 영역과 겹침" / "PTY 출력이 status 위에 그려짐" 증상이 발생한다.
         // refresh 시에는 PTY 앱이 자체 cursor 관리하므로 적용하지 않는다.
-        let (_, rows) = terminal_size();
-        if let Some(seq) = cursor_clamp_into_scroll_region(rows) {
-            stdout
-                .write_all(seq.as_bytes())
-                .context("clamp cursor inside scroll region at attach start")?;
+        // style이 None(status disabled)이면 reserve도 no-op이므로 clamp도 같이 skip한다.
+        if status.style.is_some() {
+            if let Some(seq) = cursor_clamp_into_scroll_region(rows) {
+                stdout
+                    .write_all(seq.as_bytes())
+                    .context("clamp cursor inside scroll region at attach start")?;
+            }
         }
         status.draw(stdout)?;
         stdout.flush().context("flush stdout")?;
@@ -834,15 +841,15 @@ impl StatusBar {
     }
 
     fn refresh(&mut self, stdout: &mut impl Write) -> Result<()> {
-        self.reserve_terminal_area(stdout)?;
+        let (_, rows) = terminal_size();
+        self.reserve_terminal_area(stdout, rows)?;
         self.draw(stdout)
     }
 
-    fn reserve_terminal_area(&self, stdout: &mut impl Write) -> Result<()> {
+    fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
         if self.style.is_none() {
             return Ok(());
         }
-        let (_, rows) = terminal_size();
         if rows <= 1 {
             return Ok(());
         }
