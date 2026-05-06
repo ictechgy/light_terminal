@@ -24,9 +24,13 @@ const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
 /// 리셋되어도 사용자 인지 한계(약 100~300ms) 안에 scroll region을 재확립하고 status를
-/// 재그린다. PTY가 활발히 출력 중이면 status_dirty 경로가 즉시 처리하므로 heartbeat는
-/// idle 상태에만 발화한다.
+/// 재그린다. PTY가 활발히 출력 중일 때 idle heartbeat는 status_dirty가 클리어되어야 발화하므로,
+/// busy 출력 시에는 [`STATUS_HEARTBEAT_FORCED`] 가 dirty 여부와 무관하게 강제 redraw한다.
 const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
+/// busy PTY 출력으로 [`STATUS_HEARTBEAT`] idle 경로가 차단된 경우(WouldBlock이 fire하지
+/// 않아 status_dirty가 클리어되지 않음) self-heal이 영원히 막히지 않게 강제 발화하는 상한.
+/// 사용자 보고: cmux pane swap 후 status가 회복 안 되는 증상 회복용. 500ms = 2× heartbeat.
+const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_millis(500);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
 pub fn ensure_server() -> Result<()> {
@@ -602,12 +606,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                     )?;
                 }
             }
-            // status_dirty == true 상황은 WouldBlock 경로가 곧바로 처리한다.
-            // heartbeat는 idle 상태(외부 앱 백그라운드 등)에서만 self-heal 한다.
+            // heartbeat는 idle(STATUS_HEARTBEAT) + forced(STATUS_HEARTBEAT_FORCED) 두 경로를
+            // 모두 가진다. busy PTY 출력 중에도 forced 경로로 self-heal이 발화한다.
+            // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
             if status_enabled
-                && !status_dirty
                 && !alt_screen_active
-                && last_status_refresh.elapsed() >= STATUS_HEARTBEAT
+                && heartbeat_due(last_status_refresh.elapsed(), status_dirty)
             {
                 refresh_status(
                     &mut status_bar,
@@ -695,6 +699,24 @@ fn refresh_status(
     *status_dirty = false;
     *last_status_refresh = Instant::now();
     Ok(())
+}
+
+/// heartbeat **timing/dirty 서브 게이트**만 평가한다. **호출자는 반드시 `status_enabled`
+/// 와 `!alt_screen_active` 가드를 별도로 평가해야 한다** — alt-screen 중에 forced redraw가
+/// alt buffer로 새는 회귀를 방지하기 위한 분리. 함수명이 "heartbeat 전체 게이트"로 오인되지
+/// 않도록 `heartbeat_due`로 둔다.
+///
+/// - **idle 경로**: `!status_dirty` 이고 `STATUS_HEARTBEAT` 경과 시 발화 — PTY가 잠잠한
+///   동안 외부 DECSTBM 리셋(다른 앱 백그라운드 등)을 self-heal.
+/// - **forced 경로**: `STATUS_HEARTBEAT_FORCED` 경과 시 dirty 여부와 무관하게 발화 —
+///   PTY가 연속 출력 중이면 read()가 매번 Ok(n)을 반환해 WouldBlock 분기가 fire하지
+///   않으므로 status_dirty가 영원히 클리어되지 않는다. 이 경로가 없으면 cmux pane swap /
+///   Termius 백그라운드 복귀 후 status 영역 자가복구가 무한히 차단된다.
+fn heartbeat_due(elapsed: Duration, status_dirty: bool) -> bool {
+    if !status_dirty && elapsed >= STATUS_HEARTBEAT {
+        return true;
+    }
+    elapsed >= STATUS_HEARTBEAT_FORCED
 }
 
 fn status_bar_supported(show_status: bool) -> bool {
@@ -1408,14 +1430,16 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::{
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
-        StatusStyle, TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
-        ensure_panic_terminal_cleanup_hook, format_status_line, keyboard_protocol_restore_bytes,
-        matches_env_bool, observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
-        parse_status_style, resolve_status_style,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle, TerminalOutputTracker,
+        alt_screen_param_matches, attach_pty_rows, ensure_panic_terminal_cleanup_hook,
+        format_status_line, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        resolve_status_style,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     /// 환경 변수를 변경하는 모든 테스트가 공유하는 직렬화 잠금. process-global env에 대한
     /// race를 막기 위해 env-touching 테스트는 반드시 이 lock을 잡고, 종료 시 EnvGuard로
@@ -1805,6 +1829,46 @@ mod tests {
         // semicolon은 정상적으로 분리한다
         assert!(alt_screen_param_matches(b"5;47"));
         assert!(alt_screen_param_matches(b"1049;25"));
+    }
+
+    #[test]
+    fn heartbeat_idle_path_fires_only_when_clean_and_interval_elapsed() {
+        // idle 경로: status_dirty=false 이고 STATUS_HEARTBEAT 경과 시 발화한다.
+        // attach 루프 시작 직후 ZERO elapsed는 두 경로 모두 false여야 한다.
+        assert!(!heartbeat_due(Duration::ZERO, false));
+        assert!(!heartbeat_due(Duration::ZERO, true));
+        assert!(!heartbeat_due(
+            STATUS_HEARTBEAT - Duration::from_millis(1),
+            false
+        ));
+        assert!(heartbeat_due(STATUS_HEARTBEAT, false));
+        assert!(heartbeat_due(
+            STATUS_HEARTBEAT + Duration::from_millis(50),
+            false
+        ));
+    }
+
+    #[test]
+    fn heartbeat_dirty_blocks_idle_path_until_forced_threshold() {
+        // status_dirty=true 면 STATUS_HEARTBEAT 경과만으로는 발화하지 않고,
+        // STATUS_HEARTBEAT_FORCED 경과 후에 강제 발화한다. 이 경로가 없으면
+        // PTY 연속 출력 중 외부 DECSTBM 리셋을 영원히 회복하지 못한다.
+        assert!(!heartbeat_due(STATUS_HEARTBEAT, true));
+        assert!(!heartbeat_due(
+            STATUS_HEARTBEAT_FORCED - Duration::from_millis(1),
+            true
+        ));
+        assert!(heartbeat_due(STATUS_HEARTBEAT_FORCED, true));
+        assert!(heartbeat_due(
+            STATUS_HEARTBEAT_FORCED + Duration::from_millis(100),
+            true
+        ));
+    }
+
+    #[test]
+    fn heartbeat_forced_threshold_is_strictly_greater_than_idle() {
+        // forced 경로가 idle보다 늦게 발화해야 PTY busy 출력 시 redraw 폭주가 없다.
+        assert!(STATUS_HEARTBEAT_FORCED > STATUS_HEARTBEAT);
     }
 
     #[test]
