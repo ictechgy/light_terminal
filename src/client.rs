@@ -816,6 +816,18 @@ impl StatusBar {
             style,
         };
         status.reserve_terminal_area(stdout)?;
+        // attach 시작 시점에 한 번만 cursor를 scroll region 안쪽 마지막 row로 clamp한다.
+        // reserve_terminal_area의 `\x1b7...\x1b8` cursor save/restore wrap은 사용자의
+        // pre-attach cursor 위치를 그대로 복원하는데, 만약 그 위치가 row=rows(=status row)였다면
+        // 복원 직후 PTY raw output(셸 echo 등)이 status row를 덮어써 quad-review에서 보고된
+        // "커서가 status 영역과 겹침" / "PTY 출력이 status 위에 그려짐" 증상이 발생한다.
+        // refresh 시에는 PTY 앱이 자체 cursor 관리하므로 적용하지 않는다.
+        let (_, rows) = terminal_size();
+        if let Some(seq) = cursor_clamp_into_scroll_region(rows) {
+            stdout
+                .write_all(seq.as_bytes())
+                .context("clamp cursor inside scroll region at attach start")?;
+        }
         status.draw(stdout)?;
         stdout.flush().context("flush stdout")?;
         Ok(status)
@@ -940,6 +952,20 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     let display_len = truncated.width();
     truncated.push_str(&" ".repeat(width.saturating_sub(display_len)));
     truncated
+}
+
+/// reserve_terminal_area의 cursor save/restore wrap이 attach 시작 시점에 사용자의 pre-attach
+/// cursor를 status row(=`rows`)에 복원할 수 있다. 이 경우 PTY raw output(셸 echo 등)이
+/// status를 덮어쓴다. 안전한 마지막 row(`rows-1`, scroll region 안쪽 마지막 줄)로 cursor를
+/// 강제 이동하는 escape sequence를 반환한다. `rows<=1`이면 의미가 없어 None.
+///
+/// 호출자는 attach **시작 시점에 한 번만** 사용해야 한다 — refresh 경로에서 호출하면
+/// 매 250ms 주기로 cursor가 깜빡이며 본문 사용 흐름을 방해한다.
+fn cursor_clamp_into_scroll_region(rows: u16) -> Option<String> {
+    if rows <= 1 {
+        return None;
+    }
+    Some(format!("\x1b[{};1H", rows - 1))
 }
 
 #[derive(Default)]
@@ -1447,10 +1473,10 @@ mod tests {
     use super::{
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle, TerminalOutputTracker,
-        alt_screen_param_matches, attach_pty_rows, ensure_panic_terminal_cleanup_hook,
-        format_status_line, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
-        resolve_status_style,
+        alt_screen_param_matches, attach_pty_rows, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, format_status_line, heartbeat_due,
+        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1501,6 +1527,23 @@ mod tests {
         assert_eq!(attach_pty_rows(24, true), 23);
         assert_eq!(attach_pty_rows(1, true), 1);
         assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    #[test]
+    fn cursor_clamp_emits_position_at_scroll_region_bottom() {
+        // 일반 24행 터미널: scroll region은 1..23이므로 안전한 마지막 row는 23(=rows-1).
+        assert_eq!(
+            cursor_clamp_into_scroll_region(24),
+            Some("\x1b[23;1H".to_string())
+        );
+        // 2행 (status bar 활성 최소): scroll region은 1행만, cursor를 row 1로.
+        assert_eq!(
+            cursor_clamp_into_scroll_region(2),
+            Some("\x1b[1;1H".to_string())
+        );
+        // rows<=1: clamp 자체가 의미 없음 (status bar도 미활성).
+        assert_eq!(cursor_clamp_into_scroll_region(1), None);
+        assert_eq!(cursor_clamp_into_scroll_region(0), None);
     }
 
     #[test]
