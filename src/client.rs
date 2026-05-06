@@ -913,7 +913,10 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     // 기존 구현은 잘린 wide cluster를 공백으로만 메워서 사용자가 "한글 끝글자 잘림"을
     // 모바일 SSH 렌더링 버그로 오인했다 (quad-review 사용자 보고).
     let mut truncated = if line.width() > width {
-        // `…` 한 칸을 둘 자리를 미리 확보. width=1 이면 `…`도 못 들어가므로 마진 0.
+        // `…` 한 칸을 둘 자리를 미리 확보. width=1 일 때는 의도적으로 ellipsis를 생략해
+        // 첫 cluster 한 글자라도 보여주는 쪽을 택한다 — `…` 자체는 width 1이지만 그것만
+        // 표시하면 사용자에게 정보가 0이고, status row가 한 칸뿐이라면 그 한 칸을 어떻게든
+        // 콘텐츠로 쓰는 편이 낫다는 판단. (Codex quad-review LOW 코멘트에 대한 명시화.)
         let ellipsis_margin: usize = if width >= 2 { 1 } else { 0 };
         let target = width.saturating_sub(ellipsis_margin);
         let mut acc = 0_usize;
@@ -1513,11 +1516,14 @@ mod tests {
     fn status_line_truncation_appends_ellipsis_for_cjk() {
         use unicode_width::UnicodeWidthStr;
         // CJK 잘림 시 ellipsis가 표시되어 "끝글자 잘림" UX 오인을 방지한다.
+        // 잘림 위치는 반드시 콘텐츠의 끝(trailing padding 직전)이어야 한다.
         let truncated = format_status_line("매우긴이름매우긴이름", "%1", 20);
         assert_eq!(truncated.width(), 20);
+        // contains만으로는 잘못된 위치(중간 등)에 삽입돼도 통과하므로,
+        // trim_end (trailing 공백 제거) 후 ends_with로 placement까지 검증.
         assert!(
-            truncated.contains('…'),
-            "잘림 발생 시 ellipsis 단서가 포함되어야 함: {truncated:?}"
+            truncated.trim_end().ends_with('…'),
+            "ellipsis는 콘텐츠 끝에 와야 함: {truncated:?}"
         );
         // 잘림이 일어나지 않는 충분한 width에서는 ellipsis가 추가되지 않아야 한다.
         let untruncated = format_status_line("api", "%1", 24);
@@ -1535,6 +1541,20 @@ mod tests {
         let one = format_status_line("anything", "%1", 1);
         assert_eq!(one.chars().count(), 1);
         assert!(!one.contains('…'));
+    }
+
+    #[test]
+    fn status_line_width_two_is_minimum_ellipsis_active() {
+        use unicode_width::UnicodeWidthStr;
+        // width=2는 ellipsis 활성 최소 boundary. target=1이라 첫 cluster 한 칸 + `…` = 2칸.
+        // 누가 `if width >= 2`를 `>= 3`으로 바꾸면 회귀로 잡힘.
+        let two = format_status_line("anything", "%1", 2);
+        assert_eq!(two.width(), 2);
+        assert!(two.contains('…'), "width=2는 ellipsis 활성 최소값: {two:?}");
+        assert!(
+            two.trim_end().ends_with('…'),
+            "ellipsis 위치 정확해야: {two:?}"
+        );
     }
 
     #[test]
