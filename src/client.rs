@@ -1140,7 +1140,11 @@ fn observe_alt_screen_sequences_after(
             i += 1;
             continue;
         }
-        let scan_end = bytes.len().min(i + 32);
+        // kbd observer(i+64)와 동일한 scan window를 적용한다. 과거 i+32였으나
+        // `?47;1047;1049h`처럼 그룹 set 매개변수가 32바이트를 넘기면 종결자를
+        // 찾지 못해 alt-screen 토글이 silently drop되는 비대칭이 있었다.
+        // TAIL_LIMIT(64)와 kbd scan(i+64)에 정렬한다.
+        let scan_end = bytes.len().min(i + 64);
         let mut j = i + 3;
         while j < scan_end {
             let byte = bytes[j];
@@ -1161,9 +1165,11 @@ fn observe_alt_screen_sequences_after(
 
 fn alt_screen_param_matches(params: &[u8]) -> bool {
     // xterm은 `?47;1049h` 처럼 여러 private mode를 한 CSI에 묶어 보낼 수 있다.
-    // `;` (그리고 colon 변형 `:`)로 split 후 한 파라미터라도 alt-screen 모드면 매치한다.
+    // `;`로만 split한다. `:`는 ECMA-48 subparameter separator라 `?47:5h` ("mode 47
+    // 의 subparameter 5")는 mode 5와 47을 둘 다 가진 시퀀스가 아니다. 과거에는
+    // `:`도 함께 split했으나 false-positive 매치를 유발해 제거했다.
     params
-        .split(|byte| *byte == b';' || *byte == b':')
+        .split(|byte| *byte == b';')
         .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
 }
 
@@ -1740,6 +1746,42 @@ mod tests {
         tracker.observe(b"prefix\x1b[?10");
         tracker.observe(b"49h");
         assert!(state.active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn alt_screen_tracker_handles_long_grouped_params() {
+        // scan_end가 i+32였을 때 매개변수가 32바이트를 넘기면 종결자 미발견으로 silently
+        // drop되던 회귀를 방지한다. xterm 스펙은 ?47;1047;1049 같은 그룹 set 길이에
+        // 명시적 상한이 없으므로 i+64까지 스캔한다.
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+
+        // ?25;47;1047;1049;1004;2004;1006h — i+3..j 사이가 32바이트 초과
+        tracker.observe(b"\x1b[?25;47;1047;1049;1004;2004;1006h");
+        assert!(
+            state.active.load(Ordering::Relaxed),
+            "long grouped alt-screen set must still toggle on"
+        );
+
+        tracker.observe(b"\x1b[?25;47;1047;1049;1004;2004;1006l");
+        assert!(
+            !state.active.load(Ordering::Relaxed),
+            "long grouped alt-screen reset must still toggle off"
+        );
+    }
+
+    #[test]
+    fn alt_screen_param_matches_rejects_colon_subparameter() {
+        // ECMA-48상 `:`는 sub-parameter separator라 `?47:5h`는 mode 47의 subparameter 5
+        // 의미이지 mode 47과 5를 동시에 set하는 의미가 아니다. 과거 구현은 `:`도
+        // split해 false-positive 매치를 만들었다.
+        assert!(!alt_screen_param_matches(b"47:5"));
+        assert!(!alt_screen_param_matches(b"1049:0"));
+        assert!(!alt_screen_param_matches(b"5:47"));
+        // semicolon은 정상적으로 분리한다
+        assert!(alt_screen_param_matches(b"5;47"));
+        assert!(alt_screen_param_matches(b"1049;25"));
     }
 
     #[test]
