@@ -898,21 +898,36 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     use unicode_width::UnicodeWidthStr;
 
     let width = cols as usize;
+    if width == 0 {
+        // 호출자가 cols=0를 차단해야 하지만, 향후 호출 추가 시의 underflow를
+        // 방지하기 위한 방어선.
+        return String::new();
+    }
     let line = format!(" lterm  {session_name}  {pane_id} ");
 
     // 한글/CJK/이모지(ZWJ family, 국기 regional indicator pair, variation selector,
     // 결합 문자 등)를 grapheme cluster 단위로 truncate해 부분 cluster 잔존을 막는다.
     // 폭 계산도 cluster 단위 UnicodeWidthStr::width로 누적해 wide char가 잘리지 않게 한다.
+    //
+    // 잘림이 발생한 경우 사용자에게 시각적 단서로 `…`(U+2026, width 1)을 추가한다.
+    // 기존 구현은 잘린 wide cluster를 공백으로만 메워서 사용자가 "한글 끝글자 잘림"을
+    // 모바일 SSH 렌더링 버그로 오인했다 (quad-review 사용자 보고).
     let mut truncated = if line.width() > width {
+        // `…` 한 칸을 둘 자리를 미리 확보. width=1 이면 `…`도 못 들어가므로 마진 0.
+        let ellipsis_margin: usize = if width >= 2 { 1 } else { 0 };
+        let target = width.saturating_sub(ellipsis_margin);
         let mut acc = 0_usize;
         let mut buf = String::new();
         for cluster in line.graphemes(true) {
             let w = cluster.width();
-            if acc + w > width {
+            if acc + w > target {
                 break;
             }
             buf.push_str(cluster);
             acc += w;
+        }
+        if ellipsis_margin > 0 {
+            buf.push('…');
         }
         buf
     } else {
@@ -920,9 +935,7 @@ fn format_status_line(session_name: &str, pane_id: &str, cols: u16) -> String {
     };
 
     let display_len = truncated.width();
-    if display_len < width {
-        truncated.push_str(&" ".repeat(width - display_len));
-    }
+    truncated.push_str(&" ".repeat(width.saturating_sub(display_len)));
     truncated
 }
 
@@ -1489,9 +1502,39 @@ mod tests {
 
     #[test]
     fn status_line_is_exact_terminal_width() {
-        assert_eq!(format_status_line("recovery", "%0", 12), " lterm  reco");
+        // truncate 시 마지막에 ellipsis(`…`, width 1)가 단서로 붙는다.
+        assert_eq!(format_status_line("recovery", "%0", 12), " lterm  rec…");
+        // 잘림 없는 경우는 여전히 공백으로 정확히 패딩.
         assert_eq!(format_status_line("api", "%1", 16), " lterm  api  %1 ");
         assert_eq!(format_status_line("api", "%1", 18), " lterm  api  %1   ");
+    }
+
+    #[test]
+    fn status_line_truncation_appends_ellipsis_for_cjk() {
+        use unicode_width::UnicodeWidthStr;
+        // CJK 잘림 시 ellipsis가 표시되어 "끝글자 잘림" UX 오인을 방지한다.
+        let truncated = format_status_line("매우긴이름매우긴이름", "%1", 20);
+        assert_eq!(truncated.width(), 20);
+        assert!(
+            truncated.contains('…'),
+            "잘림 발생 시 ellipsis 단서가 포함되어야 함: {truncated:?}"
+        );
+        // 잘림이 일어나지 않는 충분한 width에서는 ellipsis가 추가되지 않아야 한다.
+        let untruncated = format_status_line("api", "%1", 24);
+        assert!(
+            !untruncated.contains('…'),
+            "잘림 없는 경우 ellipsis 없어야 함: {untruncated:?}"
+        );
+    }
+
+    #[test]
+    fn status_line_handles_zero_and_one_cols() {
+        // cols=0: 안전하게 빈 문자열. (caller가 차단하지만 방어선 검증)
+        assert_eq!(format_status_line("anything", "%1", 0), "");
+        // cols=1: ellipsis margin이 0이라 `…`가 추가되지 않고 공백만 채워진다.
+        let one = format_status_line("anything", "%1", 1);
+        assert_eq!(one.chars().count(), 1);
+        assert!(!one.contains('…'));
     }
 
     #[test]
