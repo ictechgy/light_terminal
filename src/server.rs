@@ -27,7 +27,22 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 type OutputChunk = Arc<[u8]>;
-type Subscriber = (u64, SyncSender<OutputChunk>);
+
+/// attach 클라이언트 한 명의 lifecycle 단위.
+///
+/// `tx`는 PTY 출력 broadcast 채널, `shutdown`은 채널이 backpressure로
+/// `Full`/`Disconnected` 가 되어 서브스크라이버를 강제 제거할 때 호출되는 훅이다.
+/// `handle_attach`은 `shutdown`에 attach `UnixStream` 의 `shutdown(Both)` 을
+/// 등록해, eviction 발생 시 그 클라이언트의 input loop도 EOF로 깨워 종료시킨다.
+/// 이 훅이 없으면 output 만 끊긴 채 input이 살아있는 "zombie attach"가 만들어져
+/// 사용자가 frozen으로 인지하면서도 keystroke 가 PTY로 흘러들어가 위험한
+/// 명령이 실행될 수 있다 (quad-review RC-2b).
+#[derive(Clone)]
+struct Subscriber {
+    id: u64,
+    tx: SyncSender<OutputChunk>,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
+}
 
 pub fn serve_forever() -> Result<()> {
     let socket = paths::socket_path()?;
@@ -180,20 +195,33 @@ impl Session {
             Some(Arc::from(bytes))
         };
         let mut disconnected = Vec::new();
-        for (id, tx) in subscribers {
+        for sub in &subscribers {
             let Some(chunk) = &chunk else {
                 break;
             };
-            match tx.try_send(Arc::clone(chunk)) {
+            match sub.tx.try_send(Arc::clone(chunk)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    disconnected.push(id);
+                    disconnected.push(sub.id);
                 }
             }
         }
         if !disconnected.is_empty() {
-            let mut subscribers = lock(&self.subscribers);
-            subscribers.retain(|(id, _)| !disconnected.contains(id));
+            // RC-2b: backpressure로 sub를 evict할 때 attach UnixStream 도 같이 닫아
+            // input loop를 EOF로 깨운다. 그렇지 않으면 output 만 끊기고 input은
+            // 살아있는 zombie attach 가 만들어져 사용자가 frozen으로 인지하는 동안
+            // keystroke 가 PTY로 흘러들어가 위험한 명령이 실행될 수 있다.
+            //
+            // shutdown 훅은 subscribers lock 을 해제한 뒤 호출한다. handle_attach 측
+            // input loop 가 EOF로 깨어나면서 unsubscribe 경로로 들어오면 같은 lock을
+            // 다시 잡으려 시도하므로, lock 안에서 호출하면 deadlock 위험이 있다.
+            let shutdowns = {
+                let mut subscribers = lock(&self.subscribers);
+                evict_disconnected_subscribers(&mut subscribers, &disconnected)
+            };
+            for shutdown in shutdowns {
+                shutdown();
+            }
         }
     }
 
@@ -224,36 +252,62 @@ impl Session {
         bytes[spans[first].0..].to_vec()
     }
 
-    fn subscribe_with_snapshot(&self) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
+    fn subscribe_with_snapshot(
+        &self,
+        shutdown: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
         let _output_guard = lock(&self.output_state);
         let initial = {
             let ring = lock(&self.ring);
             ring.iter().copied().collect()
         };
-        let (id, rx) = self.subscribe_locked()?;
+        let (id, rx) = self.subscribe_locked(shutdown)?;
         Ok((id, rx, initial))
     }
 
-    fn subscribe_locked(&self) -> Result<(u64, Receiver<OutputChunk>)> {
+    fn subscribe_locked(
+        &self,
+        shutdown: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
             bail!("too many attached subscribers for session {}", self.name);
         }
-        subscribers.push((id, tx));
+        subscribers.push(Subscriber { id, tx, shutdown });
         Ok((id, rx))
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
         let _output_guard = lock(&self.output_state);
-        lock(&self.subscribers).retain(|(id, _)| *id != subscriber_id);
+        lock(&self.subscribers).retain(|sub| sub.id != subscriber_id);
     }
 
     fn close_subscribers(&self) {
         let _output_guard = lock(&self.output_state);
         lock(&self.subscribers).clear();
     }
+}
+
+/// `disconnected` 에 해당하는 sub들을 `subscribers` 에서 제거하고 그들의 shutdown 훅을
+/// 반환한다. 호출자는 반환된 훅들을 **subscribers lock 을 해제한 뒤** 호출해야 한다 —
+/// shutdown 훅이 내부적으로 attach input loop 를 깨우고, 그 input loop 가 unsubscribe
+/// 경로로 들어오면 같은 lock을 다시 잡으려 하므로 lock 안에서 호출 시 deadlock 위험이 있다.
+fn evict_disconnected_subscribers(
+    subscribers: &mut Vec<Subscriber>,
+    disconnected: &[u64],
+) -> Vec<Arc<dyn Fn() + Send + Sync>> {
+    let mut shutdowns = Vec::new();
+    subscribers.retain(|sub| {
+        if disconnected.contains(&sub.id) {
+            shutdowns.push(Arc::clone(&sub.shutdown));
+            false
+        } else {
+            true
+        }
+    });
+    shutdowns
 }
 
 fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
@@ -829,7 +883,24 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
         }
     };
 
-    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot() {
+    // RC-2b: subscriber 가 backpressure 로 evict 될 때 호출되는 shutdown 훅 구성.
+    // 같은 socket fd 의 SHUT_RDWR 은 input loop의 stream.read()를 EOF 로 깨워 attach 전체를
+    // 종료시키므로, output 만 끊긴 채 input은 살아있는 zombie attach 가 만들어지지 않는다.
+    let shutdown_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(err) => {
+            let response = Response::err(format!("{err:#}"));
+            serde_json::to_writer(&mut stream, &response).ok();
+            stream.write_all(b"\n").ok();
+            return Ok(());
+        }
+    };
+    let shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
+    });
+
+    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(Arc::clone(&shutdown))
+    {
         Ok(subscription) => subscription,
         Err(err) => {
             let response = Response::err(format!("{err:#}"));
@@ -1347,7 +1418,10 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::process_group_still_owns_child;
+    use super::{Subscriber, evict_disconnected_subscribers, process_group_still_owns_child};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
 
     #[test]
     fn process_group_check_requires_current_child_group_match() {
@@ -1359,5 +1433,101 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    /// shutdown 호출 횟수를 세는 카운터를 가진 테스트용 Subscriber.
+    /// `tx` 의 receiver는 보관하지 않으므로 broadcast 가 실제로 일어나는 시나리오는
+    /// 검증하지 않는다 — 이 helper 의 책임은 evict 시 shutdown 훅이 정확히 호출되는지.
+    fn test_subscriber(id: u64, calls: Arc<AtomicU32>) -> Subscriber {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let calls_for_closure = Arc::clone(&calls);
+        Subscriber {
+            id,
+            tx,
+            shutdown: Arc::new(move || {
+                calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            }),
+        }
+    }
+
+    #[test]
+    fn evict_disconnected_returns_no_shutdowns_when_disconnected_empty() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut subs = vec![test_subscriber(1, Arc::clone(&calls))];
+
+        let shutdowns = evict_disconnected_subscribers(&mut subs, &[]);
+
+        assert!(
+            shutdowns.is_empty(),
+            "no disconnected → no shutdown handles"
+        );
+        assert_eq!(subs.len(), 1, "no eviction → subscriber remains");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "shutdown must not be called when nothing is evicted",
+        );
+    }
+
+    #[test]
+    fn evict_disconnected_removes_only_listed_ids_and_returns_their_shutdowns() {
+        let c1 = Arc::new(AtomicU32::new(0));
+        let c2 = Arc::new(AtomicU32::new(0));
+        let c3 = Arc::new(AtomicU32::new(0));
+        let mut subs = vec![
+            test_subscriber(1, Arc::clone(&c1)),
+            test_subscriber(2, Arc::clone(&c2)),
+            test_subscriber(3, Arc::clone(&c3)),
+        ];
+
+        let shutdowns = evict_disconnected_subscribers(&mut subs, &[1, 3]);
+
+        // shutdown 훅은 호출 전이라 카운터는 아직 0.
+        assert_eq!(shutdowns.len(), 2, "two shutdown handles for two evictions");
+        assert_eq!(c1.load(Ordering::SeqCst), 0);
+        assert_eq!(c3.load(Ordering::SeqCst), 0);
+
+        for shutdown in &shutdowns {
+            shutdown();
+        }
+
+        assert_eq!(subs.len(), 1, "only id=2 should remain");
+        assert_eq!(subs[0].id, 2);
+        assert_eq!(
+            c1.load(Ordering::SeqCst),
+            1,
+            "evicted id=1 shutdown called exactly once",
+        );
+        assert_eq!(
+            c2.load(Ordering::SeqCst),
+            0,
+            "retained id=2 shutdown must not be called",
+        );
+        assert_eq!(
+            c3.load(Ordering::SeqCst),
+            1,
+            "evicted id=3 shutdown called exactly once",
+        );
+    }
+
+    #[test]
+    fn evict_disconnected_dedups_when_same_id_listed_twice() {
+        // disconnected 목록에 id가 중복으로 들어와도 sub 은 단 한 번만 retain-out
+        // 되며 shutdown 도 한 번만 발생해야 한다 (idempotent eviction invariant).
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut subs = vec![test_subscriber(7, Arc::clone(&calls))];
+
+        let shutdowns = evict_disconnected_subscribers(&mut subs, &[7, 7]);
+        for shutdown in &shutdowns {
+            shutdown();
+        }
+
+        assert!(subs.is_empty(), "id=7 evicted");
+        assert_eq!(
+            shutdowns.len(),
+            1,
+            "single subscriber yields single shutdown handle even if id repeats in list",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
