@@ -30,18 +30,22 @@ type OutputChunk = Arc<[u8]>;
 
 /// attach 클라이언트 한 명의 lifecycle 단위.
 ///
-/// `tx`는 PTY 출력 broadcast 채널, `shutdown`은 채널이 backpressure로
-/// `Full`/`Disconnected` 가 되어 서브스크라이버를 강제 제거할 때 호출되는 훅이다.
-/// `handle_attach`은 `shutdown`에 attach `UnixStream` 의 `shutdown(Both)` 을
-/// 등록해, eviction 발생 시 그 클라이언트의 input loop도 EOF로 깨워 종료시킨다.
-/// 이 훅이 없으면 output 만 끊긴 채 input이 살아있는 "zombie attach"가 만들어져
-/// 사용자가 frozen으로 인지하면서도 keystroke 가 PTY로 흘러들어가 위험한
-/// 명령이 실행될 수 있다 (quad-review RC-2b).
+/// `tx`는 PTY 출력 broadcast 채널, `on_evict`는 채널이 backpressure로
+/// `Full`/`Disconnected` 가 되어 서브스크라이버를 강제 제거할 때 호출되는
+/// 콜백이다. `handle_attach`은 `on_evict`에 attach `UnixStream` 의
+/// `shutdown(Both)` 을 등록해, eviction 발생 시 그 클라이언트의 input loop도
+/// EOF로 깨워 종료시킨다. 이 콜백이 없으면 output 만 끊긴 채 input이 살아있는
+/// "zombie attach"가 만들어져 사용자가 frozen으로 인지하면서도 keystroke 가
+/// PTY로 흘러들어가 위험한 명령이 실행될 수 있다 (quad-review RC-2b).
+///
+/// 필드명을 `shutdown`이 아닌 `on_evict`로 둔 것은 Gemini quad-review LOW
+/// 피드백 반영: 구조체 필드의 동사형 이름(`shutdown`)은 boolean 상태로 오인되기
+/// 쉬워 callback 임을 명시적으로 드러내기 위함.
 #[derive(Clone)]
 struct Subscriber {
     id: u64,
     tx: SyncSender<OutputChunk>,
-    shutdown: Arc<dyn Fn() + Send + Sync>,
+    on_evict: Arc<dyn Fn() + Send + Sync>,
 }
 
 pub fn serve_forever() -> Result<()> {
@@ -254,20 +258,20 @@ impl Session {
 
     fn subscribe_with_snapshot(
         &self,
-        shutdown: Arc<dyn Fn() + Send + Sync>,
+        on_evict: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
         let _output_guard = lock(&self.output_state);
         let initial = {
             let ring = lock(&self.ring);
             ring.iter().copied().collect()
         };
-        let (id, rx) = self.subscribe_locked(shutdown)?;
+        let (id, rx) = self.subscribe_locked(on_evict)?;
         Ok((id, rx, initial))
     }
 
     fn subscribe_locked(
         &self,
-        shutdown: Arc<dyn Fn() + Send + Sync>,
+        on_evict: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
@@ -275,7 +279,7 @@ impl Session {
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
             bail!("too many attached subscribers for session {}", self.name);
         }
-        subscribers.push(Subscriber { id, tx, shutdown });
+        subscribers.push(Subscriber { id, tx, on_evict });
         Ok((id, rx))
     }
 
@@ -301,7 +305,7 @@ fn evict_disconnected_subscribers(
     let mut shutdowns = Vec::new();
     subscribers.retain(|sub| {
         if disconnected.contains(&sub.id) {
-            shutdowns.push(Arc::clone(&sub.shutdown));
+            shutdowns.push(Arc::clone(&sub.on_evict));
             false
         } else {
             true
@@ -895,12 +899,11 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
             return Ok(());
         }
     };
-    let shutdown: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
     });
 
-    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(Arc::clone(&shutdown))
-    {
+    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(on_evict) {
         Ok(subscription) => subscription,
         Err(err) => {
             let response = Response::err(format!("{err:#}"));
@@ -1444,7 +1447,7 @@ mod tests {
         Subscriber {
             id,
             tx,
-            shutdown: Arc::new(move || {
+            on_evict: Arc::new(move || {
                 calls_for_closure.fetch_add(1, Ordering::SeqCst);
             }),
         }
