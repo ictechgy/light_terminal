@@ -459,13 +459,20 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
     let status_enabled = status_bar_supported(show_status);
-    let status_info = if status_enabled {
-        Some(info(target)?)
-    } else {
-        None
-    };
+    // RC-1 단기 가드: attached_clients 정보가 필요해 status 비활성화 상태에서도
+    // info() 를 항상 호출한다. RPC 한 번 비용은 attach 시작 1회뿐이라 무시 가능.
+    let session_info = info(target)?;
+    let status_info = status_enabled.then(|| session_info.clone());
     let (cols, rows) = terminal_size();
-    let _ = resize(target, attach_pty_rows(rows, status_enabled), cols);
+    // RC-1 단기 가드: 다른 attach가 이미 활성이면 PTY winsize 를 우리 사이즈로 강제하지
+    // 않는다. server 의 last-writer-wins resize 정책 때문에, secondary attach 의
+    // forced resize 가 primary attach 의 PTY 사이즈를 망가뜨려 좁은 사이즈로 redraw 된
+    // 출력이 두 클라이언트 모두에게 broadcast 되는 corrupt 패턴이 발생한다 (image #2).
+    // 본 PR 단기 가드는 "첫 attach 만 사이즈 결정" 정책으로 단순화한다. per-client
+    // geometry tracking + clamp-to-smallest 정식 정책은 follow-up PR 에서 도입.
+    if should_send_initial_resize(&session_info) {
+        let _ = resize(target, attach_pty_rows(rows, status_enabled), cols);
+    }
 
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
@@ -552,11 +559,20 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             thread::sleep(Duration::from_millis(250));
             let current = terminal_size();
             if current != last {
-                let _ = resize(
-                    &resize_target,
-                    attach_pty_rows(current.1, status_enabled),
-                    current.0,
-                );
+                // RC-1 단기 가드: 자기 외 다른 attach 가 있으면 SIGWINCH 후속 resize 도
+                // skip. info() 호출 실패 시에는 안전하게 skip 한다.
+                // status refresh trigger (resize_tx) 는 항상 보낸다 — 우리 본인 화면
+                // 의 cols/rows 는 변했으므로 status row 는 새 폭으로 다시 그려야 한다.
+                let solo = info(&resize_target)
+                    .map(|i| should_send_winsize_update(&i))
+                    .unwrap_or(false);
+                if solo {
+                    let _ = resize(
+                        &resize_target,
+                        attach_pty_rows(current.1, status_enabled),
+                        current.0,
+                    );
+                }
                 let _ = resize_tx.try_send(());
                 last = current;
             }
@@ -682,6 +698,20 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
     } else {
         rows.max(1)
     }
+}
+
+/// 첫 attach 시점 (자기 자신이 아직 subscribe 되기 전) 의 forced PTY resize 를
+/// 보낼지 결정한다. 다른 attach 가 0 명일 때만 통과 — 즉 우리가 최초/유일 attach
+/// 일 때만 PTY winsize 의 owner 가 된다. RC-1 단기 가드.
+fn should_send_initial_resize(info: &SessionInfo) -> bool {
+    info.attached_clients == 0
+}
+
+/// SIGWINCH 후속 winsize 변경 (자기 자신이 이미 subscribed) 시 PTY resize 를
+/// 보낼지 결정한다. attached_clients 카운트는 자기 자신을 포함하므로, "1 이하"
+/// 는 자기 혼자 attached 인 상태를 의미한다. RC-1 단기 가드.
+fn should_send_winsize_update(info: &SessionInfo) -> bool {
+    info.attached_clients <= 1
 }
 
 /// status bar refresh + flush + dirty/last-refresh 플래그 동기화를 한 곳에 묶는다.
@@ -1517,7 +1547,9 @@ mod tests {
         ensure_panic_terminal_cleanup_hook, format_status_line, heartbeat_due,
         keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
         panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
+        should_send_initial_resize, should_send_winsize_update,
     };
+    use crate::protocol::SessionInfo;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
@@ -2132,5 +2164,52 @@ mod tests {
         assert_eq!(parse_status_style(" full "), Some(StatusStyle::Full));
         assert_eq!(parse_status_style("off"), None);
         assert_eq!(parse_status_style(""), None);
+    }
+
+    /// SessionInfo 의 필수 필드 중 본 테스트 군에 의미가 있는 attached_clients 만
+    /// 변동시키고 나머지는 의미 없는 default 로 채운다 — RC-1 가드 헬퍼는
+    /// attached_clients 만 본다.
+    fn mock_info(attached_clients: usize) -> SessionInfo {
+        SessionInfo {
+            id: String::new(),
+            name: String::new(),
+            pane_id: String::new(),
+            command: String::new(),
+            cwd: String::new(),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            parent_pane_id: None,
+            parent_session_id: None,
+            attached_clients,
+            process_id: None,
+            process_group_id: None,
+        }
+    }
+
+    #[test]
+    fn initial_resize_only_when_session_has_no_other_attached_client() {
+        // attach 시작 시점은 자기 자신이 아직 subscribe 되기 전이므로
+        // attached_clients == 0 만 통과해야 한다 (첫 attach 만 사이즈 owner).
+        assert!(should_send_initial_resize(&mock_info(0)));
+        assert!(!should_send_initial_resize(&mock_info(1)));
+        assert!(!should_send_initial_resize(&mock_info(2)));
+        assert!(!should_send_initial_resize(&mock_info(5)));
+    }
+
+    #[test]
+    fn winsize_update_allowed_when_self_is_solo_subscriber() {
+        // resize_thread 시점에는 자기 자신이 이미 subscribed 되어 있으므로
+        // attached_clients == 1 은 자기 혼자 attached 인 상태 = solo. 통과.
+        // == 0 은 race 상황(자기 자신이 아직 server view 에 등록 전 또는 막
+        // unsubscribe 직후 polling) 이라 통과 — 안전 측면에서 본인 사이즈로 맞춰도 무방.
+        // >= 2 는 다른 attach 가 존재하므로 거부.
+        assert!(should_send_winsize_update(&mock_info(0)));
+        assert!(should_send_winsize_update(&mock_info(1)));
+        assert!(!should_send_winsize_update(&mock_info(2)));
+        assert!(!should_send_winsize_update(&mock_info(3)));
+        assert!(!should_send_winsize_update(&mock_info(32)));
     }
 }
