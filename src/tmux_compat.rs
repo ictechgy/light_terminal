@@ -440,16 +440,19 @@ fn resize_pane(args: &[String]) -> Result<i32> {
             _ => i += 1,
         }
     }
+    // tmux-compat shim 은 attach 가 아닌 컨트롤 채널이므로 subscriber_id = None.
+    // server 는 per-client geometry 추적을 거치지 않고 즉시 master.resize 한다
+    // (PR #15 legacy 경로).
     match (rows, cols) {
         (Some(0), _) | (_, Some(0)) => bail!("resize dimensions must be at least 1"),
-        (Some(rows), Some(cols)) => client::resize(&target, rows, cols)?,
+        (Some(rows), Some(cols)) => client::resize(&target, rows, cols, None)?,
         (Some(rows), None) => {
             let info = client::info(&target)?;
-            client::resize(&target, rows, info.cols)?;
+            client::resize(&target, rows, info.cols, None)?;
         }
         (None, Some(cols)) => {
             let info = client::info(&target)?;
-            client::resize(&target, info.rows, cols)?;
+            client::resize(&target, info.rows, cols, None)?;
         }
         (None, None) => {}
     }

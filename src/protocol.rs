@@ -63,9 +63,25 @@ pub enum Request {
         target: String,
         rows: u16,
         cols: u16,
+        /// PR #15: 호출자 attach client 의 subscriber id. `Some(id)` 면 server 는
+        /// 해당 subscriber 의 per-client geometry 를 갱신한 뒤 모든 attach 의
+        /// `min(rows)` × `min(cols)` 로 PTY 사이즈를 재계산한다 (clamp-to-smallest).
+        /// `None` 이면 legacy 경로 — `lterm resize` CLI 나 tmux-compat shim 처럼
+        /// attach 가 아닌 컨트롤 채널이 직접 PTY 사이즈를 강제하는 케이스이며,
+        /// 이 경우 per-client geometry 추적을 거치지 않고 즉시 master.resize 한다.
+        /// `#[serde(default)]` 로 두어 구버전 와이어 페이로드와도 호환된다.
+        #[serde(default)]
+        subscriber_id: Option<u64>,
     },
     Attach {
         target: String,
+        /// PR #15: attach 시점의 클라이언트 로컬 터미널 행 수 (status row 차감 후의
+        /// PTY rows). `subscribe_with_snapshot` 이 이 값을 Subscriber 에 박아두고
+        /// clamp-to-smallest 정책의 인풋으로 사용한다. 와이어 호환성보다 정합성을
+        /// 우선해 필수 필드로 두며, daemon/client 는 같은 버전으로 빌드된다.
+        rows: u16,
+        /// PR #15: attach 시점의 클라이언트 로컬 터미널 열 수.
+        cols: u16,
     },
     AttachOrNew {
         target: String,

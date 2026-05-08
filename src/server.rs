@@ -41,11 +41,22 @@ type OutputChunk = Arc<[u8]>;
 /// 필드명을 `shutdown`이 아닌 `on_evict`로 둔 것은 Gemini quad-review LOW
 /// 피드백 반영: 구조체 필드의 동사형 이름(`shutdown`)은 boolean 상태로 오인되기
 /// 쉬워 callback 임을 명시적으로 드러내기 위함.
+///
+/// PR #15: per-client geometry 추적을 위해 `rows`/`cols` 를 들고 있는다. 이
+/// 두 필드는 Attach 시점의 초기값이 박히고, 이후 `Request::Resize` 에
+/// `subscriber_id == Some(id)` 가 들어올 때만 갱신된다. 모든 attach 의
+/// `min(rows)`, `min(cols)` 가 PTY winsize 가 되어, 가장 좁은 클라이언트 기준
+/// 으로 clamp 된다 (PR #14 의 client-side first-attach guard 를 대체하는
+/// canonical 정책 — 모바일 detach 시 desktop 사이즈로 자동 회복).
 #[derive(Clone)]
 struct Subscriber {
     id: u64,
     tx: SyncSender<OutputChunk>,
     on_evict: Arc<dyn Fn() + Send + Sync>,
+    /// 이 attach client 가 본다고 보고한 PTY rows (status row 차감 후).
+    rows: u16,
+    /// 이 attach client 가 본다고 보고한 PTY cols.
+    cols: u16,
 }
 
 pub fn serve_forever() -> Result<()> {
@@ -256,21 +267,36 @@ impl Session {
         bytes[spans[first].0..].to_vec()
     }
 
+    /// 새 attach client 를 등록한다. 초기 geometry (`rows`, `cols`) 는 attach 요청에
+    /// 실려 들어와 Subscriber 에 박힌다 — clamp-to-smallest 정책에 즉시 반영하기
+    /// 위함. 0×0 같은 degenerate 사이즈는 여기서 fail-fast 로 막아 invariant 를
+    /// 경계에서 강제한다 (Codex PR #14 review MEDIUM 의 후속 조치).
+    ///
+    /// PTY 사이즈 재계산은 호출자가 `apply_clamped_pty_size` 를 별도로 호출해야
+    /// 한다 — 본 함수는 `output_state` lock 을 잡고 있고, master.resize 와
+    /// subscribers lock 을 같이 잡는 경로와 lock 순서가 꼬이는 것을 피하기 위함.
     fn subscribe_with_snapshot(
         &self,
+        rows: u16,
+        cols: u16,
         on_evict: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
+        if rows == 0 || cols == 0 {
+            bail!("subscribe geometry must be at least 1x1");
+        }
         let _output_guard = lock(&self.output_state);
         let initial = {
             let ring = lock(&self.ring);
             ring.iter().copied().collect()
         };
-        let (id, rx) = self.subscribe_locked(on_evict)?;
+        let (id, rx) = self.subscribe_locked(rows, cols, on_evict)?;
         Ok((id, rx, initial))
     }
 
     fn subscribe_locked(
         &self,
+        rows: u16,
+        cols: u16,
         on_evict: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
@@ -279,19 +305,88 @@ impl Session {
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
             bail!("too many attached subscribers for session {}", self.name);
         }
-        subscribers.push(Subscriber { id, tx, on_evict });
+        subscribers.push(Subscriber {
+            id,
+            tx,
+            on_evict,
+            rows,
+            cols,
+        });
         Ok((id, rx))
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
-        let _output_guard = lock(&self.output_state);
-        lock(&self.subscribers).retain(|sub| sub.id != subscriber_id);
+        {
+            let _output_guard = lock(&self.output_state);
+            lock(&self.subscribers).retain(|sub| sub.id != subscriber_id);
+        }
+        // detach 후에는 살아있는 클라이언트 들의 min 으로 PTY 사이즈를 회복시킨다 —
+        // 좁은 mobile 이 떠나면 wide desktop 사이즈로 다시 자라야 하는 핵심 시나리오.
+        // 잔여 subscriber 가 0 이면 helper 가 no-op 으로 떨어져 PTY 사이즈는 마지막
+        // 값에 그대로 남는다 (다음 attach 가 도착하면 그 시점에 다시 clamp).
+        let _ = self.apply_clamped_pty_size();
     }
 
     fn close_subscribers(&self) {
         let _output_guard = lock(&self.output_state);
         lock(&self.subscribers).clear();
     }
+
+    /// 살아있는 모든 attach client 의 geometry 로 PTY 사이즈를 재계산한다 (PR #15
+    /// canonical clamp-to-smallest 정책). subscriber 가 한 명도 없으면 PTY 사이즈는
+    /// 그대로 두어 다음 attach 가 새 정책을 결정하도록 한다.
+    ///
+    /// **lock 순서**: subscribers lock 을 짧게 잡아 min 만 계산하고 즉시 해제한 뒤,
+    /// 별도로 master lock 을 잡아 resize 한다. 두 lock 을 동시에 잡지 않는 이유는
+    /// `append_output` 이 subscribers lock 을 먼저 잡고 try_send 를 통해 broadcast
+    /// 채널을 거치는 경로와 lock 순서를 어긋나게 하지 않기 위함이다. master.resize
+    /// 가 차단될 가능성은 낮지만, 잡은 김에 두 락을 같이 잡으면 deadlock 이 생기는
+    /// 코드를 미래에 흘리기 쉬워진다.
+    ///
+    /// **`output_state` 와의 관계**: 이 함수는 `output_state` 가 잡혀 있지 **않은**
+    /// 상태에서 호출되어야 한다. `subscribe_with_snapshot` 의 caller 는 그 함수가
+    /// 반환된 *후* 에 본 helper 를 호출해 lock 충돌을 피한다.
+    fn apply_clamped_pty_size(&self) -> Result<()> {
+        let target = {
+            let subscribers = lock(&self.subscribers);
+            clamp_to_smallest(&subscribers)
+        };
+        let Some((rows, cols)) = target else {
+            return Ok(());
+        };
+        let mut current_rows = lock(&self.rows);
+        let mut current_cols = lock(&self.cols);
+        if *current_rows == rows && *current_cols == cols {
+            return Ok(());
+        }
+        lock(&self.master)
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("resize pty to clamped subscriber geometry")?;
+        *current_rows = rows;
+        *current_cols = cols;
+        Ok(())
+    }
+}
+
+/// 모든 attach client 의 geometry 중 컴포넌트별 최소값을 반환한다. 빈 리스트 면
+/// `None` — 호출자가 "잔여 subscriber 가 없으니 PTY 를 그대로 두자" 같은 분기를
+/// 명시적으로 표현할 수 있게 한다. 순수 함수로 떼낸 것은 단위 테스트에서 lock 이나
+/// PTY 모킹 없이 정책을 검증하기 위함.
+fn clamp_to_smallest(subscribers: &[Subscriber]) -> Option<(u16, u16)> {
+    let mut iter = subscribers.iter();
+    let first = iter.next()?;
+    let mut rows = first.rows;
+    let mut cols = first.cols;
+    for sub in iter {
+        rows = rows.min(sub.rows);
+        cols = cols.min(sub.cols);
+    }
+    Some((rows, cols))
 }
 
 /// `disconnected` 에 해당하는 sub들을 `subscribers` 에서 제거하고 그들의 shutdown 훅을
@@ -327,8 +422,8 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     let request: Request = serde_json::from_str(&line)
         .with_context(|| format!("parse request: {}", sanitized_preview(&line)))?;
 
-    if let Request::Attach { target } = request {
-        return handle_attach(state, stream, &target);
+    if let Request::Attach { target, rows, cols } = request {
+        return handle_attach(state, stream, &target, rows, cols);
     }
 
     let shutdown = matches!(request, Request::Shutdown);
@@ -470,21 +565,52 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             let session = resolve_session(state, &target)?;
             Ok(Response::ok(session.capture(start)))
         }
-        Request::Resize { target, rows, cols } => {
+        Request::Resize {
+            target,
+            rows,
+            cols,
+            subscriber_id,
+        } => {
             if rows == 0 || cols == 0 {
                 bail!("resize dimensions must be at least 1 row and 1 column");
             }
             let session = resolve_session(state, &target)?;
-            lock(&session.master)
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("resize pty")?;
-            *lock(&session.rows) = rows;
-            *lock(&session.cols) = cols;
+            match subscriber_id {
+                // PR #15: attach client 발 SIGWINCH 갱신. per-client geometry 만 갱신한
+                // 뒤 모든 attach 의 min 으로 PTY 를 재계산한다 (clamp-to-smallest).
+                // 매칭되는 id 가 없으면 stale subscriber id 를 보낸 것이므로 silent
+                // no-op 대신 명시적 에러로 surface 시켜 client 측 race 를 드러낸다.
+                Some(id) => {
+                    {
+                        let mut subscribers = lock(&session.subscribers);
+                        let sub = subscribers
+                            .iter_mut()
+                            .find(|sub| sub.id == id)
+                            .with_context(|| {
+                                format!("resize: subscriber id {id} no longer attached")
+                            })?;
+                        sub.rows = rows;
+                        sub.cols = cols;
+                    }
+                    session.apply_clamped_pty_size()?;
+                }
+                // legacy 경로: `lterm resize` CLI 와 tmux-compat shim 처럼 attach 가
+                // 아닌 컨트롤 채널이 직접 PTY 사이즈를 강제하는 케이스. per-client
+                // geometry 추적을 거치지 않고 즉시 master.resize 한다 — 와이어
+                // 호환성 유지.
+                None => {
+                    lock(&session.master)
+                        .resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .context("resize pty")?;
+                    *lock(&session.rows) = rows;
+                    *lock(&session.cols) = cols;
+                }
+            }
             Ok(Response::empty())
         }
         Request::Shutdown => {
@@ -495,7 +621,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             }
             Ok(Response::empty())
         }
-        Request::Attach { .. } => unreachable!(),
+        Request::Attach { .. } => unreachable!("handled by handle_attach above"),
     }
 }
 
@@ -876,7 +1002,13 @@ fn reserve_session_identity(
     })
 }
 
-fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Result<()> {
+fn handle_attach(
+    state: Arc<State>,
+    mut stream: UnixStream,
+    target: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
     let session = match resolve_session(&state, target) {
         Ok(session) => session,
         Err(err) => {
@@ -903,7 +1035,10 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
         let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
     });
 
-    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(on_evict) {
+    // PR #15: Attach 요청에 실린 클라이언트 geometry 를 Subscriber 에 박는다.
+    // subscribe_with_snapshot 은 output_state lock 을 잡고 있으므로 PTY 사이즈
+    // 재계산은 반환된 후 별도로 호출한다 (lock 순서 분리).
+    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(rows, cols, on_evict) {
         Ok(subscription) => subscription,
         Err(err) => {
             let response = Response::err(format!("{err:#}"));
@@ -912,7 +1047,22 @@ fn handle_attach(state: Arc<State>, mut stream: UnixStream, target: &str) -> Res
             return Ok(());
         }
     };
-    serde_json::to_writer(&mut stream, &Response::empty()).context("write attach ok")?;
+    // 등록 직후 clamp-to-smallest 재계산. 이 시점에 narrow client 가 새로 join 하면
+    // PTY 가 즉시 좁아지고, 반대로 wide client 만 있던 상태로 join 하면 우리도 같은
+    // 사이즈를 보고했을 가능성이 높아 변경 없이 통과한다.
+    if let Err(err) = session.apply_clamped_pty_size() {
+        let response = Response::err(format!("{err:#}"));
+        serde_json::to_writer(&mut stream, &response).ok();
+        stream.write_all(b"\n").ok();
+        // clamp 실패 — 이 클라이언트는 attach 흐름을 중단해야 한다. 이미 등록된
+        // subscriber 를 정리해 stale 한 ghost subscriber 가 남지 않게 한다.
+        session.unsubscribe(subscriber_id);
+        return Ok(());
+    }
+    // PR #15: 클라이언트가 후속 Resize 요청에서 사용할 subscriber id 를 응답에 실어
+    // 보낸다. Response 모양은 그대로 두고 result 필드에만 JSON 객체로 박는다.
+    let response = Response::ok(serde_json::json!({ "subscriber_id": subscriber_id }));
+    serde_json::to_writer(&mut stream, &response).context("write attach ok")?;
     stream.write_all(b"\n").context("write attach ok newline")?;
     if !initial.is_empty() {
         stream.write_all(&initial).ok();
@@ -1421,7 +1571,10 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{Subscriber, evict_disconnected_subscribers, process_group_still_owns_child};
+    use super::{
+        Subscriber, clamp_to_smallest, evict_disconnected_subscribers,
+        process_group_still_owns_child,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
@@ -1441,6 +1594,8 @@ mod tests {
     /// shutdown 호출 횟수를 세는 카운터를 가진 테스트용 Subscriber.
     /// `tx` 의 receiver는 보관하지 않으므로 broadcast 가 실제로 일어나는 시나리오는
     /// 검증하지 않는다 — 이 helper 의 책임은 evict 시 shutdown 훅이 정확히 호출되는지.
+    /// rows/cols 는 evict 테스트와 무관하므로 24×80 default 로 둔다 — clamp 정책
+    /// 단위 테스트는 별도 helper `geom_subscriber` 를 사용한다.
     fn test_subscriber(id: u64, calls: Arc<AtomicU32>) -> Subscriber {
         let (tx, _rx) = mpsc::sync_channel(1);
         let calls_for_closure = Arc::clone(&calls);
@@ -1450,6 +1605,21 @@ mod tests {
             on_evict: Arc::new(move || {
                 calls_for_closure.fetch_add(1, Ordering::SeqCst);
             }),
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    /// clamp_to_smallest 단위 테스트용 Subscriber. evict 카운터 없이 geometry 만
+    /// 의미가 있다 — on_evict 는 호출되지 않으므로 빈 closure 로 둔다.
+    fn geom_subscriber(id: u64, rows: u16, cols: u16) -> Subscriber {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        Subscriber {
+            id,
+            tx,
+            on_evict: Arc::new(|| {}),
+            rows,
+            cols,
         }
     }
 
@@ -1532,5 +1702,45 @@ mod tests {
             "single subscriber yields single shutdown handle even if id repeats in list",
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 빈 리스트는 None — 호출자가 "잔여 attach 가 없으니 PTY 를 그대로 두자" 분기를
+    /// 자연스럽게 표현하도록 한다 (PR #15: detach 후 마지막 사이즈 보존 정책의 기반).
+    #[test]
+    fn clamp_to_smallest_returns_none_for_empty_list() {
+        let subs: Vec<Subscriber> = Vec::new();
+        assert_eq!(clamp_to_smallest(&subs), None);
+    }
+
+    /// 단일 subscriber 면 그대로 반환. clamp 의 항등원 케이스.
+    #[test]
+    fn clamp_to_smallest_returns_single_subscriber_dims() {
+        let subs = vec![geom_subscriber(1, 30, 100)];
+        assert_eq!(clamp_to_smallest(&subs), Some((30, 100)));
+    }
+
+    /// rows/cols 가 서로 어긋난 두 client — 컴포넌트별 min 을 따로 잡는다.
+    /// 한 클라이언트는 rows 가 더 좁고 cols 는 더 넓고, 다른 쪽은 rows 가 더 넓고
+    /// cols 는 더 좁은 케이스. PTY 는 양쪽 모두 안전하게 표시되도록 컴포넌트별
+    /// 가장 좁은 값을 따라가야 한다.
+    #[test]
+    fn clamp_to_smallest_picks_componentwise_min_of_two() {
+        let subs = vec![
+            geom_subscriber(1, 24, 200), // 좁은 rows, 넓은 cols
+            geom_subscriber(2, 60, 80),  // 넓은 rows, 좁은 cols
+        ];
+        assert_eq!(clamp_to_smallest(&subs), Some((24, 80)));
+    }
+
+    /// 셋 이상이면 가장 좁은 값을 따라간다. desktop+tablet+mobile 시나리오의
+    /// canonical assertion.
+    #[test]
+    fn clamp_to_smallest_picks_narrowest_of_three() {
+        let subs = vec![
+            geom_subscriber(1, 60, 200), // wide desktop
+            geom_subscriber(2, 40, 120), // mid tablet
+            geom_subscriber(3, 24, 80),  // narrow mobile
+        ];
+        assert_eq!(clamp_to_smallest(&subs), Some((24, 80)));
     }
 }

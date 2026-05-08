@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1415,4 +1417,262 @@ fn kill_reaps_session_process_group_children() -> TestResult {
         thread::sleep(Duration::from_millis(50));
     }
     Err(format!("child process {child_pid} survived lterm kill").into())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// PR #15: server-side per-client geometry + clamp-to-smallest 통합 테스트.
+//
+// `lterm attach` 는 raw TTY 가 필요해 일반 subprocess 로는 띄울 수 없으므로,
+// 라이브러리 의존 없이 daemon 의 Unix socket 에 직접 JSON 프로토콜로 attach 한다.
+// 두 attach 를 다른 geometry 로 등록한 뒤 `lterm list --json` 으로 PTY rows/cols
+// 를 읽어 clamp 가 정확히 적용되는지, 좁은 쪽이 detach 하면 PTY 가 다시 자라는지를
+// 검증한다. 이 테스트는 client-side 가드를 우회해 server 정책 만 직접 보는 것이
+// 목적이라 내부 protocol 모듈을 import 하지 않는다 — wire-level JSON 으로 충분하다.
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn socket_path_for(env: &TestEnv) -> std::path::PathBuf {
+    env.temp.path().join("run").join("lterm.sock")
+}
+
+/// daemon 이 socket 을 listen 시작할 때까지 기다린다. `lterm new` 가 daemon 을
+/// fork 하므로 호출 직후 곧바로 connect 하면 ECONNREFUSED 가 날 수 있다.
+#[cfg(unix)]
+fn wait_for_socket(path: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if UnixStream::connect(path).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("daemon socket {} did not appear in time", path.display()).into())
+}
+
+/// 한 줄짜리 JSON 응답을 읽어 `serde_json::Value` 로 반환한다. attach 응답은
+/// `{"ok":true,"result":{"subscriber_id":N}}\n` 모양.
+#[cfg(unix)]
+fn read_response_line(stream: &mut UnixStream) -> TestResult<serde_json::Value> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    while Instant::now() < deadline {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err("daemon closed before sending response line".into()),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    let value: serde_json::Value = serde_json::from_slice(&line)?;
+                    return Ok(value);
+                }
+                line.push(byte[0]);
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err("timed out waiting for response line".into())
+}
+
+/// 주어진 geometry 로 attach 한 뒤 응답에서 subscriber_id 를 꺼낸다. 호출자는
+/// 반환된 stream 을 살려두어야 attach 가 유지되며, drop 하면 server 가 EOF 를 보고
+/// unsubscribe 해 자연스럽게 detach 된다.
+#[cfg(unix)]
+fn attach_with_geometry(
+    socket: &Path,
+    target: &str,
+    rows: u16,
+    cols: u16,
+) -> TestResult<(UnixStream, u64)> {
+    let mut stream = UnixStream::connect(socket)?;
+    let request = serde_json::json!({
+        "type": "attach",
+        "target": target,
+        "rows": rows,
+        "cols": cols,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(format!("attach failed: {response}").into());
+    }
+    let subscriber_id = response
+        .get("result")
+        .and_then(|v| v.get("subscriber_id"))
+        .and_then(|v| v.as_u64())
+        .ok_or("attach response missing subscriber_id")?;
+    Ok((stream, subscriber_id))
+}
+
+/// `lterm list --json` 으로 단일 세션의 (rows, cols) 를 조회한다.
+#[cfg(unix)]
+fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
+    let output = env.cmd().args(["list", "--json"]).output()?;
+    if !output.status.success() {
+        return Err(format!("lterm list --json failed: {output:?}").into());
+    }
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    let session = sessions
+        .iter()
+        .find(|s| s.get("name").and_then(|v| v.as_str()) == Some(name))
+        .ok_or_else(|| format!("session {name} not in list"))?;
+    let rows = session
+        .get("rows")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing rows")? as u16;
+    let cols = session
+        .get("cols")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing cols")? as u16;
+    Ok((rows, cols))
+}
+
+/// 조건이 충족될 때까지 짧은 간격으로 폴링. apply_clamped_pty_size 와 list 사이에
+/// 약간의 시차가 있을 수 있어 spin 보다 polling 이 안전하다.
+#[cfg(unix)]
+fn wait_for_size(env: &TestEnv, name: &str, want: (u16, u16)) -> TestResult<(u16, u16)> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = (0_u16, 0_u16);
+    while Instant::now() < deadline {
+        last = read_session_size(env, name)?;
+        if last == want {
+            return Ok(last);
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    Err(format!("session {name} size = {last:?}, expected {want:?}").into())
+}
+
+/// PR #15 핵심 시나리오: wide desktop attach + narrow mobile attach 가 공존하는
+/// 동안 PTY 는 둘의 컴포넌트별 min 으로 clamp 되어야 한다. mobile 이 detach 하면
+/// PTY 는 desktop 의 사이즈로 다시 자라야 한다 — PR #14 의 polling-only 가드는
+/// 잡지 못했던 자동 회복 시나리오이다.
+#[test]
+#[cfg(unix)]
+fn pty_size_clamps_to_smallest_attached_client_and_recovers_on_detach() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "clamp-test",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+
+    // wide desktop 먼저 attach. 이 시점엔 attach 한 명뿐이라 PTY 는 desktop 사이즈.
+    let (desktop_stream, _desktop_id) = attach_with_geometry(&socket, "clamp-test", 40, 152)?;
+    wait_for_size(&env, "clamp-test", (40, 152))?;
+
+    // narrow mobile 이 추가로 attach 하면 컴포넌트별 min 으로 clamp 되어야 한다.
+    let (mobile_stream, _mobile_id) = attach_with_geometry(&socket, "clamp-test", 24, 80)?;
+    wait_for_size(&env, "clamp-test", (24, 80))?;
+
+    // mobile detach (socket close → server 측 EOF → unsubscribe → apply clamp).
+    // unsubscribe 가 끝나면 PTY 는 살아있는 desktop 만의 사이즈로 자라야 한다.
+    drop(mobile_stream);
+    wait_for_size(&env, "clamp-test", (40, 152))?;
+
+    drop(desktop_stream);
+    Ok(())
+}
+
+/// stale subscriber id 를 실어 보낸 Resize 는 silent no-op 이 아니라 명시적
+/// 에러로 surface 되어야 한다. 그렇지 않으면 client-side race 가 보이지 않는
+/// 채로 PTY 사이즈가 영원히 어긋난 상태로 남을 수 있다.
+#[test]
+#[cfg(unix)]
+fn resize_with_stale_subscriber_id_returns_error() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new", "--detach", "--name", "stale-id", "--", "sh", "-lc", "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_socket(&socket)?;
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "stale-id",
+        "rows": 24_u16,
+        "cols": 80_u16,
+        "subscriber_id": 9_999_999_u64,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "stale subscriber id must yield ok=false; response={response}"
+    );
+    let error = response.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        error.contains("subscriber id"),
+        "error should mention subscriber id; got {error:?}"
+    );
+    Ok(())
+}
+
+/// rows == 0 또는 cols == 0 의 degenerate Resize 는 server 가 거부해야 한다 —
+/// 기존에도 동일하게 동작했으나 PR #15 는 subscriber_id 분기와 함께 같은 가드를
+/// 그대로 유지하므로 회귀 방지용 회로로 한 번 더 박는다.
+#[test]
+#[cfg(unix)]
+fn resize_with_zero_dimensions_returns_error() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "zero-resize",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_socket(&socket)?;
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "zero-resize",
+        "rows": 0_u16,
+        "cols": 80_u16,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "zero rows must be rejected; response={response}"
+    );
+    Ok(())
 }

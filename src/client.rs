@@ -237,12 +237,18 @@ pub fn capture(target: &str, start: Option<i32>) -> Result<String> {
     })
 }
 
-pub fn resize(target: &str, rows: u16, cols: u16) -> Result<()> {
+/// PTY resize 요청. `subscriber_id` 가 `Some(id)` 면 server 가 해당 attach client 의
+/// per-client geometry 를 갱신한 뒤 모든 attach 의 min 으로 PTY 사이즈를 재계산
+/// 한다 (PR #15 clamp-to-smallest). `None` 이면 legacy 경로 — `lterm resize` CLI
+/// 와 tmux-compat shim 처럼 attach 가 아닌 컨트롤 채널에서 직접 PTY 사이즈를
+/// 강제하는 케이스에서 사용한다.
+pub fn resize(target: &str, rows: u16, cols: u16, subscriber_id: Option<u64>) -> Result<()> {
     ensure_server()?;
     rpc::<serde_json::Value>(&Request::Resize {
         target: target.to_string(),
         rows,
         cols,
+        subscriber_id,
     })?;
     Ok(())
 }
@@ -459,26 +465,27 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
     let status_enabled = status_bar_supported(show_status);
-    // RC-1 단기 가드: attached_clients 정보가 필요해 status 비활성화 상태에서도
-    // info() 를 항상 호출한다. RPC 한 번 비용은 attach 시작 1회뿐이라 무시 가능.
-    let session_info = info(target)?;
-    let status_info = status_enabled.then(|| session_info.clone());
+    // status bar 는 SessionInfo 의 메타데이터 (이름/명령 등) 가 필요하므로 켜졌을 때만
+    // info() 를 호출한다. PR #14 의 client-side first-attach guard 가 사라졌으므로
+    // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
+    // smallest 로 사이즈 정책을 결정한다 (PR #15).
+    let status_info = if status_enabled {
+        Some(info(target)?)
+    } else {
+        None
+    };
     let (cols, rows) = terminal_size();
-    // RC-1 단기 가드: 다른 attach가 이미 활성이면 PTY winsize 를 우리 사이즈로 강제하지
-    // 않는다. server 의 last-writer-wins resize 정책 때문에, secondary attach 의
-    // forced resize 가 primary attach 의 PTY 사이즈를 망가뜨려 좁은 사이즈로 redraw 된
-    // 출력이 두 클라이언트 모두에게 broadcast 되는 corrupt 패턴이 발생한다 (image #2).
-    // 본 PR 단기 가드는 "첫 attach 만 사이즈 결정" 정책으로 단순화한다. per-client
-    // geometry tracking + clamp-to-smallest 정식 정책은 follow-up PR 에서 도입.
-    if is_sole_subscriber_pre_attach(session_info.attached_clients) {
-        let _ = resize(target, attach_pty_rows(rows, status_enabled), cols);
-    }
+    let pty_rows = attach_pty_rows(rows, status_enabled);
 
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+    // PR #15: attach 시점의 클라이언트 geometry 를 함께 보낸다. server 는 이 값을
+    // 바로 Subscriber 에 박아 clamp-to-smallest 정책의 인풋으로 쓴다.
     let request = Request::Attach {
         target: target.to_string(),
+        rows: pty_rows,
+        cols,
     };
     stream.write_all(&serde_json::to_vec(&request)?)?;
     stream.write_all(b"\n")?;
@@ -506,6 +513,16 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 .unwrap_or_else(|| "attach failed".to_string())
         );
     }
+    // PR #15: 응답에 박힌 subscriber id 를 꺼낸다. 이후 resize_thread 가 이 id 를
+    // Resize 요청에 실어 보내야 server 가 우리 per-client geometry 를 정확히
+    // 갱신할 수 있다. 응답 모양이 깨졌으면 attach 자체를 중단해 stale id 가
+    // 흘러들어가는 것을 막는다.
+    let subscriber_id = response
+        .result
+        .as_ref()
+        .and_then(|v| v.get("subscriber_id"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("attach response missing subscriber_id"))?;
 
     // RawModeGuard 먼저 → AttachActiveGuard 가 raw mode가 실제 세팅된 이후에만 활성.
     // Drop 역순: status_bar → _attach_active(flag false) → _raw(raw mode 복원).
@@ -559,31 +576,21 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             thread::sleep(Duration::from_millis(250));
             let current = terminal_size();
             if current != last {
-                // RC-1 단기 가드: 자기 외 다른 attach 가 있으면 SIGWINCH 후속 resize 를 skip.
-                // info() 가 성공해야만 정책 결정이 완료된 것으로 간주하고 last 를 갱신한다.
-                // info() 실패 시 last 를 갱신하면 다음 SIGWINCH 변화까지 영구히 resize 가
-                // 미반영되는 race 가 생긴다 (Codex/Forge quad-review MEDIUM 합의로 fold-in).
-                // status refresh trigger (resize_tx) 는 두 경로 모두 항상 보낸다 — 우리 본인
-                // 화면의 cols/rows 는 변했으므로 status row 는 새 폭으로 다시 그려야 한다.
-                match info(&resize_target) {
-                    Ok(session_info) => {
-                        if is_sole_subscriber_post_attach(session_info.attached_clients) {
-                            let _ = resize(
-                                &resize_target,
-                                attach_pty_rows(current.1, status_enabled),
-                                current.0,
-                            );
-                        }
-                        let _ = resize_tx.try_send(());
-                        last = current;
-                    }
-                    Err(_) => {
-                        // info() 실패 — 정책 결정 미완료. 다음 tick 에 재시도하기 위해 last
-                        // 를 갱신하지 않는다. 사용자 화면의 status row 는 어쨌든 새 폭으로
-                        // 다시 그려져야 하므로 status refresh trigger 만 보낸다.
-                        let _ = resize_tx.try_send(());
-                    }
-                }
+                // PR #15: server-side clamp-to-smallest 가 PTY 사이즈의 source of truth.
+                // SIGWINCH 가 감지되면 우리 subscriber id 를 실어 무조건 Resize 를 보낸다.
+                // server 는 이 client 의 per-client geometry 만 갱신한 뒤 모든 attach 의
+                // min 으로 PTY 를 재계산하므로, 더 이상 client-side 에서 "다른 attach 가
+                // 있는가" 를 판단할 필요가 없다 (PR #14 단기 가드 폐기).
+                let _ = resize(
+                    &resize_target,
+                    attach_pty_rows(current.1, status_enabled),
+                    current.0,
+                    Some(subscriber_id),
+                );
+                // 우리 화면의 cols/rows 는 변했으므로 status row 는 새 폭으로 다시
+                // 그려야 한다. resize 결과와 무관하게 status refresh 는 항상 보낸다.
+                let _ = resize_tx.try_send(());
+                last = current;
             }
         }
     });
@@ -707,30 +714,6 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
     } else {
         rows.max(1)
     }
-}
-
-/// 첫 attach 시점 (자기 자신이 아직 subscribe 되기 전) 의 forced PTY resize 를
-/// 보낼지 결정한다. 다른 attach 가 0 명일 때만 통과 — 즉 우리가 최초/유일 attach
-/// 일 때만 PTY winsize 의 owner 가 된다. RC-1 단기 가드.
-///
-/// `&SessionInfo` 가 아닌 `usize` 만 받는다 (Forge/Gemini quad-review LOW): 이
-/// 결정은 `attached_clients` 한 필드만 본다. 호출자가 SessionInfo 의 다른
-/// 필드까지 의존한다는 잘못된 인상을 주지 않기 위해 단일 정수만 노출한다.
-fn is_sole_subscriber_pre_attach(attached_clients: usize) -> bool {
-    attached_clients == 0
-}
-
-/// SIGWINCH 후속 winsize 변경 (자기 자신이 이미 subscribed) 시 PTY resize 를
-/// 보낼지 결정한다. attached_clients 는 자기 자신을 포함하므로 정확히 1 일 때만
-/// "자기 혼자 attached" 상태이고 PTY 사이즈 owner 권한을 갖는다. RC-1 단기 가드.
-///
-/// `== 1` 만 통과시키는 것이 quad-review 합의 (Codex MEDIUM + Forge HIGH 격상).
-/// `0` 으로 보이는 케이스는 race window 가 아니라 **이 클라이언트가 이미 server
-/// 측에서 evict 됐다는 신호**이다 (PR #13 backpressure shutdown 경로). 이때
-/// resize 를 보내면 detach 직전 stale geometry 를 PTY 에 반영하게 되므로 거부.
-/// 다음 tick 에 attach lifecycle 자체가 종료되므로 안전한 fail-closed 정책이다.
-fn is_sole_subscriber_post_attach(attached_clients: usize) -> bool {
-    attached_clients == 1
 }
 
 /// status bar refresh + flush + dirty/last-refresh 플래그 동기화를 한 곳에 묶는다.
@@ -1564,7 +1547,6 @@ mod tests {
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle, TerminalOutputTracker,
         alt_screen_param_matches, attach_pty_rows, cursor_clamp_into_scroll_region,
         ensure_panic_terminal_cleanup_hook, format_status_line, heartbeat_due,
-        is_sole_subscriber_post_attach, is_sole_subscriber_pre_attach,
         keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
         panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
     };
@@ -2182,31 +2164,5 @@ mod tests {
         assert_eq!(parse_status_style(" full "), Some(StatusStyle::Full));
         assert_eq!(parse_status_style("off"), None);
         assert_eq!(parse_status_style(""), None);
-    }
-
-    #[test]
-    fn pre_attach_solo_only_when_no_other_client() {
-        // attach 시작 시점은 자기 자신이 아직 subscribe 되기 전이므로
-        // attached_clients == 0 만 통과해야 한다 (첫 attach 만 사이즈 owner).
-        assert!(is_sole_subscriber_pre_attach(0));
-        assert!(!is_sole_subscriber_pre_attach(1));
-        assert!(!is_sole_subscriber_pre_attach(2));
-        assert!(!is_sole_subscriber_pre_attach(5));
-    }
-
-    #[test]
-    fn post_attach_solo_only_when_count_is_exactly_one() {
-        // resize_thread 시점에는 자기 자신이 이미 subscribed. 정확히 1 일 때만
-        // 자기 혼자 attached = solo. 0 은 race 가 아니라 server-side 에서
-        // 이미 evict 되었다는 신호이므로 fail-closed (Codex MEDIUM + Forge HIGH
-        // 합의로 `<= 1` 에서 `== 1` 로 좁힘).
-        assert!(
-            !is_sole_subscriber_post_attach(0),
-            "0 means self was evicted; resize must be rejected, not allowed"
-        );
-        assert!(is_sole_subscriber_post_attach(1));
-        assert!(!is_sole_subscriber_post_attach(2));
-        assert!(!is_sole_subscriber_post_attach(3));
-        assert!(!is_sole_subscriber_post_attach(32));
     }
 }
