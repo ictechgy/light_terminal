@@ -1676,3 +1676,113 @@ fn resize_with_zero_dimensions_returns_error() -> TestResult {
     );
     Ok(())
 }
+
+/// PR #16: attach 직후 ring snapshot 이 broadcast 채널의 첫 chunk 로 흘러들어 attach
+/// stdout 의 head 에 박혀야 하고, 그 뒤에 라이브 chunk 들이 순서대로 따라와야 한다.
+/// PRELUDE 가 ring 에 자리 잡은 뒤 attach 하고, attach 가 시작된 다음 `lterm send` 로
+/// 새 출력을 푸시해 attach stdout 에서 PRELUDE → LIVE 순서를 확인한다.
+#[test]
+#[cfg(unix)]
+fn attach_replays_ring_snapshot_before_live_output() -> TestResult {
+    let env = TestEnv::new()?;
+    // ring 에 PRELUDE 를 쌓을 시간을 주기 위해 한 번 출력하고 잠시 대기하는 세션.
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "snap-order",
+            "--",
+            "sh",
+            "-lc",
+            // PS1 가 들어오지 않도록 -i 없이 단순 sleep. PRELUDE 를 한 번 찍고 충분히
+            // 길게 sleep 해 attach 시점에도 세션이 살아있게 한다.
+            "printf 'PRELUDE\\n'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    // PRELUDE 가 ring 에 들어갔는지 capture 로 폴링 — 들어가기 전에 attach 하면
+    // snapshot 이 비어 있어 본 테스트가 검증하려는 순서가 무의미해진다.
+    env.capture_until("snap-order", "PRELUDE")?;
+
+    // attach 를 stdin/stdout pipe 로 띄운다 — `--no-status` 는 status bar 의
+    // alt-screen / cursor 제어 이스케이프를 stdout 에 끼지 않게 한다.
+    let mut attach = env
+        .cmd()
+        .args(["attach", "snap-order", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _stdin = attach.stdin.take().ok_or("missing attach stdin")?;
+    let mut stdout = attach.stdout.take().ok_or("missing attach stdout")?;
+
+    // attach stdout 에서 PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가 ring snapshot
+    // 이라는 PR #16 invariant.
+    let prelude_pos = read_until_marker(&mut stdout, b"PRELUDE", Duration::from_secs(5))?;
+
+    // 그 다음 라이브 stream 을 트리거하기 위해 send 로 새 데이터를 쏘아 넣는다 —
+    // `lterm send` 는 PTY writer 로 직접 쓰므로 PTY echo + reader 경로를 거쳐 attach
+    // stdout 으로 흘러나온다.
+    let send_status = env
+        .cmd()
+        .args(["send", "snap-order", "AFTER_PRELUDE\n"])
+        .status()?;
+    assert!(send_status.success(), "lterm send must succeed");
+
+    // attach stdout 에서 LIVE marker 를 마저 읽는다. PRELUDE 가 먼저 도착했음을 이미
+    // 검증했으므로 PR #16 의 "snapshot first, live second" invariant 를 만족한다.
+    let live_pos = read_until_marker(&mut stdout, b"AFTER_PRELUDE", Duration::from_secs(5))?;
+    assert!(
+        live_pos > prelude_pos,
+        "AFTER_PRELUDE must arrive after PRELUDE on attach stdout (snapshot/live ordering)",
+    );
+
+    drop(stdout);
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Ok(())
+}
+
+/// `stdout` 에서 `marker` 의 마지막 바이트가 등장한 byte offset 까지 읽는다. timeout
+/// 안에 못 찾으면 에러. 본 helper 는 attach 출력 head 부분의 순서 검증에만 쓰이며,
+/// PTY 가 보내는 LF/CR 변환은 무시하고 marker 의 raw 바이트만 검사한다.
+#[cfg(unix)]
+fn read_until_marker<R: Read>(
+    stdout: &mut R,
+    marker: &[u8],
+    timeout: Duration,
+) -> TestResult<usize> {
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while Instant::now() < deadline {
+        let n = stdout.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subsequence(&buf, marker) {
+            return Ok(pos + marker.len());
+        }
+    }
+    Err(format!(
+        "marker {:?} not found within {:?}; buffer head: {:?}",
+        std::str::from_utf8(marker).unwrap_or("<binary>"),
+        timeout,
+        String::from_utf8_lossy(&buf[..buf.len().min(256)])
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}

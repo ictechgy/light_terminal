@@ -23,7 +23,20 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_SESSIONS: usize = 256;
 const MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
-const SUBSCRIBER_QUEUE_LIMIT: usize = 128;
+/// PR #16: subscriber 별 broadcast 채널 슬롯 한도. 슬롯 하나가 들고 있는 것은
+/// `Arc<[u8]>` 의 fat pointer 라 메모리 비용은 슬롯 수에 비례하지만 메시지 바이트
+/// 수에 비례하지 않는다. 128 → 256 으로 키운 것은 모바일 reattach 직후 PTY burst
+/// 가 한 번에 밀려 들어오는 동안 consumer 가 따라잡을 시간 버퍼를 확보하기 위함
+/// (PR #13 의 zombie-attach guard 가 트랜지언트 jitter 를 false-positive 로 잡는
+/// 마진을 줄이는 두 번째 변).
+const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
+/// PR #16: `append_output` 의 backpressure 2-pass 회복 윈도우. 1-pass try_send 가
+/// `Full` 을 반환한 sub 에 대해 본 시간 동안 `send_timeout` 으로 한 번 더 시도하고,
+/// 그래도 자리가 나지 않으면 그제서야 evict 한다 — PR #13 의 zombie-attach 차단
+/// 보장은 유지하면서, 모바일 SSH 의 50–200ms 딸꾹질이 attach 를 끊지 않도록 한다.
+/// 최악 시 본 함수의 대기 시간은 `K * BACKPRESSURE_SEND_TIMEOUT` (K = pending 수)
+/// 이 되며 PTY reader 스레드가 그동안 정체된다 — 의도적으로 짧게 둔다.
+const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 type OutputChunk = Arc<[u8]>;
@@ -225,18 +238,10 @@ impl Session {
         } else {
             Some(Arc::from(bytes))
         };
-        let mut disconnected = Vec::new();
-        for sub in &subscribers {
-            let Some(chunk) = &chunk else {
-                break;
-            };
-            match sub.tx.try_send(Arc::clone(chunk)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    disconnected.push(sub.id);
-                }
-            }
-        }
+        let Some(chunk) = chunk else {
+            return;
+        };
+        let disconnected = broadcast_chunk(&subscribers, chunk, BACKPRESSURE_SEND_TIMEOUT);
         if !disconnected.is_empty() {
             // RC-2b: backpressure로 sub를 evict할 때 attach UnixStream 도 같이 닫아
             // input loop를 EOF로 깨운다. 그렇지 않으면 output 만 끊기고 input은
@@ -295,38 +300,61 @@ impl Session {
     /// PR #15 quad-review 후속(#4): 0×0 은 보통 `#[serde(default)]` 로 인한
     /// 구버전 클라이언트 페이로드(예: lterm 재빌드 누락) 가 원인이므로, 사용자가
     /// 다음 행동을 짐작할 수 있도록 친절한 메시지로 surface 한다.
+    ///
+    /// PR #16: ring snapshot 을 별도 동기 write 로 보내지 않고 broadcast 채널의 첫
+    /// chunk 로 직접 푸시한다. caller 의 output 스레드는 이 chunk 를 그대로 받아
+    /// 라이브 chunk 와 동일한 순서로 출력한다 — snapshot 동기 write 가 늦어지는
+    /// 사이 라이브 채널이 차서 false-positive eviction 이 일어나던 race 를 닫는다.
+    /// snapshot push 는 `output_state` 가드를 들고 있는 동안 실행되므로 등록 직후의
+    /// `append_output` 이 같은 가드를 기다리며 직렬화되어 라이브 chunk 가 snapshot
+    /// 보다 먼저 큐에 들어가지 못한다.
     fn subscribe_with_snapshot(
         &self,
         rows: u16,
         cols: u16,
         on_evict: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
+    ) -> Result<(u64, Receiver<OutputChunk>)> {
         if rows == 0 || cols == 0 {
             bail!(
                 "attach: client did not supply rows/cols (likely a version mismatch — please rebuild lterm)"
             );
         }
         let _output_guard = lock(&self.output_state);
-        let initial = {
+        let initial: Vec<u8> = {
             let ring = lock(&self.ring);
             ring.iter().copied().collect()
         };
-        let (id, rx) = self.subscribe_locked(rows, cols, on_evict)?;
-        Ok((id, rx, initial))
+        let (id, tx, rx) = self.subscribe_locked(rows, cols, on_evict)?;
+        // 갓 등록한 sub 의 채널은 SUBSCRIBER_QUEUE_LIMIT 만큼 비어 있으므로 단일
+        // chunk 푸시는 try_send 로 즉시 성공한다. 만약 실패한다면 invariant 위반 이라
+        // panic 으로 surface (channel 사이즈 < 1, mpsc 가 갑자기 disconnected 등 — 정상
+        // 코드패스에서는 도달 불가).
+        if !initial.is_empty() {
+            tx.try_send(Arc::from(initial.as_slice()))
+                .expect("fresh subscriber tx must accept first chunk");
+        }
+        Ok((id, rx))
     }
 
+    /// 새 subscriber 를 등록하고 `(id, tx_clone, rx)` 튜플을 반환한다. `tx_clone` 은
+    /// caller 가 등록 직후 broadcast 채널에 첫 chunk (예: PR #16 의 ring snapshot) 를
+    /// 직접 푸시할 수 있도록 노출한 사본 — 호출자는 본 함수가 잡고 있던 lock 을 풀기
+    /// 전에 push 를 끝내야 라이브 `append_output` 의 chunk 가 snapshot 앞에 끼어들지
+    /// 않는다 (push-before-unlock 책임은 호출자에게 있다). `tx` clone 은 SyncSender
+    /// 의 가벼운 핸들 복제이므로 Subscriber 가 들고 있는 송신자와 같은 채널을 가리킨다.
     fn subscribe_locked(
         &self,
         rows: u16,
         cols: u16,
         on_evict: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(u64, Receiver<OutputChunk>)> {
+    ) -> Result<(u64, SyncSender<OutputChunk>, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
             bail!("too many attached subscribers for session {}", self.name);
         }
+        let tx_clone = tx.clone();
         subscribers.push(Subscriber {
             id,
             tx,
@@ -334,7 +362,7 @@ impl Session {
             rows,
             cols,
         });
-        Ok((id, rx))
+        Ok((id, tx_clone, rx))
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
@@ -421,6 +449,69 @@ fn clamp_to_smallest(subscribers: &[Subscriber]) -> Option<(u16, u16)> {
         cols = cols.min(sub.cols);
     }
     Some((rows, cols))
+}
+
+/// PR #16: `subscribers` snapshot 에 `chunk` 를 broadcast 하면서 즉시 보낼 수 없는 sub
+/// 에 대해 짧은 윈도우 동안 한 번 더 회복 기회를 준다. 두 단계로 동작한다:
+///
+/// 1. **Pass 1 (`try_send`, non-blocking)**: 모든 sub 에 즉시 시도. `Ok` 면 끝, `Full`
+///    이면 대기 리스트에 보류, `Disconnected` 면 evict 대상으로 즉시 분류.
+/// 2. **Pass 2 (`try_send` 폴링, ≤ `timeout` blocking)**: pass 1 에서 보류된 sub 만
+///    대상으로, `timeout` 한도 안에서 짧게 sleep 하며 `try_send` 를 반복한다. 자리가
+///    나면 회복, `Disconnected` 가 되거나 `timeout` 이 만료되면 evict 대상.
+///
+/// `SyncSender::send_timeout` 이 stable 이 아니므로 폴링으로 같은 의미를 구현한다 —
+/// 정확한 wakeup 시점이 주어지지 않으니 polling 간격은 짧게(5ms) 두어 회복 latency 를
+/// 최소화한다. 그래야 모바일 SSH 의 50–200ms 트랜지언트 jitter 가 attach 를 끊지
+/// 않으면서도, 실제로 stuck 된 consumer 는 timeout 후에 evict 되어 PR #13 의
+/// zombie-attach guard 가 유지된다.
+///
+/// 반환값은 evict 해야 할 sub 들의 id 목록. 호출자가 이 id 들로 `subscribers` lock 을
+/// 다시 잡고 `evict_disconnected_subscribers` 를 호출해 lock-then-call 패턴을 완성한다.
+///
+/// 최악 시 본 함수의 wall time 은 `K * timeout` 이며, K 는 pass 1 에서 `Full` 을 반환한
+/// laggy sub 의 수다. 정상 sub 들은 pass 1 에서 즉시 끝나므로 본 함수가 stall 되어도
+/// 그들의 chunk 전달은 이미 완료되어 있다.
+fn broadcast_chunk(subscribers: &[Subscriber], chunk: OutputChunk, timeout: Duration) -> Vec<u64> {
+    let mut disconnected: Vec<u64> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new();
+    for (idx, sub) in subscribers.iter().enumerate() {
+        match sub.tx.try_send(Arc::clone(&chunk)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => pending.push(idx),
+            Err(TrySendError::Disconnected(_)) => disconnected.push(sub.id),
+        }
+    }
+    for idx in pending {
+        let sub = &subscribers[idx];
+        if !try_send_within(&sub.tx, &chunk, timeout) {
+            disconnected.push(sub.id);
+        }
+    }
+    disconnected
+}
+
+/// `tx.try_send(chunk)` 를 `timeout` 한도 안에서 짧게 sleep 하며 폴링한다. 성공하면
+/// `true`, `Disconnected` 가 되거나 timeout 이 만료되면 `false`. polling 간격은 5ms 로
+/// 두어 normal-case 회복 시 latency 를 최소화한다. `SyncSender::send_timeout` 이 stable
+/// 이 아니므로 같은 의미를 stable 로 구현한 helper.
+fn try_send_within(tx: &SyncSender<OutputChunk>, chunk: &OutputChunk, timeout: Duration) -> bool {
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match tx.try_send(Arc::clone(chunk)) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(_)) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let remaining = deadline - now;
+                thread::sleep(POLL_INTERVAL.min(remaining));
+            }
+        }
+    }
 }
 
 /// `disconnected` 에 해당하는 sub들을 `subscribers` 에서 제거하고 그들의 shutdown 훅을
@@ -1087,7 +1178,11 @@ fn handle_attach(
     // PR #15: Attach 요청에 실린 클라이언트 geometry 를 Subscriber 에 박는다.
     // subscribe_with_snapshot 은 output_state lock 을 잡고 있으므로 PTY 사이즈
     // 재계산은 반환된 후 별도로 호출한다 (lock 순서 분리).
-    let (subscriber_id, rx, initial) = match session.subscribe_with_snapshot(rows, cols, on_evict) {
+    //
+    // PR #16: ring snapshot 은 별도 동기 write 가 아니라 broadcast 채널의 첫 chunk
+    // 로 푸시되어 들어온다 — 아래에서 spawn 하는 output_thread 가 라이브 chunk 와
+    // 함께 순서대로 흘려준다.
+    let (subscriber_id, rx) = match session.subscribe_with_snapshot(rows, cols, on_evict) {
         Ok(subscription) => subscription,
         Err(err) => {
             let response = Response::err(format!("{err:#}"));
@@ -1121,12 +1216,15 @@ fn handle_attach(
     }
     // PR #15: 클라이언트가 후속 Resize 요청에서 사용할 subscriber id 를 응답에 실어
     // 보낸다. Response 모양은 그대로 두고 result 필드에만 JSON 객체로 박는다.
+    //
+    // PR #16: 순서 invariant — Response JSON + newline + flush 까지를 output_thread
+    // spawn **전에** 동기 stream 으로 모두 마쳐야 한다. output_thread 가 stream 의
+    // try_clone 사본에 라이브 chunk 를 즉시 쓰기 시작하면 Response JSON 과 첫 chunk
+    // 가 같은 fd 에서 인터리빙되어 클라이언트 측 JSON 파서가 깨진다.
     let response = Response::ok(serde_json::json!({ "subscriber_id": subscriber_id }));
     serde_json::to_writer(&mut stream, &response).context("write attach ok")?;
     stream.write_all(b"\n").context("write attach ok newline")?;
-    if !initial.is_empty() {
-        stream.write_all(&initial).ok();
-    }
+    stream.flush().ok();
     let mut output = stream.try_clone().context("clone output stream")?;
     let output_thread = thread::spawn(move || {
         for bytes in rx {
@@ -1632,12 +1730,16 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        Subscriber, clamp_to_smallest, evict_disconnected_subscribers,
+        BACKPRESSURE_SEND_TIMEOUT, OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber,
+        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
         process_group_still_owns_child,
     };
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn process_group_check_requires_current_child_group_match() {
@@ -1900,5 +2002,382 @@ mod tests {
                 "PTY size must match the surviving subscriber's geometry; race left a stale clamp"
             );
         }
+    }
+
+    /// PR #16: 단위테스트용 minimal Session 생성. 진짜 PTY 와 child 를 띄워야
+    /// `Session` 구조체의 trait object 필드들을 채울 수 있지만, 본 헬퍼는 child 가
+    /// 그냥 잠들어 있게 두고 PTY reader 스레드도 띄우지 않는다 — 본 PR 테스트가
+    /// 검증하려는 것은 `subscribe_with_snapshot`/`append_output` 의 채널 기반 의미
+    /// 이지 PTY 실제 동작이 아니다. 호출자는 명시적으로 `terminate` 같은 정리를 할
+    /// 필요가 없도록 child 가 자동 종료되는 짧은 명령 (`true`) 을 띄운다.
+    fn build_test_session(name: &str) -> Arc<Session> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty for test session");
+        // `true` 는 즉시 종료되지만 PTY 마스터/슬레이브 fd 는 살아 있어 Session 구조에
+        // 필요한 trait object 들을 채울 수 있다. process_id 는 보장되지 않으므로 None
+        // 으로 두어도 본 단위테스트가 사용하는 어떤 경로도 process_id 에 의존하지 않는다.
+        let mut cmd = CommandBuilder::new("true");
+        cmd.cwd(std::env::temp_dir());
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("spawn `true` for test session");
+        let killer = child.clone_killer();
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("take pty writer");
+        Arc::new(Session {
+            id: format!("test-{name}"),
+            name: name.to_string(),
+            pane_id: format!("%test-{name}"),
+            parent_pane_id: Mutex::new(None),
+            parent_session_id: Mutex::new(None),
+            parent_token: String::new(),
+            command: "true".to_string(),
+            cwd: ".".to_string(),
+            created_unix_ms: 0,
+            process_id: None,
+            process_group_id: None,
+            child: Mutex::new(child),
+            killer: Mutex::new(killer),
+            master: Mutex::new(pair.master),
+            writer: Mutex::new(writer),
+            ring: Mutex::new(VecDeque::new()),
+            subscribers: Mutex::new(Vec::new()),
+            output_state: Mutex::new(()),
+            geometry_apply: Mutex::new(()),
+            next_subscriber_id: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            exit_code: AtomicI32::new(i32::MIN),
+            rows: Mutex::new(24),
+            cols: Mutex::new(80),
+        })
+    }
+
+    /// PR #16: ring 에 쌓인 snapshot 이 broadcast 채널의 첫 chunk 로 들어가고, 이후
+    /// `append_output` 으로 들어오는 라이브 chunk 가 그 뒤에 순서대로 도착해야 한다.
+    /// 그래야 attach 직후 output_thread 가 ring 버퍼와 라이브 stream 을 같은 채널
+    /// 단일 source 로 받을 수 있다.
+    #[test]
+    fn subscribe_with_snapshot_pushes_ring_snapshot_as_first_chunk() {
+        let session = build_test_session("snap-first");
+        // ring 에 PRELUDE 를 미리 채운다 — append_output 은 subscribers 가 비어 있으면
+        // ring 만 갱신하므로 본 호출은 broadcast 부작용 없이 ring 만 채우는 효과.
+        session.append_output(b"PRELUDE\n");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        assert_eq!(
+            first.as_ref(),
+            b"PRELUDE\n",
+            "snapshot must be the first chunk on the broadcast channel",
+        );
+
+        // 후속 라이브 chunk 들도 같은 채널을 통해 순서대로 들어와야 한다.
+        session.append_output(b"LIVE-1\n");
+        session.append_output(b"LIVE-2\n");
+        let live1 = rx.recv_timeout(Duration::from_secs(1)).expect("live1");
+        let live2 = rx.recv_timeout(Duration::from_secs(1)).expect("live2");
+        assert_eq!(live1.as_ref(), b"LIVE-1\n");
+        assert_eq!(live2.as_ref(), b"LIVE-2\n");
+    }
+
+    /// PR #16: ring 이 비어 있으면 snapshot push 자체를 건너뛴다 — 빈 chunk 가 채널에
+    /// 떨어지면 클라이언트가 의미 없는 0 byte write 를 받아 혼란이 생긴다.
+    #[test]
+    fn subscribe_with_snapshot_skips_push_when_ring_empty() {
+        let session = build_test_session("snap-empty");
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        match rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {} // 정상: 빈 ring → 빈 채널
+            Ok(chunk) => panic!("expected empty channel, got chunk of {} bytes", chunk.len()),
+            Err(err) => panic!("unexpected receiver error: {err}"),
+        }
+    }
+
+    /// PR #16: 한 번 try_send 가 `Full` 을 반환했더라도, 그 sub 의 consumer 가
+    /// `BACKPRESSURE_SEND_TIMEOUT` 안에 한 칸이라도 비워주면 evict 되지 않고 회복해야
+    /// 한다. 모바일 SSH 의 50–200ms 트랜지언트 jitter 시나리오의 happy-path 검증.
+    ///
+    /// `rx` 는 본 함수가 끝날 때까지 살아 있어야 한다 — drain 스레드 안에서만 잡고
+    /// 있다 종료 시점에 drop 시키면 채널이 Disconnected 로 전이해 broadcast 의 try_send
+    /// 가 Full 이 아닌 Disconnected 를 받아 즉시 evict 된다 (테스트가 실제로 검증하려는
+    /// timeout 회복과 무관한 경로). 따라서 `rx` 는 본 함수의 stack-local 로 두고
+    /// drain 스레드는 `Receiver` 를 빌리는 식이 아니라, drain 메시지를 본 함수에서
+    /// 직접 처리한다 — 단순히 timeout 안에 한 번이라도 recv 가 일어나면 충분.
+    #[test]
+    fn append_output_send_timeout_recovers_when_consumer_drains_within_window() {
+        let session = build_test_session("recover");
+        let on_evict_calls = Arc::new(AtomicU32::new(0));
+        let calls_for_closure = Arc::clone(&on_evict_calls);
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        // 채널을 정확히 가득 채운다 — 이 시점 이후의 append_output 은 첫 try_send 가
+        // Full 을 반환한다.
+        for _ in 0..SUBSCRIBER_QUEUE_LIMIT {
+            session.append_output(b"x");
+        }
+
+        // 별도 스레드에서 본 메인 스레드의 broadcast 와 동시에 drain 한다. 본 함수가
+        // `rx` 를 들고 있어 채널 endpoint 는 살아 있고, drain 스레드는 같은 `rx` 를
+        // 빌려서 한 번 recv 하고 끝난다.
+        //
+        // 본 helper 함수는 두 스레드 사이에 `rx` 를 공유하기 위해 Mutex 로 감싸지만
+        // mpsc::Receiver 는 Sync 가 아니라 Mutex 가 안전하다 (한 번에 하나의 스레드만
+        // 잡는다). drain 스레드가 lock 을 기다리는 동안 broadcast 가 try_send 를 계속
+        // 시도하는 경로는 drain 이 한 번 recv 를 한 후에 lock 을 풀어 broadcast 가 빈
+        // 슬롯을 보게 만드는 happy-path 를 그대로 모델링한다.
+        let rx_shared = Arc::new(Mutex::new(rx));
+        let rx_for_drain = Arc::clone(&rx_shared);
+        let drain_started = Arc::new(AtomicBool::new(false));
+        let drain_started_clone = Arc::clone(&drain_started);
+        let drain_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drain_started_clone.store(true, Ordering::SeqCst);
+            let rx = rx_for_drain.lock().expect("drain rx lock");
+            // 여러 칸 비운다 — broadcast pass 2 polling 이 5ms 마다 try_send 를 시도
+            // 하는 동안 recv 가 한 슬롯을 비우면 그 다음 polling 시점에 회복한다.
+            for _ in 0..5 {
+                if rx.recv_timeout(Duration::from_millis(20)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        session.append_output(b"recovered");
+        let elapsed = started.elapsed();
+        drain_thread.join().expect("drain thread");
+        // `rx_shared` 는 본 함수의 끝까지 살아있다. drop 시 Disconnected 로 전이하지만
+        // assertion 들은 모두 그 전에 evaluate 된다.
+
+        assert!(
+            drain_started.load(Ordering::SeqCst),
+            "drain thread should have started before append_output returned",
+        );
+        assert!(
+            elapsed < BACKPRESSURE_SEND_TIMEOUT + Duration::from_millis(50),
+            "append_output should return within timeout window, took {elapsed:?}",
+        );
+        assert_eq!(
+            on_evict_calls.load(Ordering::SeqCst),
+            0,
+            "consumer recovered within timeout — must NOT trigger eviction",
+        );
+        let remaining = super::lock(&session.subscribers).len();
+        assert_eq!(
+            remaining, 1,
+            "subscriber must still be attached after recovery"
+        );
+        drop(rx_shared);
+    }
+
+    /// PR #16: consumer 가 timeout 안에 절대 회복하지 못하면 그 sub 는 evict 되어야
+    /// 한다 — PR #13 의 zombie-attach guard 가 timeout fallback 으로도 유지됨을 확인.
+    #[test]
+    fn append_output_send_timeout_evicts_when_consumer_persistently_stuck() {
+        let session = build_test_session("evict");
+        let on_evict_calls = Arc::new(AtomicU32::new(0));
+        let calls_for_closure = Arc::clone(&on_evict_calls);
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (_id, _rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        // 채널을 가득 채운다 — _rx 는 drain 하지 않으므로 pass 2 polling 이 timeout
+        // 까지 다 소진한 뒤 evict.
+        for _ in 0..SUBSCRIBER_QUEUE_LIMIT {
+            session.append_output(b"y");
+        }
+
+        let started = Instant::now();
+        session.append_output(b"trigger-evict");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= BACKPRESSURE_SEND_TIMEOUT,
+            "append_output must wait at least the full timeout before evicting; took {elapsed:?}",
+        );
+        assert_eq!(
+            on_evict_calls.load(Ordering::SeqCst),
+            1,
+            "stuck consumer must trigger eviction exactly once",
+        );
+        let remaining = super::lock(&session.subscribers).len();
+        assert_eq!(remaining, 0, "evicted subscriber must be removed");
+    }
+
+    /// PR #16: 3 sub — sub#0 healthy, sub#1 laggy (queue full), sub#2 healthy.
+    /// pass 1 에서 sub#0 / sub#2 는 즉시 try_send 로 받고, pass 2 가 sub#1 을 두고
+    /// timeout 까지 폴링해도 sub#0 / sub#2 의 chunk 전달은 이미 끝나 있어야 한다.
+    #[test]
+    fn append_output_two_pass_only_blocks_on_laggy_subscribers() {
+        let session = build_test_session("two-pass");
+        let calls_0 = Arc::new(AtomicU32::new(0));
+        let calls_1 = Arc::new(AtomicU32::new(0));
+        let calls_2 = Arc::new(AtomicU32::new(0));
+        let make_evict = |c: Arc<AtomicU32>| -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        let (_id0, rx0) = session
+            .subscribe_with_snapshot(24, 80, make_evict(Arc::clone(&calls_0)))
+            .expect("subscribe sub#0");
+        let (_id1, _rx1) = session
+            .subscribe_with_snapshot(24, 80, make_evict(Arc::clone(&calls_1)))
+            .expect("subscribe sub#1");
+        let (_id2, rx2) = session
+            .subscribe_with_snapshot(24, 80, make_evict(Arc::clone(&calls_2)))
+            .expect("subscribe sub#2");
+
+        // sub#1 의 채널만 가득 채운다 — sub#1 _rx1 는 drain 하지 않고, sub#0 과 sub#2
+        // 는 본 루프가 도는 동안 별도 스레드에서 drain 한다. drain 스레드는 본 함수가
+        // 큐를 채우는 동안에도 동작해야 sub#0 / sub#2 가 함께 가득 차지 않는다.
+        let rx0_arc = std::sync::Arc::new(std::sync::Mutex::new(rx0));
+        let rx2_arc = std::sync::Arc::new(std::sync::Mutex::new(rx2));
+        let rx0_drain = Arc::clone(&rx0_arc);
+        let rx2_drain = Arc::clone(&rx2_arc);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_drain = Arc::clone(&stop);
+        let drainer = std::thread::spawn(move || {
+            while !stop_drain.load(Ordering::SeqCst) {
+                let _ = rx0_drain
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(5));
+                let _ = rx2_drain
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(5));
+            }
+        });
+
+        // sub#1 의 큐를 가득 채우기 위해 SUBSCRIBER_QUEUE_LIMIT 만큼 broadcast 한다.
+        // sub#0 / sub#2 는 drainer 가 받아주므로 안 막힌다.
+        for _ in 0..SUBSCRIBER_QUEUE_LIMIT {
+            session.append_output(b"f");
+        }
+
+        // 이 시점에 sub#1 의 채널이 가득 — 다음 broadcast 가 pass 2 를 트리거한다.
+        // sub#1 timeout 동안 sub#0 / sub#2 는 즉시 받아야 한다 (pass 1).
+        let started = Instant::now();
+        session.append_output(b"final");
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        drainer.join().expect("drainer thread");
+
+        // 본 broadcast 의 wall time 은 timeout 한 윈도우 + 약간의 슬랙 안에 들어와야
+        // 한다 (sub#1 한 명만 laggy 이므로 K=1).
+        assert!(
+            elapsed < BACKPRESSURE_SEND_TIMEOUT + Duration::from_millis(80),
+            "two-pass broadcast wall time must be one timeout window plus slack, got {elapsed:?}",
+        );
+        // sub#0 / sub#2 는 evict 되지 않아야 한다 — 본 PR 의 핵심 invariant.
+        assert_eq!(
+            calls_0.load(Ordering::SeqCst),
+            0,
+            "healthy sub#0 must not be evicted",
+        );
+        assert_eq!(
+            calls_2.load(Ordering::SeqCst),
+            0,
+            "healthy sub#2 must not be evicted",
+        );
+        // sub#1 은 timeout 후 evict.
+        assert_eq!(
+            calls_1.load(Ordering::SeqCst),
+            1,
+            "laggy sub#1 must be evicted exactly once",
+        );
+    }
+
+    /// PR #16: `broadcast_chunk` 가 pass-1 try_send 로 정상 sub 에 즉시 chunk 를
+    /// 전달하고, pass-2 폴링은 laggy sub 에만 적용해야 한다. session/lock 없이도
+    /// 정책의 핵심 invariant 를 빠르게 검증할 수 있는 단위테스트.
+    #[test]
+    fn broadcast_chunk_pass1_delivers_to_healthy_subs_immediately() {
+        let (tx_a, rx_a) = mpsc::sync_channel::<OutputChunk>(SUBSCRIBER_QUEUE_LIMIT);
+        let (tx_b, _rx_b) = mpsc::sync_channel::<OutputChunk>(2);
+        let (tx_c, rx_c) = mpsc::sync_channel::<OutputChunk>(SUBSCRIBER_QUEUE_LIMIT);
+        // sub#1 의 채널을 가득 채워 둔다 — pass 2 로 빠지게.
+        tx_b.try_send(Arc::from(&b"x"[..])).expect("seed b 1");
+        tx_b.try_send(Arc::from(&b"y"[..])).expect("seed b 2");
+
+        let subs = vec![
+            Subscriber {
+                id: 10,
+                tx: tx_a,
+                on_evict: Arc::new(|| {}),
+                rows: 24,
+                cols: 80,
+            },
+            Subscriber {
+                id: 11,
+                tx: tx_b,
+                on_evict: Arc::new(|| {}),
+                rows: 24,
+                cols: 80,
+            },
+            Subscriber {
+                id: 12,
+                tx: tx_c,
+                on_evict: Arc::new(|| {}),
+                rows: 24,
+                cols: 80,
+            },
+        ];
+
+        let chunk: OutputChunk = Arc::from(&b"hello"[..]);
+        let started = Instant::now();
+        let disconnected = broadcast_chunk(&subs, chunk, Duration::from_millis(50));
+        let elapsed = started.elapsed();
+
+        // sub#1 은 timeout 끝까지 돌고 evict.
+        assert_eq!(disconnected, vec![11]);
+        // sub#0 / sub#2 의 첫 chunk 는 즉시 도달해 있어야 한다 — pass 2 timeout 진입
+        // 전에 try_recv 가 성공해야 함.
+        assert_eq!(
+            rx_a.try_recv().map(|c| c.as_ref().to_vec()).ok(),
+            Some(b"hello".to_vec()),
+            "healthy sub#0 must have received chunk in pass 1",
+        );
+        assert_eq!(
+            rx_c.try_recv().map(|c| c.as_ref().to_vec()).ok(),
+            Some(b"hello".to_vec()),
+            "healthy sub#2 must have received chunk in pass 1",
+        );
+        // 본 함수 자체는 pass 2 timeout 한 번을 다 소진하지만 sub#0 / sub#2 chunk 는
+        // 그 전에 이미 들어가 있다.
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "broadcast_chunk waits the full timeout for the laggy sub; took {elapsed:?}",
+        );
     }
 }
