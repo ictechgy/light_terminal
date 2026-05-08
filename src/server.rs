@@ -162,6 +162,22 @@ struct Session {
     ring: Mutex<VecDeque<u8>>,
     subscribers: Mutex<Vec<Subscriber>>,
     output_state: Mutex<()>,
+    /// PR #15 quad-review HIGH 후속: per-client geometry 갱신 → clamp 결정 →
+    /// `master.resize` → 세션 cached `rows`/`cols` 갱신 의 4단계가 다른 attach 의
+    /// subscribe/unsubscribe/Resize 와 인터리빙되지 않도록 보호하는 단일 직렬화 락.
+    ///
+    /// 보호 대상 시나리오 (Codex/Forge/Claude 합의의 race):
+    /// - narrow client A 가 Resize(24, 80) 을 보내 per-client geometry 를 갱신함.
+    /// - 같은 순간 다른 스레드가 narrow A 를 unsubscribe → re-clamp 가 wide 한
+    ///   잔여 client 사이즈로 PTY 를 키움.
+    /// - 그 직후 처음 Resize 의 apply 가 깨어나 PTY 를 다시 narrow 사이즈로 줄임.
+    ///
+    /// 결과적으로 살아있는 attach 가 wide 한데 PTY 가 narrow 인 stale 상태가 된다.
+    ///
+    /// 락 순서: `geometry_apply > subscribers`, `geometry_apply > master`. 즉 geometry
+    /// 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야 한다.
+    /// `output_state` 와는 독립 — 서로의 critical section 안에서 잡지 않는다.
+    geometry_apply: Mutex<()>,
     next_subscriber_id: AtomicU64,
     alive: AtomicBool,
     exit_code: AtomicI32,
@@ -275,6 +291,10 @@ impl Session {
     /// PTY 사이즈 재계산은 호출자가 `apply_clamped_pty_size` 를 별도로 호출해야
     /// 한다 — 본 함수는 `output_state` lock 을 잡고 있고, master.resize 와
     /// subscribers lock 을 같이 잡는 경로와 lock 순서가 꼬이는 것을 피하기 위함.
+    ///
+    /// PR #15 quad-review 후속(#4): 0×0 은 보통 `#[serde(default)]` 로 인한
+    /// 구버전 클라이언트 페이로드(예: lterm 재빌드 누락) 가 원인이므로, 사용자가
+    /// 다음 행동을 짐작할 수 있도록 친절한 메시지로 surface 한다.
     fn subscribe_with_snapshot(
         &self,
         rows: u16,
@@ -282,7 +302,9 @@ impl Session {
         on_evict: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<OutputChunk>, Vec<u8>)> {
         if rows == 0 || cols == 0 {
-            bail!("subscribe geometry must be at least 1x1");
+            bail!(
+                "attach: client did not supply rows/cols (likely a version mismatch — please rebuild lterm)"
+            );
         }
         let _output_guard = lock(&self.output_state);
         let initial = {
@@ -316,6 +338,10 @@ impl Session {
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
+        // PR #15 quad-review HIGH 후속(#1): geometry_apply 락을 가장 먼저 잡아
+        // "subscriber 제거 → clamp 재계산 → PTY resize" 4단계 동안 다른 attach 의
+        // Resize/subscribe/unsubscribe 가 끼어들지 못하게 한다.
+        let geometry_guard = lock(&self.geometry_apply);
         {
             let _output_guard = lock(&self.output_state);
             lock(&self.subscribers).retain(|sub| sub.id != subscriber_id);
@@ -324,7 +350,7 @@ impl Session {
         // 좁은 mobile 이 떠나면 wide desktop 사이즈로 다시 자라야 하는 핵심 시나리오.
         // 잔여 subscriber 가 0 이면 helper 가 no-op 으로 떨어져 PTY 사이즈는 마지막
         // 값에 그대로 남는다 (다음 attach 가 도착하면 그 시점에 다시 clamp).
-        let _ = self.apply_clamped_pty_size();
+        let _ = self.apply_clamped_pty_size(&geometry_guard);
     }
 
     fn close_subscribers(&self) {
@@ -336,17 +362,25 @@ impl Session {
     /// canonical clamp-to-smallest 정책). subscriber 가 한 명도 없으면 PTY 사이즈는
     /// 그대로 두어 다음 attach 가 새 정책을 결정하도록 한다.
     ///
-    /// **lock 순서**: subscribers lock 을 짧게 잡아 min 만 계산하고 즉시 해제한 뒤,
-    /// 별도로 master lock 을 잡아 resize 한다. 두 lock 을 동시에 잡지 않는 이유는
-    /// `append_output` 이 subscribers lock 을 먼저 잡고 try_send 를 통해 broadcast
-    /// 채널을 거치는 경로와 lock 순서를 어긋나게 하지 않기 위함이다. master.resize
-    /// 가 차단될 가능성은 낮지만, 잡은 김에 두 락을 같이 잡으면 deadlock 이 생기는
-    /// 코드를 미래에 흘리기 쉬워진다.
+    /// **`geometry_apply` 락 보유 요구**: 호출자는 본 함수에 진입하기 전에 반드시
+    /// `session.geometry_apply` 의 `MutexGuard` 를 들고 있어야 한다. 이 가드는
+    /// "per-client geometry 갱신 → clamp 결정 → master.resize → cached rows/cols 갱신"
+    /// 전 구간을 단일 critical section 으로 묶어, 다른 attach 의 Resize/unsubscribe
+    /// 가 중간에 끼어들어 PTY 사이즈가 살아있는 attach 와 어긋나는 결과를 막는다
+    /// (PR #15 quad-review HIGH: Codex+Forge+Claude 의 race 시나리오).
+    /// 가드를 컴파일타임에 강제하기 위해 인자로 `&MutexGuard<()>` 를 받는다.
+    ///
+    /// **하위 lock 순서**: 본 함수 내부에서는 subscribers lock 을 짧게 잡아 min 만
+    /// 계산하고 즉시 해제한 뒤, 별도로 master lock 을 잡아 resize 한다. 두 lock 을
+    /// 동시에 잡지 않는 이유는 `append_output` 이 subscribers lock 을 먼저 잡고
+    /// try_send 를 통해 broadcast 채널을 거치는 경로와 lock 순서를 어긋나게 하지
+    /// 않기 위함이다. lock-order 표기: `geometry_apply > subscribers`,
+    /// `geometry_apply > master`, `output_state` 는 독립.
     ///
     /// **`output_state` 와의 관계**: 이 함수는 `output_state` 가 잡혀 있지 **않은**
     /// 상태에서 호출되어야 한다. `subscribe_with_snapshot` 의 caller 는 그 함수가
     /// 반환된 *후* 에 본 helper 를 호출해 lock 충돌을 피한다.
-    fn apply_clamped_pty_size(&self) -> Result<()> {
+    fn apply_clamped_pty_size(&self, _geometry_guard: &MutexGuard<'_, ()>) -> Result<()> {
         let target = {
             let subscribers = lock(&self.subscribers);
             clamp_to_smallest(&subscribers)
@@ -575,6 +609,12 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 bail!("resize dimensions must be at least 1 row and 1 column");
             }
             let session = resolve_session(state, &target)?;
+            // PR #15 quad-review HIGH 후속(#1): per-client geometry 변경 / clamp 결정 /
+            // master.resize / cached rows·cols 갱신 의 4단계가 다른 attach 의
+            // subscribe/unsubscribe/Resize 와 인터리빙되지 않게 본 핸들러 진입과
+            // 동시에 geometry_apply 락을 잡는다. 두 분기 (per-attach·legacy) 모두
+            // 같은 락을 공유하므로 legacy 경로의 직접 master.resize 도 직렬화된다.
+            let geometry_guard = lock(&session.geometry_apply);
             match subscriber_id {
                 // PR #15: attach client 발 SIGWINCH 갱신. per-client geometry 만 갱신한
                 // 뒤 모든 attach 의 min 으로 PTY 를 재계산한다 (clamp-to-smallest).
@@ -592,12 +632,19 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                         sub.rows = rows;
                         sub.cols = cols;
                     }
-                    session.apply_clamped_pty_size()?;
+                    session.apply_clamped_pty_size(&geometry_guard)?;
                 }
                 // legacy 경로: `lterm resize` CLI 와 tmux-compat shim 처럼 attach 가
                 // 아닌 컨트롤 채널이 직접 PTY 사이즈를 강제하는 케이스. per-client
                 // geometry 추적을 거치지 않고 즉시 master.resize 한다 — 와이어
                 // 호환성 유지.
+                //
+                // PR #15 quad-review MEDIUM 후속(#3): attach client 가 살아있는 동안에
+                // 본 경로로 사이즈를 강제하면, 다음 attach client 발 Resize 또는
+                // (un)subscribe 이벤트에서 clamp-to-smallest 가 다시 PTY 를 덮어쓴다.
+                // 즉 legacy 경로는 attach 가 0 명일 때나, 호출자가 이 override race 를
+                // 의도적으로 받아들일 때만 안전하다. 자세한 contract 는
+                // `protocol::Request::Resize` 의 `subscriber_id` 도큐먼트 참조.
                 None => {
                     lock(&session.master)
                         .resize(PtySize {
@@ -611,6 +658,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     *lock(&session.cols) = cols;
                 }
             }
+            drop(geometry_guard);
             Ok(Response::empty())
         }
         Request::Shutdown => {
@@ -783,6 +831,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         ring: Mutex::new(VecDeque::new()),
         subscribers: Mutex::new(Vec::new()),
         output_state: Mutex::new(()),
+        geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
         exit_code: AtomicI32::new(i32::MIN),
@@ -1050,7 +1099,18 @@ fn handle_attach(
     // 등록 직후 clamp-to-smallest 재계산. 이 시점에 narrow client 가 새로 join 하면
     // PTY 가 즉시 좁아지고, 반대로 wide client 만 있던 상태로 join 하면 우리도 같은
     // 사이즈를 보고했을 가능성이 높아 변경 없이 통과한다.
-    if let Err(err) = session.apply_clamped_pty_size() {
+    //
+    // PR #15 quad-review HIGH 후속(#1): geometry_apply 락을 잡고 들어가
+    // subscribe_with_snapshot 직후 발생할 수 있는 다른 attach 의 Resize/unsubscribe
+    // 와 인터리빙되지 않게 한다. 다만 subscribe_with_snapshot 은 geometry_apply 가
+    // **없이도** 안전하게 새 subscriber 를 등록할 수 있어야 하므로 이 락은 등록 직후
+    // 의 apply 단계에서만 잡는다 (subscribe_with_snapshot 은 output_state 와의
+    // 충돌을 피하기 위해 자체 가드를 잡고 있다).
+    let apply_result = {
+        let geometry_guard = lock(&session.geometry_apply);
+        session.apply_clamped_pty_size(&geometry_guard)
+    };
+    if let Err(err) = apply_result {
         let response = Response::err(format!("{err:#}"));
         serde_json::to_writer(&mut stream, &response).ok();
         stream.write_all(b"\n").ok();
@@ -1742,5 +1802,103 @@ mod tests {
             geom_subscriber(3, 24, 80),  // narrow mobile
         ];
         assert_eq!(clamp_to_smallest(&subs), Some((24, 80)));
+    }
+
+    /// PR #15 quad-review HIGH 후속(#1): geometry_apply 락이 "per-client geometry
+    /// 변경 → clamp 결정 → PTY 사이즈 갱신" 을 단일 critical section 으로 묶지 않으면,
+    /// narrow client 의 Resize 와 narrow client 의 unsubscribe 가 인터리빙되어
+    /// 살아있는 attach (wide) 가 narrow 한 PTY 사이즈에 묶이는 race 가 발생한다.
+    ///
+    /// 본 테스트는 실제 `Session` 인스턴스 (real PTY backed) 없이도 같은
+    /// linearizability 불변식을 직접 모델링한다 — `Mutex<Vec<Subscriber>>` 와
+    /// `Mutex<(u16, u16)>` 를 PTY 사이즈 캐시의 stand-in 으로 두고, 모든 mutate
+    /// 경로가 별도의 `geometry_apply: Mutex<()>` 를 가장 먼저 잡도록 한다.
+    /// 100 회 stress 루프 동안 두 스레드가 Barrier 로 동시 진입한 뒤, race 가
+    /// 막혔는지 확인하는 invariant: "최종 PTY 사이즈는 최종 subscriber 의 geometry
+    /// 와 일치해야 한다" (남은 단일 attach 의 사이즈를 PTY 가 따라가는 정책).
+    ///
+    /// race 가 막히지 않으면 narrow 가 unsubscribe 된 뒤 wide 만 남았는데도 PTY 가
+    /// (24, 80) 으로 남는 케이스가 일정 확률로 관측된다. 본 테스트는 그 stale 상태가
+    /// **단 한 번도** 발생하지 않아야 한다고 강제한다.
+    #[test]
+    fn concurrent_resize_then_detach_does_not_leave_stale_pty_size() {
+        use std::sync::Barrier;
+        use std::sync::Mutex;
+
+        const ITERATIONS: usize = 100;
+        const WIDE: (u16, u16) = (40, 152);
+        const NARROW: (u16, u16) = (24, 80);
+
+        for _ in 0..ITERATIONS {
+            let geometry_apply = Arc::new(Mutex::new(()));
+            let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(vec![
+                geom_subscriber(1, WIDE.0, WIDE.1),
+                geom_subscriber(2, NARROW.0, NARROW.1),
+            ]));
+            let pty_size = Arc::new(Mutex::new(NARROW)); // 시작 시 이미 clamp 가 적용됐다고 가정
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Thread A: narrow client 가 자기 사이즈를 (24, 80) 으로 갱신 후 clamp.
+            // (현실 시나리오에서는 사이즈가 이미 같지만, race 윈도우를 만들기 위해
+            //  명시적 갱신 → apply 호출의 두 단계를 거친다.)
+            let ga_a = Arc::clone(&geometry_apply);
+            let subs_a = Arc::clone(&subscribers);
+            let pty_a = Arc::clone(&pty_size);
+            let bar_a = Arc::clone(&barrier);
+            let thread_a = std::thread::spawn(move || {
+                bar_a.wait();
+                let _g = ga_a.lock().expect("lock geometry_apply (A)");
+                {
+                    let mut subs = subs_a.lock().expect("lock subscribers (A)");
+                    if let Some(narrow) = subs.iter_mut().find(|s| s.id == 2) {
+                        narrow.rows = NARROW.0;
+                        narrow.cols = NARROW.1;
+                    }
+                }
+                let target = clamp_to_smallest(&subs_a.lock().expect("lock subscribers (A2)"));
+                if let Some((rows, cols)) = target {
+                    *pty_a.lock().expect("lock pty (A)") = (rows, cols);
+                }
+            });
+
+            // Thread B: narrow client 가 unsubscribe → re-clamp.
+            let ga_b = Arc::clone(&geometry_apply);
+            let subs_b = Arc::clone(&subscribers);
+            let pty_b = Arc::clone(&pty_size);
+            let bar_b = Arc::clone(&barrier);
+            let thread_b = std::thread::spawn(move || {
+                bar_b.wait();
+                let _g = ga_b.lock().expect("lock geometry_apply (B)");
+                {
+                    let mut subs = subs_b.lock().expect("lock subscribers (B)");
+                    subs.retain(|s| s.id != 2);
+                }
+                let target = clamp_to_smallest(&subs_b.lock().expect("lock subscribers (B2)"));
+                if let Some((rows, cols)) = target {
+                    *pty_b.lock().expect("lock pty (B)") = (rows, cols);
+                }
+            });
+
+            thread_a.join().expect("thread A");
+            thread_b.join().expect("thread B");
+
+            // 최종 상태: narrow 가 unsubscribe 되었으므로 wide 만 남고, PTY 사이즈는
+            // wide 와 일치해야 한다. geometry_apply 락이 두 스레드를 직렬화하므로
+            // 어떤 인터리빙으로 진행되든 마지막 critical section 의 결과가 PTY 에
+            // 박혀야 한다 — 그리고 두 critical section 모두 narrow 가 빠졌든 안 빠졌든
+            // 끝낼 때 clamp 를 다시 계산하므로, 최종 결과는 항상 살아있는 attach 의
+            // geometry 와 정합한다.
+            let subs = subscribers.lock().expect("final subs");
+            let pty = pty_size.lock().expect("final pty");
+            assert_eq!(subs.len(), 1, "narrow subscriber should be removed");
+            assert_eq!(subs[0].id, 1);
+            // 살아있는 attach 의 사이즈와 PTY 사이즈가 정합해야 한다.
+            assert_eq!(
+                (subs[0].rows, subs[0].cols),
+                *pty,
+                "PTY size must match the surviving subscriber's geometry; race left a stale clamp"
+            );
+        }
     }
 }

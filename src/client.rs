@@ -575,22 +575,42 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         while resize_running.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(250));
             let current = terminal_size();
-            if current != last {
-                // PR #15: server-side clamp-to-smallest 가 PTY 사이즈의 source of truth.
-                // SIGWINCH 가 감지되면 우리 subscriber id 를 실어 무조건 Resize 를 보낸다.
-                // server 는 이 client 의 per-client geometry 만 갱신한 뒤 모든 attach 의
-                // min 으로 PTY 를 재계산하므로, 더 이상 client-side 에서 "다른 attach 가
-                // 있는가" 를 판단할 필요가 없다 (PR #14 단기 가드 폐기).
-                let _ = resize(
-                    &resize_target,
-                    attach_pty_rows(current.1, status_enabled),
-                    current.0,
-                    Some(subscriber_id),
-                );
-                // 우리 화면의 cols/rows 는 변했으므로 status row 는 새 폭으로 다시
-                // 그려야 한다. resize 결과와 무관하게 status refresh 는 항상 보낸다.
-                let _ = resize_tx.try_send(());
-                last = current;
+            if current == last {
+                continue;
+            }
+            // PR #15: server-side clamp-to-smallest 가 PTY 사이즈의 source of truth.
+            // SIGWINCH 가 감지되면 우리 subscriber id 를 실어 Resize 를 보낸다. server
+            // 는 이 client 의 per-client geometry 만 갱신한 뒤 모든 attach 의 min 으로
+            // PTY 를 재계산하므로, 더 이상 client-side 에서 "다른 attach 가 있는가" 를
+            // 판단할 필요가 없다 (PR #14 단기 가드 폐기).
+            let resize_result = resize(
+                &resize_target,
+                attach_pty_rows(current.1, status_enabled),
+                current.0,
+                Some(subscriber_id),
+            );
+            match handle_resize_tick(resize_result) {
+                ResizeTickOutcome::Advance => {
+                    // 우리 화면 cols/rows 가 변했으므로 status row 는 새 폭으로 다시
+                    // 그려야 한다. status refresh 는 always 보낸다.
+                    let _ = resize_tx.try_send(());
+                    last = current;
+                }
+                ResizeTickOutcome::Retry => {
+                    // PR #14 의 "info() 실패 시 last 갱신 보류" 와 같은 패턴 — transient
+                    // RPC failure 일 가능성이 높으므로 last 를 advance 하지 않아 다음
+                    // tick 에서 재시도되게 한다. status refresh 는 폭 변화가 사용자 화면
+                    // 에는 이미 반영됐으므로 그대로 보낸다.
+                    let _ = resize_tx.try_send(());
+                }
+                ResizeTickOutcome::StaleSubscriberId => {
+                    // server 가 우리 subscriber id 를 더 이상 모른다고 응답했다 — attach
+                    // 가 구조적으로 죽은 상태다. main thread 의 output loop 를 깨워
+                    // 빠져나갈 수 있도록 running 플래그를 내리고 자체 종료한다.
+                    resize_running.store(false, Ordering::SeqCst);
+                    let _ = resize_tx.try_send(());
+                    break;
+                }
             }
         }
     });
@@ -713,6 +733,44 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
         rows - 1
     } else {
         rows.max(1)
+    }
+}
+
+/// `resize_thread` 한 tick 의 처리 결과. RPC 결과는 세 가지 의미상 분기로 나뉘는데,
+/// 결정 자체는 RPC 호출과 무관한 순수 함수로 분리해 단위 테스트가 가능하도록 한다.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeTickOutcome {
+    /// 성공 — `last` 를 새 사이즈로 advance.
+    Advance,
+    /// 일시적 RPC 실패 — `last` 를 advance 하지 않고 다음 tick 에서 재시도.
+    Retry,
+    /// daemon 이 우리 subscriber id 를 모른다고 응답 — attach 가 구조적으로 dead.
+    /// 호출자는 running 플래그를 내려 main thread 가 빠져나오도록 해야 한다.
+    StaleSubscriberId,
+}
+
+/// `resize_thread` 의 tick 본문에서 RPC 결과를 분류한다. PR #15 quad-review HIGH
+/// 후속(#2): PR #14 의 "info() 실패 시 last 갱신 보류" 패턴이 PR #15 에서 제거됐던
+/// 것을 복원하면서, daemon 이 stale-subscriber-id 응답을 보내는 케이스 (`Some(id)`
+/// Resize 인데 그 id 가 더 이상 attach 되어 있지 않을 때 server 가 명시적 에러로
+/// surface 하는 경로) 에 대한 처리도 동시에 도입한다.
+///
+/// stale 판정은 daemon 의 `with_context` 메시지에 포함된 `"subscriber id"` 부분
+/// 문자열로 이루어진다 — 와이어 레벨에는 별도 에러 코드가 없어 메시지 매칭이
+/// 차선이지만, daemon/client 가 같은 버전으로 빌드되는 본 코드베이스 컨벤션
+/// (`AGENTS.md`) 안에서는 충분히 안정적이다. 미래에 코드화된 에러를 도입하면
+/// 이 매칭 로직을 한 곳에서만 바꾸면 된다.
+fn handle_resize_tick(resize_result: Result<()>) -> ResizeTickOutcome {
+    match resize_result {
+        Ok(()) => ResizeTickOutcome::Advance,
+        Err(err) => {
+            let message = format!("{err:#}");
+            if message.contains("subscriber id") {
+                ResizeTickOutcome::StaleSubscriberId
+            } else {
+                ResizeTickOutcome::Retry
+            }
+        }
     }
 }
 
@@ -1544,11 +1602,12 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::{
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
-        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle, TerminalOutputTracker,
-        alt_screen_param_matches, attach_pty_rows, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, format_status_line, heartbeat_due,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
+        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle,
+        TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        resolve_status_style,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1599,6 +1658,47 @@ mod tests {
         assert_eq!(attach_pty_rows(24, true), 23);
         assert_eq!(attach_pty_rows(1, true), 1);
         assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    /// PR #15 quad-review HIGH 후속(#2): 성공 응답은 last 를 advance 시키는 Outcome
+    /// 으로 매핑되어야 한다. resize_thread 의 정상 경로가 흔들리지 않는지 핀 박는다.
+    #[test]
+    fn handle_resize_tick_success_advances_last() {
+        let outcome = handle_resize_tick(Ok(()));
+        assert_eq!(outcome, ResizeTickOutcome::Advance);
+    }
+
+    /// PR #15 quad-review HIGH 후속(#2): "subscriber id" 키워드를 포함한 에러는 stale
+    /// 분기로 매핑되어야 한다. 호출자는 이를 받아 running 플래그를 내리고 종료한다.
+    /// daemon 측 메시지 (`server.rs`: `"resize: subscriber id {id} no longer attached"`)
+    /// 와 `with_context` 가 만든 chained 메시지를 모두 매칭하도록 substring 매치를
+    /// 사용한다.
+    #[test]
+    fn handle_resize_tick_stale_subscriber_id_signals_break() {
+        let err: anyhow::Error = anyhow::anyhow!("resize: subscriber id 7 no longer attached");
+        let outcome = handle_resize_tick(Err(err));
+        assert_eq!(outcome, ResizeTickOutcome::StaleSubscriberId);
+    }
+
+    /// `with_context` 로 wrap 된 anyhow chain 도 `{err:#}` 포맷으로 substring 이 잡혀야
+    /// 한다 — daemon 응답이 `Error::root_cause` 가 아닌 chain 의 일부로 도착하는
+    /// 케이스 (RPC 어댑터 측의 wrap) 를 시뮬레이션한다.
+    #[test]
+    fn handle_resize_tick_stale_id_in_chained_anyhow_context_still_matches() {
+        let inner: anyhow::Error = anyhow::anyhow!("resize: subscriber id 99 no longer attached");
+        let chained = inner.context("rpc dispatch failed");
+        let outcome = handle_resize_tick(Err(chained));
+        assert_eq!(outcome, ResizeTickOutcome::StaleSubscriberId);
+    }
+
+    /// PR #15 quad-review HIGH 후속(#2): 그 밖의 transient 실패는 Retry 로 매핑되어
+    /// 호출자가 last 를 advance 하지 않고 다음 tick 에서 재시도하도록 한다 (PR #14
+    /// 의 "info() 실패 시 last 갱신 보류" 패턴 복원).
+    #[test]
+    fn handle_resize_tick_transient_failure_is_retry() {
+        let err: anyhow::Error = anyhow::anyhow!("connection refused");
+        let outcome = handle_resize_tick(Err(err));
+        assert_eq!(outcome, ResizeTickOutcome::Retry);
     }
 
     #[test]
