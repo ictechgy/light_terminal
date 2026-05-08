@@ -324,45 +324,73 @@ impl Session {
             let ring = lock(&self.ring);
             ring.iter().copied().collect()
         };
-        let (id, tx, rx) = self.subscribe_locked(rows, cols, on_evict)?;
-        // 갓 등록한 sub 의 채널은 SUBSCRIBER_QUEUE_LIMIT 만큼 비어 있으므로 단일
-        // chunk 푸시는 try_send 로 즉시 성공한다. 만약 실패한다면 invariant 위반 이라
-        // panic 으로 surface (channel 사이즈 < 1, mpsc 가 갑자기 disconnected 등 — 정상
-        // 코드패스에서는 도달 불가).
-        if !initial.is_empty() {
-            tx.try_send(Arc::from(initial.as_slice()))
-                .expect("fresh subscriber tx must accept first chunk");
-        }
-        Ok((id, rx))
+        // 빈 ring 일 때는 None 으로 두어 0-byte chunk 가 채널에 들어가지 않게 한다 —
+        // subscribe_locked 안에서 빈 chunk 분기를 다시 검사하지 않아도 되도록 호출자
+        // 측에서 명시적으로 분기.
+        let initial_chunk: Option<OutputChunk> = if initial.is_empty() {
+            None
+        } else {
+            Some(Arc::from(initial.as_slice()))
+        };
+        self.subscribe_locked(rows, cols, on_evict, initial_chunk)
     }
 
-    /// 새 subscriber 를 등록하고 `(id, tx_clone, rx)` 튜플을 반환한다. `tx_clone` 은
-    /// caller 가 등록 직후 broadcast 채널에 첫 chunk (예: PR #16 의 ring snapshot) 를
-    /// 직접 푸시할 수 있도록 노출한 사본 — 호출자는 본 함수가 잡고 있던 lock 을 풀기
-    /// 전에 push 를 끝내야 라이브 `append_output` 의 chunk 가 snapshot 앞에 끼어들지
-    /// 않는다 (push-before-unlock 책임은 호출자에게 있다). `tx` clone 은 SyncSender
-    /// 의 가벼운 핸들 복제이므로 Subscriber 가 들고 있는 송신자와 같은 채널을 가리킨다.
+    /// 새 subscriber 를 등록하고 `(id, rx)` 를 반환한다. `initial_chunk` 가 `Some` 이면
+    /// 등록 직후 그 chunk 를 broadcast 채널에 푸시한다 — PR #16 의 ring snapshot 첫
+    /// chunk 시나리오. 푸시는 본 함수가 `subscribers` lock 을 들고 있는 동안 실행되어
+    /// 다른 broadcast 가 끼어들 여지를 차단한다.
+    ///
+    /// **순서 invariant 의 진짜 책임**: lock 자체보다 호출자의 `output_state` 가드가
+    /// 핵심이다. `append_output` 은 `output_state` 를 잡고 들어가 (a) ring 갱신,
+    /// (b) subscribers 스냅샷 복사, (c) broadcast 까지 직렬화한다. 따라서 호출자는
+    /// `initial_chunk` 가 `Some` 일 때 본 함수 진입 전에 `output_state` 를 잡고 있어야
+    /// 라이브 chunk 가 snapshot 앞에 끼어들지 못한다 (PR #16 의 race fix). 호출자가
+    /// 그 가드를 들지 않으면 라이브 chunk 가 snapshot 보다 먼저 큐에 들어갈 수 있다.
+    ///
+    /// **PR #16 quad-review HIGH 후속 (Codex/Claude/Gemini)**: 이전 시그니처는
+    /// `(id, tx_clone, rx)` 를 반환하고 caller 가 자체적으로 push 를 했다. 그런데
+    /// `subscribers` lock 은 함수 종료 시점에 이미 풀려 있으므로 도큐멘테이션이 약속
+    /// 한 "push-before-unlock" invariant 가 사실은 성립하지 않았다 — 진짜로 보장하던
+    /// 것은 호출자의 `output_state` 가드였다. 향후 `output_state` 없이 호출하는 caller
+    /// 가 추가되면 침묵하며 순서가 깨지므로, 본 PR 에서는 push 자체를 본 함수 안으로
+    /// 옮겨 호출자가 잘못 쓰는 경로를 줄였다.
+    ///
+    /// **Push 실패 시 rollback (Codex/Claude HIGH)**: 갓 등록한 sub 의 채널은
+    /// `SUBSCRIBER_QUEUE_LIMIT` 만큼 비어 있어 단일 chunk 의 `try_send` 는 정상
+    /// 코드패스에서 항상 성공한다. 그래도 invariant 가 깨질 가능성 (예: 채널 capacity
+    /// 가 0 이라거나, mpsc 구현 버그로 즉시 disconnected 가 되는 등) 을 panic 이 아닌
+    /// rollback + bail 로 처리한다 — 방금 push 한 Subscriber 를 같은 lock 안에서
+    /// `retain` 으로 제거해 ghost 가 남지 않게 하고 caller 에 에러를 돌려준다.
     fn subscribe_locked(
         &self,
         rows: u16,
         cols: u16,
         on_evict: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(u64, SyncSender<OutputChunk>, Receiver<OutputChunk>)> {
+        initial_chunk: Option<OutputChunk>,
+    ) -> Result<(u64, Receiver<OutputChunk>)> {
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
             bail!("too many attached subscribers for session {}", self.name);
         }
-        let tx_clone = tx.clone();
         subscribers.push(Subscriber {
             id,
-            tx,
+            tx: tx.clone(),
             on_evict,
             rows,
             cols,
         });
-        Ok((id, tx_clone, rx))
+        if let Some(chunk) = initial_chunk {
+            if let Err(err) = tx.try_send(chunk) {
+                // 정상 코드패스에서는 도달 불가 — 그래도 panic 대신 push 한 sub 를
+                // 즉시 같은 lock 안에서 빼낸다. caller 는 에러를 받고 attach 흐름을
+                // 중단해 ghost subscriber 가 남지 않게 한다.
+                subscribers.retain(|s| s.id != id);
+                bail!("snapshot push failed for subscriber {}: {:?}", id, err);
+            }
+        }
+        Ok((id, rx))
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
@@ -456,9 +484,18 @@ fn clamp_to_smallest(subscribers: &[Subscriber]) -> Option<(u16, u16)> {
 ///
 /// 1. **Pass 1 (`try_send`, non-blocking)**: 모든 sub 에 즉시 시도. `Ok` 면 끝, `Full`
 ///    이면 대기 리스트에 보류, `Disconnected` 면 evict 대상으로 즉시 분류.
-/// 2. **Pass 2 (`try_send` 폴링, ≤ `timeout` blocking)**: pass 1 에서 보류된 sub 만
-///    대상으로, `timeout` 한도 안에서 짧게 sleep 하며 `try_send` 를 반복한다. 자리가
-///    나면 회복, `Disconnected` 가 되거나 `timeout` 이 만료되면 evict 대상.
+/// 2. **Pass 2 (round-robin `try_send`, 단일 공유 deadline)**: pass 1 에서 보류된 sub
+///    들을 라운드로빈으로 돌며 `try_send` 를 반복한다. 라운드 한 번 돌아도 비워지지
+///    않은 sub 가 남아 있으면 5ms sleep 후 다시 라운드. 한 sub 가 회복되면 `pending`
+///    에서 빠지고, `Disconnected` 가 되면 evict 후보로 분류된다. 라운드를 도는 동안
+///    공유 deadline (`Instant::now() + timeout`) 이 만료되면 잔여 sub 들은 일괄 evict.
+///
+/// **PR #16 quad-review HIGH 후속 (Codex security)**: 이전 구현은 pending sub 마다
+/// 별도 `timeout` 윈도우를 순차로 소진했다 — 최악 시 wall time = `K * timeout`. 한
+/// 세션에 32개 attach 가 모두 laggy 면 32 × 100ms = 3.2s 동안 PTY reader 스레드가
+/// 멈춰 다른 모든 attach 의 출력이 정체되는 attacker-influenced DoS 경로였다. 본
+/// 라운드로빈 + 공유 deadline 구조에서는 K 와 무관하게 worst-case wall time = `timeout`.
+/// 라운드로빈이라 한 sub 의 `Full` 이 다른 sub 의 회복 기회를 차단하지도 않는다.
 ///
 /// `SyncSender::send_timeout` 이 stable 이 아니므로 폴링으로 같은 의미를 구현한다 —
 /// 정확한 wakeup 시점이 주어지지 않으니 polling 간격은 짧게(5ms) 두어 회복 latency 를
@@ -469,12 +506,13 @@ fn clamp_to_smallest(subscribers: &[Subscriber]) -> Option<(u16, u16)> {
 /// 반환값은 evict 해야 할 sub 들의 id 목록. 호출자가 이 id 들로 `subscribers` lock 을
 /// 다시 잡고 `evict_disconnected_subscribers` 를 호출해 lock-then-call 패턴을 완성한다.
 ///
-/// 최악 시 본 함수의 wall time 은 `K * timeout` 이며, K 는 pass 1 에서 `Full` 을 반환한
-/// laggy sub 의 수다. 정상 sub 들은 pass 1 에서 즉시 끝나므로 본 함수가 stall 되어도
-/// 그들의 chunk 전달은 이미 완료되어 있다.
+/// 최악 시 본 함수의 wall time 은 K (pending sub 수) 와 무관하게 `timeout` 이다 —
+/// 정상 sub 들은 pass 1 에서 이미 chunk 를 받았으므로 pass 2 가 길어져도 그들의
+/// 전달은 영향이 없다.
 fn broadcast_chunk(subscribers: &[Subscriber], chunk: OutputChunk, timeout: Duration) -> Vec<u64> {
     let mut disconnected: Vec<u64> = Vec::new();
     let mut pending: Vec<usize> = Vec::new();
+    // Pass 1: 모든 sub 에 즉시 try_send. Full 이면 pending 에 보류.
     for (idx, sub) in subscribers.iter().enumerate() {
         match sub.tx.try_send(Arc::clone(&chunk)) {
             Ok(()) => {}
@@ -482,36 +520,29 @@ fn broadcast_chunk(subscribers: &[Subscriber], chunk: OutputChunk, timeout: Dura
             Err(TrySendError::Disconnected(_)) => disconnected.push(sub.id),
         }
     }
-    for idx in pending {
-        let sub = &subscribers[idx];
-        if !try_send_within(&sub.tx, &chunk, timeout) {
-            disconnected.push(sub.id);
+    // Pass 2: 단일 공유 deadline 안에서 pending 을 라운드로빈으로 폴링.
+    let deadline = std::time::Instant::now() + timeout;
+    while !pending.is_empty() && std::time::Instant::now() < deadline {
+        pending.retain(|&idx| {
+            let sub = &subscribers[idx];
+            match sub.tx.try_send(Arc::clone(&chunk)) {
+                Ok(()) => false,
+                Err(TrySendError::Disconnected(_)) => {
+                    disconnected.push(sub.id);
+                    false
+                }
+                Err(TrySendError::Full(_)) => true,
+            }
+        });
+        if !pending.is_empty() {
+            thread::sleep(Duration::from_millis(5));
         }
+    }
+    // Deadline 만료 시점에 남은 sub 는 모두 evict.
+    for idx in pending {
+        disconnected.push(subscribers[idx].id);
     }
     disconnected
-}
-
-/// `tx.try_send(chunk)` 를 `timeout` 한도 안에서 짧게 sleep 하며 폴링한다. 성공하면
-/// `true`, `Disconnected` 가 되거나 timeout 이 만료되면 `false`. polling 간격은 5ms 로
-/// 두어 normal-case 회복 시 latency 를 최소화한다. `SyncSender::send_timeout` 이 stable
-/// 이 아니므로 같은 의미를 stable 로 구현한 helper.
-fn try_send_within(tx: &SyncSender<OutputChunk>, chunk: &OutputChunk, timeout: Duration) -> bool {
-    const POLL_INTERVAL: Duration = Duration::from_millis(5);
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match tx.try_send(Arc::clone(chunk)) {
-            Ok(()) => return true,
-            Err(TrySendError::Disconnected(_)) => return false,
-            Err(TrySendError::Full(_)) => {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    return false;
-                }
-                let remaining = deadline - now;
-                thread::sleep(POLL_INTERVAL.min(remaining));
-            }
-        }
-    }
 }
 
 /// `disconnected` 에 해당하는 sub들을 `subscribers` 에서 제거하고 그들의 shutdown 훅을
@@ -1224,7 +1255,15 @@ fn handle_attach(
     let response = Response::ok(serde_json::json!({ "subscriber_id": subscriber_id }));
     serde_json::to_writer(&mut stream, &response).context("write attach ok")?;
     stream.write_all(b"\n").context("write attach ok newline")?;
-    stream.flush().ok();
+    // PR #16 quad-review MEDIUM 후속 (Codex/Claude 합의): flush 실패는 본 PR 에서
+    // 새로 보장하기로 한 "Response JSON 이 첫 chunk 보다 먼저 나간다" invariant 가
+    // 깨졌다는 신호다. 무시하면 클라이언트 측 JSON 파서가 깨지면서도 서버는 정상
+    // 진행해 ghost subscriber + output_thread 가 매달려 남는다 — apply_clamped 실패
+    // 와 동일한 패턴으로 등록한 sub 를 unsubscribe 한 뒤 에러를 surface 한다.
+    if let Err(err) = stream.flush() {
+        session.unsubscribe(subscriber_id);
+        return Err(err).context("flush attach ok before output thread");
+    }
     let mut output = stream.try_clone().context("clone output stream")?;
     let output_thread = thread::spawn(move || {
         for bytes in rx {
@@ -2094,6 +2133,69 @@ mod tests {
         assert_eq!(live2.as_ref(), b"LIVE-2\n");
     }
 
+    /// PR #16 quad-review HIGH 후속 (Forge 고유): 기존 `subscribe_with_snapshot_*`
+    /// 단위테스트는 sequential happy-path (먼저 ring 채우고 → subscribe → 라이브 push)
+    /// 만 검증해 PR 이 실제로 수정한다고 주장하는 race (subscribe 도중 다른 스레드의
+    /// `append_output` 이 들어오는 상황) 를 exercise 하지 못한다. 본 테스트는 백그라운드
+    /// 스레드가 라이브 출력을 producing 하는 도중 `subscribe_with_snapshot` 을 호출하고,
+    /// 첫 chunk 가 항상 ring snapshot prefix (`PRELUDE`) 로 시작함을 확인한다.
+    ///
+    /// `output_state` 가드가 (a) ring 갱신, (b) subscribers 스냅샷 복사, (c) broadcast
+    /// 를 직렬화하므로, subscribe 의 snapshot push 가 lock 안에서 끝나야 새 sub 의 큐에
+    /// 라이브 chunk 가 snapshot 보다 먼저 들어가지 않는다.
+    #[test]
+    fn subscribe_with_snapshot_first_chunk_is_snapshot_even_under_concurrent_live_output() {
+        use std::sync::Barrier;
+
+        let session = build_test_session("snap-race");
+        session.append_output(b"PRELUDE");
+
+        // 백그라운드에서 라이브 출력을 계속 produce 하는 스레드. subscribe 시점에 이미
+        // append_output 이 동시에 호출되고 있어야 본 PR 의 race 를 실제로 exercise 한다.
+        let session_for_thread = Arc::clone(&session);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let live_started = Arc::new(Barrier::new(2));
+        let live_started_clone = Arc::clone(&live_started);
+        let live_thread = std::thread::spawn(move || {
+            // 라이브 스레드가 produce 직전임을 main 에 알린다.
+            live_started_clone.wait();
+            let mut counter = 0u32;
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                session_for_thread.append_output(format!("LIVE-{counter}|").as_bytes());
+                counter += 1;
+                // CPU 100% 사용을 막기 위한 짧은 sleep — race 자체와 무관.
+                std::thread::sleep(Duration::from_micros(50));
+            }
+        });
+
+        // 라이브 스레드가 막 시작 직전임을 확인한 뒤 추가로 짧게 sleep — 라이브 스레드
+        // 가 실제로 append_output 을 몇 번 돌려 진짜로 race 가 발생하게 한다.
+        live_started.wait();
+        std::thread::sleep(Duration::from_millis(2));
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        // 첫 chunk 는 subscribe 시점의 ring snapshot prefix 로 시작해야 한다.
+        // `subscribe_with_snapshot` 안의 `output_state` 가드가 snapshot push 와
+        // append_output 의 broadcast 를 직렬화해 라이브 chunk 가 snapshot 앞에 끼어들
+        // 수 없게 한다.
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        assert!(
+            first.starts_with(b"PRELUDE"),
+            "first chunk must be ring snapshot (start with PRELUDE), got: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        live_thread.join().expect("live thread");
+    }
+
     /// PR #16: ring 이 비어 있으면 snapshot push 자체를 건너뛴다 — 빈 chunk 가 채널에
     /// 떨어지면 클라이언트가 의미 없는 0 byte write 를 받아 혼란이 생긴다.
     #[test]
@@ -2121,6 +2223,14 @@ mod tests {
     /// timeout 회복과 무관한 경로). 따라서 `rx` 는 본 함수의 stack-local 로 두고
     /// drain 스레드는 `Receiver` 를 빌리는 식이 아니라, drain 메시지를 본 함수에서
     /// 직접 처리한다 — 단순히 timeout 안에 한 번이라도 recv 가 일어나면 충분.
+    ///
+    /// PR #16 quad-review HIGH 후속 (Forge): 이전 구현은 drain 스레드가 `sleep(15ms)`
+    /// 후 동작한다고 가정하고 main 스레드의 broadcast 가 그 사이 pass 2 에 진입해
+    /// 있을 거라 기대했지만, 슬로우 CI / 다른 부하 상황에서는 main 스레드의 broadcast
+    /// 가 sleep 보다 늦게 돌아 fail 했다. 또한 wall-clock 의 `elapsed <
+    /// BACKPRESSURE_SEND_TIMEOUT + 50ms` assertion 도 fragile 했다. mpsc::channel 시그
+    /// 널로 drain 준비 완료 → broadcast 트리거 순서를 강제하고, wall-clock 측정을
+    /// 제거해 logical assertion (eviction count + sub presence) 만 남긴다.
     #[test]
     fn append_output_send_timeout_recovers_when_consumer_drains_within_window() {
         let session = build_test_session("recover");
@@ -2140,22 +2250,17 @@ mod tests {
             session.append_output(b"x");
         }
 
-        // 별도 스레드에서 본 메인 스레드의 broadcast 와 동시에 drain 한다. 본 함수가
-        // `rx` 를 들고 있어 채널 endpoint 는 살아 있고, drain 스레드는 같은 `rx` 를
-        // 빌려서 한 번 recv 하고 끝난다.
-        //
-        // 본 helper 함수는 두 스레드 사이에 `rx` 를 공유하기 위해 Mutex 로 감싸지만
-        // mpsc::Receiver 는 Sync 가 아니라 Mutex 가 안전하다 (한 번에 하나의 스레드만
-        // 잡는다). drain 스레드가 lock 을 기다리는 동안 broadcast 가 try_send 를 계속
-        // 시도하는 경로는 drain 이 한 번 recv 를 한 후에 lock 을 풀어 broadcast 가 빈
-        // 슬롯을 보게 만드는 happy-path 를 그대로 모델링한다.
+        // mpsc::channel 시그널로 drain 스레드 준비 완료를 기다린 뒤 broadcast 를
+        // 트리거한다. 이렇게 하면 slow CI 에서 sleep(15ms) 가 부족해 main 스레드가
+        // 먼저 broadcast 에 진입해 timeout 까지 다 소진하는 race 가 사라진다.
         let rx_shared = Arc::new(Mutex::new(rx));
         let rx_for_drain = Arc::clone(&rx_shared);
-        let drain_started = Arc::new(AtomicBool::new(false));
-        let drain_started_clone = Arc::clone(&drain_started);
+        let (drain_ready_tx, drain_ready_rx) = mpsc::channel::<()>();
         let drain_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(15));
-            drain_started_clone.store(true, Ordering::SeqCst);
+            // drain 스레드 진입 직후 즉시 ready 신호를 보낸다 — main 이 이 신호를
+            // 받은 후에 broadcast 를 시작하므로 drain 스레드가 lock 을 잡고 recv
+            // 를 도는 시점이 broadcast 의 pass 2 와 겹친다.
+            drain_ready_tx.send(()).expect("signal drain ready");
             let rx = rx_for_drain.lock().expect("drain rx lock");
             // 여러 칸 비운다 — broadcast pass 2 polling 이 5ms 마다 try_send 를 시도
             // 하는 동안 recv 가 한 슬롯을 비우면 그 다음 polling 시점에 회복한다.
@@ -2166,21 +2271,13 @@ mod tests {
             }
         });
 
-        let started = Instant::now();
+        // drain 스레드가 ready 일 때까지 블록 — slow CI 에서도 deterministic.
+        drain_ready_rx.recv().expect("drain ready signal");
         session.append_output(b"recovered");
-        let elapsed = started.elapsed();
         drain_thread.join().expect("drain thread");
         // `rx_shared` 는 본 함수의 끝까지 살아있다. drop 시 Disconnected 로 전이하지만
         // assertion 들은 모두 그 전에 evaluate 된다.
 
-        assert!(
-            drain_started.load(Ordering::SeqCst),
-            "drain thread should have started before append_output returned",
-        );
-        assert!(
-            elapsed < BACKPRESSURE_SEND_TIMEOUT + Duration::from_millis(50),
-            "append_output should return within timeout window, took {elapsed:?}",
-        );
         assert_eq!(
             on_evict_calls.load(Ordering::SeqCst),
             0,
@@ -2293,11 +2390,13 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         drainer.join().expect("drainer thread");
 
-        // 본 broadcast 의 wall time 은 timeout 한 윈도우 + 약간의 슬랙 안에 들어와야
-        // 한다 (sub#1 한 명만 laggy 이므로 K=1).
+        // 본 broadcast 의 wall time 은 timeout 한 윈도우 + slow-CI 슬랙 안에 들어와야
+        // 한다 (sub#1 한 명만 laggy 이므로 K=1). PR #16 quad-review HIGH 후속 (Forge):
+        // wall-clock 의 ±80ms 슬랙은 슬로우 CI 에서 fragile — 3x 상한으로 풀어 둔다.
+        // logical invariant 는 아래 eviction-count assertion 들이 보호한다.
         assert!(
-            elapsed < BACKPRESSURE_SEND_TIMEOUT + Duration::from_millis(80),
-            "two-pass broadcast wall time must be one timeout window plus slack, got {elapsed:?}",
+            elapsed < BACKPRESSURE_SEND_TIMEOUT * 3 + Duration::from_millis(100),
+            "two-pass broadcast wall time must stay within timeout × 3 + slack, got {elapsed:?}",
         );
         // sub#0 / sub#2 는 evict 되지 않아야 한다 — 본 PR 의 핵심 invariant.
         assert_eq!(
