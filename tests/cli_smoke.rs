@@ -5,6 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -1675,4 +1677,141 @@ fn resize_with_zero_dimensions_returns_error() -> TestResult {
         "zero rows must be rejected; response={response}"
     );
     Ok(())
+}
+
+/// PR #16: attach 직후 ring snapshot 이 broadcast 채널의 첫 chunk 로 흘러들어 attach
+/// stdout 의 head 에 박혀야 하고, 그 뒤에 라이브 chunk 들이 순서대로 따라와야 한다.
+/// PRELUDE 가 ring 에 자리 잡은 뒤 attach 하고, attach 가 시작된 다음 `lterm send` 로
+/// 새 출력을 푸시해 attach stdout 에서 PRELUDE → LIVE 순서를 확인한다.
+#[test]
+#[cfg(unix)]
+fn attach_replays_ring_snapshot_before_live_output() -> TestResult {
+    let env = TestEnv::new()?;
+    // ring 에 PRELUDE 를 쌓을 시간을 주기 위해 한 번 출력하고 잠시 대기하는 세션.
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "snap-order",
+            "--",
+            "sh",
+            "-lc",
+            // PS1 가 들어오지 않도록 -i 없이 단순 sleep. PRELUDE 를 한 번 찍고 충분히
+            // 길게 sleep 해 attach 시점에도 세션이 살아있게 한다.
+            "printf 'PRELUDE\\n'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    // PRELUDE 가 ring 에 들어갔는지 capture 로 폴링 — 들어가기 전에 attach 하면
+    // snapshot 이 비어 있어 본 테스트가 검증하려는 순서가 무의미해진다.
+    env.capture_until("snap-order", "PRELUDE")?;
+
+    // attach 를 stdin/stdout pipe 로 띄운다 — `--no-status` 는 status bar 의
+    // alt-screen / cursor 제어 이스케이프를 stdout 에 끼지 않게 한다.
+    let mut attach = env
+        .cmd()
+        .args(["attach", "snap-order", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let _stdin = attach.stdin.take().ok_or("missing attach stdin")?;
+    let mut stdout = attach.stdout.take().ok_or("missing attach stdout")?;
+
+    // attach stdout 에서 PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가 ring snapshot
+    // 이라는 PR #16 invariant.
+    let _prelude_end = read_until_marker(&mut stdout, b"PRELUDE", Duration::from_secs(5))?;
+
+    // 그 다음 라이브 stream 을 트리거하기 위해 send 로 새 데이터를 쏘아 넣는다 —
+    // `lterm send` 는 PTY writer 로 직접 쓰므로 PTY echo + reader 경로를 거쳐 attach
+    // stdout 으로 흘러나온다.
+    let send_status = env
+        .cmd()
+        .args(["send", "snap-order", "AFTER_PRELUDE\n"])
+        .status()?;
+    assert!(send_status.success(), "lterm send must succeed");
+
+    // attach stdout 에서 LIVE marker 를 마저 읽는다. 두 번의 `read_until_marker` 가
+    // 같은 stdout 위에서 순차로 검색하므로 (PR #16 quad-review LOW Forge 후속):
+    // AFTER_PRELUDE 가 발견된 시점에 PRELUDE 는 이미 그 앞 byte 위치에서 발견되었음이
+    // stream 순서로 강제된다. 별도 buffer 의 offset 비교 (`live_pos > prelude_pos`)
+    // 는 두 buffer 가 분리된 시점부터 invalid 했으므로 제거.
+    let _live_end = read_until_marker(&mut stdout, b"AFTER_PRELUDE", Duration::from_secs(5))?;
+
+    drop(stdout);
+    let _ = attach.kill();
+    let _ = attach.wait();
+    Ok(())
+}
+
+/// `stdout` 에서 `marker` 의 마지막 바이트가 등장한 byte offset 을 반환한다. timeout
+/// 안에 못 찾으면 에러. 본 helper 는 attach 출력 head 부분의 순서 검증에만 쓰이며,
+/// PTY 가 보내는 LF/CR 변환은 무시하고 marker 의 raw 바이트만 검사한다.
+///
+/// PR #16 quad-review MEDIUM 후속 (Codex/Forge 합의): 이전 구현은 `Instant::now <
+/// deadline` 루프가 blocking `stdout.read()` 를 감싸는 구조였다. marker 가 절대
+/// 도착하지 않더라도 child 가 살아있으면 `read()` 가 무한정 블록되어 `timeout`
+/// 인자가 사실상 무력화됐다. fd 를 `O_NONBLOCK` 으로 두고 `WouldBlock` 시 짧게
+/// sleep 하며 deadline 을 다시 본다 — child 가 살아있어도 진짜로 timeout 이 강제된다.
+/// (reader 스레드 + `mpsc::recv_timeout` 패턴은 marker 발견 후 `reader.join()` 이
+/// 매달린 read() 를 기다리며 hang 하는 부수효과가 있어 NONBLOCK 방식을 채택.)
+///
+/// fd 의 NONBLOCK 플래그는 본 호출 이후에도 유지된다 — caller 가 같은 reader 로
+/// 후속 read 를 부르면 모두 NONBLOCK 으로 동작한다 (본 helper 의 일관된 사용 패턴).
+/// 본 fd 는 child stdout 만 다루는 테스트 컨텍스트라 외부 영향을 걱정하지 않아도 된다.
+#[cfg(unix)]
+fn read_until_marker<R: Read + AsRawFd>(
+    stdout: &mut R,
+    marker: &[u8],
+    timeout: Duration,
+) -> TestResult<usize> {
+    // fd 를 non-blocking 으로 전환. 이미 non-blocking 이어도 멱등.
+    let fd = stdout.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while Instant::now() < deadline {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_subsequence(&buf, marker) {
+                    return Ok(pos + marker.len());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                return Err(format!("stdout read error: {err}").into());
+            }
+        }
+    }
+    Err(format!(
+        "marker {:?} not found within {:?}; buffer head: {:?}",
+        std::str::from_utf8(marker).unwrap_or("<binary>"),
+        timeout,
+        String::from_utf8_lossy(&buf[..buf.len().min(256)])
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
