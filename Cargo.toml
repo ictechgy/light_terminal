@@ -28,4 +28,5 @@ unicode-width = "0.2"  # status bar 정렬용 CJK/이모지 디스플레이 폭 
 uuid = { version = "1.8", features = ["v4", "serde"] }
 
 [dev-dependencies]
+serde_json = "1.0"
 tempfile = "3.10"
