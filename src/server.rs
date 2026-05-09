@@ -23,6 +23,9 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_SESSIONS: usize = 256;
 const MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
+const MAX_TERMINAL_ROWS: u16 = 1000;
+const MAX_TERMINAL_COLS: u16 = 1000;
+const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 /// PR #16: subscriber 별 broadcast 채널 슬롯 한도. 슬롯 하나가 들고 있는 것은
 /// `Arc<[u8]>` 의 fat pointer 라 메모리 비용은 슬롯 수에 비례하지만 메시지 바이트
 /// 수에 비례하지 않는다. 128 → 256 으로 키운 것은 모바일 reattach 직후 PTY burst
@@ -34,8 +37,8 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 /// `Full` 을 반환한 sub 에 대해 본 시간 동안 `send_timeout` 으로 한 번 더 시도하고,
 /// 그래도 자리가 나지 않으면 그제서야 evict 한다 — PR #13 의 zombie-attach 차단
 /// 보장은 유지하면서, 모바일 SSH 의 50–200ms 딸꾹질이 attach 를 끊지 않도록 한다.
-/// 최악 시 본 함수의 대기 시간은 `K * BACKPRESSURE_SEND_TIMEOUT` (K = pending 수)
-/// 이 되며 PTY reader 스레드가 그동안 정체된다 — 의도적으로 짧게 둔다.
+/// PR #16 fold-in 이후 최악 시 본 함수의 대기 시간은 pending 수 K 와 무관하게
+/// `BACKPRESSURE_SEND_TIMEOUT` 하나로 묶인다.
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -173,6 +176,11 @@ struct Session {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     ring: Mutex<VecDeque<u8>>,
+    /// PR #17: attach snapshot 은 raw 2 MiB ring replay 가 아니라 이 in-memory
+    /// terminal state 에서 합성한 현재 화면 frame 을 보낸다. raw ring 은 capture 와
+    /// 라인 기반 조회를 위해 그대로 유지하지만, attach 초기 출력에는 오래된 scrollback
+    /// / 이미 지워진 escape history 를 다시 먹이지 않는다.
+    terminal_screen: Mutex<vt100::Parser>,
     subscribers: Mutex<Vec<Subscriber>>,
     output_state: Mutex<()>,
     /// PR #15 quad-review HIGH 후속: per-client geometry 갱신 → clamp 결정 →
@@ -187,9 +195,10 @@ struct Session {
     ///
     /// 결과적으로 살아있는 attach 가 wide 한데 PTY 가 narrow 인 stale 상태가 된다.
     ///
-    /// 락 순서: `geometry_apply > subscribers`, `geometry_apply > master`. 즉 geometry
-    /// 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야 한다.
-    /// `output_state` 와는 독립 — 서로의 critical section 안에서 잡지 않는다.
+    /// 락 순서: `geometry_apply > subscribers`,
+    /// `geometry_apply > output_state > master/terminal_screen`. 즉 geometry
+    /// 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야 하며,
+    /// PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
     geometry_apply: Mutex<()>,
     next_subscriber_id: AtomicU64,
     alive: AtomicBool,
@@ -231,6 +240,7 @@ impl Session {
                 ring.push_back(*byte);
             }
         }
+        lock(&self.terminal_screen).process(bytes);
 
         let subscribers = lock(&self.subscribers).clone();
         let chunk: Option<OutputChunk> = if subscribers.is_empty() {
@@ -301,13 +311,18 @@ impl Session {
     /// 구버전 클라이언트 페이로드(예: lterm 재빌드 누락) 가 원인이므로, 사용자가
     /// 다음 행동을 짐작할 수 있도록 친절한 메시지로 surface 한다.
     ///
-    /// PR #16: ring snapshot 을 별도 동기 write 로 보내지 않고 broadcast 채널의 첫
+    /// PR #16: attach snapshot 을 별도 동기 write 로 보내지 않고 broadcast 채널의 첫
     /// chunk 로 직접 푸시한다. caller 의 output 스레드는 이 chunk 를 그대로 받아
-    /// 라이브 chunk 와 동일한 순서로 출력한다 — snapshot 동기 write 가 늦어지는
-    /// 사이 라이브 채널이 차서 false-positive eviction 이 일어나던 race 를 닫는다.
-    /// snapshot push 는 `output_state` 가드를 들고 있는 동안 실행되므로 등록 직후의
-    /// `append_output` 이 같은 가드를 기다리며 직렬화되어 라이브 chunk 가 snapshot
-    /// 보다 먼저 큐에 들어가지 못한다.
+    /// 라이브 chunk 와 동일한 순서로 출력한다 — snapshot 동기 write 가 늦어지는 사이
+    /// 라이브 채널이 차서 false-positive eviction 이 일어나던 race 를 닫는다.
+    ///
+    /// PR #17: 그 첫 chunk 의 내용은 더 이상 raw ring dump 가 아니다. raw ring 은
+    /// capture 용으로 유지하되, attach replay 는 `terminal_screen` 이 합성한 현재
+    /// visible state (`vt100::Screen::state_formatted`) 만 보낸다. 따라서 이미 지운
+    /// 과거 output, scrollback, 잘린 escape sequence 를 새 attach terminal 에 다시
+    /// 주입하지 않는다. snapshot push 는 `output_state` 가드를 들고 있는 동안 실행되므로
+    /// 등록 직후의 `append_output` 이 같은 가드를 기다리며 직렬화되어 라이브 chunk 가
+    /// snapshot 보다 먼저 큐에 들어가지 못한다.
     fn subscribe_with_snapshot(
         &self,
         rows: u16,
@@ -319,24 +334,30 @@ impl Session {
                 "attach: client did not supply rows/cols (likely a version mismatch — please rebuild lterm)"
             );
         }
+        validate_terminal_geometry("attach", rows, cols)?;
         let _output_guard = lock(&self.output_state);
-        let initial: Vec<u8> = {
+        let has_output = {
             let ring = lock(&self.ring);
-            ring.iter().copied().collect()
+            !ring.is_empty()
         };
-        // 빈 ring 일 때는 None 으로 두어 0-byte chunk 가 채널에 들어가지 않게 한다 —
-        // subscribe_locked 안에서 빈 chunk 분기를 다시 검사하지 않아도 되도록 호출자
-        // 측에서 명시적으로 분기.
-        let initial_chunk: Option<OutputChunk> = if initial.is_empty() {
-            None
+        // 빈 ring 일 때는 None 으로 두어 의미 없는 clear/reset snapshot 을 채널에
+        // 넣지 않는다. 한 번이라도 PTY output 이 있었던 세션만 현재 screen state 를
+        // 합성해 첫 chunk 로 보낸다.
+        let initial_chunk: Option<OutputChunk> = if has_output {
+            let (snapshot_rows, snapshot_cols) = {
+                let subscribers = lock(&self.subscribers);
+                clamp_to_smallest_with_candidate(&subscribers, rows, cols)
+            };
+            let terminal_screen = lock(&self.terminal_screen);
+            screen_state_snapshot(&terminal_screen, snapshot_rows, snapshot_cols)
         } else {
-            Some(Arc::from(initial.as_slice()))
+            None
         };
         self.subscribe_locked(rows, cols, on_evict, initial_chunk)
     }
 
     /// 새 subscriber 를 등록하고 `(id, rx)` 를 반환한다. `initial_chunk` 가 `Some` 이면
-    /// 등록 직후 그 chunk 를 broadcast 채널에 푸시한다 — PR #16 의 ring snapshot 첫
+    /// 등록 직후 그 chunk 를 broadcast 채널에 푸시한다 — PR #16/17 의 snapshot 첫
     /// chunk 시나리오. 푸시는 본 함수가 `subscribers` lock 을 들고 있는 동안 실행되어
     /// 다른 broadcast 가 끼어들 여지를 차단한다.
     ///
@@ -427,11 +448,12 @@ impl Session {
     /// 가드를 컴파일타임에 강제하기 위해 인자로 `&MutexGuard<()>` 를 받는다.
     ///
     /// **하위 lock 순서**: 본 함수 내부에서는 subscribers lock 을 짧게 잡아 min 만
-    /// 계산하고 즉시 해제한 뒤, 별도로 master lock 을 잡아 resize 한다. 두 lock 을
-    /// 동시에 잡지 않는 이유는 `append_output` 이 subscribers lock 을 먼저 잡고
-    /// try_send 를 통해 broadcast 채널을 거치는 경로와 lock 순서를 어긋나게 하지
-    /// 않기 위함이다. lock-order 표기: `geometry_apply > subscribers`,
-    /// `geometry_apply > master`, `output_state` 는 독립.
+    /// 계산하고 즉시 해제한 뒤, `apply_pty_size` 가 `output_state` 아래에서 master
+    /// resize 와 parser resize 를 직렬화한다. subscribers lock 과 master/parser lock 을
+    /// 동시에 잡지 않는 이유는 `append_output` 의 broadcast 경로와 lock 순서를
+    /// 어긋나게 하지 않기 위함이다. lock-order 표기:
+    /// `geometry_apply > subscribers`, `geometry_apply > output_state > master`,
+    /// `geometry_apply > output_state > terminal_screen`.
     ///
     /// **`output_state` 와의 관계**: 이 함수는 `output_state` 가 잡혀 있지 **않은**
     /// 상태에서 호출되어야 한다. `subscribe_with_snapshot` 의 caller 는 그 함수가
@@ -444,11 +466,16 @@ impl Session {
         let Some((rows, cols)) = target else {
             return Ok(());
         };
-        let mut current_rows = lock(&self.rows);
-        let mut current_cols = lock(&self.cols);
-        if *current_rows == rows && *current_cols == cols {
+        let current = (*lock(&self.rows), *lock(&self.cols));
+        if current == (rows, cols) {
             return Ok(());
         }
+        self.apply_pty_size(rows, cols, "resize pty to clamped subscriber geometry")?;
+        Ok(())
+    }
+
+    fn apply_pty_size(&self, rows: u16, cols: u16, context: &'static str) -> Result<()> {
+        let _output_guard = lock(&self.output_state);
         lock(&self.master)
             .resize(PtySize {
                 rows,
@@ -456,10 +483,17 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("resize pty to clamped subscriber geometry")?;
-        *current_rows = rows;
-        *current_cols = cols;
+            .context(context)?;
+        *lock(&self.rows) = rows;
+        *lock(&self.cols) = cols;
+        self.resize_terminal_screen(rows, cols);
         Ok(())
+    }
+
+    fn resize_terminal_screen(&self, rows: u16, cols: u16) {
+        lock(&self.terminal_screen)
+            .screen_mut()
+            .set_size(rows, cols);
     }
 }
 
@@ -477,6 +511,67 @@ fn clamp_to_smallest(subscribers: &[Subscriber]) -> Option<(u16, u16)> {
         cols = cols.min(sub.cols);
     }
     Some((rows, cols))
+}
+
+/// 기존 attach 들에 새 attach 후보 geometry 를 더했을 때의 clamp target 을 계산한다.
+/// subscribe snapshot 은 실제 등록/resize 적용보다 먼저 합성되므로, 새 narrow client
+/// 에게 wide frame 을 보내지 않도록 후보 geometry 를 포함한 target 크기로 만든다.
+fn clamp_to_smallest_with_candidate(
+    subscribers: &[Subscriber],
+    candidate_rows: u16,
+    candidate_cols: u16,
+) -> (u16, u16) {
+    let mut rows = candidate_rows;
+    let mut cols = candidate_cols;
+    for sub in subscribers {
+        rows = rows.min(sub.rows);
+        cols = cols.min(sub.cols);
+    }
+    (rows, cols)
+}
+
+fn validate_terminal_geometry(context: &str, rows: u16, cols: u16) -> Result<()> {
+    if rows == 0 || cols == 0 {
+        bail!("{context}: terminal dimensions must be at least 1 row and 1 column");
+    }
+    if rows > MAX_TERMINAL_ROWS || cols > MAX_TERMINAL_COLS {
+        bail!(
+            "{context}: terminal dimensions {rows}x{cols} exceed maximum {MAX_TERMINAL_ROWS}x{MAX_TERMINAL_COLS}"
+        );
+    }
+    Ok(())
+}
+
+fn initial_pty_size(rows: Option<u16>, cols: Option<u16>) -> Result<(u16, u16)> {
+    let rows = rows.unwrap_or(24);
+    let cols = cols.unwrap_or(80);
+    validate_terminal_geometry("new", rows, cols)?;
+    Ok((rows, cols))
+}
+
+/// PR #17: raw ring replay 대신 현재 terminal state 를 새 attach 가 바로 해석할 수
+/// 있는 escape stream 으로 합성한다. `vt100` 의 `state_formatted` 는 현재 visible
+/// contents 와 input mode 를 재현하기에 충분한 bytes 를 만든다. 새 attach 의 geometry
+/// 로 clone screen 을 resize 한 뒤 합성해, narrow mobile attach 에 wide raw history 를
+/// 그대로 주입하지 않는다.
+fn screen_state_snapshot(parser: &vt100::Parser, rows: u16, cols: u16) -> Option<OutputChunk> {
+    let mut snapshot = Vec::new();
+    if parser.screen().alternate_screen() {
+        // `state_formatted` 는 visible contents/input modes 를 재현하지만 xterm
+        // alternate-screen 진입 CSI 자체는 방출하지 않는다. lterm client 는 이 CSI 를
+        // 관찰해야 status-bar refresh 를 alt buffer 위에 그리지 않으므로, active
+        // alt-screen snapshot 앞에 명시적으로 1049 enter 를 붙인다.
+        snapshot.extend_from_slice(ALT_SCREEN_ENTER);
+    }
+    let mut screen = parser.screen().clone();
+    screen.set_scrollback(0);
+    screen.set_size(rows, cols);
+    snapshot.extend(screen.state_formatted());
+    if snapshot.is_empty() {
+        None
+    } else {
+        Some(Arc::from(snapshot.into_boxed_slice()))
+    }
 }
 
 /// PR #16: `subscribers` snapshot 에 `chunk` 를 broadcast 하면서 즉시 보낼 수 없는 sub
@@ -727,9 +822,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cols,
             subscriber_id,
         } => {
-            if rows == 0 || cols == 0 {
-                bail!("resize dimensions must be at least 1 row and 1 column");
-            }
+            validate_terminal_geometry("resize", rows, cols)?;
             let session = resolve_session(state, &target)?;
             // PR #15 quad-review HIGH 후속(#1): per-client geometry 변경 / clamp 결정 /
             // master.resize / cached rows·cols 갱신 의 4단계가 다른 attach 의
@@ -768,16 +861,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 // 의도적으로 받아들일 때만 안전하다. 자세한 contract 는
                 // `protocol::Request::Resize` 의 `subscriber_id` 도큐먼트 참조.
                 None => {
-                    lock(&session.master)
-                        .resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })
-                        .context("resize pty")?;
-                    *lock(&session.rows) = rows;
-                    *lock(&session.cols) = cols;
+                    session.apply_pty_size(rows, cols, "resize pty")?;
                 }
             }
             drop(geometry_guard);
@@ -861,8 +945,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     }
     let reservation = reserve_session_identity(state, params.name)?;
     let pty_system = native_pty_system();
-    let rows = params.rows.unwrap_or(24).max(1);
-    let cols = params.cols.unwrap_or(80).max(1);
+    let (rows, cols) = initial_pty_size(params.rows, params.cols)?;
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -951,6 +1034,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         ring: Mutex::new(VecDeque::new()),
+        terminal_screen: Mutex::new(vt100::Parser::new(rows, cols, 0)),
         subscribers: Mutex::new(Vec::new()),
         output_state: Mutex::new(()),
         geometry_apply: Mutex::new(()),
@@ -1210,9 +1294,9 @@ fn handle_attach(
     // subscribe_with_snapshot 은 output_state lock 을 잡고 있으므로 PTY 사이즈
     // 재계산은 반환된 후 별도로 호출한다 (lock 순서 분리).
     //
-    // PR #16: ring snapshot 은 별도 동기 write 가 아니라 broadcast 채널의 첫 chunk
-    // 로 푸시되어 들어온다 — 아래에서 spawn 하는 output_thread 가 라이브 chunk 와
-    // 함께 순서대로 흘려준다.
+    // PR #17: screen-state snapshot 은 별도 동기 write 가 아니라 broadcast 채널의
+    // 첫 chunk 로 푸시되어 들어온다 — 아래에서 spawn 하는 output_thread 가 라이브
+    // chunk 와 함께 순서대로 흘려준다.
     let (subscriber_id, rx) = match session.subscribe_with_snapshot(rows, cols, on_evict) {
         Ok(subscription) => subscription,
         Err(err) => {
@@ -1769,9 +1853,10 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKPRESSURE_SEND_TIMEOUT, OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber,
-        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
-        process_group_still_owns_child,
+        ALT_SCREEN_ENTER, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS,
+        OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber, broadcast_chunk,
+        clamp_to_smallest, evict_disconnected_subscribers, initial_pty_size,
+        process_group_still_owns_child, validate_terminal_geometry,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
@@ -2088,6 +2173,7 @@ mod tests {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             ring: Mutex::new(VecDeque::new()),
+            terminal_screen: Mutex::new(vt100::Parser::new(24, 80, 0)),
             subscribers: Mutex::new(Vec::new()),
             output_state: Mutex::new(()),
             geometry_apply: Mutex::new(()),
@@ -2099,15 +2185,40 @@ mod tests {
         })
     }
 
-    /// PR #16: ring 에 쌓인 snapshot 이 broadcast 채널의 첫 chunk 로 들어가고, 이후
-    /// `append_output` 으로 들어오는 라이브 chunk 가 그 뒤에 순서대로 도착해야 한다.
-    /// 그래야 attach 직후 output_thread 가 ring 버퍼와 라이브 stream 을 같은 채널
-    /// 단일 source 로 받을 수 있다.
     #[test]
-    fn subscribe_with_snapshot_pushes_ring_snapshot_as_first_chunk() {
+    fn terminal_geometry_validation_accepts_common_size_and_rejects_edges() {
+        validate_terminal_geometry("test", 24, 80).expect("common terminal size");
+        assert!(
+            validate_terminal_geometry("test", 0, 80)
+                .expect_err("zero rows rejected")
+                .to_string()
+                .contains("at least 1"),
+        );
+        assert!(
+            validate_terminal_geometry("test", MAX_TERMINAL_ROWS + 1, 80)
+                .expect_err("oversized rows rejected")
+                .to_string()
+                .contains("exceed maximum"),
+        );
+        assert!(
+            validate_terminal_geometry("test", 24, MAX_TERMINAL_COLS + 1)
+                .expect_err("oversized cols rejected")
+                .to_string()
+                .contains("exceed maximum"),
+        );
+        assert_eq!(initial_pty_size(None, None).expect("defaults"), (24, 80));
+        assert!(initial_pty_size(Some(0), Some(80)).is_err());
+    }
+
+    /// PR #17: attach snapshot 은 raw ring dump 가 아니라 terminal screen state 에서
+    /// 합성한 현재 frame 이 broadcast 채널의 첫 chunk 로 들어가야 한다. 이후
+    /// `append_output` 으로 들어오는 라이브 chunk 는 같은 채널에서 그 뒤에 순서대로
+    /// 도착해야 한다.
+    #[test]
+    fn subscribe_with_snapshot_pushes_screen_state_as_first_chunk() {
         let session = build_test_session("snap-first");
-        // ring 에 PRELUDE 를 미리 채운다 — append_output 은 subscribers 가 비어 있으면
-        // ring 만 갱신하므로 본 호출은 broadcast 부작용 없이 ring 만 채우는 효과.
+        // PRELUDE 를 현재 화면 state 에 반영한다. subscriber 가 아직 없으므로 broadcast
+        // 부작용 없이 ring 과 terminal_screen 만 갱신된다.
         session.append_output(b"PRELUDE\n");
 
         let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
@@ -2118,10 +2229,15 @@ mod tests {
         let first = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first chunk");
-        assert_eq!(
+        let rendered = String::from_utf8_lossy(&first);
+        assert!(
+            rendered.contains("PRELUDE"),
+            "screen-state snapshot must contain the rendered current frame, got: {rendered:?}",
+        );
+        assert_ne!(
             first.as_ref(),
             b"PRELUDE\n",
-            "snapshot must be the first chunk on the broadcast channel",
+            "snapshot must be formatted screen state, not raw ring bytes",
         );
 
         // 후속 라이브 chunk 들도 같은 채널을 통해 순서대로 들어와야 한다.
@@ -2133,12 +2249,98 @@ mod tests {
         assert_eq!(live2.as_ref(), b"LIVE-2\n");
     }
 
+    /// PR #17: raw ring replay 는 이미 지워진 scrollback/history 를 새 attach 에 다시
+    /// 먹이는 문제가 있었다. screen-state replay 는 현재 visible frame 만 합성하므로
+    /// clear 된 과거 텍스트가 snapshot 에 들어가지 않아야 한다.
+    #[test]
+    fn subscribe_with_snapshot_does_not_replay_cleared_ring_history() {
+        let session = build_test_session("snap-current-frame");
+        session.append_output(b"STALE-HISTORY\n");
+        session.append_output(b"\x1b[2J\x1b[HFRESH-FRAME");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        let rendered = String::from_utf8_lossy(&first);
+        assert!(
+            rendered.contains("FRESH-FRAME"),
+            "snapshot must contain current visible frame, got: {rendered:?}",
+        );
+        assert!(
+            !rendered.contains("STALE-HISTORY"),
+            "snapshot must not replay cleared raw ring history, got: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn subscribe_with_snapshot_preserves_alt_screen_state() {
+        let session = build_test_session("snap-alt-screen");
+        session.append_output(b"\x1b[?1049hALT-FRAME");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        assert!(
+            first.starts_with(ALT_SCREEN_ENTER),
+            "alt-screen snapshot must explicitly enter alt buffer first, got: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        assert!(
+            String::from_utf8_lossy(&first).contains("ALT-FRAME"),
+            "snapshot must include alt-screen contents"
+        );
+    }
+
+    #[test]
+    fn subscribe_with_snapshot_rejects_oversized_attach_geometry() {
+        let session = build_test_session("snap-oversized");
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let err = match session.subscribe_with_snapshot(MAX_TERMINAL_ROWS + 1, 80, on_evict) {
+            Ok(_) => panic!("oversized attach rows should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("exceed maximum"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn apply_pty_size_updates_terminal_screen_size() {
+        let session = build_test_session("screen-resize");
+        session
+            .apply_pty_size(12, 40, "test resize")
+            .expect("resize test pty");
+        assert_eq!(*session.rows.lock().expect("rows"), 12);
+        assert_eq!(*session.cols.lock().expect("cols"), 40);
+        assert_eq!(
+            session
+                .terminal_screen
+                .lock()
+                .expect("terminal screen")
+                .screen()
+                .size(),
+            (12, 40),
+            "parser screen size must track successful PTY resize"
+        );
+    }
+
     /// PR #16 quad-review HIGH 후속 (Forge 고유): 기존 `subscribe_with_snapshot_*`
     /// 단위테스트는 sequential happy-path (먼저 ring 채우고 → subscribe → 라이브 push)
     /// 만 검증해 PR 이 실제로 수정한다고 주장하는 race (subscribe 도중 다른 스레드의
     /// `append_output` 이 들어오는 상황) 를 exercise 하지 못한다. 본 테스트는 백그라운드
     /// 스레드가 라이브 출력을 producing 하는 도중 `subscribe_with_snapshot` 을 호출하고,
-    /// 첫 chunk 가 항상 ring snapshot prefix (`PRELUDE`) 로 시작함을 확인한다.
+    /// 첫 chunk 가 항상 screen-state snapshot 임을 확인한다.
     ///
     /// `output_state` 가드가 (a) ring 갱신, (b) subscribers 스냅샷 복사, (c) broadcast
     /// 를 직렬화하므로, subscribe 의 snapshot push 가 lock 안에서 끝나야 새 sub 의 큐에
@@ -2162,7 +2364,7 @@ mod tests {
             live_started_clone.wait();
             let mut counter = 0u32;
             while !stop_for_thread.load(Ordering::SeqCst) {
-                session_for_thread.append_output(format!("LIVE-{counter}|").as_bytes());
+                session_for_thread.append_output(format!("\x1b[2;1HLIVE-{counter:<8}").as_bytes());
                 counter += 1;
                 // CPU 100% 사용을 막기 위한 짧은 sleep — race 자체와 무관.
                 std::thread::sleep(Duration::from_micros(50));
@@ -2179,17 +2381,21 @@ mod tests {
             .subscribe_with_snapshot(24, 80, on_evict)
             .expect("subscribe");
 
-        // 첫 chunk 는 subscribe 시점의 ring snapshot prefix 로 시작해야 한다.
+        // 첫 chunk 는 subscribe 시점의 screen-state snapshot 이어야 한다.
         // `subscribe_with_snapshot` 안의 `output_state` 가드가 snapshot push 와
         // append_output 의 broadcast 를 직렬화해 라이브 chunk 가 snapshot 앞에 끼어들
         // 수 없게 한다.
         let first = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first chunk");
+        let rendered = String::from_utf8_lossy(&first);
         assert!(
-            first.starts_with(b"PRELUDE"),
-            "first chunk must be ring snapshot (start with PRELUDE), got: {:?}",
-            String::from_utf8_lossy(&first)
+            rendered.contains("PRELUDE"),
+            "first chunk must be formatted screen-state snapshot containing PRELUDE, got: {rendered:?}",
+        );
+        assert!(
+            first.starts_with(b"\x1b"),
+            "screen-state snapshot should start with terminal formatting escape, got: {rendered:?}",
         );
 
         stop.store(true, Ordering::SeqCst);

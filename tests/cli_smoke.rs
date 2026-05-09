@@ -1679,15 +1679,62 @@ fn resize_with_zero_dimensions_returns_error() -> TestResult {
     Ok(())
 }
 
-/// PR #16: attach 직후 ring snapshot 이 broadcast 채널의 첫 chunk 로 흘러들어 attach
-/// stdout 의 head 에 박혀야 하고, 그 뒤에 라이브 chunk 들이 순서대로 따라와야 한다.
-/// PRELUDE 가 ring 에 자리 잡은 뒤 attach 하고, attach 가 시작된 다음 `lterm send` 로
-/// 새 출력을 푸시해 attach stdout 에서 PRELUDE → LIVE 순서를 확인한다.
 #[test]
 #[cfg(unix)]
-fn attach_replays_ring_snapshot_before_live_output() -> TestResult {
+fn resize_with_oversized_dimensions_returns_error() -> TestResult {
     let env = TestEnv::new()?;
-    // ring 에 PRELUDE 를 쌓을 시간을 주기 위해 한 번 출력하고 잠시 대기하는 세션.
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "oversized-resize",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_socket(&socket)?;
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "oversized-resize",
+        "rows": 1001_u16,
+        "cols": 80_u16,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "oversized rows must be rejected; response={response}"
+    );
+    assert!(
+        response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|msg| msg.contains("exceed maximum")),
+        "oversized resize should explain the maximum; response={response}"
+    );
+    Ok(())
+}
+
+/// PR #17: attach 직후 screen-state snapshot 이 broadcast 채널의 첫 chunk 로 흘러들어
+/// attach stdout 의 head 에 박혀야 하고, 그 뒤에 라이브 chunk 들이 순서대로 따라와야
+/// 한다. PRELUDE 가 terminal state 에 자리 잡은 뒤 attach 하고, attach 가 시작된 다음
+/// `lterm send` 로 새 출력을 푸시해 attach stdout 에서 PRELUDE → LIVE 순서를 확인한다.
+#[test]
+#[cfg(unix)]
+fn attach_replays_screen_state_before_live_output() -> TestResult {
+    let env = TestEnv::new()?;
+    // terminal state 에 PRELUDE 를 쌓을 시간을 주기 위해 한 번 출력하고 잠시 대기하는 세션.
     let status = env
         .cmd()
         .args([
@@ -1705,8 +1752,8 @@ fn attach_replays_ring_snapshot_before_live_output() -> TestResult {
         .status()?;
     assert!(status.success());
 
-    // PRELUDE 가 ring 에 들어갔는지 capture 로 폴링 — 들어가기 전에 attach 하면
-    // snapshot 이 비어 있어 본 테스트가 검증하려는 순서가 무의미해진다.
+    // PRELUDE 가 PTY output 으로 들어갔는지 capture 로 폴링 — 들어가기 전에 attach
+    // 하면 snapshot 이 비어 있어 본 테스트가 검증하려는 순서가 무의미해진다.
     env.capture_until("snap-order", "PRELUDE")?;
 
     // attach 를 stdin/stdout pipe 로 띄운다 — `--no-status` 는 status bar 의
@@ -1721,8 +1768,8 @@ fn attach_replays_ring_snapshot_before_live_output() -> TestResult {
     let _stdin = attach.stdin.take().ok_or("missing attach stdin")?;
     let mut stdout = attach.stdout.take().ok_or("missing attach stdout")?;
 
-    // attach stdout 에서 PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가 ring snapshot
-    // 이라는 PR #16 invariant.
+    // attach stdout 에서 PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가
+    // screen-state snapshot 이라는 PR #17 invariant.
     let _prelude_end = read_until_marker(&mut stdout, b"PRELUDE", Duration::from_secs(5))?;
 
     // 그 다음 라이브 stream 을 트리거하기 위해 send 로 새 데이터를 쏘아 넣는다 —
