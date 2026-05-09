@@ -1723,18 +1723,41 @@ fn resize_with_oversized_dimensions_returns_error() -> TestResult {
             .is_some_and(|msg| msg.contains("exceed maximum")),
         "oversized resize should explain the maximum; response={response}"
     );
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "oversized-resize",
+        "rows": 1000_u16,
+        "cols": 1000_u16,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "oversized area must be rejected; response={response}"
+    );
+    assert!(
+        response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|msg| msg.contains("terminal area")),
+        "oversized resize should explain the area limit; response={response}"
+    );
     Ok(())
 }
 
 /// PR #17: attach 직후 screen-state snapshot 이 broadcast 채널의 첫 chunk 로 흘러들어
 /// attach stdout 의 head 에 박혀야 하고, 그 뒤에 라이브 chunk 들이 순서대로 따라와야
-/// 한다. PRELUDE 가 terminal state 에 자리 잡은 뒤 attach 하고, attach 가 시작된 다음
-/// `lterm send` 로 새 출력을 푸시해 attach stdout 에서 PRELUDE → LIVE 순서를 확인한다.
+/// 한다. stale text 를 출력한 뒤 화면을 지우고 fresh frame 을 만든 다음 attach 해,
+/// raw ring replay 였다면 보였을 stale history 가 새 attach 에 나오지 않음을 확인한다.
 #[test]
 #[cfg(unix)]
 fn attach_replays_screen_state_before_live_output() -> TestResult {
     let env = TestEnv::new()?;
-    // terminal state 에 PRELUDE 를 쌓을 시간을 주기 위해 한 번 출력하고 잠시 대기하는 세션.
+    // stale history 를 만든 뒤 화면을 지우고 fresh frame 만 현재 terminal state 에 남긴다.
     let status = env
         .cmd()
         .args([
@@ -1745,16 +1768,16 @@ fn attach_replays_screen_state_before_live_output() -> TestResult {
             "--",
             "sh",
             "-lc",
-            // PS1 가 들어오지 않도록 -i 없이 단순 sleep. PRELUDE 를 한 번 찍고 충분히
-            // 길게 sleep 해 attach 시점에도 세션이 살아있게 한다.
-            "printf 'PRELUDE\\n'; sleep 30",
+            // PS1 가 들어오지 않도록 -i 없이 단순 sleep. 충분히 길게 sleep 해 attach
+            // 시점에도 세션이 살아있게 한다.
+            "printf 'STALE_PRELUDE\\n'; printf '\\033[2J\\033[HFRESH_PRELUDE'; sleep 30",
         ])
         .status()?;
     assert!(status.success());
 
-    // PRELUDE 가 PTY output 으로 들어갔는지 capture 로 폴링 — 들어가기 전에 attach
+    // FRESH_PRELUDE 가 PTY output 으로 들어갔는지 capture 로 폴링 — 들어가기 전에 attach
     // 하면 snapshot 이 비어 있어 본 테스트가 검증하려는 순서가 무의미해진다.
-    env.capture_until("snap-order", "PRELUDE")?;
+    env.capture_until("snap-order", "FRESH_PRELUDE")?;
 
     // attach 를 stdin/stdout pipe 로 띄운다 — `--no-status` 는 status bar 의
     // alt-screen / cursor 제어 이스케이프를 stdout 에 끼지 않게 한다.
@@ -1768,9 +1791,18 @@ fn attach_replays_screen_state_before_live_output() -> TestResult {
     let _stdin = attach.stdin.take().ok_or("missing attach stdin")?;
     let mut stdout = attach.stdout.take().ok_or("missing attach stdout")?;
 
-    // attach stdout 에서 PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가
-    // screen-state snapshot 이라는 PR #17 invariant.
-    let _prelude_end = read_until_marker(&mut stdout, b"PRELUDE", Duration::from_secs(5))?;
+    // attach stdout 에서 FRESH_PRELUDE 를 먼저 본다 — broadcast 채널 첫 chunk 가
+    // screen-state snapshot 이라는 PR #17 invariant. 이 시점까지 STALE_PRELUDE 가
+    // 같이 보이면 raw ring replay 로 회귀한 것이다.
+    let snapshot_head =
+        read_until_marker_bytes(&mut stdout, b"FRESH_PRELUDE", Duration::from_secs(5))?;
+    assert!(
+        !snapshot_head
+            .windows(b"STALE_PRELUDE".len())
+            .any(|window| window == b"STALE_PRELUDE"),
+        "screen-state snapshot must not replay cleared raw history: {:?}",
+        String::from_utf8_lossy(&snapshot_head)
+    );
 
     // 그 다음 라이브 stream 을 트리거하기 위해 send 로 새 데이터를 쏘아 넣는다 —
     // `lterm send` 는 PTY writer 로 직접 쓰므로 PTY echo + reader 경로를 거쳐 attach
@@ -1815,6 +1847,16 @@ fn read_until_marker<R: Read + AsRawFd>(
     marker: &[u8],
     timeout: Duration,
 ) -> TestResult<usize> {
+    let buf = read_until_marker_bytes(stdout, marker, timeout)?;
+    Ok(find_subsequence(&buf, marker).expect("marker already found") + marker.len())
+}
+
+#[cfg(unix)]
+fn read_until_marker_bytes<R: Read + AsRawFd>(
+    stdout: &mut R,
+    marker: &[u8],
+    timeout: Duration,
+) -> TestResult<Vec<u8>> {
     // fd 를 non-blocking 으로 전환. 이미 non-blocking 이어도 멱등.
     let fd = stdout.as_raw_fd();
     unsafe {
@@ -1833,7 +1875,8 @@ fn read_until_marker<R: Read + AsRawFd>(
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = find_subsequence(&buf, marker) {
-                    return Ok(pos + marker.len());
+                    buf.truncate(pos + marker.len());
+                    return Ok(buf);
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
