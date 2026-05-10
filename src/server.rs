@@ -928,16 +928,15 @@ fn forward_attach_output(mut output: UnixStream, rx: Receiver<OutputChunk>) -> b
             output_failed = true;
             break;
         }
-        if output.flush().is_err() {
-            output_failed = true;
-            break;
-        }
+        let _ = output.flush();
     }
-    // If the output half dies first (mobile SSH drop, CMUX pane teardown, or a
-    // broken local stdout), wake the input loop too. Otherwise the server can keep
-    // a subscriber with stale mobile geometry, so surviving desktop attaches stay
-    // clamped and keystrokes may be accepted by a zombie attach.
-    let _ = output.shutdown(std::net::Shutdown::Both);
+    if output_failed {
+        // If the output half dies first (mobile SSH drop, CMUX pane teardown, or a
+        // broken local stdout), wake the input loop too. Otherwise the server can keep
+        // a subscriber with stale mobile geometry, so surviving desktop attaches stay
+        // clamped and keystrokes may be accepted by a zombie attach.
+        let _ = output.shutdown(std::net::Shutdown::Both);
+    }
     output_failed
 }
 
@@ -2116,7 +2115,7 @@ mod tests {
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -2264,8 +2263,12 @@ mod tests {
     }
 
     #[test]
-    fn attach_output_forwarder_shutdowns_peer_when_channel_closes() {
+    fn attach_output_forwarder_leaves_peer_open_when_channel_closes_cleanly() {
         let (server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
+        let _input_side_still_open = server_end.try_clone().expect("clone server end");
+        client_end
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
         let (tx, rx) = mpsc::sync_channel(1);
         drop(tx);
 
@@ -2274,10 +2277,12 @@ mod tests {
             "closed channel without write error is a clean output-drain path"
         );
         let mut byte = [0_u8; 1];
-        assert_eq!(
-            client_end.read(&mut byte).expect("read peer eof"),
-            0,
-            "forwarder must shutdown the socket so the peer wakes up"
+        let err = client_end
+            .read(&mut byte)
+            .expect_err("clean channel close should not shutdown the peer socket");
+        assert!(
+            err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut,
+            "peer should stay open on clean output-drain path, got {err:?}"
         );
     }
 

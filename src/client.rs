@@ -554,7 +554,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                     Ok(n) => {
                         if let Err(err) = writer.write_all(&buf[..n]) {
                             input_running.store(false, Ordering::SeqCst);
-                            let _ = writer.shutdown(std::net::Shutdown::Both);
+                            let _ = writer.shutdown(std::net::Shutdown::Write);
                             return Err(err).context("write pty input");
                         }
                     }
