@@ -893,10 +893,15 @@ struct StatusBar {
     pane_id: String,
     /// None 이면 status bar를 그리지 않는다 (--no-status / LTERM_NO_STATUS=1 등).
     style: Option<StatusStyle>,
-    /// 마지막으로 status bar 를 그린 터미널 row. cmux/Termius 리사이즈 뒤 새 bottom
+    /// status bar 를 그린 적 있는 terminal rows. cmux/Termius 리사이즈 뒤 새 bottom
     /// row 에 다시 그리기 전에 예전 bottom row 를 지우지 않으면, 그 row 가 본문
     /// 영역으로 편입되며 파란 status line 잔상이 여러 개 남는다.
-    last_drawn_row: Option<u16>,
+    ///
+    /// 하나의 `last_drawn_row` 만 보관하면 24→20→30 같은 shrink-then-grow 에서
+    /// row 24 가 화면 밖으로 밀린 동안 row 20 으로 덮여, 다시 커졌을 때 row 24
+    /// 잔상을 지울 기회를 잃는다. 화면 밖 row 는 보관했다가 다시 visible 해지는
+    /// redraw/restore 에서 clearing 한다.
+    drawn_status_rows: Vec<u16>,
 }
 
 impl StatusBar {
@@ -917,7 +922,7 @@ impl StatusBar {
             session_name,
             pane_id,
             style,
-            last_drawn_row: None,
+            drawn_status_rows: Vec::new(),
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -992,11 +997,9 @@ impl StatusBar {
         // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
         // 그러나 write! 매크로는 placeholder 마다 write_fmt 가 분할 syscall을 일으켜 SGR sequence
         // 중간이 다른 출력과 interleave 될 위험이 컸다 — buffered write 로 그 위험을 줄인다.
-        let previous_row = self
-            .last_drawn_row
-            .filter(|previous| *previous != rows && *previous <= rows);
+        let rows_to_clear = self.visible_previous_status_rows(rows);
         let mut payload = String::from("\x1b7");
-        if let Some(previous_row) = previous_row {
+        for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
             // 중간에 남아 "statusline 여러 개"처럼 보인다.
@@ -1006,7 +1009,7 @@ impl StatusBar {
         stdout
             .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
-        self.last_drawn_row = Some(rows);
+        self.remember_status_row(rows, &rows_to_clear);
         Ok(())
     }
 
@@ -1015,11 +1018,9 @@ impl StatusBar {
             return Ok(());
         }
         let (_, rows) = terminal_size();
-        let previous_row = self
-            .last_drawn_row
-            .filter(|previous| *previous != rows && *previous <= rows);
+        let rows_to_clear = self.visible_previous_status_rows(rows);
         let mut payload = String::from("\x1b7\x1b[r");
-        if let Some(previous_row) = previous_row {
+        for previous_row in &rows_to_clear {
             payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
         payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K\x1b8"));
@@ -1028,6 +1029,22 @@ impl StatusBar {
             .context("restore terminal after lterm status bar")?;
         stdout.flush().ok();
         Ok(())
+    }
+
+    fn visible_previous_status_rows(&self, rows: u16) -> Vec<u16> {
+        self.drawn_status_rows
+            .iter()
+            .copied()
+            .filter(|previous| *previous != rows && *previous <= rows)
+            .collect()
+    }
+
+    fn remember_status_row(&mut self, rows: u16, rows_to_clear: &[u16]) {
+        self.drawn_status_rows
+            .retain(|row| *row >= rows || !rows_to_clear.contains(row));
+        if !self.drawn_status_rows.contains(&rows) {
+            self.drawn_status_rows.push(rows);
+        }
     }
 }
 
@@ -1704,7 +1721,7 @@ mod tests {
             session_name: "omx-lterm".to_string(),
             pane_id: "%0".to_string(),
             style: Some(StatusStyle::Full),
-            last_drawn_row: None,
+            drawn_status_rows: Vec::new(),
         };
         let mut output = Vec::new();
 
@@ -1724,6 +1741,50 @@ mod tests {
         assert!(
             payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
             "new status row must still be drawn: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_redraw_clears_rows_hidden_by_shrink_then_growth() {
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full),
+            drawn_status_rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("initial tall draw");
+        output.clear();
+        status_bar
+            .draw_at_size(&mut output, 80, 20)
+            .expect("shrink draw");
+        let shrink_payload = String::from_utf8(output.clone()).expect("utf8 payload");
+        assert!(
+            !shrink_payload.contains("\x1b[24;1H\x1b[0m\x1b[2K"),
+            "off-screen old status row is retained, not cleared during shrink"
+        );
+
+        output.clear();
+        status_bar
+            .draw_at_size(&mut output, 80, 30)
+            .expect("growth draw");
+
+        let grow_payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            grow_payload.contains("\x1b[24;1H\x1b[0m\x1b[2K"),
+            "old tall status row must be cleared once it becomes visible again: {grow_payload:?}"
+        );
+        assert!(
+            grow_payload.contains("\x1b[20;1H\x1b[0m\x1b[2K"),
+            "intermediate shrink status row must also be cleared: {grow_payload:?}"
+        );
+        assert!(
+            grow_payload.contains("\x1b[30;1H\x1b[2K\x1b[0;30;104m"),
+            "new status row must still be drawn: {grow_payload:?}"
         );
         status_bar.style = None;
     }
