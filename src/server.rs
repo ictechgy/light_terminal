@@ -921,6 +921,26 @@ fn evict_disconnected_subscribers(
     shutdowns
 }
 
+fn forward_attach_output(mut output: UnixStream, rx: Receiver<OutputChunk>) -> bool {
+    let mut output_failed = false;
+    for bytes in rx {
+        if output.write_all(bytes.as_ref()).is_err() {
+            output_failed = true;
+            break;
+        }
+        if output.flush().is_err() {
+            output_failed = true;
+            break;
+        }
+    }
+    // If the output half dies first (mobile SSH drop, CMUX pane teardown, or a
+    // broken local stdout), wake the input loop too. Otherwise the server can keep
+    // a subscriber with stale mobile geometry, so surviving desktop attaches stay
+    // clamped and keystrokes may be accepted by a zombie attach.
+    let _ = output.shutdown(std::net::Shutdown::Both);
+    output_failed
+}
+
 fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     verify_peer_owner(&stream)?;
     stream
@@ -1586,13 +1606,11 @@ fn handle_attach(
         session.unsubscribe(subscriber_id);
         return Err(err).context("flush attach ok before output thread");
     }
-    let mut output = stream.try_clone().context("clone output stream")?;
+    let output = stream.try_clone().context("clone output stream")?;
+    let output_session = Arc::clone(&session);
     let output_thread = thread::spawn(move || {
-        for bytes in rx {
-            if output.write_all(bytes.as_ref()).is_err() {
-                break;
-            }
-            let _ = output.flush();
+        if forward_attach_output(output, rx) {
+            output_session.unsubscribe(subscriber_id);
         }
     });
 
@@ -2093,11 +2111,13 @@ mod tests {
     use super::{
         ALT_SCREEN_ENTER, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS,
         OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber, TerminalPrefixTracker,
-        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers, initial_pty_size,
-        process_group_still_owns_child, validate_terminal_geometry,
+        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers, forward_attach_output,
+        initial_pty_size, process_group_still_owns_child, validate_terminal_geometry,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Mutex, mpsc};
@@ -2226,6 +2246,39 @@ mod tests {
             "single subscriber yields single shutdown handle even if id repeats in list",
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attach_output_forwarder_reports_write_failure() {
+        let (server_end, client_end) = UnixStream::pair().expect("unix stream pair");
+        drop(client_end);
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Arc::from(&b"hello"[..]))
+            .expect("queue output chunk");
+        drop(tx);
+
+        assert!(
+            forward_attach_output(server_end, rx),
+            "dropped peer should surface as an attach output failure"
+        );
+    }
+
+    #[test]
+    fn attach_output_forwarder_shutdowns_peer_when_channel_closes() {
+        let (server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(tx);
+
+        assert!(
+            !forward_attach_output(server_end, rx),
+            "closed channel without write error is a clean output-drain path"
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            client_end.read(&mut byte).expect("read peer eof"),
+            0,
+            "forwarder must shutdown the socket so the peer wakes up"
+        );
     }
 
     /// 빈 리스트는 None — 호출자가 "잔여 attach 가 없으니 PTY 를 그대로 두자" 분기를

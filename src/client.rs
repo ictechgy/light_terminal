@@ -551,7 +551,13 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 }
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => writer.write_all(&buf[..n]).context("write pty input")?,
+                    Ok(n) => {
+                        if let Err(err) = writer.write_all(&buf[..n]) {
+                            input_running.store(false, Ordering::SeqCst);
+                            let _ = writer.shutdown(std::net::Shutdown::Both);
+                            return Err(err).context("write pty input");
+                        }
+                    }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -629,6 +635,9 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut prev_alt_screen_active = false;
     let output_result = (|| -> Result<()> {
         loop {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
 
             // alt-screen 종료 즉시 refresh: alt buffer로 흘러갔던 status는 폐기되었으므로
@@ -884,6 +893,10 @@ struct StatusBar {
     pane_id: String,
     /// None 이면 status bar를 그리지 않는다 (--no-status / LTERM_NO_STATUS=1 등).
     style: Option<StatusStyle>,
+    /// 마지막으로 status bar 를 그린 터미널 row. cmux/Termius 리사이즈 뒤 새 bottom
+    /// row 에 다시 그리기 전에 예전 bottom row 를 지우지 않으면, 그 row 가 본문
+    /// 영역으로 편입되며 파란 status line 잔상이 여러 개 남는다.
+    last_drawn_row: Option<u16>,
 }
 
 impl StatusBar {
@@ -904,6 +917,7 @@ impl StatusBar {
             session_name,
             pane_id,
             style,
+            last_drawn_row: None,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -951,6 +965,10 @@ impl StatusBar {
 
     fn draw(&mut self, stdout: &mut impl Write) -> Result<()> {
         let (cols, rows) = terminal_size();
+        self.draw_at_size(stdout, cols, rows)
+    }
+
+    fn draw_at_size(&mut self, stdout: &mut impl Write, cols: u16, rows: u16) -> Result<()> {
         // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
         if rows <= 1 || cols <= 1 {
             return Ok(());
@@ -974,10 +992,21 @@ impl StatusBar {
         // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
         // 그러나 write! 매크로는 placeholder 마다 write_fmt 가 분할 syscall을 일으켜 SGR sequence
         // 중간이 다른 출력과 interleave 될 위험이 컸다 — buffered write 로 그 위험을 줄인다.
-        let payload = format!("\x1b7\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8");
+        let previous_row = self
+            .last_drawn_row
+            .filter(|previous| *previous != rows && *previous <= rows);
+        let mut payload = String::from("\x1b7");
+        if let Some(previous_row) = previous_row {
+            // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
+            // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
+            // 중간에 남아 "statusline 여러 개"처럼 보인다.
+            payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
+        }
+        payload.push_str(&format!("\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8"));
         stdout
             .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
+        self.last_drawn_row = Some(rows);
         Ok(())
     }
 
@@ -986,7 +1015,16 @@ impl StatusBar {
             return Ok(());
         }
         let (_, rows) = terminal_size();
-        write!(stdout, "\x1b7\x1b[r\x1b[{rows};1H\x1b[0m\x1b[2K\x1b8")
+        let previous_row = self
+            .last_drawn_row
+            .filter(|previous| *previous != rows && *previous <= rows);
+        let mut payload = String::from("\x1b7\x1b[r");
+        if let Some(previous_row) = previous_row {
+            payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
+        }
+        payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K\x1b8"));
+        stdout
+            .write_all(payload.as_bytes())
             .context("restore terminal after lterm status bar")?;
         stdout.flush().ok();
         Ok(())
@@ -1602,7 +1640,7 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::{
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
-        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusStyle,
+        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle,
         TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
@@ -1658,6 +1696,36 @@ mod tests {
         assert_eq!(attach_pty_rows(24, true), 23);
         assert_eq!(attach_pty_rows(1, true), 1);
         assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    #[test]
+    fn status_bar_redraw_clears_previous_row_after_resize() {
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full),
+            last_drawn_row: None,
+        };
+        let mut output = Vec::new();
+
+        status_bar
+            .draw_at_size(&mut output, 80, 20)
+            .expect("initial draw");
+        output.clear();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("resized draw");
+
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.contains("\x1b[20;1H\x1b[0m\x1b[2K"),
+            "old status row must be cleared when it becomes body text: {payload:?}"
+        );
+        assert!(
+            payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
+            "new status row must still be drawn: {payload:?}"
+        );
+        status_bar.style = None;
     }
 
     /// PR #15 quad-review HIGH 후속(#2): 성공 응답은 last 를 advance 시키는 Outcome
