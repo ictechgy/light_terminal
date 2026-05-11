@@ -33,10 +33,13 @@ enum Commands {
     Daemon,
     /// Create a persistent session and attach to it.
     New {
+        /// Session name to use instead of an auto-generated name.
         #[arg(short, long)]
         name: Option<String>,
+        /// Working directory for the session command.
         #[arg(short = 'c', long)]
         cwd: Option<String>,
+        /// Expose the lterm tmux compatibility shim inside the session (off by default).
         #[arg(long)]
         tmux: bool,
         /// Create the session without attaching to it.
@@ -45,20 +48,27 @@ enum Commands {
         /// Disable the blue lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
+        /// Shell command to run in the session; defaults to the user's shell when omitted.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
     /// Create a tmux-shimmed session and attach to it.
     Run {
+        /// Session name to use instead of an auto-generated name.
         #[arg(short, long)]
         name: Option<String>,
+        /// Working directory for the session command.
         #[arg(short = 'c', long)]
         cwd: Option<String>,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, hide = true)]
         tmux: bool,
+        /// Disable the lterm tmux compatibility shim for this run session (enabled by default).
+        #[arg(long)]
+        no_tmux: bool,
         /// Disable the blue lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
+        /// Required shell command to run in the tmux-compatible session.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
@@ -243,10 +253,14 @@ fn run() -> Result<()> {
         Commands::Run {
             name,
             cwd,
-            tmux,
+            // Hidden no-op kept for callers that already pass `run --tmux`.
+            // `--no-tmux` intentionally wins so old aliases can opt out later.
+            tmux: _,
+            no_tmux,
             no_status,
             command,
         } => {
+            let tmux = !no_tmux;
             if tmux {
                 tmux_compat::ensure_shim()?;
             }
