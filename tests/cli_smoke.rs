@@ -438,6 +438,82 @@ fn help_shows_short_attach_alias() -> TestResult {
 }
 
 #[test]
+fn help_describes_general_agent_profile_surface() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let top_level = env.cmd().arg("--help").output()?;
+    assert!(top_level.status.success(), "{top_level:?}");
+    let stdout = String::from_utf8_lossy(&top_level.stdout);
+    let normalized = normalize_help(&stdout);
+    assert!(
+        normalized
+            .contains("List agent launcher profiles, default settings, and PATH availability"),
+        "top-level help should not describe agents as built-in-only:\n{stdout}"
+    );
+    assert!(
+        normalized.contains(
+            "Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session"
+        ),
+        "top-level help should expose the general agent profile model:\n{stdout}"
+    );
+    assert!(
+        !normalized.contains("List built-in agent launcher profiles"),
+        "stale built-in-only help leaked into top-level help:\n{stdout}"
+    );
+    assert!(
+        !normalized.contains("Run a known or PATH-resolved agent CLI"),
+        "stale known-only agent help leaked into top-level help:\n{stdout}"
+    );
+
+    let agents = env.cmd().args(["agents", "--help"]).output()?;
+    assert!(agents.status.success(), "{agents:?}");
+    let stdout = String::from_utf8_lossy(&agents.stdout);
+    let normalized = normalize_help(&stdout);
+    for expected in [
+        "List agent launcher profiles, default settings, and PATH availability",
+        "Print profiles as a JSON array",
+        "JSON file with additional configured custom agent profiles",
+        "Optional built-in, configured, or PATH-resolved custom profile names to inspect",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "missing {expected:?}:\n{stdout}"
+        );
+    }
+    assert!(
+        !normalized.contains("List built-in agent launcher profiles"),
+        "stale built-in-only help leaked into agents help:\n{stdout}"
+    );
+
+    let agent = env.cmd().args(["agent", "--help"]).output()?;
+    assert!(agent.status.success(), "{agent:?}");
+    let stdout = String::from_utf8_lossy(&agent.stdout);
+    let normalized = normalize_help(&stdout);
+    for expected in [
+        "Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session",
+        "Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, gemini",
+        "JSON file with additional configured custom agent profiles",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "missing {expected:?}:\n{stdout}"
+        );
+    }
+    assert!(
+        !normalized.contains("Run a known or PATH-resolved agent CLI"),
+        "stale known-only agent help leaked into agent help:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+fn normalize_help(help: &str) -> String {
+    // Clap wraps help at terminal-dependent widths; collapse whitespace so the
+    // smoke contract checks wording rather than a particular render width.
+    help.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
 fn attached_client_exits_when_session_kills_itself() -> TestResult {
     let env = TestEnv::new()?;
     let status = env.cmd().arg("list").status()?;
