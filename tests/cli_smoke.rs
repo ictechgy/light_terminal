@@ -32,10 +32,19 @@ impl TestEnv {
     }
 
     fn capture_until(&self, target: &str, needle: &str) -> TestResult<String> {
+        self.capture_command_until("capture", target, needle)
+    }
+
+    fn capture_command_until(
+        &self,
+        command: &str,
+        target: &str,
+        needle: &str,
+    ) -> TestResult<String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut last = String::new();
         while Instant::now() < deadline {
-            let output = self.cmd().args(["capture", target, "-S=-20"]).output()?;
+            let output = self.cmd().args([command, target, "-S=-20"]).output()?;
             if output.status.success() {
                 last = String::from_utf8_lossy(&output.stdout).to_string();
                 if last.contains(needle) {
@@ -330,6 +339,29 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
+fn logs_alias_captures_output() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "log-alias",
+            "--",
+            "sh",
+            "-lc",
+            "echo LOG_ALIAS_READY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_command_until("logs", "log-alias", "LOG_ALIAS_READY")?;
+    assert!(captured.contains("LOG_ALIAS_READY"));
+    Ok(())
+}
+
+#[test]
 fn new_attaches_by_default() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
@@ -437,6 +469,10 @@ fn help_shows_common_aliases() -> TestResult {
     assert!(
         stdout.contains("[aliases: ls, sessions]"),
         "list aliases were not visible in help:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[aliases: logs]"),
+        "capture alias was not visible in help:\n{stdout}"
     );
     Ok(())
 }
