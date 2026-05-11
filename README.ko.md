@@ -118,7 +118,20 @@ lterm agent codex
 lterm agent gemini -- -p "이 저장소를 요약해줘"
 ```
 
-Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. 직접 generic primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run --tmux -- <command>`를 사용하세요.
+agent launcher는 built-in profile과 custom `lterm agent <profile>` 실행에서 같은 세션 제어 옵션을 받습니다.
+
+```bash
+lterm claude --name repo-review --cwd /path/to/repo
+lterm codex --detach --name repo-codex -- exec "이 저장소를 요약해줘"
+lterm gemini --status -- -p "lterm status를 유지해줘"
+```
+
+Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. 직접 generic primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run --tmux -- <command>`를 사용하세요.
+
+launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`)입니다. 이 옵션들은 `claude`, `codex`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다.
+`--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
+명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
+이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
 
 **Oh My Codex를 shim이 적용된 세션에서 실행:**
 

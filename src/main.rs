@@ -6,12 +6,13 @@ mod server;
 mod tmux_compat;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use client::AttachStdinEof;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::Command;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -131,11 +132,15 @@ enum Commands {
     },
     /// Run Oh My Codex inside a tmux-compatible lterm session.
     Omx {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run Oh My Claude inside a tmux-compatible lterm session.
     Omc {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -143,21 +148,29 @@ enum Commands {
     Agent {
         /// Agent profile or binary name, e.g. claude, codex, gemini, omx, omc.
         profile: String,
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run Claude Code inside a tmux-compatible lterm session.
     Claude {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run Codex CLI inside a tmux-compatible lterm session.
     Codex {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run Gemini CLI inside a tmux-compatible lterm session.
     Gemini {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -304,14 +317,26 @@ fn run() -> Result<()> {
             subtitle,
             body,
         } => notify(&title, subtitle.as_deref(), &body),
-        Commands::Omx { args } => run_agent_profile(AgentProfile::known("omx"), args),
-        Commands::Omc { args } => run_agent_profile(AgentProfile::known("omc"), args),
-        Commands::Agent { profile, args } => {
-            run_agent_profile(AgentProfile::resolve(&profile)?, args)
+        Commands::Omx { launch, args } => {
+            run_agent_profile(AgentProfile::known("omx"), launch, args)
         }
-        Commands::Claude { args } => run_agent_profile(AgentProfile::known("claude"), args),
-        Commands::Codex { args } => run_agent_profile(AgentProfile::known("codex"), args),
-        Commands::Gemini { args } => run_agent_profile(AgentProfile::known("gemini"), args),
+        Commands::Omc { launch, args } => {
+            run_agent_profile(AgentProfile::known("omc"), launch, args)
+        }
+        Commands::Agent {
+            profile,
+            launch,
+            args,
+        } => run_agent_profile(AgentProfile::resolve(&profile)?, launch, args),
+        Commands::Claude { launch, args } => {
+            run_agent_profile(AgentProfile::known("claude"), launch, args)
+        }
+        Commands::Codex { launch, args } => {
+            run_agent_profile(AgentProfile::known("codex"), launch, args)
+        }
+        Commands::Gemini { launch, args } => {
+            run_agent_profile(AgentProfile::known("gemini"), launch, args)
+        }
         Commands::Ssh {
             host,
             target,
@@ -404,6 +429,49 @@ struct AgentProfile {
     show_status: bool,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+struct AgentLaunchOptions {
+    /// Session name to use instead of the profile default.
+    #[arg(long)]
+    name: Option<String>,
+    /// Working directory for the agent process.
+    #[arg(long)]
+    cwd: Option<String>,
+    /// Create the agent session without attaching to it.
+    #[arg(long, conflicts_with_all = ["status", "no_status"])]
+    detach: bool,
+    /// Force-enable the lterm status bar while attached.
+    #[arg(long, conflicts_with = "no_status")]
+    status: bool,
+    /// Disable the lterm status bar while attached.
+    #[arg(long, conflicts_with = "status")]
+    no_status: bool,
+}
+
+impl AgentLaunchOptions {
+    fn session_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    fn detach(&self) -> bool {
+        self.detach
+    }
+
+    fn show_status(&self, default: bool) -> bool {
+        if self.status {
+            true
+        } else if self.no_status {
+            false
+        } else {
+            default
+        }
+    }
+}
+
 impl AgentProfile {
     fn known(name: &'static str) -> Self {
         match name {
@@ -461,7 +529,17 @@ impl AgentProfile {
     }
 }
 
-fn run_agent_profile(profile: AgentProfile, mut args: Vec<String>) -> Result<()> {
+fn run_agent_profile(
+    profile: AgentProfile,
+    launch: AgentLaunchOptions,
+    mut args: Vec<String>,
+) -> Result<()> {
+    if let Some(name) = launch.session_name() {
+        validate_agent_session_name(name)?;
+    }
+    if let Some(cwd) = launch.cwd() {
+        validate_agent_cwd(cwd)?;
+    }
     if args.first().is_some_and(|arg| arg == "--") {
         args.remove(0);
     }
@@ -478,27 +556,127 @@ fn run_agent_profile(profile: AgentProfile, mut args: Vec<String>) -> Result<()>
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
     let mut last_conflict = None;
-    for _ in 0..32 {
-        let session_name = next_agent_session_name(&profile.session_base)?;
+    let explicit_session_name = launch.session_name().map(str::to_string);
+    let max_attempts = if explicit_session_name.is_some() {
+        1
+    } else {
+        32
+    };
+    for _ in 0..max_attempts {
+        let session_name = match &explicit_session_name {
+            Some(name) => name.clone(),
+            None => next_agent_session_name(&profile.session_base)?,
+        };
         let env = HashMap::from([("LTERM_AGENT".to_string(), profile.name.to_string())]);
-        match client::new_session(Some(session_name), Some(command.clone()), None, env, true) {
+        let created = client::new_session(
+            Some(session_name),
+            Some(command.clone()),
+            launch.cwd().map(str::to_string),
+            env,
+            true,
+        );
+        match created {
             Ok(info) => {
+                if launch.detach() {
+                    // Machine-readable detach mode reserves stdout for this single TSV record.
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(detached_output_line(&info).as_bytes())?;
+                    stdout.flush()?;
+                    return Ok(());
+                }
                 return client::attach(
                     &info.pane_id,
-                    profile.show_status,
+                    launch.show_status(profile.show_status),
                     AttachStdinEof::KeepAttached,
                 );
             }
-            Err(err) if is_session_name_conflict(&err) => last_conflict = Some(err),
-            Err(err) => return Err(err),
+            Err(err) if is_session_name_conflict(&err) => {
+                last_conflict = Some(if let Some(name) = explicit_session_name.as_deref() {
+                    err.context(format!("failed to create agent session named {name}"))
+                } else {
+                    err
+                });
+            }
+            Err(err) => {
+                return if let Some(name) = explicit_session_name.as_deref() {
+                    Err(err).with_context(|| format!("failed to create agent session named {name}"))
+                } else {
+                    Err(err)
+                };
+            }
         }
     }
-    Err(last_conflict.unwrap_or_else(|| {
-        anyhow::anyhow!(
-            "could not allocate session name for {}",
-            profile.session_base
-        )
-    }))
+    let err = last_conflict.unwrap_or_else(|| {
+        if let Some(name) = explicit_session_name.as_deref() {
+            anyhow::anyhow!("could not allocate session name {name}")
+        } else {
+            anyhow::anyhow!(
+                "could not allocate session name for {}",
+                profile.session_base
+            )
+        }
+    });
+    Err(err)
+}
+
+fn detached_output_line(info: &protocol::SessionInfo) -> String {
+    format!(
+        "{}\t{}\t{}\n",
+        detached_field(&info.name),
+        detached_field(&info.pane_id),
+        detached_field(&info.command)
+    )
+}
+
+fn detached_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn validate_agent_session_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("agent session name cannot be empty");
+    }
+    if name.len() > 128 {
+        bail!("agent session name cannot exceed 128 bytes");
+    }
+    if name.starts_with('-') {
+        bail!("agent session name cannot start with '-': {name}");
+    }
+    if name.starts_with('%') {
+        bail!("agent session name cannot look like a pane id: {name}");
+    }
+    if Uuid::parse_str(name).is_ok() {
+        bail!("agent session name cannot look like a UUID: {name}");
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!("agent session name may only contain ASCII letters, numbers, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
+fn validate_agent_cwd(cwd: &str) -> Result<()> {
+    if cwd.trim().is_empty() {
+        bail!("agent cwd cannot be empty");
+    }
+    if cwd != cwd.trim() {
+        bail!("agent cwd cannot have leading or trailing whitespace");
+    }
+    if cwd.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        bail!("agent cwd cannot contain control characters");
+    }
+    Ok(())
 }
 
 fn validate_agent_profile_name(profile: &str) -> Result<()> {
@@ -665,6 +843,136 @@ mod tests {
         assert_eq!(profile.binary, "my-agent");
         assert_eq!(profile.session_base, "my-agent-lterm");
         assert!(profile.show_status);
+    }
+
+    #[test]
+    fn agent_launch_status_flags_override_profile_default() {
+        let default = AgentLaunchOptions::default();
+        assert!(default.show_status(true));
+        assert!(!default.show_status(false));
+
+        let status = AgentLaunchOptions {
+            status: true,
+            ..AgentLaunchOptions::default()
+        };
+        assert!(status.show_status(false));
+
+        let no_status = AgentLaunchOptions {
+            no_status: true,
+            ..AgentLaunchOptions::default()
+        };
+        assert!(!no_status.show_status(true));
+    }
+
+    #[test]
+    fn agent_launch_options_keep_agent_short_flags_as_args() {
+        let cli = Cli::try_parse_from(["lterm", "codex", "-c", "agent-config"])
+            .expect("agent short flags should pass through without --");
+        match cli.command {
+            Commands::Codex { launch, args } => {
+                assert_eq!(launch.cwd(), None);
+                assert_eq!(args, vec!["-c", "agent-config"]);
+            }
+            other => panic!("expected codex command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_launch_options_parse_long_controls_before_separator() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "agent",
+            "codex",
+            "--name",
+            "repo-agent",
+            "--cwd",
+            "/tmp",
+            "--detach",
+            "--",
+            "-c",
+            "agent-config",
+        ])
+        .expect("long launch controls should parse before --");
+        match cli.command {
+            Commands::Agent {
+                profile,
+                launch,
+                args,
+            } => {
+                assert_eq!(profile, "codex");
+                assert_eq!(launch.session_name(), Some("repo-agent"));
+                assert_eq!(launch.cwd(), Some("/tmp"));
+                assert!(launch.detach());
+                assert_eq!(args, vec!["-c", "agent-config"]);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_launch_detach_conflicts_with_status_flags() {
+        assert!(
+            Cli::try_parse_from(["lterm", "codex", "--detach", "--status"]).is_err(),
+            "--status applies to attach and should not be accepted with --detach"
+        );
+        assert!(
+            Cli::try_parse_from(["lterm", "codex", "--detach", "--no-status"]).is_err(),
+            "--no-status applies to attach and should not be accepted with --detach"
+        );
+    }
+
+    #[test]
+    fn detached_output_fields_are_tab_and_line_safe() {
+        assert_eq!(detached_field("safe"), "safe");
+        assert_eq!(detached_field("tab\tline\nesc\u{1b}"), "tab line esc ");
+        assert_eq!(
+            detached_field("line\u{2028}paragraph\u{2029}"),
+            "line paragraph "
+        );
+
+        let line = detached_output_line(&protocol::SessionInfo {
+            id: "id".into(),
+            name: "name\twith\ncontrols".into(),
+            pane_id: "%7".into(),
+            command: "cmd\targ\nnext".into(),
+            cwd: "/tmp".into(),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            parent_pane_id: None,
+            parent_session_id: None,
+            attached_clients: 0,
+            process_id: None,
+            process_group_id: None,
+        });
+        assert_eq!(line.matches('\t').count(), 2, "{line:?}");
+        assert!(line.ends_with('\n'), "{line:?}");
+        assert_eq!(line, "name with controls\t%7\tcmd arg next\n");
+    }
+
+    #[test]
+    fn explicit_agent_session_names_use_session_safe_syntax() {
+        assert!(validate_agent_session_name("repo.agent_1").is_ok());
+        assert!(validate_agent_session_name("").is_err());
+        assert!(validate_agent_session_name("-bad").is_err());
+        assert!(validate_agent_session_name("%0").is_err());
+        assert!(validate_agent_session_name("bad/name").is_err());
+        assert!(validate_agent_session_name("bad name").is_err());
+        assert!(validate_agent_session_name("550e8400-e29b-41d4-a716-446655440000").is_err());
+        assert!(validate_agent_session_name(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn agent_cwd_rejects_empty_or_control_paths() {
+        assert!(validate_agent_cwd("/tmp/repo").is_ok());
+        assert!(validate_agent_cwd("relative repo").is_ok());
+        assert!(validate_agent_cwd("").is_err());
+        assert!(validate_agent_cwd("   ").is_err());
+        assert!(validate_agent_cwd(" /tmp/repo").is_err());
+        assert!(validate_agent_cwd("/tmp/repo ").is_err());
+        assert!(validate_agent_cwd("/tmp/repo\nnext").is_err());
     }
 
     #[test]
