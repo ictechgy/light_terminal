@@ -118,6 +118,7 @@ enum Commands {
         target: String,
     },
     /// Send text to a session or pane.
+    #[command(visible_alias = "input")]
     Send {
         /// Session or pane target to receive input.
         target: String,
