@@ -1984,9 +1984,25 @@ fn agent_command_uses_unique_name_when_base_is_occupied() -> TestResult {
 fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
+    let config_path = env.temp.path().join("agents.json");
     std::fs::create_dir(&fake_bin)?;
     write_executable(&fake_bin.join("codex"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("my-agent"), "#!/bin/sh\nexit 0\n")?;
+    write_executable(&fake_bin.join("helper"), "#!/bin/sh\nexit 0\n")?;
+    std::fs::write(
+        &config_path,
+        r#"{
+  "profiles": [
+    {
+      "name": "repo-review",
+      "binary": "codex",
+      "session_base": "repo-review-session",
+      "status_default": false
+    },
+    { "name": "helper" }
+  ]
+}"#,
+    )?;
     let path = std::env::join_paths([fake_bin.as_path()])?;
 
     let output = env.cmd().env("PATH", &path).arg("agents").output()?;
@@ -2085,6 +2101,59 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
             .unwrap_or_default()
             .ends_with("/my-agent")
     );
+
+    let configured = env
+        .cmd()
+        .env("PATH", &path)
+        .args([
+            "agents",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+            "--json",
+            "repo-review",
+            "helper",
+        ])
+        .output()?;
+    assert!(configured.status.success(), "{configured:?}");
+    let profiles: serde_json::Value = serde_json::from_slice(&configured.stdout)?;
+    let profiles = profiles
+        .as_array()
+        .ok_or("configured agent profiles JSON should be an array")?;
+    assert_eq!(profiles.len(), 2, "{profiles:?}");
+    assert_eq!(profiles[0]["profile"], "repo-review");
+    assert_eq!(profiles[0]["kind"], "configured");
+    assert_eq!(profiles[0]["binary"], "codex");
+    assert_eq!(profiles[0]["session_base"], "repo-review-session");
+    assert_eq!(profiles[0]["status_default"], false);
+    assert_eq!(profiles[0]["available"], true);
+    assert_eq!(profiles[1]["profile"], "helper");
+    assert_eq!(profiles[1]["kind"], "configured");
+    assert_eq!(profiles[1]["binary"], "helper");
+    assert_eq!(profiles[1]["session_base"], "helper-lterm");
+    assert_eq!(profiles[1]["status_default"], true);
+    assert_eq!(profiles[1]["available"], true);
+
+    let unknown = env
+        .cmd()
+        .env("PATH", &path)
+        .args([
+            "agents",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+            "--json",
+            "typo-agent",
+        ])
+        .output()?;
+    assert!(!unknown.status.success(), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.contains("was not found in --agent-config"),
+        "{stderr:?}"
+    );
     Ok(())
 }
 
@@ -2146,6 +2215,169 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
         !stdout.contains("FAKE_TMUX_SHOULD_NOT_RUN"),
         "fake tmux won PATH precedence: {stdout:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn configured_agent_profile_launches_configured_binary() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    let config_path = env.temp.path().join("agents.json");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
+printf 'ARG1:%s\n' "$1"
+"#,
+    )?;
+    std::fs::write(
+        &config_path,
+        r#"{
+  "profiles": [
+    {
+      "name": "repo-review",
+      "binary": "codex",
+      "session_base": "repo-review-session",
+      "status_default": false
+    }
+  ]
+}"#,
+    )?;
+    let path = std::env::join_paths([fake_bin.as_path()])?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args([
+            "agent",
+            "repo-review",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+            "--",
+            "inspect",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("LTERM_AGENT:repo-review"), "{stdout:?}");
+    assert!(
+        stdout.contains("LTERM_SESSION:repo-review-session"),
+        "{stdout:?}"
+    );
+    assert!(stdout.contains("ARG1:inspect"), "{stdout:?}");
+
+    let typo = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args([
+            "agent",
+            "repo-revue",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(!typo.status.success(), "{typo:?}");
+    let stderr = String::from_utf8_lossy(&typo.stderr);
+    assert!(
+        stderr.contains("was not found in --agent-config"),
+        "{stderr:?}"
+    );
+
+    let bad_config = env.temp.path().join("bad-agents.json");
+    std::fs::write(&bad_config, "{ not json")?;
+    let built_in_with_bad_config = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args([
+            "agent",
+            "codex",
+            "--agent-config",
+            bad_config
+                .to_str()
+                .ok_or("bad agent config path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        !built_in_with_bad_config.status.success(),
+        "{built_in_with_bad_config:?}"
+    );
+    let stderr = String::from_utf8_lossy(&built_in_with_bad_config.stderr);
+    assert!(stderr.contains("parse agent config"), "{stderr:?}");
+
+    let escaped_config_path = env.temp.path().join("bad-\u{1b}[31m-agents.json");
+    std::fs::write(&escaped_config_path, "{ not json")?;
+    let escaped_error = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args([
+            "agents",
+            "--agent-config",
+            escaped_config_path
+                .to_str()
+                .ok_or("escaped agent config path should be UTF-8")?,
+            "--json",
+        ])
+        .output()?;
+    assert!(!escaped_error.status.success(), "{escaped_error:?}");
+    let stderr = String::from_utf8_lossy(&escaped_error.stderr);
+    assert!(stderr.contains("parse agent config"), "{stderr:?}");
+    assert!(stderr.contains("\\u{1b}"), "{stderr:?}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+
+    let rejected_config = |file_name: &str, contents: &str, expected: &str| -> TestResult {
+        let rejected_config_path = env.temp.path().join(file_name);
+        std::fs::write(&rejected_config_path, contents)?;
+        let output = env
+            .cmd()
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .args([
+                "agents",
+                "--agent-config",
+                rejected_config_path
+                    .to_str()
+                    .ok_or("rejected agent config path should be UTF-8")?,
+                "--json",
+            ])
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "expected {expected:?} in {stderr:?}"
+        );
+        Ok(())
+    };
+    rejected_config(
+        "unknown-field-agents.json",
+        r#"{ "profiles": [{ "name": "helper", "unknown": true }] }"#,
+        "unknown field",
+    )?;
+    rejected_config(
+        "built-in-agents.json",
+        r#"{ "profiles": [{ "name": "codex" }] }"#,
+        "cannot redefine built-in",
+    )?;
+    rejected_config(
+        "bad-binary-agents.json",
+        r#"{ "profiles": [{ "name": "helper", "binary": "../codex" }] }"#,
+        "invalid binary",
+    )?;
+    rejected_config(
+        "bad-session-agents.json",
+        r#"{ "profiles": [{ "name": "helper", "session_base": "-bad" }] }"#,
+        "invalid session_base",
+    )?;
     Ok(())
 }
 

@@ -8,10 +8,11 @@ mod tmux_compat;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use client::AttachStdinEof;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
 
@@ -149,6 +150,9 @@ enum Commands {
     Agents {
         #[arg(long)]
         json: bool,
+        /// JSON file with additional custom agent profiles.
+        #[arg(long = "agent-config")]
+        agent_config: Option<String>,
         /// Optional profile or binary names to inspect instead of all built-ins.
         profiles: Vec<String>,
     },
@@ -156,6 +160,9 @@ enum Commands {
     Agent {
         /// Agent profile or binary name, e.g. claude, codex, gemini, omx, omc.
         profile: String,
+        /// JSON file with additional custom agent profiles.
+        #[arg(long = "agent-config")]
+        agent_config: Option<String>,
         #[command(flatten)]
         launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -331,12 +338,21 @@ fn run() -> Result<()> {
         Commands::Omc { launch, args } => {
             run_agent_profile(AgentProfile::known("omc"), launch, args)
         }
-        Commands::Agents { json, profiles } => print_agent_profiles(json, profiles),
+        Commands::Agents {
+            json,
+            agent_config,
+            profiles,
+        } => print_agent_profiles(json, agent_config.as_deref(), profiles),
         Commands::Agent {
             profile,
+            agent_config,
             launch,
             args,
-        } => run_agent_profile(AgentProfile::resolve(&profile)?, launch, args),
+        } => run_agent_profile(
+            resolve_agent_profile(&profile, agent_config.as_deref())?,
+            launch,
+            args,
+        ),
         Commands::Claude { launch, args } => {
             run_agent_profile(AgentProfile::known("claude"), launch, args)
         }
@@ -449,6 +465,25 @@ struct AgentProfileInfo {
     path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentProfilesConfig {
+    #[serde(default)]
+    profiles: Vec<ConfiguredAgentProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredAgentProfile {
+    name: String,
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    session_base: Option<String>,
+    #[serde(default)]
+    status_default: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Args)]
 struct AgentLaunchOptions {
     /// Session name to use instead of the profile default.
@@ -495,7 +530,7 @@ impl AgentLaunchOptions {
 const BUILT_IN_AGENT_PROFILES: &[&str] = &["claude", "codex", "gemini", "omx", "omc"];
 
 impl AgentProfile {
-    fn known(name: &'static str) -> Self {
+    fn known(name: &str) -> Self {
         match name {
             "claude" => Self {
                 name: name.to_string(),
@@ -554,20 +589,45 @@ impl AgentProfile {
 fn built_in_agent_profile_infos() -> Vec<AgentProfileInfo> {
     BUILT_IN_AGENT_PROFILES
         .iter()
-        .map(|name| agent_profile_info(AgentProfile::known(name), true))
+        .map(|name| agent_profile_info(AgentProfile::known(name), "built-in"))
         .collect()
 }
 
-fn selected_agent_profile_infos(profiles: Vec<String>) -> Result<Vec<AgentProfileInfo>> {
+fn selected_agent_profile_infos(
+    config_path: Option<&str>,
+    profiles: Vec<String>,
+) -> Result<Vec<AgentProfileInfo>> {
+    let config_supplied = config_path.is_some();
+    let configured_profiles = load_agent_profiles_config(config_path)?;
     if profiles.is_empty() {
-        return Ok(built_in_agent_profile_infos());
+        let mut infos = built_in_agent_profile_infos();
+        infos.extend(
+            configured_profiles
+                .into_iter()
+                .map(|profile| agent_profile_info(profile, "configured")),
+        );
+        return Ok(infos);
     }
 
     profiles
         .into_iter()
         .map(|profile| {
-            let built_in = is_built_in_agent_profile(&profile);
-            AgentProfile::resolve(&profile).map(|profile| agent_profile_info(profile, built_in))
+            if is_built_in_agent_profile(&profile) {
+                return Ok(agent_profile_info(
+                    AgentProfile::known(&profile),
+                    "built-in",
+                ));
+            }
+            if let Some(configured) = configured_profiles
+                .iter()
+                .find(|configured| configured.name == profile)
+            {
+                return Ok(agent_profile_info(configured.clone(), "configured"));
+            }
+            if config_supplied {
+                bail!("agent profile {profile:?} was not found in --agent-config");
+            }
+            AgentProfile::resolve(&profile).map(|profile| agent_profile_info(profile, "custom"))
         })
         .collect()
 }
@@ -576,12 +636,12 @@ fn is_built_in_agent_profile(profile: &str) -> bool {
     BUILT_IN_AGENT_PROFILES.contains(&profile)
 }
 
-fn agent_profile_info(profile: AgentProfile, built_in: bool) -> AgentProfileInfo {
+fn agent_profile_info(profile: AgentProfile, kind: &str) -> AgentProfileInfo {
     let path =
         client::find_command(&profile.binary).map(|path| path.to_string_lossy().into_owned());
     AgentProfileInfo {
         profile: profile.name,
-        kind: if built_in { "built-in" } else { "custom" }.to_string(),
+        kind: kind.to_string(),
         binary: profile.binary,
         session_base: profile.session_base,
         status_default: profile.show_status,
@@ -590,8 +650,12 @@ fn agent_profile_info(profile: AgentProfile, built_in: bool) -> AgentProfileInfo
     }
 }
 
-fn print_agent_profiles(json: bool, profiles: Vec<String>) -> Result<()> {
-    let profiles = selected_agent_profile_infos(profiles)?;
+fn print_agent_profiles(
+    json: bool,
+    config_path: Option<&str>,
+    profiles: Vec<String>,
+) -> Result<()> {
+    let profiles = selected_agent_profile_infos(config_path, profiles)?;
     if json {
         println!("{}", client::json_pretty(&profiles));
         return Ok(());
@@ -615,6 +679,93 @@ fn print_agent_profiles(json: bool, profiles: Vec<String>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_agent_profile(profile: &str, config_path: Option<&str>) -> Result<AgentProfile> {
+    let config_supplied = config_path.is_some();
+    let configured_profiles = load_agent_profiles_config(config_path)?;
+    if is_built_in_agent_profile(profile) {
+        return Ok(AgentProfile::known(profile));
+    }
+    if let Some(configured) = configured_profiles
+        .iter()
+        .find(|configured| configured.name == profile)
+    {
+        return Ok(configured.clone());
+    }
+    if config_supplied {
+        bail!(
+            "agent profile {profile:?} was not found in --agent-config; omit --agent-config to use a PATH-resolved custom profile"
+        );
+    }
+    AgentProfile::resolve(profile)
+}
+
+fn load_agent_profiles_config(config_path: Option<&str>) -> Result<Vec<AgentProfile>> {
+    let Some(config_path) = config_path else {
+        return Ok(Vec::new());
+    };
+    let path = Path::new(config_path);
+    let source = agent_config_source_label(path);
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("read agent config {source}"))?;
+    parse_agent_profiles_config(&contents, &source)
+}
+
+fn agent_config_source_label(path: &Path) -> String {
+    path.display().to_string().escape_debug().to_string()
+}
+
+fn parse_agent_profiles_config(contents: &str, source: &str) -> Result<Vec<AgentProfile>> {
+    let config: AgentProfilesConfig =
+        serde_json::from_str(contents).with_context(|| format!("parse agent config {source}"))?;
+    let mut seen = HashSet::new();
+    config
+        .profiles
+        .into_iter()
+        .map(|profile| configured_agent_profile(profile, &mut seen))
+        .collect()
+}
+
+fn configured_agent_profile(
+    profile: ConfiguredAgentProfile,
+    seen: &mut HashSet<String>,
+) -> Result<AgentProfile> {
+    validate_agent_profile_name(&profile.name)
+        .with_context(|| format!("invalid configured agent profile {:?}", profile.name))?;
+    if is_built_in_agent_profile(&profile.name) {
+        bail!(
+            "configured agent profile cannot redefine built-in profile {:?}",
+            profile.name
+        );
+    }
+    if !seen.insert(profile.name.clone()) {
+        bail!("duplicate configured agent profile {:?}", profile.name);
+    }
+
+    let binary = profile.binary.unwrap_or_else(|| profile.name.clone());
+    validate_agent_profile_name(&binary).with_context(|| {
+        format!(
+            "invalid binary for configured agent profile {:?}",
+            profile.name
+        )
+    })?;
+    let session_base = profile
+        .session_base
+        .unwrap_or_else(|| format!("{}-lterm", profile.name));
+    validate_agent_session_name(&session_base).with_context(|| {
+        format!(
+            "invalid session_base for configured agent profile {:?}",
+            profile.name
+        )
+    })?;
+
+    Ok(AgentProfile {
+        name: profile.name,
+        binary,
+        session_base,
+        show_status: profile.status_default.unwrap_or(true),
+    })
 }
 
 fn run_agent_profile(
@@ -950,8 +1101,9 @@ mod tests {
 
     #[test]
     fn selected_agent_profile_infos_include_custom_profiles() {
-        let infos = selected_agent_profile_infos(vec!["codex".to_string(), "my-agent".to_string()])
-            .expect("selected agent profile infos");
+        let infos =
+            selected_agent_profile_infos(None, vec!["codex".to_string(), "my-agent".to_string()])
+                .expect("selected agent profile infos");
         assert_eq!(infos.len(), 2);
 
         let codex = &infos[0];
@@ -967,7 +1119,66 @@ mod tests {
         assert_eq!(custom.session_base, "my-agent-lterm");
         assert!(custom.status_default);
 
-        assert!(selected_agent_profile_infos(vec!["../agent".to_string()]).is_err());
+        assert!(selected_agent_profile_infos(None, vec!["../agent".to_string()]).is_err());
+    }
+
+    #[test]
+    fn agent_config_profiles_are_validated_and_resolved() {
+        let profiles = parse_agent_profiles_config(
+            r#"{
+                "profiles": [
+                    {
+                        "name": "repo-review",
+                        "binary": "codex",
+                        "session_base": "repo-review-session",
+                        "status_default": false
+                    },
+                    { "name": "helper" }
+                ]
+            }"#,
+            "inline test config",
+        )
+        .expect("agent config");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "repo-review");
+        assert_eq!(profiles[0].binary, "codex");
+        assert_eq!(profiles[0].session_base, "repo-review-session");
+        assert!(!profiles[0].show_status);
+        assert_eq!(profiles[1].name, "helper");
+        assert_eq!(profiles[1].binary, "helper");
+        assert_eq!(profiles[1].session_base, "helper-lterm");
+        assert!(profiles[1].show_status);
+
+        let infos =
+            selected_agent_profile_infos(None, vec!["codex".to_string(), "my-agent".to_string()])
+                .expect("selected infos without config");
+        assert_eq!(infos[1].kind, "custom");
+
+        assert!(
+            parse_agent_profiles_config(
+                r#"{ "profiles": [{ "name": "codex", "binary": "codex" }] }"#,
+                "inline test config",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_agent_profiles_config(
+                r#"{ "profiles": [{ "name": "../bad", "binary": "codex" }] }"#,
+                "inline test config",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_agent_profiles_config(
+                r#"{ "profiles": [{ "name": "dup" }, { "name": "dup" }] }"#,
+                "inline test config",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            agent_config_source_label(Path::new("bad-\u{1b}[31m-agents.json")),
+            "bad-\\u{1b}[31m-agents.json"
+        );
     }
 
     #[test]
@@ -1030,10 +1241,12 @@ mod tests {
         match cli.command {
             Commands::Agent {
                 profile,
+                agent_config,
                 launch,
                 args,
             } => {
                 assert_eq!(profile, "codex");
+                assert_eq!(agent_config, None);
                 assert_eq!(launch.session_name(), Some("repo-agent"));
                 assert_eq!(launch.cwd(), Some("/tmp"));
                 assert!(launch.detach());

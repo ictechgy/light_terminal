@@ -134,6 +134,18 @@ Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--n
 Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not look like a UUID, and are limited to 128 bytes.
 Use `lterm agents` (or `lterm agents --json`) to inspect built-in profile defaults and whether their binaries are currently available in `PATH`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom set; availability is a point-in-time PATH probe.
+For reusable custom aliases, pass an explicit JSON config file:
+
+```bash
+cat > agents.json <<'JSON'
+{ "profiles": [{ "name": "repo-review", "binary": "codex", "session_base": "repo-review-session", "status_default": false }] }
+JSON
+lterm agents --agent-config agents.json --json
+lterm agent repo-review --agent-config agents.json -- exec "review this repo"
+```
+
+Configured names and binaries use the same safe profile syntax as `lterm agent <profile>`; built-in names cannot be redefined.
+`binary` must be a bare command name resolved from `PATH`, not a shell fragment or path. `binary` defaults to `name`, `session_base` defaults to `<name>-lterm`, `status_default` defaults to `true`, duplicate names and unknown JSON fields are rejected, and when `--agent-config` is supplied non-built-in selected names must exist in that file.
 
 **Run Oh My Codex inside a shimmed session:**
 
