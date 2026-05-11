@@ -507,6 +507,56 @@ fn help_describes_general_agent_profile_surface() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn help_describes_forwarded_agent_arguments() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let agent = env.cmd().args(["agent", "--help"]).output()?;
+    assert!(agent.status.success(), "{agent:?}");
+    let stdout = String::from_utf8_lossy(&agent.stdout);
+    let normalized = normalize_help(&stdout);
+    assert!(
+        normalized.contains(
+            "Arguments forwarded to the agent CLI; use `--` before args that look like lterm options"
+        ),
+        "generic agent help should explain forwarded args:\n{stdout}"
+    );
+
+    for (command, expected) in [
+        (
+            "claude",
+            "Arguments forwarded to claude; use `--` before args that look like lterm options",
+        ),
+        (
+            "codex",
+            "Arguments forwarded to codex; use `--` before args that look like lterm options",
+        ),
+        (
+            "gemini",
+            "Arguments forwarded to gemini; use `--` before args that look like lterm options",
+        ),
+        (
+            "omx",
+            "Arguments forwarded to omx; use `--` before args that look like lterm options",
+        ),
+        (
+            "omc",
+            "Arguments forwarded to omc; use `--` before args that look like lterm options",
+        ),
+    ] {
+        let output = env.cmd().args([command, "--help"]).output()?;
+        assert!(output.status.success(), "{command} help failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let normalized = normalize_help(&stdout);
+        assert!(
+            normalized.contains(expected),
+            "{command} help should explain forwarded args:\n{stdout}"
+        );
+    }
+
+    Ok(())
+}
+
 fn normalize_help(help: &str) -> String {
     // Clap wraps help at terminal-dependent widths; collapse whitespace so the
     // smoke contract checks wording rather than a particular render width.
