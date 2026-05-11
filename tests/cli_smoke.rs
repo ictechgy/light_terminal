@@ -649,13 +649,17 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         (
             "attach",
             &[
-                "Session or pane target to attach; defaults to %0",
+                "Session or pane target to attach",
+                "default: %0",
                 "Disable the blue lterm status bar while attached",
             ][..],
         ),
         (
             "attach-or-new",
-            &["Session or pane target to attach or create; defaults to main"][..],
+            &[
+                "Session or pane target to attach or create",
+                "default: main",
+            ][..],
         ),
         ("kill", &["Session or pane target to kill"][..]),
         (
@@ -689,7 +693,8 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             "ssh",
             &[
                 "SSH host to connect to",
-                "Remote session or pane target to attach; defaults to main",
+                "Remote session or pane target to attach",
+                "default: main",
                 "Additional ssh arguments after `--`",
             ][..],
         ),
@@ -702,6 +707,18 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             assert!(
                 normalized.contains(phrase),
                 "{command} help should include {phrase:?}:\n{stdout}"
+            );
+        }
+
+        let unexpected_defaults = match command {
+            "attach" => &["defaults to %0"][..],
+            "attach-or-new" | "ssh" => &["defaults to main"][..],
+            _ => &[][..],
+        };
+        for phrase in unexpected_defaults {
+            assert!(
+                !normalized.contains(phrase),
+                "{command} help should not duplicate clap default text with {phrase:?}:\n{stdout}"
             );
         }
     }
