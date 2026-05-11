@@ -480,8 +480,12 @@ struct ConfiguredAgentProfile {
     binary: Option<String>,
     #[serde(default)]
     session_base: Option<String>,
-    #[serde(default)]
-    status_default: Option<bool>,
+    #[serde(default = "default_agent_status")]
+    status_default: bool,
+}
+
+fn default_agent_status() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -625,7 +629,7 @@ fn selected_agent_profile_infos(
                 return Ok(agent_profile_info(configured.clone(), "configured"));
             }
             if config_supplied {
-                bail!("agent profile {profile:?} was not found in --agent-config");
+                bail!("{}", missing_configured_agent_profile_message(&profile));
             }
             AgentProfile::resolve(&profile).map(|profile| agent_profile_info(profile, "custom"))
         })
@@ -694,11 +698,15 @@ fn resolve_agent_profile(profile: &str, config_path: Option<&str>) -> Result<Age
         return Ok(configured.clone());
     }
     if config_supplied {
-        bail!(
-            "agent profile {profile:?} was not found in --agent-config; omit --agent-config to use a PATH-resolved custom profile"
-        );
+        bail!("{}", missing_configured_agent_profile_message(profile));
     }
     AgentProfile::resolve(profile)
+}
+
+fn missing_configured_agent_profile_message(profile: &str) -> String {
+    format!(
+        "agent profile {profile:?} was not found in --agent-config; omit --agent-config to use a PATH-resolved custom profile"
+    )
 }
 
 fn load_agent_profiles_config(config_path: Option<&str>) -> Result<Vec<AgentProfile>> {
@@ -764,7 +772,7 @@ fn configured_agent_profile(
         name: profile.name,
         binary,
         session_base,
-        show_status: profile.status_default.unwrap_or(true),
+        show_status: profile.status_default,
     })
 }
 
@@ -1174,6 +1182,17 @@ mod tests {
                 "inline test config",
             )
             .is_err()
+        );
+        assert!(
+            parse_agent_profiles_config(
+                r#"{ "profiles": [{ "name": "null-status", "status_default": null }] }"#,
+                "inline test config",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            missing_configured_agent_profile_message("typo-agent"),
+            r#"agent profile "typo-agent" was not found in --agent-config; omit --agent-config to use a PATH-resolved custom profile"#
         );
         assert_eq!(
             agent_config_source_label(Path::new("bad-\u{1b}[31m-agents.json")),

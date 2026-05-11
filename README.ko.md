@@ -133,7 +133,7 @@ launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않�
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
 명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
 이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
-`lterm agents` 또는 `lterm agents --json`으로 built-in profile의 기본값과 현재 `PATH`에서 binary를 찾을 수 있는지 확인할 수 있습니다. `lterm agents codex my-agent --json`처럼 profile 이름을 넘기면 선택한 built-in/custom profile만 확인합니다. availability는 실행 시점의 PATH probe입니다.
+`lterm agents` 또는 `lterm agents --json`으로 profile 기본값과 현재 `PATH`에서 binary를 찾을 수 있는지 확인할 수 있습니다. JSON row의 `kind` 값은 `built-in`, `custom`, `configured` 중 하나입니다. `lterm agents codex my-agent --json`처럼 profile 이름을 넘기면 선택한 built-in/custom/configured profile만 확인합니다. availability는 실행 시점의 PATH probe입니다.
 반복해서 쓰는 custom alias는 명시적인 JSON config 파일로 넘길 수 있습니다.
 
 ```bash
@@ -145,7 +145,7 @@ lterm agent repo-review --agent-config agents.json -- exec "이 저장소를 리
 ```
 
 configured name과 binary는 `lterm agent <profile>`과 같은 안전한 profile 문법을 사용하며, built-in 이름은 재정의할 수 없습니다.
-`binary`는 shell fragment나 path가 아니라 `PATH`에서 찾는 bare command name이어야 합니다. `binary`는 기본적으로 `name`, `session_base`는 `<name>-lterm`, `status_default`는 `true`이며, 중복 이름과 알 수 없는 JSON field는 거부됩니다. `--agent-config`를 넘긴 경우 built-in이 아닌 선택 이름은 그 파일 안에 있어야 합니다.
+`binary`는 shell fragment나 path가 아니라 `PATH`에서 찾는 bare command name이어야 합니다. `binary`는 기본적으로 `name`, `session_base`는 `<name>-lterm`, `status_default`는 `true`이며 field가 있을 때는 boolean이어야 합니다. 중복 이름과 알 수 없는 JSON field는 거부됩니다. `--agent-config`를 넘긴 경우 built-in이 아닌 선택 이름은 그 파일 안에 있어야 합니다.
 
 **Oh My Codex를 shim이 적용된 세션에서 실행:**
 
