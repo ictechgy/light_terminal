@@ -2378,6 +2378,11 @@ printf 'ARG1:%s\n' "$1"
         r#"{ "profiles": [{ "name": "helper", "session_base": "-bad" }] }"#,
         "invalid session_base",
     )?;
+    rejected_config(
+        "null-status-agents.json",
+        r#"{ "profiles": [{ "name": "helper", "status_default": null }] }"#,
+        "invalid type",
+    )?;
     Ok(())
 }
 
