@@ -82,6 +82,7 @@ enum Commands {
     /// List sessions.
     #[command(alias = "ls")]
     List {
+        /// Print sessions as a JSON array for automation.
         #[arg(long)]
         json: bool,
         /// Include child panes created from inside another lterm session.
@@ -93,7 +94,9 @@ enum Commands {
     },
     /// Show child process trees for lterm sessions.
     Ps {
+        /// Optional session or pane target to inspect.
         target: Option<String>,
+        /// Print process rows as a JSON array for automation.
         #[arg(long)]
         json: bool,
     },
