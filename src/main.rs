@@ -128,6 +128,7 @@ enum Commands {
         enter: bool,
     },
     /// Capture scrollback from a session or pane.
+    #[command(visible_alias = "logs")]
     Capture {
         /// Session or pane target to capture.
         target: String,
