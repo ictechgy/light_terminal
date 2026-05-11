@@ -471,6 +471,10 @@ fn help_shows_common_aliases() -> TestResult {
         "list aliases were not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: input]"),
+        "send alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: logs]"),
         "capture alias was not visible in help:\n{stdout}"
     );
@@ -704,6 +708,14 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         ("kill", &["Session or pane target to kill"][..]),
         (
             "send",
+            &[
+                "Session or pane target to receive input",
+                "Text to send to the target PTY",
+                "Append Enter after the text",
+            ][..],
+        ),
+        (
+            "input",
             &[
                 "Session or pane target to receive input",
                 "Text to send to the target PTY",
@@ -1391,6 +1403,37 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
     let captured = env.capture_until("keys", "GOT:hello")?;
     assert!(captured.contains("READY"), "{captured}");
     assert!(captured.contains("GOT:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn input_alias_sends_text_to_pty() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "input-alias",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo INPUT:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("input-alias", "READY")?;
+    let status = env
+        .cmd()
+        .args(["input", "input-alias", "hello", "--enter"])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("input-alias", "INPUT:hello")?;
+    assert!(captured.contains("READY"), "{captured}");
+    assert!(captured.contains("INPUT:hello"), "{captured}");
     Ok(())
 }
 
