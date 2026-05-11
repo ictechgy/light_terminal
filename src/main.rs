@@ -146,21 +146,22 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// List built-in agent launcher profiles and PATH availability.
+    /// List agent launcher profiles, default settings, and PATH availability.
     Agents {
+        /// Print profiles as a JSON array.
         #[arg(long)]
         json: bool,
-        /// JSON file with additional custom agent profiles.
+        /// JSON file with additional configured custom agent profiles.
         #[arg(long = "agent-config")]
         agent_config: Option<String>,
-        /// Optional profile or binary names to inspect instead of all built-ins.
+        /// Optional built-in, configured, or PATH-resolved custom profile names to inspect.
         profiles: Vec<String>,
     },
-    /// Run a known or PATH-resolved agent CLI inside a tmux-compatible lterm session.
+    /// Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session.
     Agent {
-        /// Agent profile or binary name, e.g. claude, codex, gemini, omx, omc.
+        /// Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, gemini.
         profile: String,
-        /// JSON file with additional custom agent profiles.
+        /// JSON file with additional configured custom agent profiles.
         #[arg(long = "agent-config")]
         agent_config: Option<String>,
         #[command(flatten)]
