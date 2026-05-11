@@ -594,6 +594,53 @@ fn help_describes_machine_readable_session_surfaces() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn help_describes_session_creation_arguments() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (command, tmux_flag, tmux_description, command_description) in [
+        (
+            "new",
+            "--tmux",
+            "Expose the lterm tmux compatibility shim inside the session (off by default)",
+            "Shell command to run in the session; defaults to the user's shell when omitted",
+        ),
+        (
+            "run",
+            "--no-tmux",
+            "Disable the lterm tmux compatibility shim for this run session (enabled by default)",
+            "Required shell command to run in the tmux-compatible session",
+        ),
+    ] {
+        let output = env.cmd().args([command, "--help"]).output()?;
+        assert!(output.status.success(), "{command} help failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let normalized = normalize_help(&stdout);
+        assert!(
+            normalized.contains("Session name to use instead of an auto-generated name"),
+            "{command} help should describe --name:\n{stdout}"
+        );
+        assert!(
+            normalized.contains("Working directory for the session command"),
+            "{command} help should describe --cwd:\n{stdout}"
+        );
+        assert!(
+            normalized.contains(tmux_flag),
+            "{command} help should show the tmux compatibility flag:\n{stdout}"
+        );
+        assert!(
+            normalized.contains(tmux_description),
+            "{command} help should describe the tmux compatibility flag:\n{stdout}"
+        );
+        assert!(
+            normalized.contains(command_description),
+            "{command} help should describe trailing command args:\n{stdout}"
+        );
+    }
+
+    Ok(())
+}
+
 fn normalize_help(help: &str) -> String {
     // Clap wraps help at terminal-dependent widths; collapse whitespace so the
     // smoke contract checks wording rather than a particular render width.
@@ -2062,6 +2109,86 @@ fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
         "command -v tmux resolved fake tmux: {stdout:?}"
     );
     assert!(stdout.contains("%0"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn run_no_tmux_does_not_inject_lterm_tmux_shim() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--no-tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'PATH:%s\\n' \"$PATH\"",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let shim_dir = env.temp.path().join("data").join("shims");
+    let shim_dir = shim_dir.display().to_string();
+    assert!(
+        !stdout.contains(&shim_dir),
+        "lterm shim directory should not be injected when --no-tmux is set: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn run_defaults_to_lterm_tmux_shim() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'TMUX_BIN:%s\\n' \"$(command -v tmux)\"",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let shim_tmux = env.temp.path().join("data").join("shims").join("tmux");
+    let shim_tmux = shim_tmux.display().to_string();
+    assert!(
+        stdout.contains(&shim_tmux),
+        "run should inject the lterm tmux shim by default: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn run_hidden_tmux_flag_keeps_default_shim() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'TMUX_BIN:%s\\n' \"$(command -v tmux)\"",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let shim_tmux = env.temp.path().join("data").join("shims").join("tmux");
+    let shim_tmux = shim_tmux.display().to_string();
+    assert!(
+        stdout.contains(&shim_tmux),
+        "hidden run --tmux compatibility flag should keep the default shim: {stdout:?}"
+    );
     Ok(())
 }
 
