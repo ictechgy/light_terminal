@@ -6,6 +6,7 @@ use crate::sanitize;
 use crate::server;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -85,8 +86,11 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         }
         "new" | "new-session" => new_session(rest),
         "attach" | "attach-session" | "a" => attach_session(rest),
-        "has-session" => has_session(rest),
+        "has" | "has-session" => has_session(rest),
         "list-sessions" | "ls" => list_sessions(rest),
+        "list-windows" | "lsw" => list_windows(rest),
+        "list-clients" | "lsc" => list_clients(rest),
+        "list-commands" | "lscm" => list_commands(rest),
         "kill-session" => kill_session(rest),
         "split-window" | "splitw" => split_window(rest),
         "list-panes" | "lsp" => list_panes(rest),
@@ -96,17 +100,24 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "kill-pane" | "killp" => kill_pane(rest),
         "resize-pane" | "resizep" => resize_pane(rest),
         "select-pane" | "selectp" => Ok(0),
-        "select-layout" => Ok(0),
+        "select-layout" | "selectl" => Ok(0),
         "set-option" | "set" | "setw" | "set-window-option" => Ok(0),
-        "show-options" | "show" | "show-option" | "showw" | "show-window-option" => {
-            show_option(rest)
-        }
+        "show-options"
+        | "show"
+        | "show-option"
+        | "showw"
+        | "show-window-option"
+        | "show-window-options" => show_option(rest),
         "display-popup" | "popup" => display_popup(rest),
         "wait-for" | "wait" => wait_for(rest),
         "load-buffer" | "loadb" => load_buffer(rest),
         "save-buffer" | "saveb" => save_buffer(rest),
         "paste-buffer" | "pasteb" => paste_buffer(rest),
-        "set-environment" | "setenv" | "show-environment" | "showenv" => Ok(0),
+        "set-environment" | "setenv" | "show-environment" | "showenv" => {
+            // Agent scripts commonly probe these commands; lterm has no tmux-style
+            // environment store yet, so they are accepted as compatibility no-ops.
+            Ok(0)
+        }
         unknown => bail!(
             "unsupported tmux command in lterm compat: {unknown} {}",
             rest.join(" ")
@@ -196,15 +207,109 @@ fn has_session(args: &[String]) -> Result<i32> {
 }
 
 fn list_sessions(args: &[String]) -> Result<i32> {
+    reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{session_name}".to_string());
-    for pane in client::list_sessions()? {
-        // The daemon stores aliases; collapse by pane id.
-        if pane.parent_pane_id.is_some() || pane.name.starts_with('%') || pane.name == pane.id {
-            continue;
-        }
+    for pane in root_session_rows()? {
         println!("{}", expand_format(&format, &pane));
     }
     Ok(0)
+}
+
+fn list_windows(args: &[String]) -> Result<i32> {
+    reject_filter(args)?;
+    let format =
+        parse_format(args).unwrap_or_else(|| "#{window_index}: #{window_name}".to_string());
+    if has_flag(args, "-a") {
+        for pane in root_session_rows()? {
+            println!("{}", expand_format(&format, &pane));
+        }
+    } else {
+        let target = parse_target(args).unwrap_or_else(default_target);
+        let pane = window_row_for_target(&target)?;
+        println!("{}", expand_format(&format, &pane));
+    }
+    Ok(0)
+}
+
+fn list_clients(args: &[String]) -> Result<i32> {
+    reject_filter(args)?;
+    let format = parse_format(args).unwrap_or_else(|| "#{client_name}".to_string());
+    let panes = if let Some(target) = parse_target(args) {
+        vec![window_row_for_target(&target)?]
+    } else {
+        root_session_rows()?
+    };
+    for pane in panes {
+        if pane.attached_clients > 0 {
+            for _ in 0..pane.attached_clients {
+                println!("{}", expand_format(&format, &pane));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn list_commands(args: &[String]) -> Result<i32> {
+    reject_filter(args)?;
+    let format = parse_format(args).unwrap_or_else(|| "#{command_name}".to_string());
+    let requested = parse_command_filter(args);
+    for (command, alias, extra_aliases) in SUPPORTED_COMMANDS {
+        if let Some(requested) = requested.as_deref() {
+            let alias_matches = alias.is_some_and(|alias| requested == alias);
+            let extra_alias_matches = extra_aliases.contains(&requested);
+            if requested != *command && !alias_matches && !extra_alias_matches {
+                continue;
+            }
+        }
+        println!("{}", expand_command_format(&format, command, *alias));
+    }
+    Ok(0)
+}
+
+fn root_session_rows() -> Result<Vec<SessionInfo>> {
+    Ok(client::list_sessions()?
+        .into_iter()
+        // The daemon stores aliases; collapse by pane id.
+        .filter(|pane| {
+            pane.parent_pane_id.is_none() && !pane.name.starts_with('%') && pane.name != pane.id
+        })
+        .collect())
+}
+
+fn window_row_for_target(target: &str) -> Result<SessionInfo> {
+    let mut pane = client::info(target)?;
+    let rows = client::list_sessions()?;
+    let mut seen = HashSet::new();
+    while let Some(parent_session_id) = pane.parent_session_id.clone() {
+        if !seen.insert(parent_session_id.clone()) {
+            break;
+        }
+        let Some(parent) = rows
+            .iter()
+            .find(|candidate| {
+                candidate.id == parent_session_id
+                    && candidate.parent_pane_id.is_none()
+                    && !candidate.name.starts_with('%')
+                    && candidate.name != candidate.id
+            })
+            .or_else(|| {
+                rows.iter()
+                    .find(|candidate| candidate.id == parent_session_id)
+            })
+        else {
+            break;
+        };
+        pane = parent.clone();
+    }
+    if let Some(canonical) = rows.iter().find(|candidate| {
+        candidate.id == pane.id
+            && candidate.parent_pane_id.is_none()
+            && !candidate.name.starts_with('%')
+            && candidate.name != candidate.id
+    }) {
+        pane = canonical.clone();
+    }
+    Ok(pane)
 }
 
 fn kill_session(args: &[String]) -> Result<i32> {
@@ -282,6 +387,7 @@ fn split_window(args: &[String]) -> Result<i32> {
 }
 
 fn list_panes(args: &[String]) -> Result<i32> {
+    reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
     if let Some(target) = parse_target(args) {
         let pane = client::info(&target)?;
@@ -749,6 +855,9 @@ impl Drop for StoreLock {
 fn parse_target(args: &[String]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
         if args[i] == "-t" {
             return args.get(i + 1).cloned();
         }
@@ -758,7 +867,17 @@ fn parse_target(args: &[String]) -> Option<String> {
         if args[i].starts_with("-t") && args[i].len() > 2 {
             return Some(args[i][2..].to_string());
         }
-        i += 1;
+        if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
+            if let Some(value) = value {
+                return Some(value);
+            }
+            return args.get(i + 1).cloned();
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            i += 1;
+        }
     }
     None
 }
@@ -766,6 +885,9 @@ fn parse_target(args: &[String]) -> Option<String> {
 fn parse_format(args: &[String]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
         if args[i] == "-F" {
             return args.get(i + 1).cloned();
         }
@@ -773,24 +895,162 @@ fn parse_format(args: &[String]) -> Option<String> {
             return Some(value.to_string());
         }
         if args[i].starts_with("-F") && args[i].len() > 2 {
-            return Some(args[i][2..].to_string());
+            let value = &args[i][2..];
+            return Some(value.strip_prefix('=').unwrap_or(value).to_string());
         }
-        i += 1;
+        if let Some((_, value)) = short_cluster_flag_value(&args[i], 'F', args, i) {
+            if let Some(value) = value {
+                return Some(value);
+            }
+            return args.get(i + 1).cloned();
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            i += 1;
+        }
     }
     None
 }
 
-fn flag_arg_width(flag: &str, args: &[String], i: usize) -> usize {
-    match flag {
-        "-t" | "-F" | "-c" | "-s" | "-n" | "-x" | "-y" | "-l" => {
-            if args.get(i + 1).is_some() {
-                2
-            } else {
-                1
+fn parse_command_filter(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            return args.get(i + 1).cloned();
+        }
+        if args[i] == "-F" {
+            i += 2;
+        } else if args[i].starts_with("-F") {
+            i += 1;
+        } else if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            return Some(args[i].clone());
+        }
+    }
+    None
+}
+
+fn reject_filter(args: &[String]) -> Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
+        if args[i] == "-f" || short_cluster_flag_value(&args[i], 'f', args, i).is_some() {
+            bail!("tmux -f filters are not supported by lterm compat");
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn has_flag(args: &[String], needle: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            return false;
+        }
+        if args[i] == needle {
+            return true;
+        }
+        if let Some(short) = needle.strip_prefix('-') {
+            if short.len() == 1 {
+                if let Some(cluster) = args[i].strip_prefix('-') {
+                    if !cluster.starts_with('-')
+                        && short_cluster_flag_value(&args[i], needle_char(short), args, i).is_some()
+                    {
+                        return true;
+                    }
+                }
             }
         }
-        _ => 1,
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            i += 1;
+        }
     }
+    false
+}
+
+fn needle_char(short: &str) -> char {
+    short
+        .chars()
+        .next()
+        .expect("short option needle should contain one char")
+}
+
+fn flag_arg_width(flag: &str, args: &[String], i: usize) -> usize {
+    if let Some(cluster) = short_cluster(flag) {
+        for (pos, short_flag) in cluster.char_indices() {
+            if is_value_taking_short_flag(short_flag) {
+                let rest = &cluster[pos + short_flag.len_utf8()..];
+                return if rest.is_empty() && args.get(i + 1).is_some() {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    1
+}
+
+fn short_cluster_flag_value(
+    arg: &str,
+    needle: char,
+    args: &[String],
+    i: usize,
+) -> Option<(usize, Option<String>)> {
+    let cluster = short_cluster(arg)?;
+    for (pos, flag) in cluster.char_indices() {
+        let value = value_for_short_flag(cluster, pos, flag, args, i);
+        if flag == needle {
+            return Some((pos, value));
+        }
+        if value.is_some()
+            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            break;
+        }
+    }
+    None
+}
+
+fn value_for_short_flag(
+    cluster: &str,
+    pos: usize,
+    flag: char,
+    args: &[String],
+    i: usize,
+) -> Option<String> {
+    if !is_value_taking_short_flag(flag) {
+        return None;
+    }
+    let rest = &cluster[pos + flag.len_utf8()..];
+    if rest.is_empty() {
+        return args.get(i + 1).cloned();
+    }
+    Some(rest.strip_prefix('=').unwrap_or(rest).to_string())
+}
+
+fn short_cluster(arg: &str) -> Option<&str> {
+    let cluster = arg.strip_prefix('-')?;
+    if cluster.is_empty() || cluster.starts_with('-') {
+        None
+    } else {
+        Some(cluster)
+    }
+}
+
+fn is_value_taking_short_flag(flag: char) -> bool {
+    matches!(flag, 'F' | 't' | 'f' | 'c' | 'n' | 'x' | 'y')
 }
 
 fn default_target() -> String {
@@ -833,7 +1093,7 @@ pub fn expand_format(format: &str, info: &SessionInfo) -> String {
             out.push_str(&info.rows.to_string());
             i += "#{pane_height}".len();
         } else if let Some((needle, value)) = format_replacement(rest, info, &current_command) {
-            out.push_str(&sanitize::terminal_text(value));
+            out.push_str(&sanitize::terminal_text(value.as_ref()));
             i += needle.len();
         } else {
             let ch = rest
@@ -851,35 +1111,148 @@ fn format_replacement<'a>(
     rest: &str,
     info: &'a SessionInfo,
     current_command: &'a str,
-) -> Option<(&'static str, &'a str)> {
+) -> Option<(&'static str, Cow<'a, str>)> {
     const ACTIVE: &str = "1";
+    const CLIENT_NAME: &str = "lterm";
+    const CLIENT_PID: &str = "";
+    const CLIENT_TTY: &str = "";
     const IN_MODE: &str = "0";
-    const WIDTH: &str = "80";
-    const HEIGHT: &str = "24";
+    const WINDOW_INDEX: &str = "0";
+    const WINDOW_PANES: &str = "1";
     if rest.starts_with("#{pane_id}") {
-        Some(("#{pane_id}", info.pane_id.as_str()))
+        Some(("#{pane_id}", Cow::Borrowed(info.pane_id.as_str())))
     } else if rest.starts_with("#D") {
-        Some(("#D", info.pane_id.as_str()))
+        Some(("#D", Cow::Borrowed(info.pane_id.as_str())))
     } else if rest.starts_with("#{session_name}") {
-        Some(("#{session_name}", info.name.as_str()))
+        Some(("#{session_name}", Cow::Borrowed(info.name.as_str())))
     } else if rest.starts_with("#S") {
-        Some(("#S", info.name.as_str()))
+        Some(("#S", Cow::Borrowed(info.name.as_str())))
     } else if rest.starts_with("#{pane_current_command}") {
-        Some(("#{pane_current_command}", current_command))
+        Some(("#{pane_current_command}", Cow::Borrowed(current_command)))
     } else if rest.starts_with("#{pane_start_command}") {
-        Some(("#{pane_start_command}", info.command.as_str()))
+        Some((
+            "#{pane_start_command}",
+            Cow::Borrowed(info.command.as_str()),
+        ))
     } else if rest.starts_with("#{pane_current_path}") {
-        Some(("#{pane_current_path}", info.cwd.as_str()))
+        Some(("#{pane_current_path}", Cow::Borrowed(info.cwd.as_str())))
     } else if rest.starts_with("#{pane_active}") {
-        Some(("#{pane_active}", ACTIVE))
+        Some(("#{pane_active}", Cow::Borrowed(ACTIVE)))
     } else if rest.starts_with("#{pane_in_mode}") {
-        Some(("#{pane_in_mode}", IN_MODE))
+        Some(("#{pane_in_mode}", Cow::Borrowed(IN_MODE)))
+    } else if rest.starts_with("#{window_id}") {
+        Some((
+            "#{window_id}",
+            Cow::Owned(format!("@{}", info.pane_id.trim_start_matches('%'))),
+        ))
+    } else if rest.starts_with("#{window_index}") {
+        Some(("#{window_index}", Cow::Borrowed(WINDOW_INDEX)))
+    } else if rest.starts_with("#{window_name}") {
+        Some(("#{window_name}", Cow::Borrowed(info.name.as_str())))
+    } else if rest.starts_with("#{window_active}") {
+        Some(("#{window_active}", Cow::Borrowed(ACTIVE)))
+    } else if rest.starts_with("#{window_panes}") {
+        Some(("#{window_panes}", Cow::Borrowed(WINDOW_PANES)))
+    } else if rest.starts_with("#{client_name}") {
+        Some(("#{client_name}", Cow::Borrowed(CLIENT_NAME)))
+    } else if rest.starts_with("#{client_session}") {
+        Some(("#{client_session}", Cow::Borrowed(info.name.as_str())))
+    } else if rest.starts_with("#{client_pane}") {
+        Some(("#{client_pane}", Cow::Borrowed(info.pane_id.as_str())))
+    } else if rest.starts_with("#{client_pid}") {
+        Some(("#{client_pid}", Cow::Borrowed(CLIENT_PID)))
+    } else if rest.starts_with("#{client_tty}") {
+        Some(("#{client_tty}", Cow::Borrowed(CLIENT_TTY)))
     } else if rest.starts_with("#{window_width}") {
-        Some(("#{window_width}", WIDTH))
+        Some(("#{window_width}", Cow::Owned(info.cols.to_string())))
     } else if rest.starts_with("#{window_height}") {
-        Some(("#{window_height}", HEIGHT))
+        Some(("#{window_height}", Cow::Owned(info.rows.to_string())))
     } else {
         None
+    }
+}
+
+fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> String {
+    let alias = alias.unwrap_or_default();
+    let usage = sanitize::terminal_text(command_usage(command));
+    let command = sanitize::terminal_text(command);
+    let alias = sanitize::terminal_text(alias);
+    format
+        .replace("#{command_list_name}", &command)
+        .replace("#{command_list_alias}", &alias)
+        .replace("#{command_list_usage}", &usage)
+        .replace("#{command_name}", &command)
+        .replace("#{command_alias}", &alias)
+}
+
+const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
+    ("attach-session", Some("attach"), &["a"]),
+    ("capture-pane", Some("capturep"), &[]),
+    ("display-message", Some("display"), &[]),
+    ("display-popup", Some("popup"), &[]),
+    ("has-session", Some("has"), &[]),
+    ("kill-pane", Some("killp"), &[]),
+    ("kill-session", None, &[]),
+    ("list-clients", Some("lsc"), &[]),
+    ("list-commands", Some("lscm"), &[]),
+    ("list-panes", Some("lsp"), &[]),
+    ("list-sessions", Some("ls"), &[]),
+    ("list-windows", Some("lsw"), &[]),
+    ("load-buffer", Some("loadb"), &[]),
+    ("new-session", Some("new"), &[]),
+    ("paste-buffer", Some("pasteb"), &[]),
+    ("resize-pane", Some("resizep"), &[]),
+    ("save-buffer", Some("saveb"), &[]),
+    ("select-layout", Some("selectl"), &[]),
+    ("select-pane", Some("selectp"), &[]),
+    ("send-keys", Some("send"), &[]),
+    ("set-environment", Some("setenv"), &[]),
+    ("set-option", Some("set"), &[]),
+    ("set-window-option", Some("setw"), &[]),
+    ("show-environment", Some("showenv"), &[]),
+    ("show-options", Some("show"), &["show-option"]),
+    (
+        "show-window-options",
+        Some("showw"),
+        &["show-window-option"],
+    ),
+    ("split-window", Some("splitw"), &[]),
+    ("wait-for", Some("wait"), &[]),
+];
+
+fn command_usage(command: &str) -> &'static str {
+    match command {
+        "attach-session" => "[-dErx] [-c working-directory] [-f flags] [-t target-session]",
+        "capture-pane" => "[-aCeJMNpPqT] [-E end-line] [-S start-line] [-t target-pane]",
+        "display-message" => "[-p] [-F format] [-t target-pane] [message]",
+        "display-popup" => "[-E] [shell-command [argument ...]]",
+        "has-session" => "[-t target-session]",
+        "kill-pane" => "[-t target-pane]",
+        "kill-session" => "[-t target-session]",
+        "list-clients" => "[-F format] [-t target-session]",
+        "list-commands" => "[-F format] [command]",
+        "list-panes" => "[-F format] [-t target-pane]",
+        "list-sessions" => "[-F format]",
+        "list-windows" => "[-a] [-F format] [-t target-session]",
+        "load-buffer" => "path",
+        "new-session" => "[-d] [-c start-directory] [-s session-name] [shell-command]",
+        "paste-buffer" => "[-t target-pane]",
+        "resize-pane" => "[-x width] [-y height] [-t target-pane]",
+        "save-buffer" => "path",
+        "select-layout" => "[-t target-pane] [layout-name]",
+        "select-pane" => "[-t target-pane]",
+        "send-keys" => "[-l] [-t target-pane] [key ...]",
+        "set-environment" => "[-t target-session] variable [value]",
+        "set-option" => "[-t target-pane] option [value]",
+        "set-window-option" => "[-t target-window] option [value]",
+        "show-environment" => "[-t target-session] [variable]",
+        "show-options" => "[-t target-pane] [option]",
+        "show-window-options" => "[-t target-window] [option]",
+        "split-window" => {
+            "[-dhvP] [-F format] [-c start-directory] [-t target-pane] [shell-command]"
+        }
+        "wait-for" => "[-S] channel",
+        _ => "",
     }
 }
 
@@ -965,5 +1338,92 @@ mod tests {
             expand_format("#{pane_id} #S #{pane_current_command}", &info),
             "%1 s codex"
         );
+    }
+
+    #[test]
+    fn parses_format_short_flag_forms_without_confusing_values() {
+        assert_eq!(
+            parse_format(&args(["-F", "#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-F#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-F=#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-aF", "#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-aF#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-aF=#{session_name}"])).as_deref(),
+            Some("#{session_name}")
+        );
+        assert_eq!(
+            parse_format(&args(["-tFoo", "-F", "real"])).as_deref(),
+            Some("real")
+        );
+        assert_eq!(parse_format(&args(["--", "-F", "ignored"])), None);
+    }
+
+    #[test]
+    fn parses_target_without_confusing_format_values() {
+        assert_eq!(
+            parse_target(&args(["-F", "-t#{session_name}"])),
+            None,
+            "-F values that look like targets must remain format literals"
+        );
+        assert_eq!(
+            parse_target(&args(["-F", "-t#{session_name}", "-t", "real"])).as_deref(),
+            Some("real")
+        );
+        assert_eq!(
+            parse_target(&args(["-aF", "-t#{session_name}", "-tfoo"])).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(parse_target(&args(["--", "-tfoo"])), None);
+        assert_eq!(parse_target(&args(["-at", "foo"])).as_deref(), Some("foo"));
+        assert_eq!(parse_target(&args(["-atfoo"])).as_deref(), Some("foo"));
+        assert_eq!(parse_target(&args(["-at=foo"])).as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn rejects_only_real_filter_short_flags() {
+        assert!(reject_filter(&args(["-tfoo"])).is_ok());
+        assert!(reject_filter(&args(["-Ffoo"])).is_ok());
+        assert!(reject_filter(&args(["-aFfoo"])).is_ok());
+        assert!(reject_filter(&args(["--", "-f"])).is_ok());
+        assert!(reject_filter(&args(["-s", "-f", "#{session_name}"])).is_err());
+        assert!(reject_filter(&args(["-f", "#{session_name}"])).is_err());
+        assert!(reject_filter(&args(["-f#{session_name}"])).is_err());
+        assert!(reject_filter(&args(["-af", "#{session_name}"])).is_err());
+    }
+
+    #[test]
+    fn parses_short_flag_clusters_consistently() {
+        assert!(has_flag(&args(["-aF#{session_name}"]), "-a"));
+        assert!(!has_flag(&args(["-F#{session_name}"]), "-a"));
+        assert_eq!(
+            flag_arg_width("-aF", &args(["-aF", "#{session_name}"]), 0),
+            2
+        );
+        assert_eq!(
+            flag_arg_width("-aF#{session_name}", &args(["-aF#{session_name}"]), 0),
+            1
+        );
+        assert_eq!(flag_arg_width("-tfoo", &args(["-tfoo"]), 0), 1);
+        assert_eq!(flag_arg_width("-t", &args(["-t", "foo"]), 0), 2);
+        assert_eq!(flag_arg_width("-s", &args(["-s", "-F", "format"]), 0), 1);
+    }
+
+    fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
+        values.into_iter().map(String::from).collect()
     }
 }

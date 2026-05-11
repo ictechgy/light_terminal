@@ -148,9 +148,15 @@ lterm run --tmux -- codex exec "summarize the repository"
 Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. The shim implements the command subset most AI orchestration scripts rely on:
 
 - **Sessions** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
+- **Queries** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Panes** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffers / popups** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
-- **No-op compatibility** — `select-pane`, `select-layout`, `set-option`, `show-option`
+- **No-op compatibility** — `select-pane`, `select-layout`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
+
+Compatibility notes: lterm models each root session as one pseudo-window
+(`window_index=0`, `window_panes=1`). `client_pid` and `client_tty` expand to
+empty strings because lterm does not expose per-client process or TTY metadata.
+tmux `-f` filters are intentionally rejected instead of being silently ignored.
 
 ## cmux behavior
 

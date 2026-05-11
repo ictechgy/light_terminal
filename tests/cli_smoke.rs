@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,44 @@ impl Drop for TestEnv {
     }
 }
 
+struct ChildCleanup {
+    child: Option<Child>,
+}
+
+impl ChildCleanup {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> TestResult<&mut Child> {
+        self.child.as_mut().ok_or("child already reaped".into())
+    }
+
+    fn kill_and_wait(&mut self) -> TestResult {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() {
+            match child.kill() {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(err) => {
+                    return Err(format!("failed to kill child {}: {err}", child.id()).into());
+                }
+            }
+        }
+        let mut child = self.child.take().ok_or("child already reaped")?;
+        child.wait()?;
+        Ok(())
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        let _ = self.kill_and_wait();
+    }
+}
+
 fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
     stdout
         .lines()
@@ -89,6 +127,27 @@ fn wait_for_file_contents(path: &Path) -> TestResult<String> {
         last_err
     )
     .into())
+}
+
+fn wait_for_no_client_rows(env: &TestEnv, sessions: &[&str]) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env
+            .cmd()
+            .args(["tmux-compat", "list-clients", "-F", "#{client_session}"])
+            .output()?;
+        if output.status.success() {
+            last = String::from_utf8_lossy(&output.stdout).to_string();
+            if !last.lines().any(|line| sessions.contains(&line)) {
+                return Ok(());
+            }
+        } else {
+            last = format!("{output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("timed out waiting for client rows to detach: {last:?}").into())
 }
 
 fn write_executable(path: &Path, contents: &str) -> TestResult {
@@ -945,6 +1004,746 @@ fn tmux_compat_display_message_honors_format_flag() -> TestResult {
             .starts_with('%'),
         "{output:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_list_windows_reports_pseudo_window_metadata() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "window-query",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-windows",
+            "-t",
+            "window-query",
+            "-F",
+            "#{session_name}:#{window_index}:#{window_name}:#{window_id}:#{window_panes}:#{window_active}:#{pane_width}:#{window_width}:#{pane_height}:#{window_height}",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("window-query:0:window-query:@"))
+        .ok_or_else(|| format!("window-query row missing: {stdout:?}"))?;
+    let fields: Vec<_> = row.split(':').collect();
+    assert_eq!(fields.len(), 10, "{row:?}");
+    let window_id = fields[3]
+        .strip_prefix('@')
+        .ok_or_else(|| format!("window_id missing @ prefix: {row:?}"))?;
+    assert!(!window_id.is_empty(), "{row:?}");
+    assert!(window_id.chars().all(|ch| ch.is_ascii_digit()), "{row:?}");
+    assert_eq!(fields[4], "1", "{row:?}");
+    assert_eq!(fields[5], "1", "{row:?}");
+    assert_eq!(fields[6], fields[7], "{row:?}");
+    assert_eq!(fields[8], fields[9], "{row:?}");
+    assert!(fields[6].parse::<u16>()? > 0, "{row:?}");
+    assert!(fields[8].parse::<u16>()? > 0, "{row:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_list_clients_reports_attached_lterm_client() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-lc",
+            "tmux list-clients -F '#{client_name}:#{client_session}:#{client_pane}:pid=#{client_pid}:end'",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line.starts_with("lterm:")
+            && line
+                .split(':')
+                .nth(2)
+                .is_some_and(|pane| pane.starts_with('%'))),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().all(|line| line.ends_with(":pid=:end")),
+        "client_pid is intentionally unsupported and must expand empty, not as hazardous fake pid 0: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_list_clients_honors_target_and_attached_row_count() -> TestResult {
+    let env = TestEnv::new()?;
+    for name in ["client-one", "client-two"] {
+        let status = env
+            .cmd()
+            .args(["new", "--detach", "-n", name, "--", "sh", "-lc", "sleep 60"])
+            .status()?;
+        assert!(status.success());
+    }
+
+    let mut attach_one_a = ChildCleanup::new(
+        env.cmd()
+            .args(["attach", "client-one", "--no-status"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let attach_one_a_stdin = attach_one_a
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or("missing attach stdin")?;
+    let mut attach_one_b = ChildCleanup::new(
+        env.cmd()
+            .args(["attach", "client-one", "--no-status"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let attach_one_b_stdin = attach_one_b
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or("missing attach stdin")?;
+    let mut attach_two = ChildCleanup::new(
+        env.cmd()
+            .args(["attach", "client-two", "--no-status"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let attach_two_stdin = attach_two
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or("missing attach stdin")?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    let mut all_clients_seen = false;
+    while Instant::now() < deadline {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "list-clients",
+                "-F",
+                "#{client_session}:#{client_pane}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            last = format!("{output:?}");
+            break;
+        }
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        let lines: Vec<_> = last.lines().collect();
+        let client_one_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("client-one:%"))
+            .count();
+        let client_two_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("client-two:%"))
+            .count();
+        let unexpected_rows = lines
+            .iter()
+            .filter(|line| !line.starts_with("client-one:%") && !line.starts_with("client-two:%"))
+            .count();
+        if lines.len() == 3 && client_one_rows == 2 && client_two_rows == 1 && unexpected_rows == 0
+        {
+            all_clients_seen = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !all_clients_seen {
+        drop(attach_one_a_stdin);
+        drop(attach_one_b_stdin);
+        drop(attach_two_stdin);
+        let _ = attach_one_a.kill_and_wait();
+        let _ = attach_one_b.kill_and_wait();
+        let _ = attach_two.kill_and_wait();
+        return Err(format!("timed out waiting for all client rows: {last:?}").into());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "list-clients",
+                "-t",
+                "client-one",
+                "-F",
+                "#{client_session}:#{client_pane}:pid=#{client_pid}:end",
+            ])
+            .output()?;
+        if !output.status.success() {
+            last = format!("{output:?}");
+            break;
+        }
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        let lines: Vec<_> = last.lines().collect();
+        if lines.len() == 2 && lines.iter().all(|line| line.starts_with("client-one:%")) {
+            // lterm exposes the attached pane, not a per-client id, so two
+            // clients attached to the same pane intentionally render as two
+            // identical client rows.
+            if !lines.iter().all(|line| line.ends_with(":pid=:end")) {
+                drop(attach_one_a_stdin);
+                drop(attach_one_b_stdin);
+                drop(attach_two_stdin);
+                let _ = attach_one_a.kill_and_wait();
+                let _ = attach_one_b.kill_and_wait();
+                let _ = attach_two.kill_and_wait();
+                return Err(format!(
+                    "client_pid must expand empty, not as hazardous fake pid 0: {last:?}"
+                )
+                .into());
+            }
+            drop(attach_one_a_stdin);
+            drop(attach_one_b_stdin);
+            drop(attach_two_stdin);
+            attach_one_a.kill_and_wait()?;
+            attach_one_b.kill_and_wait()?;
+            attach_two.kill_and_wait()?;
+            wait_for_no_client_rows(&env, &["client-one", "client-two"])?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(attach_one_a_stdin);
+    drop(attach_one_b_stdin);
+    drop(attach_two_stdin);
+    let _ = attach_one_a.kill_and_wait();
+    let _ = attach_one_b.kill_and_wait();
+    let _ = attach_two.kill_and_wait();
+    Err(format!("timed out waiting for targeted client rows: {last:?}").into())
+}
+
+#[test]
+fn tmux_compat_list_windows_defaults_to_current_target_unless_all() -> TestResult {
+    let env = TestEnv::new()?;
+    for name in ["window-one", "window-two", "foo-target"] {
+        let status = env
+            .cmd()
+            .args(["tmux-compat", "new-session", "-d", "-s", name, "sleep 60"])
+            .status()?;
+        assert!(status.success());
+    }
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let window_one = list_row(&stdout, "window-one")
+        .ok_or_else(|| format!("window-one row missing: {stdout:?}"))?;
+    let window_one_pane = window_one
+        .get(1)
+        .ok_or_else(|| format!("window-one row missing pane id: {window_one:?}"))?;
+
+    let current = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-F", "#{session_name}"])
+        .output()?;
+    assert!(current.status.success(), "{current:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&current.stdout).trim(),
+        "window-one"
+    );
+
+    let attached_target = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-windows",
+            "-tfoo-target",
+            "-F",
+            "#{session_name}",
+        ])
+        .output()?;
+    assert!(attached_target.status.success(), "{attached_target:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&attached_target.stdout).trim(),
+        "foo-target"
+    );
+
+    let all = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-a", "-F", "#{session_name}"])
+        .output()?;
+    assert!(all.status.success(), "{all:?}");
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "window-one"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "window-two"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foo-target"),
+        "{stdout:?}"
+    );
+
+    let clustered = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-aF", "#{session_name}"])
+        .output()?;
+    assert!(clustered.status.success(), "{clustered:?}");
+    let stdout = String::from_utf8_lossy(&clustered.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "window-one"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "window-two"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foo-target"),
+        "{stdout:?}"
+    );
+
+    let clustered_inline = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-aF#{session_name}"])
+        .output()?;
+    assert!(clustered_inline.status.success(), "{clustered_inline:?}");
+    let stdout = String::from_utf8_lossy(&clustered_inline.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "window-one"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "window-two"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foo-target"),
+        "{stdout:?}"
+    );
+
+    let clustered_equals_inline = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-aF=#{session_name}"])
+        .output()?;
+    assert!(
+        clustered_equals_inline.status.success(),
+        "{clustered_equals_inline:?}"
+    );
+    let stdout = String::from_utf8_lossy(&clustered_equals_inline.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "window-one"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "window-two"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "foo-target"),
+        "{stdout:?}"
+    );
+
+    let literal_format = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-F", "-a"])
+        .output()?;
+    assert!(literal_format.status.success(), "{literal_format:?}");
+    assert_eq!(String::from_utf8_lossy(&literal_format.stdout).trim(), "-a");
+
+    let inline_format = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-F#{session_name}"])
+        .output()?;
+    assert!(inline_format.status.success(), "{inline_format:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&inline_format.stdout).trim(),
+        "window-one"
+    );
+
+    let equals_format = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-F=#{session_name}"])
+        .output()?;
+    assert!(equals_format.status.success(), "{equals_format:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&equals_format.stdout).trim(),
+        "window-one"
+    );
+    let target_like_format = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args(["tmux-compat", "list-windows", "-F", "-t#{session_name}"])
+        .output()?;
+    assert!(
+        target_like_format.status.success(),
+        "{target_like_format:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&target_like_format.stdout).trim(),
+        "-twindow-one"
+    );
+
+    let unsupported_filter = env
+        .cmd()
+        .args(["tmux-compat", "list-windows", "-f", "#{session_name}"])
+        .output()?;
+    assert!(
+        !unsupported_filter.status.success(),
+        "{unsupported_filter:?}"
+    );
+    let unsupported_clustered_filter = env
+        .cmd()
+        .args(["tmux-compat", "list-windows", "-af", "#{session_name}"])
+        .output()?;
+    assert!(
+        !unsupported_clustered_filter.status.success(),
+        "{unsupported_clustered_filter:?}"
+    );
+    let unsupported_pane_filter = env
+        .cmd()
+        .args(["tmux-compat", "list-panes", "-f", "#{pane_id}"])
+        .output()?;
+    assert!(
+        !unsupported_pane_filter.status.success(),
+        "{unsupported_pane_filter:?}"
+    );
+    let scoped_pane_format = env
+        .cmd()
+        .args(["tmux-compat", "list-panes", "-s", "-F", "literal"])
+        .output()?;
+    assert!(
+        scoped_pane_format.status.success(),
+        "{scoped_pane_format:?}"
+    );
+    let stdout = String::from_utf8_lossy(&scoped_pane_format.stdout);
+    assert!(
+        !stdout.trim().is_empty() && stdout.lines().all(|line| line == "literal"),
+        "{stdout:?}"
+    );
+    let unsupported_scoped_pane_filter = env
+        .cmd()
+        .args(["tmux-compat", "list-panes", "-s", "-f", "#{pane_id}"])
+        .output()?;
+    assert!(
+        !unsupported_scoped_pane_filter.status.success(),
+        "{unsupported_scoped_pane_filter:?}"
+    );
+
+    let dash_dash_literal = env
+        .cmd()
+        .env("TMUX_PANE", window_one_pane)
+        .args([
+            "tmux-compat",
+            "list-windows",
+            "-F",
+            "#{session_name}",
+            "--",
+            "-f",
+            "#{session_name}",
+        ])
+        .output()?;
+    assert!(dash_dash_literal.status.success(), "{dash_dash_literal:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&dash_dash_literal.stdout).trim(),
+        "window-one"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_list_windows_resolves_child_target_to_root_window() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "window-parent",
+            "--",
+            "sh",
+            "-lc",
+            "\"$LTERM_BIN\" new --detach -n window-child -- sh -lc 'sleep 60' && echo CHILD_READY; sleep 60",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("window-parent", "CHILD_READY")?;
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-windows",
+            "-t",
+            "window-child",
+            "-F",
+            "#{session_name}:#{window_name}:#{window_id}",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "{stdout:?}");
+    assert!(
+        lines[0].starts_with("window-parent:window-parent:@"),
+        "{stdout:?}"
+    );
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "window-decoy",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let mut attach_parent = ChildCleanup::new(
+        env.cmd()
+            .args(["attach", "window-parent", "--no-status"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let attach_parent_stdin = attach_parent
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or("missing attach stdin")?;
+    let mut attach_decoy = ChildCleanup::new(
+        env.cmd()
+            .args(["attach", "window-decoy", "--no-status"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let attach_decoy_stdin = attach_decoy
+        .child_mut()?
+        .stdin
+        .take()
+        .ok_or("missing attach stdin")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    let mut all_clients_seen = false;
+    while Instant::now() < deadline {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "list-clients",
+                "-F",
+                "#{client_session}:#{client_pane}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            last = format!("{output:?}");
+            break;
+        }
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        let lines: Vec<_> = last.lines().collect();
+        let parent_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("window-parent:%"))
+            .count();
+        let decoy_rows = lines
+            .iter()
+            .filter(|line| line.starts_with("window-decoy:%"))
+            .count();
+        if lines.len() == 2 && parent_rows == 1 && decoy_rows == 1 {
+            all_clients_seen = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !all_clients_seen {
+        drop(attach_parent_stdin);
+        drop(attach_decoy_stdin);
+        let _ = attach_parent.kill_and_wait();
+        let _ = attach_decoy.kill_and_wait();
+        return Err(format!("timed out waiting for parent and decoy clients: {last:?}").into());
+    }
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-clients",
+            "-t",
+            "window-child",
+            "-F",
+            "#{client_session}:#{client_pane}",
+        ])
+        .output()?;
+    if !output.status.success() {
+        drop(attach_parent_stdin);
+        drop(attach_decoy_stdin);
+        let _ = attach_parent.kill_and_wait();
+        let _ = attach_decoy.kill_and_wait();
+        return Err(format!("child-target list-clients failed: {output:?}").into());
+    }
+    last = String::from_utf8_lossy(&output.stdout).to_string();
+    let lines: Vec<_> = last.lines().collect();
+    if lines.len() != 1 || !lines[0].starts_with("window-parent:%") {
+        drop(attach_parent_stdin);
+        drop(attach_decoy_stdin);
+        let _ = attach_parent.kill_and_wait();
+        let _ = attach_decoy.kill_and_wait();
+        return Err(format!(
+            "child-target list-clients did not filter to exactly the root client session: {last:?}"
+        )
+        .into());
+    }
+
+    drop(attach_parent_stdin);
+    drop(attach_decoy_stdin);
+    attach_parent.kill_and_wait()?;
+    attach_decoy.kill_and_wait()?;
+    wait_for_no_client_rows(&env, &["window-parent", "window-decoy"])?;
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "has-alias",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success());
+    let status = env
+        .cmd()
+        .args(["tmux-compat", "has", "-t", "has-alias"])
+        .status()?;
+    assert!(status.success());
+    for args in [
+        vec!["tmux-compat", "set-environment", "LTERM_TEST_VAR", "1"],
+        vec!["tmux-compat", "setenv", "LTERM_TEST_VAR", "1"],
+    ] {
+        let status = env.cmd().args(args).status()?;
+        assert!(status.success());
+    }
+    for args in [
+        vec!["tmux-compat", "show-environment", "LTERM_TEST_VAR"],
+        vec!["tmux-compat", "showenv", "LTERM_TEST_VAR"],
+    ] {
+        let output = env.cmd().args(args).output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "show-environment is a compatibility no-op and should not synthesize values: {output:?}"
+        );
+    }
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-commands",
+            "-F",
+            "cmd=#{command_list_name}:#{command_list_alias}:#{command_list_usage}",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for (command, alias) in [
+        ("list-windows", "lsw"),
+        ("list-clients", "lsc"),
+        ("list-commands", "lscm"),
+        ("attach-session", "attach"),
+        ("has-session", "has"),
+        ("set-environment", "setenv"),
+        ("show-environment", "showenv"),
+    ] {
+        let expected = format!("cmd={command}:{alias}:");
+        assert!(
+            stdout.lines().any(|line| line.starts_with(&expected)),
+            "{command} missing from list-commands output: {stdout:?}"
+        );
+    }
+    let list_commands_row = stdout
+        .lines()
+        .find(|line| line.starts_with("cmd=list-commands:lscm:"))
+        .ok_or_else(|| format!("list-commands row missing: {stdout:?}"))?;
+    assert!(
+        list_commands_row.contains("[-F format]"),
+        "list-commands usage field missing: {list_commands_row:?}"
+    );
+    let unsupported_filter = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "-f", "#{command_name}"])
+        .output()?;
+    assert!(
+        !unsupported_filter.status.success(),
+        "{unsupported_filter:?}"
+    );
+
+    for (alias, expected) in [
+        ("has", "has-session:has"),
+        ("a", "attach-session:attach"),
+        ("show-option", "show-options:show"),
+        ("show-window-option", "show-window-options:showw"),
+    ] {
+        let filtered = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "list-commands",
+                "-F",
+                "#{command_list_name}:#{command_list_alias}",
+                alias,
+            ])
+            .output()?;
+        assert!(filtered.status.success(), "{filtered:?}");
+        assert_eq!(String::from_utf8_lossy(&filtered.stdout).trim(), expected);
+    }
     Ok(())
 }
 
