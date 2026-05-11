@@ -150,6 +150,91 @@ fn wait_for_no_client_rows(env: &TestEnv, sessions: &[&str]) -> TestResult {
     Err(format!("timed out waiting for client rows to detach: {last:?}").into())
 }
 
+fn wait_for_session_absent(env: &TestEnv, session: &str) -> TestResult {
+    wait_for_session_absent_for(env, session, Duration::from_secs(10))
+}
+
+fn wait_for_session_absent_for(env: &TestEnv, session: &str, timeout: Duration) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().arg("ls").output()?;
+        if output.status.success() {
+            last = String::from_utf8_lossy(&output.stdout).to_string();
+            if list_row(&last, session).is_none() {
+                return Ok(());
+            }
+        } else {
+            last = format!("{output:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("timed out waiting for session {session:?} to exit: {last:?}").into())
+}
+
+fn wait_for_session_present(env: &TestEnv, session: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let output = env.cmd().arg("ls").output()?;
+        if output.status.success() {
+            last = String::from_utf8_lossy(&output.stdout).to_string();
+            if list_row(&last, session).is_some() {
+                return Ok(());
+            }
+        } else {
+            last = format!("{output:?}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("timed out waiting for session {session:?} to appear: {last:?}").into())
+}
+
+struct SessionCleanup<'a> {
+    env: &'a TestEnv,
+    target: String,
+    armed: bool,
+}
+
+impl<'a> SessionCleanup<'a> {
+    fn new(env: &'a TestEnv, target: impl Into<String>) -> Self {
+        Self {
+            env,
+            target: target.into(),
+            armed: true,
+        }
+    }
+
+    fn kill_now(&mut self) -> TestResult {
+        let output = self.env.cmd().args(["kill", &self.target]).output()?;
+        if !output.status.success() {
+            if wait_for_session_absent(self.env, &self.target).is_ok() {
+                self.armed = false;
+                return Ok(());
+            }
+            return Err(format!("failed to kill session {:?}: {output:?}", self.target).into());
+        }
+        wait_for_session_absent(self.env, &self.target)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for SessionCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .env
+                .cmd()
+                .args(["kill", &self.target])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = wait_for_session_absent_for(self.env, &self.target, Duration::from_secs(1));
+        }
+    }
+}
+
 fn write_executable(path: &Path, contents: &str) -> TestResult {
     std::fs::write(path, contents)?;
     #[cfg(unix)]
@@ -1983,6 +2068,162 @@ printf 'ARG1:%s\n' "$1"
     assert!(stdout.contains("LTERM_AGENT:gemini"), "{stdout:?}");
     assert!(stdout.contains("LTERM_SESSION:gemini-lterm"), "{stdout:?}");
     assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn agent_launch_controls_set_name_cwd_and_detach() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    let workdir = env.temp.path().join("agent-workdir");
+    let suffix = env
+        .temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent")
+        .trim_start_matches('.');
+    let session_name = format!("repo-agent-{}-{suffix}", std::process::id());
+    std::fs::create_dir(&fake_bin)?;
+    std::fs::create_dir(&workdir)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
+printf 'PWD:%s\n' "$(pwd -P)"
+printf 'ARG1:%s\n' "$1"
+sleep 300
+"#,
+    )?;
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin.as_path().to_path_buf()).chain(std::env::split_paths(&old_path)),
+    )?;
+    let expected_pwd = std::fs::canonicalize(&workdir)?;
+    let mut cleanup = SessionCleanup::new(&env, session_name.clone());
+
+    let started = Instant::now();
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .current_dir(env.temp.path())
+        .args([
+            "agent",
+            "codex",
+            "--name",
+            &session_name,
+            "--cwd",
+            workdir
+                .to_str()
+                .ok_or("temporary workdir path should be UTF-8")?,
+            "--detach",
+            "--",
+            "exec",
+        ])
+        .output()?;
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "--detach should return before the agent exits; elapsed={elapsed:?}, output={output:?}"
+    );
+    let fields: Vec<_> = stdout.trim_end().split('\t').collect();
+    assert_eq!(fields.len(), 3, "{stdout:?}");
+    assert_eq!(fields[0], session_name, "{stdout:?}");
+    assert!(
+        fields[1].len() > 1
+            && fields[1].starts_with('%')
+            && fields[1][1..].chars().all(|ch| ch.is_ascii_digit()),
+        "{stdout:?}"
+    );
+    assert!(fields[2].contains("codex"), "{stdout:?}");
+    wait_for_session_present(&env, &session_name)?;
+
+    let captured = env.capture_until(&session_name, "ARG1:exec")?;
+    assert!(captured.contains("LTERM_AGENT:codex"), "{captured:?}");
+    assert!(
+        captured.contains(&format!("LTERM_SESSION:{session_name}")),
+        "{captured:?}"
+    );
+    assert!(
+        captured.contains(&format!("PWD:{}", expected_pwd.display())),
+        "{captured:?}"
+    );
+    assert!(captured.contains("ARG1:exec"), "{captured:?}");
+    cleanup.kill_now()?;
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn agent_launch_explicit_name_conflict_does_not_autosuffix() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 60\n")?;
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin.as_path().to_path_buf()).chain(std::env::split_paths(&old_path)),
+    )?;
+    let suffix = env
+        .temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent")
+        .trim_start_matches('.');
+    let session_name = format!("repo-agent-conflict-{}-{suffix}", std::process::id());
+    let mut cleanup = SessionCleanup::new(&env, session_name.clone());
+
+    let first = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["agent", "codex", "--name", &session_name, "--detach"])
+        .output()?;
+    assert!(first.status.success(), "{first:?}");
+    wait_for_session_present(&env, &session_name)?;
+
+    let second = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["agent", "codex", "--name", &session_name, "--detach"])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(list_row(&stdout, &session_name).is_some(), "{stdout:?}");
+    let unexpected_prefixed: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .filter(|name| *name != session_name.as_str() && name.starts_with(&session_name))
+        .map(ToOwned::to_owned)
+        .collect();
+    for leaked in &unexpected_prefixed {
+        let mut leaked_cleanup = SessionCleanup::new(&env, leaked.clone());
+        let _ = leaked_cleanup.kill_now();
+    }
+    assert!(!second.status.success(), "{second:?}");
+    assert!(
+        stderr.contains(&format!(
+            "failed to create agent session named {session_name}"
+        )) && stderr.contains("session name already exists"),
+        "{stderr:?}"
+    );
+    assert!(unexpected_prefixed.is_empty(), "{stdout:?}");
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with(&format!("{session_name}\t")))
+            .count(),
+        1,
+        "{stdout:?}"
+    );
+    cleanup.kill_now()?;
     Ok(())
 }
 

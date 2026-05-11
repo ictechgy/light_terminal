@@ -118,7 +118,20 @@ lterm agent codex
 lterm agent gemini -- -p "summarize this repo"
 ```
 
-Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `lterm run --tmux -- <command>` when you want the generic primitive directly or need to launch an unprofiled future agent.
+Agent launchers accept the same session controls across built-in profiles and custom `lterm agent <profile>` launches:
+
+```bash
+lterm claude --name repo-review --cwd /path/to/repo
+lterm codex --detach --name repo-codex -- exec "summarize this repo"
+lterm gemini --status -- -p "keep lterm status visible"
+```
+
+Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. Use `lterm run --tmux -- <command>` when you want the generic primitive directly or need to launch an unprofiled future agent.
+
+Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to `claude`, `codex`, `gemini`, `omx`, `omc`, and `agent <profile>`.
+`--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; reattach later with `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
+Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
+Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not look like a UUID, and are limited to 128 bytes.
 
 **Run Oh My Codex inside a shimmed session:**
 
