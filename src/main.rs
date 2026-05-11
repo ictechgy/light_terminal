@@ -75,7 +75,7 @@ enum Commands {
     /// Attach to a persistent session or pane.
     #[command(visible_alias = "a")]
     Attach {
-        /// Session or pane target to attach; defaults to %0.
+        /// Session or pane target to attach.
         #[arg(default_value = "%0")]
         target: String,
         /// Disable the blue lterm status bar while attached.
@@ -84,7 +84,7 @@ enum Commands {
     },
     /// Attach to a session, creating it first when missing.
     AttachOrNew {
-        /// Session or pane target to attach or create; defaults to main.
+        /// Session or pane target to attach or create.
         #[arg(default_value = "main")]
         target: String,
         /// Disable the blue lterm status bar while attached.
@@ -227,7 +227,7 @@ enum Commands {
     Ssh {
         /// SSH host to connect to.
         host: String,
-        /// Remote session or pane target to attach; defaults to main.
+        /// Remote session or pane target to attach.
         #[arg(default_value = "main")]
         target: String,
         /// Additional ssh arguments after `--`.
