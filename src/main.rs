@@ -149,6 +149,8 @@ enum Commands {
     Agents {
         #[arg(long)]
         json: bool,
+        /// Optional profile or binary names to inspect instead of all built-ins.
+        profiles: Vec<String>,
     },
     /// Run a known or PATH-resolved agent CLI inside a tmux-compatible lterm session.
     Agent {
@@ -329,7 +331,7 @@ fn run() -> Result<()> {
         Commands::Omc { launch, args } => {
             run_agent_profile(AgentProfile::known("omc"), launch, args)
         }
-        Commands::Agents { json } => print_agent_profiles(json),
+        Commands::Agents { json, profiles } => print_agent_profiles(json, profiles),
         Commands::Agent {
             profile,
             launch,
@@ -439,6 +441,7 @@ struct AgentProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct AgentProfileInfo {
     profile: String,
+    kind: String,
     binary: String,
     session_base: String,
     status_default: bool,
@@ -551,15 +554,34 @@ impl AgentProfile {
 fn built_in_agent_profile_infos() -> Vec<AgentProfileInfo> {
     BUILT_IN_AGENT_PROFILES
         .iter()
-        .map(|name| agent_profile_info(AgentProfile::known(name)))
+        .map(|name| agent_profile_info(AgentProfile::known(name), true))
         .collect()
 }
 
-fn agent_profile_info(profile: AgentProfile) -> AgentProfileInfo {
+fn selected_agent_profile_infos(profiles: Vec<String>) -> Result<Vec<AgentProfileInfo>> {
+    if profiles.is_empty() {
+        return Ok(built_in_agent_profile_infos());
+    }
+
+    profiles
+        .into_iter()
+        .map(|profile| {
+            let built_in = is_built_in_agent_profile(&profile);
+            AgentProfile::resolve(&profile).map(|profile| agent_profile_info(profile, built_in))
+        })
+        .collect()
+}
+
+fn is_built_in_agent_profile(profile: &str) -> bool {
+    BUILT_IN_AGENT_PROFILES.contains(&profile)
+}
+
+fn agent_profile_info(profile: AgentProfile, built_in: bool) -> AgentProfileInfo {
     let path =
         client::find_command(&profile.binary).map(|path| path.to_string_lossy().into_owned());
     AgentProfileInfo {
         profile: profile.name,
+        kind: if built_in { "built-in" } else { "custom" }.to_string(),
         binary: profile.binary,
         session_base: profile.session_base,
         status_default: profile.show_status,
@@ -568,17 +590,17 @@ fn agent_profile_info(profile: AgentProfile) -> AgentProfileInfo {
     }
 }
 
-fn print_agent_profiles(json: bool) -> Result<()> {
-    let profiles = built_in_agent_profile_infos();
+fn print_agent_profiles(json: bool, profiles: Vec<String>) -> Result<()> {
+    let profiles = selected_agent_profile_infos(profiles)?;
     if json {
         println!("{}", client::json_pretty(&profiles));
         return Ok(());
     }
 
-    println!("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH");
+    println!("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH\tKIND");
     for profile in profiles {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             sanitize::terminal_text(&profile.profile),
             sanitize::terminal_text(&profile.binary),
             sanitize::terminal_text(&profile.session_base),
@@ -588,7 +610,8 @@ fn print_agent_profiles(json: bool) -> Result<()> {
             } else {
                 "missing"
             },
-            sanitize::terminal_text(profile.path.as_deref().unwrap_or("-"))
+            sanitize::terminal_text(profile.path.as_deref().unwrap_or("-")),
+            sanitize::terminal_text(&profile.kind)
         );
     }
     Ok(())
@@ -911,6 +934,7 @@ mod tests {
             .iter()
             .find(|info| info.profile == "claude")
             .expect("claude profile info");
+        assert_eq!(claude.kind, "built-in");
         assert_eq!(claude.binary, "claude");
         assert_eq!(claude.session_base, "claude-lterm");
         assert!(!claude.status_default);
@@ -922,6 +946,28 @@ mod tests {
         assert_eq!(omc.binary, "omc");
         assert_eq!(omc.session_base, "omc-lterm");
         assert!(omc.status_default);
+    }
+
+    #[test]
+    fn selected_agent_profile_infos_include_custom_profiles() {
+        let infos = selected_agent_profile_infos(vec!["codex".to_string(), "my-agent".to_string()])
+            .expect("selected agent profile infos");
+        assert_eq!(infos.len(), 2);
+
+        let codex = &infos[0];
+        assert_eq!(codex.profile, "codex");
+        assert_eq!(codex.kind, "built-in");
+        assert_eq!(codex.session_base, "codex-lterm");
+        assert!(!codex.status_default);
+
+        let custom = &infos[1];
+        assert_eq!(custom.profile, "my-agent");
+        assert_eq!(custom.kind, "custom");
+        assert_eq!(custom.binary, "my-agent");
+        assert_eq!(custom.session_base, "my-agent-lterm");
+        assert!(custom.status_default);
+
+        assert!(selected_agent_profile_infos(vec!["../agent".to_string()]).is_err());
     }
 
     #[test]
