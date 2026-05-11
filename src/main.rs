@@ -136,6 +136,7 @@ enum Commands {
     Omx {
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to omx; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -143,6 +144,7 @@ enum Commands {
     Omc {
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to omc; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -166,6 +168,7 @@ enum Commands {
         agent_config: Option<String>,
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to the agent CLI; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -173,6 +176,7 @@ enum Commands {
     Claude {
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to claude; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -180,6 +184,7 @@ enum Commands {
     Codex {
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to codex; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -187,6 +192,7 @@ enum Commands {
     Gemini {
         #[command(flatten)]
         launch: AgentLaunchOptions,
+        /// Arguments forwarded to gemini; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
