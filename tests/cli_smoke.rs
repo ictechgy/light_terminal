@@ -425,7 +425,7 @@ fn attach_short_aliases_detach_on_stdin_eof() -> TestResult {
 }
 
 #[test]
-fn help_shows_short_attach_alias() -> TestResult {
+fn help_shows_common_aliases() -> TestResult {
     let env = TestEnv::new()?;
     let output = env.cmd().arg("--help").output()?;
     assert!(output.status.success(), "{output:?}");
@@ -433,6 +433,10 @@ fn help_shows_short_attach_alias() -> TestResult {
     assert!(
         stdout.contains("[aliases: a]"),
         "attach alias was not visible in help:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[aliases: ls, sessions]"),
+        "list aliases were not visible in help:\n{stdout}"
     );
     Ok(())
 }
@@ -799,7 +803,7 @@ fn concurrent_new_sessions_get_unique_default_panes() -> TestResult {
 }
 
 #[test]
-fn new_short_name_and_ls_alias_work() -> TestResult {
+fn new_short_name_and_list_aliases_work() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -816,10 +820,15 @@ fn new_short_name_and_ls_alias_work() -> TestResult {
         .status()?;
     assert!(status.success());
 
-    let listed = env.cmd().arg("ls").output()?;
-    assert!(listed.status.success(), "{listed:?}");
-    let stdout = String::from_utf8_lossy(&listed.stdout);
-    assert!(stdout.contains("shorty"), "{stdout}");
+    for alias in ["ls", "sessions"] {
+        let listed = env.cmd().arg(alias).output()?;
+        assert!(listed.status.success(), "{alias} failed: {listed:?}");
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            stdout.contains("shorty"),
+            "{alias} output missing session:\n{stdout}"
+        );
+    }
 
     let captured = env.capture_until("shorty", "SHORTY")?;
     assert!(captured.contains("SHORTY"));
