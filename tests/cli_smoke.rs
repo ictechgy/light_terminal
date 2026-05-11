@@ -1986,6 +1986,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let fake_bin = env.temp.path().join("fake-bin");
     std::fs::create_dir(&fake_bin)?;
     write_executable(&fake_bin.join("codex"), "#!/bin/sh\nexit 0\n")?;
+    write_executable(&fake_bin.join("my-agent"), "#!/bin/sh\nexit 0\n")?;
     let path = std::env::join_paths([fake_bin.as_path()])?;
 
     let output = env.cmd().env("PATH", &path).arg("agents").output()?;
@@ -1994,7 +1995,16 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let mut lines = stdout.lines();
     assert_eq!(
         lines.next(),
-        Some("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH"),
+        Some("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH\tKIND"),
+        "{stdout:?}"
+    );
+    let profile_names: Vec<_> = lines
+        .clone()
+        .filter_map(|line| line.split('\t').next())
+        .collect();
+    assert_eq!(
+        profile_names,
+        ["claude", "codex", "gemini", "omx", "omc"],
         "{stdout:?}"
     );
 
@@ -2003,11 +2013,12 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .find(|line| line.starts_with("codex\t"))
         .ok_or("missing codex row")?;
     let fields: Vec<_> = codex.split('\t').collect();
-    assert_eq!(fields.len(), 6, "{codex:?}");
+    assert_eq!(fields.len(), 7, "{codex:?}");
     assert_eq!(fields[2], "codex-lterm", "{codex:?}");
     assert_eq!(fields[3], "off", "{codex:?}");
     assert_eq!(fields[4], "available", "{codex:?}");
     assert!(fields[5].ends_with("/codex"), "{codex:?}");
+    assert_eq!(fields[6], "built-in", "{codex:?}");
 
     let omx = stdout
         .lines()
@@ -2017,6 +2028,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(fields[3], "on", "{omx:?}");
     assert_eq!(fields[4], "missing", "{omx:?}");
     assert_eq!(fields[5], "-", "{omx:?}");
+    assert_eq!(fields[6], "built-in", "{omx:?}");
 
     let json = env
         .cmd()
@@ -2047,6 +2059,32 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(omx["status_default"], true);
     assert_eq!(omx["available"], false);
     assert!(omx["path"].is_null());
+
+    let custom = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["agents", "--json", "codex", "my-agent"])
+        .output()?;
+    assert!(custom.status.success(), "{custom:?}");
+    let profiles: serde_json::Value = serde_json::from_slice(&custom.stdout)?;
+    let profiles = profiles
+        .as_array()
+        .ok_or("selected agent profiles JSON should be an array")?;
+    assert_eq!(profiles.len(), 2, "{profiles:?}");
+    assert_eq!(profiles[0]["profile"], "codex");
+    assert_eq!(profiles[0]["kind"], "built-in");
+    assert_eq!(profiles[0]["available"], true);
+    assert_eq!(profiles[1]["profile"], "my-agent");
+    assert_eq!(profiles[1]["kind"], "custom");
+    assert_eq!(profiles[1]["session_base"], "my-agent-lterm");
+    assert_eq!(profiles[1]["status_default"], true);
+    assert_eq!(profiles[1]["available"], true);
+    assert!(
+        profiles[1]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/my-agent")
+    );
     Ok(())
 }
 

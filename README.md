@@ -133,7 +133,7 @@ Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--n
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; reattach later with `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
 Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not look like a UUID, and are limited to 128 bytes.
-Use `lterm agents` (or `lterm agents --json`) to inspect built-in profile defaults and whether their binaries are currently available in `PATH`.
+Use `lterm agents` (or `lterm agents --json`) to inspect built-in profile defaults and whether their binaries are currently available in `PATH`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom set; availability is a point-in-time PATH probe.
 
 **Run Oh My Codex inside a shimmed session:**
 
