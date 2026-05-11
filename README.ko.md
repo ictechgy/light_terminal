@@ -148,9 +148,15 @@ lterm run --tmux -- codex exec "저장소를 요약해줘"
 이 세션 안에서는 `tmux`가 `lterm tmux-compat` shim으로 해석됩니다. 현재 shim은 AI orchestration 스크립트가 자주 사용하는 다음 명령 subset을 구현합니다.
 
 - **세션** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
+- **조회** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Pane** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffer / popup** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
-- **호환용 no-op** — `select-pane`, `select-layout`, `set-option`, `show-option`
+- **호환용 no-op** — `select-pane`, `select-layout`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
+
+호환성 참고: lterm은 각 root session을 하나의 pseudo-window로 모델링합니다
+(`window_index=0`, `window_panes=1`). lterm은 client별 process/TTY metadata를
+노출하지 않기 때문에 `client_pid`와 `client_tty`는 빈 문자열로 확장됩니다.
+tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니다.
 
 ## cmux 동작
 
