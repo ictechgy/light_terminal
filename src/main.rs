@@ -75,6 +75,7 @@ enum Commands {
     /// Attach to a persistent session or pane.
     #[command(visible_alias = "a")]
     Attach {
+        /// Session or pane target to attach; defaults to %0.
         #[arg(default_value = "%0")]
         target: String,
         /// Disable the blue lterm status bar while attached.
@@ -83,6 +84,7 @@ enum Commands {
     },
     /// Attach to a session, creating it first when missing.
     AttachOrNew {
+        /// Session or pane target to attach or create; defaults to main.
         #[arg(default_value = "main")]
         target: String,
         /// Disable the blue lterm status bar while attached.
@@ -111,17 +113,25 @@ enum Commands {
         json: bool,
     },
     /// Kill a session or pane.
-    Kill { target: String },
+    Kill {
+        /// Session or pane target to kill.
+        target: String,
+    },
     /// Send text to a session or pane.
     Send {
+        /// Session or pane target to receive input.
         target: String,
+        /// Text to send to the target PTY.
         text: String,
+        /// Append Enter after the text.
         #[arg(long)]
         enter: bool,
     },
     /// Capture scrollback from a session or pane.
     Capture {
+        /// Session or pane target to capture.
         target: String,
+        /// Starting scrollback line offset, matching tmux -S semantics.
         #[arg(short = 'S', long, allow_hyphen_values = true)]
         start: Option<i32>,
     },
@@ -133,15 +143,19 @@ enum Commands {
     Env,
     /// tmux-compatible command surface used by the shim.
     TmuxCompat {
+        /// Arguments forwarded to the tmux compatibility parser.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Send a cmux-friendly notification.
     Notify {
+        /// Notification title.
         #[arg(long)]
         title: String,
+        /// Optional notification subtitle.
         #[arg(long)]
         subtitle: Option<String>,
+        /// Notification body text.
         #[arg(long, default_value = "")]
         body: String,
     },
@@ -211,9 +225,12 @@ enum Commands {
     },
     /// Attach to lterm on a remote host over SSH. Requires lterm installed remotely.
     Ssh {
+        /// SSH host to connect to.
         host: String,
+        /// Remote session or pane target to attach; defaults to main.
         #[arg(default_value = "main")]
         target: String,
+        /// Additional ssh arguments after `--`.
         #[arg(last = true)]
         ssh_args: Vec<String>,
     },
