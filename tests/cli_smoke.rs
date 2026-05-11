@@ -557,6 +557,43 @@ fn help_describes_forwarded_agent_arguments() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn help_describes_machine_readable_session_surfaces() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let list = env.cmd().args(["list", "--help"]).output()?;
+    assert!(list.status.success(), "{list:?}");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    let normalized = normalize_help(&stdout);
+    assert!(
+        normalized.contains("Print sessions as a JSON array for automation"),
+        "list help should describe --json output:\n{stdout}"
+    );
+    assert!(
+        normalized.contains("Include child panes created from inside another lterm session"),
+        "list help should describe --all scope:\n{stdout}"
+    );
+    assert!(
+        normalized.contains("Show only child panes created from inside another lterm session"),
+        "list help should describe --children scope:\n{stdout}"
+    );
+
+    let ps = env.cmd().args(["ps", "--help"]).output()?;
+    assert!(ps.status.success(), "{ps:?}");
+    let stdout = String::from_utf8_lossy(&ps.stdout);
+    let normalized = normalize_help(&stdout);
+    assert!(
+        normalized.contains("Optional session or pane target to inspect"),
+        "ps help should describe target argument:\n{stdout}"
+    );
+    assert!(
+        normalized.contains("Print process rows as a JSON array for automation"),
+        "ps help should describe --json output:\n{stdout}"
+    );
+
+    Ok(())
+}
+
 fn normalize_help(help: &str) -> String {
     // Clap wraps help at terminal-dependent widths; collapse whitespace so the
     // smoke contract checks wording rather than a particular render width.
