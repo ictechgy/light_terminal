@@ -108,6 +108,7 @@ lterm kill api
 lterm claude
 lterm codex
 lterm gemini -- -p "이 저장소를 요약해줘"
+lterm agents
 ```
 
 위 명령은 다음 profile 명령의 얇은 alias입니다.
@@ -132,6 +133,7 @@ launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않�
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
 명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
 이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
+`lterm agents` 또는 `lterm agents --json`으로 built-in profile의 기본값과 현재 `PATH`에서 binary를 찾을 수 있는지 확인할 수 있습니다.
 
 **Oh My Codex를 shim이 적용된 세션에서 실행:**
 

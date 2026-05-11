@@ -1981,6 +1981,76 @@ fn agent_command_uses_unique_name_when_base_is_occupied() -> TestResult {
 }
 
 #[test]
+fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nexit 0\n")?;
+    let path = std::env::join_paths([fake_bin.as_path()])?;
+
+    let output = env.cmd().env("PATH", &path).arg("agents").output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH"),
+        "{stdout:?}"
+    );
+
+    let codex = stdout
+        .lines()
+        .find(|line| line.starts_with("codex\t"))
+        .ok_or("missing codex row")?;
+    let fields: Vec<_> = codex.split('\t').collect();
+    assert_eq!(fields.len(), 6, "{codex:?}");
+    assert_eq!(fields[2], "codex-lterm", "{codex:?}");
+    assert_eq!(fields[3], "off", "{codex:?}");
+    assert_eq!(fields[4], "available", "{codex:?}");
+    assert!(fields[5].ends_with("/codex"), "{codex:?}");
+
+    let omx = stdout
+        .lines()
+        .find(|line| line.starts_with("omx\t"))
+        .ok_or("missing omx row")?;
+    let fields: Vec<_> = omx.split('\t').collect();
+    assert_eq!(fields[3], "on", "{omx:?}");
+    assert_eq!(fields[4], "missing", "{omx:?}");
+    assert_eq!(fields[5], "-", "{omx:?}");
+
+    let json = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["agents", "--json"])
+        .output()?;
+    assert!(json.status.success(), "{json:?}");
+    let profiles: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+    let profiles = profiles
+        .as_array()
+        .ok_or("agent profiles JSON should be an array")?;
+    assert_eq!(profiles.len(), 5, "{profiles:?}");
+    let codex = profiles
+        .iter()
+        .find(|row| row["profile"] == "codex")
+        .ok_or("missing codex JSON row")?;
+    assert_eq!(codex["available"], true);
+    assert!(
+        codex["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/codex")
+    );
+    let omx = profiles
+        .iter()
+        .find(|row| row["profile"] == "omx")
+        .ok_or("missing omx JSON row")?;
+    assert_eq!(omx["status_default"], true);
+    assert_eq!(omx["available"], false);
+    assert!(omx["path"].is_null());
+    Ok(())
+}
+
+#[test]
 fn generic_agent_profile_forwards_args_and_tmux_environment() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
