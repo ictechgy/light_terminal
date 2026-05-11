@@ -5,15 +5,15 @@
 ## TL;DR
 
 - **What** — A Rust-based PTY session daemon with a tmux-compatible shim. Persistent sessions you can detach and reattach by name or pane id.
-- **Who it's for** — AI-agent tooling that expects tmux (`oh-my-codex`, `oh-my-claude`) and users running it inside `cmux`.
-- **How** — `lterm new` to start, `lterm attach` to (re)connect, `lterm omx` / `lterm omc` for shimmed runs. Inside a session, the `tmux` command resolves to `lterm tmux-compat`.
+- **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
+- **How** — `lterm new` to start, `lterm attach` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini` for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
 - **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
 
 A lightweight terminal session daemon with a tmux-compatible shim, built for AI-agent workflows.
 
-`lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by oh-my-codex and oh-my-claude tooling.
+`lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by terminal-first agent tooling.
 
 > **Status:** alpha MVP. Usable for local detached sessions and compatibility testing — not yet a full tmux replacement.
 >
@@ -25,7 +25,7 @@ The project addresses three constraints:
 
 1. **tmux-like persistence and remote access** — sessions run inside a background daemon and can be attached or detached by name or pane id. Remote access is available through `lterm ssh`, provided `lterm` is installed on the remote host.
 2. **cmux compatibility** — when running inside cmux, `lterm` preserves OSC notifications, exposes `lterm notify`, and the tmux shim opens worker panes as native cmux splits when possible.
-3. **AI tooling support** — `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that AI tools expect.
+3. **AI tooling support** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that agent tools expect.
 
 cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and a tmux shim that maps tmux commands into native cmux panes.
 
@@ -102,6 +102,24 @@ lterm kill api
 
 ## AI workflows
 
+**Run common agent CLIs inside shimmed sessions:**
+
+```bash
+lterm claude
+lterm codex
+lterm gemini -- -p "summarize this repo"
+```
+
+These are thin profile aliases for:
+
+```bash
+lterm agent claude
+lterm agent codex
+lterm agent gemini -- -p "summarize this repo"
+```
+
+Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `lterm run --tmux -- <command>` when you want the generic primitive directly or need to launch an unprofiled future agent.
+
 **Run Oh My Codex inside a shimmed session:**
 
 ```bash
@@ -123,6 +141,8 @@ lterm omc --madmax
 
 ```bash
 lterm run --tmux -- omx hud --tmux
+lterm run --tmux -- claude
+lterm run --tmux -- codex exec "summarize the repository"
 ```
 
 Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. The shim implements the command subset most AI orchestration scripts rely on:

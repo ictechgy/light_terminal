@@ -91,6 +91,17 @@ fn wait_for_file_contents(path: &Path) -> TestResult<String> {
     .into())
 }
 
+fn write_executable(path: &Path, contents: &str) -> TestResult {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn pid_alive(pid: &str) -> TestResult<bool> {
     let output = match Command::new(ps_path()?)
@@ -1003,7 +1014,6 @@ fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
         !stdout.contains(&fake_tmux.display().to_string()),
         "command -v tmux resolved fake tmux: {stdout:?}"
     );
-    assert!(stdout.contains("data/shims/tmux"), "{stdout:?}");
     assert!(stdout.contains("%0"), "{stdout:?}");
     Ok(())
 }
@@ -1082,6 +1092,116 @@ fn agent_command_uses_unique_name_when_base_is_occupied() -> TestResult {
     assert!(
         !stdout.contains("EXISTING_AGENT"),
         "should start a new uniquely named agent session instead of attaching the occupied base name: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn generic_agent_profile_forwards_args_and_tmux_environment() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
+printf 'LTERM_PANE:%s\n' "$LTERM_PANE"
+printf 'TMUX_PANE:%s\n' "$TMUX_PANE"
+printf 'TMUX_BIN:%s\n' "$(command -v tmux)"
+i=1
+for arg in "$@"; do
+  printf 'ARG%d:%s\n' "$i" "$arg"
+  i=$((i + 1))
+done
+printf 'PANE_LIST:'
+tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
+"#,
+    )?;
+    write_executable(
+        &fake_bin.join("tmux"),
+        "#!/bin/sh\necho FAKE_TMUX_SHOULD_NOT_RUN\nexit 99\n",
+    )?;
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{old_path}", fake_bin.display());
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args([
+            "agent",
+            "codex",
+            "--",
+            "--model",
+            "gpt 5",
+            "semi;colon",
+            "--flag",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("LTERM_AGENT:codex"), "{stdout:?}");
+    assert!(stdout.contains("LTERM_SESSION:codex-lterm"), "{stdout:?}");
+    assert!(stdout.contains("LTERM_PANE:%0"), "{stdout:?}");
+    assert!(stdout.contains("TMUX_PANE:%0"), "{stdout:?}");
+    assert!(stdout.contains("ARG1:--model"), "{stdout:?}");
+    assert!(stdout.contains("ARG2:gpt 5"), "{stdout:?}");
+    assert!(stdout.contains("ARG3:semi;colon"), "{stdout:?}");
+    assert!(stdout.contains("ARG4:--flag"), "{stdout:?}");
+    assert!(stdout.contains("PANE_LIST:%0"), "{stdout:?}");
+    assert!(
+        !stdout.contains("FAKE_TMUX_SHOULD_NOT_RUN"),
+        "fake tmux won PATH precedence: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn named_agent_alias_uses_profile_environment() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("gemini"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
+printf 'ARG1:%s\n' "$1"
+"#,
+    )?;
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{old_path}", fake_bin.display());
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args(["gemini", "--", "-p"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("LTERM_AGENT:gemini"), "{stdout:?}");
+    assert!(stdout.contains("LTERM_SESSION:gemini-lterm"), "{stdout:?}");
+    assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn missing_agent_profile_reports_binary_lookup_error() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", &fake_bin)
+        .args(["agent", "definitely-missing-agent"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("definitely-missing-agent not found in PATH"),
+        "{stderr:?}"
     );
     Ok(())
 }

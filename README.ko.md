@@ -5,15 +5,15 @@
 ## TL;DR
 
 - **무엇** — Rust로 만든 PTY 세션 데몬 + tmux 호환 shim. 이름이나 pane id로 detach·reattach할 수 있는 영속 세션을 제공합니다.
-- **대상** — tmux를 전제하는 AI 에이전트 도구(`oh-my-codex`, `oh-my-claude`)와, 그것을 `cmux` 안에서 돌리는 사용자.
-- **사용법** — `lterm new`로 만들고 `lterm attach`로 (재)접속, shim이 적용된 실행에는 `lterm omx` / `lterm omc`. 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
+- **대상** — Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent와, 그것을 `cmux` 안에서 돌리는 사용자.
+- **사용법** — `lterm new`로 만들고 `lterm attach`로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도 escape-sequence sanitizer도 완전한 tmux 대체품도 아닙니다.**
 
 ---
 
 AI 에이전트 워크플로를 위해 만든 가벼운 터미널 세션 데몬입니다. tmux 호환 shim을 함께 제공합니다.
 
-`lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, oh-my-codex / oh-my-claude 계열 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.
+`lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, terminal-first agent 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.
 
 > **상태:** alpha MVP. 로컬 detached 세션과 호환성 테스트에는 사용할 수 있지만, 아직 완전한 tmux 대체품은 아닙니다.
 >
@@ -25,7 +25,7 @@ AI 에이전트 워크플로를 위해 만든 가벼운 터미널 세션 데몬�
 
 1. **tmux와 비슷한 세션 지속성과 원격 접속** — 세션은 백그라운드 데몬에서 실행되며, 이름이나 pane id로 attach/detach할 수 있습니다. 원격 호스트에 `lterm`이 설치되어 있다면 `lterm ssh`로 접속할 수 있습니다.
 2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, tmux shim은 가능한 경우 worker pane을 cmux native split으로 엽니다.
-3. **AI 도구 지원** — `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
+3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
 
 cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux pane으로 매핑하는 oh-my-codex 통합을 제공합니다.
 
@@ -102,6 +102,24 @@ lterm kill api
 
 ## AI 워크플로
 
+**자주 쓰는 agent CLI를 shim이 적용된 세션에서 실행:**
+
+```bash
+lterm claude
+lterm codex
+lterm gemini -- -p "이 저장소를 요약해줘"
+```
+
+위 명령은 다음 profile 명령의 얇은 alias입니다.
+
+```bash
+lterm agent claude
+lterm agent codex
+lterm agent gemini -- -p "이 저장소를 요약해줘"
+```
+
+Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. 직접 generic primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run --tmux -- <command>`를 사용하세요.
+
 **Oh My Codex를 shim이 적용된 세션에서 실행:**
 
 ```bash
@@ -123,6 +141,8 @@ lterm omc --madmax
 
 ```bash
 lterm run --tmux -- omx hud --tmux
+lterm run --tmux -- claude
+lterm run --tmux -- codex exec "저장소를 요약해줘"
 ```
 
 이 세션 안에서는 `tmux`가 `lterm tmux-compat` shim으로 해석됩니다. 현재 shim은 AI orchestration 스크립트가 자주 사용하는 다음 명령 subset을 구현합니다.
