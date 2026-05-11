@@ -92,7 +92,7 @@ enum Commands {
         no_status: bool,
     },
     /// List sessions.
-    #[command(alias = "ls")]
+    #[command(visible_aliases = ["ls", "sessions"])]
     List {
         /// Print sessions as a JSON array for automation.
         #[arg(long)]
