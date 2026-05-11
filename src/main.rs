@@ -8,6 +8,7 @@ mod tmux_compat;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use client::AttachStdinEof;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
@@ -143,6 +144,11 @@ enum Commands {
         launch: AgentLaunchOptions,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// List built-in agent launcher profiles and PATH availability.
+    Agents {
+        #[arg(long)]
+        json: bool,
     },
     /// Run a known or PATH-resolved agent CLI inside a tmux-compatible lterm session.
     Agent {
@@ -323,6 +329,7 @@ fn run() -> Result<()> {
         Commands::Omc { launch, args } => {
             run_agent_profile(AgentProfile::known("omc"), launch, args)
         }
+        Commands::Agents { json } => print_agent_profiles(json),
         Commands::Agent {
             profile,
             launch,
@@ -429,6 +436,16 @@ struct AgentProfile {
     show_status: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentProfileInfo {
+    profile: String,
+    binary: String,
+    session_base: String,
+    status_default: bool,
+    available: bool,
+    path: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Args)]
 struct AgentLaunchOptions {
     /// Session name to use instead of the profile default.
@@ -471,6 +488,8 @@ impl AgentLaunchOptions {
         }
     }
 }
+
+const BUILT_IN_AGENT_PROFILES: &[&str] = &["claude", "codex", "gemini", "omx", "omc"];
 
 impl AgentProfile {
     fn known(name: &'static str) -> Self {
@@ -527,6 +546,52 @@ impl AgentProfile {
             }
         }
     }
+}
+
+fn built_in_agent_profile_infos() -> Vec<AgentProfileInfo> {
+    BUILT_IN_AGENT_PROFILES
+        .iter()
+        .map(|name| agent_profile_info(AgentProfile::known(name)))
+        .collect()
+}
+
+fn agent_profile_info(profile: AgentProfile) -> AgentProfileInfo {
+    let path =
+        client::find_command(&profile.binary).map(|path| path.to_string_lossy().into_owned());
+    AgentProfileInfo {
+        profile: profile.name,
+        binary: profile.binary,
+        session_base: profile.session_base,
+        status_default: profile.show_status,
+        available: path.is_some(),
+        path,
+    }
+}
+
+fn print_agent_profiles(json: bool) -> Result<()> {
+    let profiles = built_in_agent_profile_infos();
+    if json {
+        println!("{}", client::json_pretty(&profiles));
+        return Ok(());
+    }
+
+    println!("PROFILE\tBINARY\tSESSION_BASE\tSTATUS\tAVAILABLE\tPATH");
+    for profile in profiles {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            sanitize::terminal_text(&profile.profile),
+            sanitize::terminal_text(&profile.binary),
+            sanitize::terminal_text(&profile.session_base),
+            if profile.status_default { "on" } else { "off" },
+            if profile.available {
+                "available"
+            } else {
+                "missing"
+            },
+            sanitize::terminal_text(profile.path.as_deref().unwrap_or("-"))
+        );
+    }
+    Ok(())
 }
 
 fn run_agent_profile(
@@ -834,6 +899,29 @@ mod tests {
         assert_eq!(omx.binary, "omx");
         assert_eq!(omx.session_base, "omx-lterm");
         assert!(omx.show_status);
+    }
+
+    #[test]
+    fn built_in_agent_profile_infos_match_launcher_contract() {
+        let infos = built_in_agent_profile_infos();
+        let names: Vec<_> = infos.iter().map(|info| info.profile.as_str()).collect();
+        assert_eq!(names, ["claude", "codex", "gemini", "omx", "omc"]);
+
+        let claude = infos
+            .iter()
+            .find(|info| info.profile == "claude")
+            .expect("claude profile info");
+        assert_eq!(claude.binary, "claude");
+        assert_eq!(claude.session_base, "claude-lterm");
+        assert!(!claude.status_default);
+
+        let omc = infos
+            .iter()
+            .find(|info| info.profile == "omc")
+            .expect("omc profile info");
+        assert_eq!(omc.binary, "omc");
+        assert_eq!(omc.session_base, "omc-lterm");
+        assert!(omc.status_default);
     }
 
     #[test]
