@@ -641,6 +641,74 @@ fn help_describes_session_creation_arguments() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn help_describes_target_io_and_remote_arguments() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (command, expected) in [
+        (
+            "attach",
+            &[
+                "Session or pane target to attach; defaults to %0",
+                "Disable the blue lterm status bar while attached",
+            ][..],
+        ),
+        (
+            "attach-or-new",
+            &["Session or pane target to attach or create; defaults to main"][..],
+        ),
+        ("kill", &["Session or pane target to kill"][..]),
+        (
+            "send",
+            &[
+                "Session or pane target to receive input",
+                "Text to send to the target PTY",
+                "Append Enter after the text",
+            ][..],
+        ),
+        (
+            "capture",
+            &[
+                "Session or pane target to capture",
+                "Starting scrollback line offset, matching tmux -S semantics",
+            ][..],
+        ),
+        (
+            "tmux-compat",
+            &["Arguments forwarded to the tmux compatibility parser"][..],
+        ),
+        (
+            "notify",
+            &[
+                "Notification title",
+                "Optional notification subtitle",
+                "Notification body text",
+            ][..],
+        ),
+        (
+            "ssh",
+            &[
+                "SSH host to connect to",
+                "Remote session or pane target to attach; defaults to main",
+                "Additional ssh arguments after `--`",
+            ][..],
+        ),
+    ] {
+        let output = env.cmd().args([command, "--help"]).output()?;
+        assert!(output.status.success(), "{command} help failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let normalized = normalize_help(&stdout);
+        for phrase in expected {
+            assert!(
+                normalized.contains(phrase),
+                "{command} help should include {phrase:?}:\n{stdout}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_help(help: &str) -> String {
     // Clap wraps help at terminal-dependent widths; collapse whitespace so the
     // smoke contract checks wording rather than a particular render width.
