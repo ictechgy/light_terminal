@@ -139,6 +139,28 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run a known or PATH-resolved agent CLI inside a tmux-compatible lterm session.
+    Agent {
+        /// Agent profile or binary name, e.g. claude, codex, gemini, omx, omc.
+        profile: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Claude Code inside a tmux-compatible lterm session.
+    Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Codex CLI inside a tmux-compatible lterm session.
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Gemini CLI inside a tmux-compatible lterm session.
+    Gemini {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Attach to lterm on a remote host over SSH. Requires lterm installed remotely.
     Ssh {
         host: String,
@@ -282,8 +304,14 @@ fn run() -> Result<()> {
             subtitle,
             body,
         } => notify(&title, subtitle.as_deref(), &body),
-        Commands::Omx { args } => run_agent_command("omx", args),
-        Commands::Omc { args } => run_agent_command("omc", args),
+        Commands::Omx { args } => run_agent_profile(AgentProfile::known("omx"), args),
+        Commands::Omc { args } => run_agent_profile(AgentProfile::known("omc"), args),
+        Commands::Agent { profile, args } => {
+            run_agent_profile(AgentProfile::resolve(&profile)?, args)
+        }
+        Commands::Claude { args } => run_agent_profile(AgentProfile::known("claude"), args),
+        Commands::Codex { args } => run_agent_profile(AgentProfile::known("codex"), args),
+        Commands::Gemini { args } => run_agent_profile(AgentProfile::known("gemini"), args),
         Commands::Ssh {
             host,
             target,
@@ -368,37 +396,128 @@ fn parent_pane_display(session: &protocol::SessionInfo) -> &str {
     session.parent_pane_id.as_deref().unwrap_or("-")
 }
 
-fn run_agent_command(binary: &str, args: Vec<String>) -> Result<()> {
-    let binary_path =
-        client::find_command(binary).with_context(|| format!("{binary} not found in PATH"))?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentProfile {
+    name: String,
+    binary: String,
+    session_base: String,
+    show_status: bool,
+}
+
+impl AgentProfile {
+    fn known(name: &'static str) -> Self {
+        match name {
+            "claude" => Self {
+                name: name.to_string(),
+                binary: "claude".to_string(),
+                session_base: "claude-lterm".to_string(),
+                show_status: false,
+            },
+            "codex" => Self {
+                name: name.to_string(),
+                binary: "codex".to_string(),
+                session_base: "codex-lterm".to_string(),
+                show_status: false,
+            },
+            "gemini" => Self {
+                name: name.to_string(),
+                binary: "gemini".to_string(),
+                session_base: "gemini-lterm".to_string(),
+                show_status: false,
+            },
+            "omx" => Self {
+                name: name.to_string(),
+                binary: "omx".to_string(),
+                session_base: "omx-lterm".to_string(),
+                show_status: true,
+            },
+            "omc" => Self {
+                name: name.to_string(),
+                binary: "omc".to_string(),
+                session_base: "omc-lterm".to_string(),
+                show_status: true,
+            },
+            _ => unreachable!("unknown built-in agent profile: {name}"),
+        }
+    }
+
+    fn resolve(profile: &str) -> Result<Self> {
+        match profile {
+            "claude" => Ok(Self::known("claude")),
+            "codex" => Ok(Self::known("codex")),
+            "gemini" => Ok(Self::known("gemini")),
+            "omx" => Ok(Self::known("omx")),
+            "omc" => Ok(Self::known("omc")),
+            custom => {
+                validate_agent_profile_name(custom)?;
+                Ok(Self {
+                    name: custom.to_string(),
+                    binary: custom.to_string(),
+                    session_base: format!("{custom}-lterm"),
+                    show_status: true,
+                })
+            }
+        }
+    }
+}
+
+fn run_agent_profile(profile: AgentProfile, mut args: Vec<String>) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "--") {
+        args.remove(0);
+    }
+    let binary_path = client::find_command(&profile.binary)
+        .with_context(|| format!("{} not found in PATH", profile.binary))?;
     tmux_compat::ensure_shim()?;
     let mut cmd = Vec::with_capacity(args.len() + 1);
     cmd.push(
         binary_path
             .to_str()
-            .with_context(|| format!("{binary} resolved to a non-UTF-8 path"))?
+            .with_context(|| format!("{} resolved to a non-UTF-8 path", profile.binary))?
             .to_string(),
     );
     cmd.extend(args);
     let command = client::shell_join(&cmd)?;
-    let base_name = format!("{binary}-lterm");
     let mut last_conflict = None;
     for _ in 0..32 {
-        let session_name = next_agent_session_name(&base_name)?;
-        match client::new_session(
-            Some(session_name),
-            Some(command.clone()),
-            None,
-            HashMap::new(),
-            true,
-        ) {
-            Ok(info) => return client::attach(&info.pane_id, true, AttachStdinEof::KeepAttached),
+        let session_name = next_agent_session_name(&profile.session_base)?;
+        let env = HashMap::from([("LTERM_AGENT".to_string(), profile.name.to_string())]);
+        match client::new_session(Some(session_name), Some(command.clone()), None, env, true) {
+            Ok(info) => {
+                return client::attach(
+                    &info.pane_id,
+                    profile.show_status,
+                    AttachStdinEof::KeepAttached,
+                );
+            }
             Err(err) if is_session_name_conflict(&err) => last_conflict = Some(err),
             Err(err) => return Err(err),
         }
     }
-    Err(last_conflict
-        .unwrap_or_else(|| anyhow::anyhow!("could not allocate session name for {base_name}")))
+    Err(last_conflict.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "could not allocate session name for {}",
+            profile.session_base
+        )
+    }))
+}
+
+fn validate_agent_profile_name(profile: &str) -> Result<()> {
+    if profile.is_empty() {
+        bail!("agent profile cannot be empty");
+    }
+    if profile.len() > 64 {
+        bail!("agent profile cannot exceed 64 bytes");
+    }
+    if !profile
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        bail!("agent profile may only contain ASCII letters, numbers, '.', '_' and '-'");
+    }
+    if profile.starts_with('-') {
+        bail!("agent profile cannot start with '-': {profile}");
+    }
+    Ok(())
 }
 
 fn is_session_name_conflict(err: &anyhow::Error) -> bool {
@@ -514,5 +633,49 @@ mod tests {
             expand_attach_short_flag(os_args(&["lterm"])),
             os_args(&["lterm"])
         );
+    }
+
+    #[test]
+    fn known_agent_profiles_define_terminal_policy() {
+        let claude = AgentProfile::resolve("claude").expect("claude profile");
+        assert_eq!(claude.binary, "claude");
+        assert_eq!(claude.session_base, "claude-lterm");
+        assert!(!claude.show_status);
+
+        let codex = AgentProfile::resolve("codex").expect("codex profile");
+        assert_eq!(codex.binary, "codex");
+        assert_eq!(codex.session_base, "codex-lterm");
+        assert!(!codex.show_status);
+
+        let gemini = AgentProfile::resolve("gemini").expect("gemini profile");
+        assert_eq!(gemini.binary, "gemini");
+        assert_eq!(gemini.session_base, "gemini-lterm");
+        assert!(!gemini.show_status);
+
+        let omx = AgentProfile::resolve("omx").expect("omx profile");
+        assert_eq!(omx.binary, "omx");
+        assert_eq!(omx.session_base, "omx-lterm");
+        assert!(omx.show_status);
+    }
+
+    #[test]
+    fn custom_agent_profile_uses_profile_as_binary() {
+        let profile = AgentProfile::resolve("my-agent").expect("custom profile");
+        assert_eq!(profile.name, "my-agent");
+        assert_eq!(profile.binary, "my-agent");
+        assert_eq!(profile.session_base, "my-agent-lterm");
+        assert!(profile.show_status);
+    }
+
+    #[test]
+    fn custom_agent_profile_rejects_shell_or_path_syntax() {
+        assert!(AgentProfile::resolve("../claude").is_err());
+        assert!(AgentProfile::resolve("claude code").is_err());
+        assert!(AgentProfile::resolve("-claude").is_err());
+        let err = AgentProfile::resolve("-\u{1b}[31m")
+            .expect_err("control bytes in rejected profile must not be echoed")
+            .to_string();
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        assert!(err.contains("may only contain ASCII"), "{err:?}");
     }
 }
