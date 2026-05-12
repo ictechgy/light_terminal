@@ -2420,10 +2420,12 @@ fn copy_ring_lines(ring: &VecDeque<u8>, first: usize, last: Option<usize>) -> Ve
             out.push(byte);
         }
         if byte == b'\n' {
-            if last.is_some_and(|last| line_index >= last) {
-                break;
-            }
             line_index += 1;
+            if let Some(last) = last {
+                if line_index > last {
+                    break;
+                }
+            }
         }
     }
     out
@@ -3090,6 +3092,10 @@ mod tests {
         assert_eq!(
             super::capture_bytes_from_ring(&ring, None, Some(-2)),
             b"KEEP1\nKEEP2\n".to_vec()
+        );
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, Some(0), Some(0)),
+            b"KEEP1\n".to_vec()
         );
         assert_eq!(
             super::capture_bytes_from_ring(&ring, Some(2), Some(2)),
