@@ -210,7 +210,14 @@ struct Session {
     /// PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
     geometry_apply: Mutex<()>,
     next_subscriber_id: AtomicU64,
+    /// Whether the leader process is still considered live for user-visible
+    /// session state and attach input loops.
     alive: AtomicBool,
+    /// One-shot finalizer gate shared by the leader waiter and explicit
+    /// kill/shutdown paths. `alive` can become false before teardown finishes,
+    /// so cleanup needs its own idempotence and completion state.
+    cleanup_started: AtomicBool,
+    cleanup_complete: AtomicBool,
     exit_code: AtomicI32,
     rows: Mutex<u16>,
     cols: Mutex<u16>,
@@ -1396,6 +1403,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
+        cleanup_started: AtomicBool::new(false),
+        cleanup_complete: AtomicBool::new(false),
         exit_code: AtomicI32::new(i32::MIN),
         rows: Mutex::new(rows),
         cols: Mutex::new(cols),
@@ -1439,10 +1448,11 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         session_for_waiter
             .exit_code
             .store(exit_code, Ordering::SeqCst);
-        session_for_waiter.alive.store(false, Ordering::SeqCst);
-        session_for_waiter.close_subscribers();
-        terminate_child_sessions(&state_for_waiter, &session_for_waiter.id);
-        remove_session(&state_for_waiter, &session_for_waiter);
+        finalize_session(
+            &state_for_waiter,
+            &session_for_waiter,
+            SessionFinalizeReason::LeaderExited,
+        );
     });
 
     Ok(session)
@@ -1818,23 +1828,63 @@ fn verified_process_group_id(
     None
 }
 
+#[derive(Clone, Copy)]
+enum SessionFinalizeReason {
+    LeaderExited,
+    TerminateRequested,
+}
+
 fn terminate_session(state: &Arc<State>, session: &Session) {
-    if !session.alive.swap(false, Ordering::SeqCst) {
-        session.close_subscribers();
-        terminate_child_sessions(state, &session.id);
-        remove_session(state, session);
+    finalize_session(state, session, SessionFinalizeReason::TerminateRequested);
+}
+
+fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
+    session.alive.store(false, Ordering::SeqCst);
+    if session.cleanup_started.swap(true, Ordering::SeqCst) {
+        wait_for_cleanup_complete(session, Duration::from_secs(1));
         return;
     }
+
     session.close_subscribers();
     terminate_child_sessions(state, &session.id);
+    match reason {
+        SessionFinalizeReason::LeaderExited => {
+            cleanup_stored_process_group_after_leader_exit(session)
+        }
+        SessionFinalizeReason::TerminateRequested => terminate_verified_process_group(session),
+    }
+    session.close_subscribers();
+    remove_session(state, session);
+    session.cleanup_complete.store(true, Ordering::SeqCst);
+}
+
+fn wait_for_cleanup_complete(session: &Session, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !session.cleanup_complete.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_verified_process_group(session: &Session) {
     signal_process_group(session, libc::SIGHUP);
     wait_for_process_group_exit(session, Duration::from_millis(150));
     signal_process_group(session, libc::SIGTERM);
     wait_for_process_group_exit(session, Duration::from_millis(350));
     signal_process_group(session, libc::SIGKILL);
     wait_for_process_group_exit(session, Duration::from_millis(150));
-    session.close_subscribers();
-    remove_session(state, session);
+}
+
+fn cleanup_stored_process_group_after_leader_exit(session: &Session) {
+    // The leader pid no longer verifies the process group after `wait()`
+    // returns, but the pgid was captured and verified at spawn time. Use that
+    // stored pgid only from the waiter path, immediately after leader exit, to
+    // reap residual PTY holders that would otherwise outlive the lterm session.
+    signal_stored_process_group(session, libc::SIGHUP);
+    wait_for_stored_process_group_exit(session, Duration::from_millis(150));
+    signal_stored_process_group(session, libc::SIGTERM);
+    wait_for_stored_process_group_exit(session, Duration::from_millis(350));
+    signal_stored_process_group(session, libc::SIGKILL);
+    wait_for_stored_process_group_exit(session, Duration::from_millis(150));
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
@@ -1892,6 +1942,36 @@ fn process_group_still_owns_child(process_id: Option<u32>, pgid: i32) -> bool {
 fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
     let Some(pgid) = verified_session_process_group_id(session) else {
         thread::sleep(timeout);
+        return;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn signal_stored_process_group(session: &Session, signal: libc::c_int) {
+    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
+        return;
+    };
+    let rc = unsafe { libc::kill(-pgid, signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!(
+                "failed to signal stored process group {} for {} after leader exit: {}",
+                pgid, session.name, err
+            );
+        }
+    }
+}
+
+fn wait_for_stored_process_group_exit(session: &Session, timeout: Duration) {
+    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
         return;
     };
     let deadline = std::time::Instant::now() + timeout;
@@ -2646,6 +2726,8 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
+            cleanup_started: AtomicBool::new(false),
+            cleanup_complete: AtomicBool::new(false),
             exit_code: AtomicI32::new(i32::MIN),
             rows: Mutex::new(24),
             cols: Mutex::new(80),

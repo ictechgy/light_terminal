@@ -4157,22 +4157,23 @@ fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestRe
             "--",
             "sh",
             "-lc",
-            "trap '' HUP; sleep 3 & echo LEADER_DONE",
+            "trap '' HUP; sleep 30 & echo CHILD:$!; sleep 0.2; echo LEADER_DONE",
         ])
         .status()?;
     assert!(status.success());
+    let captured = env.capture_until("leader-reap", "CHILD:")?;
+    let child_pid = captured
+        .split("CHILD:")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .ok_or("missing background child pid")?;
+    assert!(
+        pid_alive(child_pid)?,
+        "background child should be alive before leader exits"
+    );
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
-        let output = env.cmd().arg("list").output()?;
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.lines().any(|line| line.starts_with("leader-reap	")) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err("session leader exited but lterm kept the pane until background PTY holder exited".into())
+    wait_for_session_absent_for(&env, "leader-reap", Duration::from_secs(3))?;
+    wait_for_pid_exit(child_pid)
 }
 
 #[test]
