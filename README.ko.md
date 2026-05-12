@@ -80,6 +80,7 @@ lterm -a api
 | 영속 프로세스 시작 | `lterm new -n api -- npm run dev` | — |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
+| 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
 | PTY에 텍스트 보내기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
@@ -104,12 +105,12 @@ child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard proto
 lterm sessions
 lterm sessions --children
 lterm sessions --all
-lterm ps api
+lterm processes api
 lterm logs api --start=-80
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 스크립트와 기존 사용 습관을 위해 tmux 호환 이름도 계속 사용할 수 있습니다: `list` / `ls`, `capture`, `send`.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 스크립트와 기존 사용 습관을 위해 호환 이름도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `send`.
 
 **세션 종료:**
 
@@ -250,7 +251,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **Capture 출력은 사람/AI가 읽기 쉽도록 정제됩니다.** `lterm capture`와 `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다.
 
-**프로세스 가시성.** `lterm ps [session]`은 각 세션 child 아래의 process tree를 보여 줍니다. Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인하는 용도입니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
+**프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 각 세션 child 아래의 process tree를 보여 줍니다. Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인하는 용도입니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
 
 **Socket 위치.** 커스텀 `LTERM_SOCKET` 경로는 소유자 전용 디렉터리 안에 있어야 합니다. 격리된 socket 위치가 필요할 때는 `LTERM_RUNTIME_DIR`를 우선 사용하세요.
 
@@ -265,7 +266,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - 이 프로젝트는 완전한 tmux server가 아니라 호환 subset만 제공합니다. 고급 tmux format/option을 사용하는 스크립트는 shim 명령 추가가 필요할 수 있습니다.
 - cmux pane capture는 cmux scrollback API가 아니라 `lterm` 세션을 통해 처리합니다.
 - 데몬은 로컬 클라이언트를 OS peer credential과 소유자 전용 socket 경로로 인증합니다. 세션별 ACL은 아직 없습니다.
-- 세션 종료는 verified process-group signaling을 사용하므로 `shell → OMX → Codex → MCP` 같은 child tree는 가능한 한 함께 정리됩니다. 의도적으로 다른 session/process group으로 detach한 프로세스는 `lterm kill` 이후에도 살아 있을 수 있으니, `lterm ps`나 OS process 도구로 확인하세요.
+- 세션 종료는 verified process-group signaling을 사용하므로 `shell → OMX → Codex → MCP` 같은 child tree는 가능한 한 함께 정리됩니다. 의도적으로 다른 session/process group으로 detach한 프로세스는 `lterm kill` 이후에도 살아 있을 수 있으니, `lterm processes` / `lterm ps`나 OS process 도구로 확인하세요.
 
 ## 개발
 

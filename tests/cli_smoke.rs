@@ -471,6 +471,10 @@ fn help_shows_common_aliases() -> TestResult {
         "list aliases were not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: processes]"),
+        "ps alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: close]"),
         "kill alias was not visible in help:\n{stdout}"
     );
@@ -626,18 +630,20 @@ fn help_describes_machine_readable_session_surfaces() -> TestResult {
         "list help should describe --children scope:\n{stdout}"
     );
 
-    let ps = env.cmd().args(["ps", "--help"]).output()?;
-    assert!(ps.status.success(), "{ps:?}");
-    let stdout = String::from_utf8_lossy(&ps.stdout);
-    let normalized = normalize_help(&stdout);
-    assert!(
-        normalized.contains("Optional session or pane target to inspect"),
-        "ps help should describe target argument:\n{stdout}"
-    );
-    assert!(
-        normalized.contains("Print process rows as a JSON array for automation"),
-        "ps help should describe --json output:\n{stdout}"
-    );
+    for command in ["ps", "processes"] {
+        let ps = env.cmd().args([command, "--help"]).output()?;
+        assert!(ps.status.success(), "{command} help failed: {ps:?}");
+        let stdout = String::from_utf8_lossy(&ps.stdout);
+        let normalized = normalize_help(&stdout);
+        assert!(
+            normalized.contains("Optional session or pane target to inspect"),
+            "{command} help should describe target argument:\n{stdout}"
+        );
+        assert!(
+            normalized.contains("Print process rows as a JSON array for automation"),
+            "{command} help should describe --json output:\n{stdout}"
+        );
+    }
 
     Ok(())
 }
@@ -3407,12 +3413,17 @@ fn kill_reaps_session_process_group_children() -> TestResult {
         "child process should be alive before lterm kill"
     );
 
-    let ps_output = env.cmd().args(["ps", "pgrp", "--json"]).output()?;
-    assert!(ps_output.status.success());
-    assert!(
-        String::from_utf8_lossy(&ps_output.stdout).contains(child_pid),
-        "lterm ps should include child process tree"
-    );
+    for command in ["ps", "processes"] {
+        let ps_output = env.cmd().args([command, "pgrp", "--json"]).output()?;
+        assert!(
+            ps_output.status.success(),
+            "{command} failed: {ps_output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&ps_output.stdout).contains(child_pid),
+            "lterm {command} should include child process tree"
+        );
+    }
 
     let status = env.cmd().args(["kill", "pgrp"]).status()?;
     assert!(status.success());
