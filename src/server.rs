@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -217,7 +217,12 @@ struct Session {
     /// kill/shutdown paths. `alive` can become false before teardown finishes,
     /// so cleanup needs its own idempotence and completion state.
     cleanup_started: AtomicBool,
+    cleanup_completion: (Mutex<bool>, Condvar),
     cleanup_complete: AtomicBool,
+    /// Set immediately after the leader wait returns. A concurrent explicit
+    /// kill must not rely on the reaped leader pid to verify the process group;
+    /// it needs the stored-pgid cleanup path for residual PTY holders.
+    leader_reaped: AtomicBool,
     exit_code: AtomicI32,
     rows: Mutex<u16>,
     cols: Mutex<u16>,
@@ -1404,7 +1409,9 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
         cleanup_started: AtomicBool::new(false),
+        cleanup_completion: (Mutex::new(false), Condvar::new()),
         cleanup_complete: AtomicBool::new(false),
+        leader_reaped: AtomicBool::new(false),
         exit_code: AtomicI32::new(i32::MIN),
         rows: Mutex::new(rows),
         cols: Mutex::new(cols),
@@ -1445,6 +1452,9 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                 1
             }
         };
+        session_for_waiter
+            .leader_reaped
+            .store(true, Ordering::SeqCst);
         session_for_waiter
             .exit_code
             .store(exit_code, Ordering::SeqCst);
@@ -1828,7 +1838,7 @@ fn verified_process_group_id(
     None
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum SessionFinalizeReason {
     LeaderExited,
     TerminateRequested,
@@ -1841,27 +1851,86 @@ fn terminate_session(state: &Arc<State>, session: &Session) {
 fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
     session.alive.store(false, Ordering::SeqCst);
     if session.cleanup_started.swap(true, Ordering::SeqCst) {
-        wait_for_cleanup_complete(session, Duration::from_secs(1));
+        wait_for_cleanup_complete(session);
         return;
     }
 
+    let mut completion_guard = CleanupCompletionGuard::new(session);
     session.close_subscribers();
     terminate_child_sessions(state, &session.id);
     match reason {
         SessionFinalizeReason::LeaderExited => {
             cleanup_stored_process_group_after_leader_exit(session)
         }
-        SessionFinalizeReason::TerminateRequested => terminate_verified_process_group(session),
+        SessionFinalizeReason::TerminateRequested => terminate_process_group_for_request(session),
     }
-    session.close_subscribers();
     remove_session(state, session);
-    session.cleanup_complete.store(true, Ordering::SeqCst);
+    mark_cleanup_complete(session);
+    completion_guard.disarm();
 }
 
-fn wait_for_cleanup_complete(session: &Session, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while !session.cleanup_complete.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
+struct CleanupCompletionGuard<'a> {
+    session: &'a Session,
+    armed: bool,
+}
+
+impl<'a> CleanupCompletionGuard<'a> {
+    fn new(session: &'a Session) -> Self {
+        Self {
+            session,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CleanupCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && !self.session.cleanup_complete.load(Ordering::SeqCst) {
+            eprintln!(
+                "session cleanup for {} unwound before normal completion; releasing waiters",
+                self.session.name
+            );
+            mark_cleanup_complete(self.session);
+        }
+    }
+}
+
+fn mark_cleanup_complete(session: &Session) {
+    session.cleanup_complete.store(true, Ordering::SeqCst);
+    let (complete, changed) = &session.cleanup_completion;
+    *lock(complete) = true;
+    changed.notify_all();
+}
+
+fn wait_for_cleanup_complete(session: &Session) {
+    if session.cleanup_complete.load(Ordering::SeqCst) {
+        return;
+    }
+    let (complete, changed) = &session.cleanup_completion;
+    let mut complete = lock(complete);
+    while !*complete {
+        complete = match changed.wait(complete) {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("recovering poisoned cleanup completion mutex");
+                poisoned.into_inner()
+            }
+        };
+    }
+}
+
+fn terminate_process_group_for_request(session: &Session) {
+    if session.leader_reaped.load(Ordering::SeqCst) {
+        cleanup_stored_process_group_after_leader_exit(session);
+        return;
+    }
+    terminate_verified_process_group(session);
+    if session.leader_reaped.load(Ordering::SeqCst) {
+        cleanup_stored_process_group_after_leader_exit(session);
     }
 }
 
@@ -1877,14 +1946,27 @@ fn terminate_verified_process_group(session: &Session) {
 fn cleanup_stored_process_group_after_leader_exit(session: &Session) {
     // The leader pid no longer verifies the process group after `wait()`
     // returns, but the pgid was captured and verified at spawn time. Use that
-    // stored pgid only from the waiter path, immediately after leader exit, to
-    // reap residual PTY holders that would otherwise outlive the lterm session.
-    signal_stored_process_group(session, libc::SIGHUP);
-    wait_for_stored_process_group_exit(session, Duration::from_millis(150));
-    signal_stored_process_group(session, libc::SIGTERM);
-    wait_for_stored_process_group_exit(session, Duration::from_millis(350));
-    signal_stored_process_group(session, libc::SIGKILL);
-    wait_for_stored_process_group_exit(session, Duration::from_millis(150));
+    // stored pgid only after the waiter has recorded leader exit, as close to
+    // that exit as possible, to reap residual PTY holders that would otherwise
+    // outlive the lterm session.
+    // Once a probe observes ESRCH the original group is gone, so do not send
+    // later escalation signals to the stale numeric pgid.
+    if !signal_stored_process_group(session, libc::SIGHUP) {
+        return;
+    }
+    if !wait_for_stored_process_group_exit(session, Duration::from_millis(150)) {
+        return;
+    }
+    if !signal_stored_process_group(session, libc::SIGTERM) {
+        return;
+    }
+    if !wait_for_stored_process_group_exit(session, Duration::from_millis(350)) {
+        return;
+    }
+    if !signal_stored_process_group(session, libc::SIGKILL) {
+        return;
+    }
+    let _ = wait_for_stored_process_group_exit(session, Duration::from_millis(150));
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
@@ -1954,34 +2036,38 @@ fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
     }
 }
 
-fn signal_stored_process_group(session: &Session, signal: libc::c_int) {
+fn signal_stored_process_group(session: &Session, signal: libc::c_int) -> bool {
     let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
-        return;
+        return false;
     };
     let rc = unsafe { libc::kill(-pgid, signal) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!(
-                "failed to signal stored process group {} for {} after leader exit: {}",
-                pgid, session.name, err
-            );
-        }
+    if rc == 0 {
+        return true;
     }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    eprintln!(
+        "failed to signal stored process group {} for {} after leader exit: {}",
+        pgid, session.name, err
+    );
+    true
 }
 
-fn wait_for_stored_process_group_exit(session: &Session, timeout: Duration) {
+fn wait_for_stored_process_group_exit(session: &Session, timeout: Duration) -> bool {
     let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
-        return;
+        return false;
     };
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         let rc = unsafe { libc::kill(-pgid, 0) };
         if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
+            return false;
         }
         thread::sleep(Duration::from_millis(25));
     }
+    true
 }
 
 fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
@@ -2311,7 +2397,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2727,11 +2814,79 @@ mod tests {
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             cleanup_started: AtomicBool::new(false),
+            cleanup_completion: (Mutex::new(false), Condvar::new()),
             cleanup_complete: AtomicBool::new(false),
+            leader_reaped: AtomicBool::new(false),
             exit_code: AtomicI32::new(i32::MIN),
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn concurrent_finalize_waits_for_single_cleanup_completion() {
+        use std::sync::Barrier;
+
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("finalize-idempotent");
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert(session.name.clone(), Arc::clone(&session));
+            sessions
+                .by_pane
+                .insert(session.pane_id.clone(), Arc::clone(&session));
+            sessions
+                .by_id
+                .insert(session.id.clone(), Arc::clone(&session));
+        }
+
+        let output_guard = super::lock(&session.output_state);
+        let first_ready = Arc::new(Barrier::new(2));
+        let state_for_first = Arc::clone(&state);
+        let session_for_first = Arc::clone(&session);
+        let first_ready_for_thread = Arc::clone(&first_ready);
+        let first = thread::spawn(move || {
+            first_ready_for_thread.wait();
+            super::finalize_session(
+                &state_for_first,
+                &session_for_first,
+                super::SessionFinalizeReason::LeaderExited,
+            );
+        });
+
+        first_ready.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session.cleanup_started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            session.cleanup_started.load(Ordering::SeqCst),
+            "first finalizer should enter cleanup before the second caller"
+        );
+
+        let state_for_second = Arc::clone(&state);
+        let session_for_second = Arc::clone(&session);
+        let second = thread::spawn(move || {
+            super::terminate_session(&state_for_second, &session_for_second);
+        });
+
+        thread::sleep(Duration::from_millis(25));
+        assert!(
+            !session.cleanup_complete.load(Ordering::SeqCst),
+            "cleanup should still be blocked on the first finalizer"
+        );
+        drop(output_guard);
+
+        first.join().expect("first finalizer panicked");
+        second.join().expect("second finalizer panicked");
+        assert!(!session.alive.load(Ordering::SeqCst));
+        assert!(session.cleanup_complete.load(Ordering::SeqCst));
+        let sessions = super::lock(&state.sessions);
+        assert!(!sessions.by_name.contains_key(&session.name));
+        assert!(!sessions.by_pane.contains_key(&session.pane_id));
+        assert!(!sessions.by_id.contains_key(&session.id));
     }
 
     #[test]

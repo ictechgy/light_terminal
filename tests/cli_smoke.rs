@@ -4147,6 +4147,8 @@ fn custom_socket_refuses_existing_regular_file() -> TestResult {
 #[test]
 fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestResult {
     let env = TestEnv::new()?;
+    let release = env.temp.path().join("leader-reap-release");
+    let release_arg = release.to_string_lossy().to_string();
     let status = env
         .cmd()
         .args([
@@ -4157,11 +4159,13 @@ fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestRe
             "--",
             "sh",
             "-lc",
-            "trap '' HUP; sleep 30 & echo CHILD:$!; sleep 0.2; echo LEADER_DONE",
+            "trap '' HUP; release=$1; sleep 30 & printf 'CHILD:%s\\nCHILD_READY\\n' \"$!\"; while [ ! -f \"$release\" ]; do sleep 0.05; done; echo LEADER_DONE",
+            "sh",
+            &release_arg,
         ])
         .status()?;
     assert!(status.success());
-    let captured = env.capture_until("leader-reap", "CHILD:")?;
+    let captured = env.capture_until("leader-reap", "CHILD_READY")?;
     let child_pid = captured
         .split("CHILD:")
         .nth(1)
@@ -4172,6 +4176,7 @@ fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestRe
         "background child should be alive before leader exits"
     );
 
+    std::fs::write(&release, b"go")?;
     wait_for_session_absent_for(&env, "leader-reap", Duration::from_secs(3))?;
     wait_for_pid_exit(child_pid)
 }
