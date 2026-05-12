@@ -78,6 +78,7 @@ lterm -a api
 | 작업 | 일반 명령 | 호환 이름 |
 | --- | --- | --- |
 | 영속 프로세스 시작 | `lterm start -n api -- npm run dev` | `new` |
+| 세션 열기 또는 생성 | `lterm open main` | `attach-or-new` |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
 | 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
@@ -231,7 +232,7 @@ lterm notify --title 'Task complete' --body 'All checks passed'
 lterm ssh user@host main
 ```
 
-내부적으로 `ssh -t user@host 'lterm attach-or-new main'`을 실행합니다. SSH 옵션은 `--` 뒤에 전달할 수 있습니다.
+원격 호스트에서는 `lterm open main`과 같은 attach-or-create 동작을 사용합니다. 구버전 원격 `lterm`이 `open`을 모르더라도 새 로컬 클라이언트가 계속 접속할 수 있도록 실제 wire command는 `lterm attach-or-new main`으로 유지합니다. SSH 옵션은 `--` 뒤에 전달할 수 있습니다.
 
 ```bash
 lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
