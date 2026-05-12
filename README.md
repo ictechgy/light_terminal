@@ -83,22 +83,26 @@ Session names containing CJK characters or emoji (including ZWJ families, countr
 
 When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
-**Inspect or send input:**
+**Inspect or control a session:**
 
 ```bash
-lterm ls
-lterm ls --children
-lterm ls --all
+lterm sessions
+lterm sessions --children
+lterm sessions --all
 lterm ps api
-lterm capture api -S=-80
-lterm send api 'echo hello' --enter
+lterm logs api -S=-80
+lterm input api 'echo hello' --enter
 ```
+
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The tmux-compatible names remain available for scripts and muscle memory: `list` / `ls`, `capture`, and `send`.
 
 **Stop a session:**
 
 ```bash
-lterm kill api
+lterm close api
 ```
+
+`close` is a visible alias for `kill`; it uses the same session/pane termination path and is intentionally still described as killing the target in command help.
 
 ## AI workflows
 
