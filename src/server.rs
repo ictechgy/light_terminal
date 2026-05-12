@@ -2054,6 +2054,10 @@ fn terminate_unreaped_process_group(
     session: &Session,
     _reap_guard: &MutexGuard<'_, Box<dyn Child + Send + Sync>>,
 ) {
+    // The guard is a witness that callers hold this session's `child` lock:
+    // the waiter cannot set `leader_reaped` while this function decides
+    // whether the stored pgid is still anchored by the unreaped zombie leader.
+    // Keep the explicit reaped check as defense-in-depth for future call paths.
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
@@ -2961,6 +2965,21 @@ mod tests {
         assert!(
             session.unreaped_cleanup_started.load(Ordering::SeqCst),
             "late observed-but-unreaped leaders must run the residual process-group cleanup"
+        );
+    }
+
+    #[test]
+    fn terminate_unreaped_cleanup_skips_after_leader_reaped() {
+        let session = build_test_session("terminate-reaped-skip");
+        session.leader_exit_observed.store(true, Ordering::SeqCst);
+        session.leader_reaped.store(true, Ordering::SeqCst);
+
+        let reap_guard = super::lock(&session.child);
+        super::terminate_unreaped_process_group(&session, &reap_guard);
+
+        assert!(
+            !session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "reaped leaders must not start residual stored-pgid cleanup"
         );
     }
 
