@@ -1759,6 +1759,7 @@ fn tmux_compat_split_window_treats_b_as_boolean_outside_buffer_commands() -> Tes
 #[test]
 fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
     let env = TestEnv::new()?;
+    let marker = env.temp.path().join("split-empty-format-marker.txt");
     let output = env
         .cmd()
         .args([
@@ -1767,7 +1768,11 @@ fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
             "-dP",
             "-F",
             "",
-            "echo SPLIT_EMPTY_FORMAT_READY; sleep 2",
+            "sh",
+            "-lc",
+            "printf SPLIT_EMPTY_FORMAT_READY > \"$1\"; sleep 2",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
@@ -1776,7 +1781,17 @@ fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
         "\n",
         "empty split-window format should be accepted and print one newline"
     );
-    Ok(())
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(
+            std::fs::read_to_string(&marker).as_deref(),
+            Ok("SPLIT_EMPTY_FORMAT_READY")
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("split-window command payload did not run after empty -F value".into())
 }
 
 #[test]
@@ -1800,7 +1815,7 @@ fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
         .args(["tmux-compat", "display-message", "-p", "hello", "-t"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello -t");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello -t\n");
     Ok(())
 }
 
