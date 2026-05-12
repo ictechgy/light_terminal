@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const RING_LIMIT: usize = 2 * 1024 * 1024;
@@ -939,11 +939,9 @@ fn forward_attach_output(mut output: UnixStream, rx: Receiver<OutputChunk>) -> b
 
 fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     verify_peer_owner(&stream)?;
-    stream
-        .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
-        .context("set request read timeout")?;
-    let line = read_request_line(&mut stream)?;
+    let frame = read_request_frame_with_timeout(&mut stream, REQUEST_READ_TIMEOUT)?;
     stream.set_read_timeout(None).ok();
+    let line = frame.line;
     if line.trim().is_empty() {
         return Ok(());
     }
@@ -951,7 +949,7 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         .with_context(|| format!("parse request: {}", sanitized_preview(&line)))?;
 
     if let Request::Attach { target, rows, cols } = request {
-        return handle_attach(state, stream, &target, rows, cols);
+        return handle_attach(state, stream, &target, rows, cols, frame.buffered);
     }
 
     let shutdown = matches!(request, Request::Shutdown);
@@ -970,26 +968,105 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn read_request_line(stream: &mut UnixStream) -> Result<String> {
+#[derive(Debug)]
+struct RequestFrame {
+    line: String,
+    /// Bytes read after the newline while chunk-reading the request header.
+    ///
+    /// For normal RPC these are ignored because the protocol is one request per
+    /// connection. For attach they are already user input bytes and must be
+    /// replayed into the PTY after the attach handshake succeeds.
+    buffered: Vec<u8>,
+}
+
+fn read_request_frame_with_timeout(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<RequestFrame> {
+    read_request_frame_with_limit(stream, timeout, MAX_REQUEST_BYTES)
+}
+
+fn read_request_frame_with_limit(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    max_request_bytes: usize,
+) -> Result<RequestFrame> {
+    let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
-    let mut byte = [0_u8; 1];
+    let mut buf = [0_u8; 8192];
     loop {
-        let n = stream.read(&mut byte).context("read request line")?;
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("request timed out before newline");
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            bail!("request timed out before newline");
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .context("set request read timeout")?;
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    bail!("request timed out before newline");
+                }
+                continue;
+            }
+            Err(err) => return Err(err).context("read request line"),
+        };
         if n == 0 {
             break;
         }
-        bytes.push(byte[0]);
-        if bytes.len() > MAX_REQUEST_BYTES {
-            bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
-        }
-        if byte[0] == b'\n' {
-            break;
+        if let Some(frame) = request_frame_from_chunk(&mut bytes, &buf[..n], max_request_bytes)? {
+            return Ok(frame);
         }
     }
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+    if !bytes.is_empty() {
         bail!("request missing newline before EOF");
     }
-    String::from_utf8(bytes).context("request is not valid UTF-8")
+    Ok(RequestFrame {
+        line: String::from_utf8(bytes).context("request is not valid UTF-8")?,
+        buffered: Vec::new(),
+    })
+}
+
+fn request_frame_from_chunk(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    max_request_bytes: usize,
+) -> Result<Option<RequestFrame>> {
+    if let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') {
+        let line_len = pos + 1;
+        ensure_request_capacity(bytes.len(), line_len, max_request_bytes)?;
+        bytes.extend_from_slice(&chunk[..line_len]);
+        return Ok(Some(RequestFrame {
+            line: String::from_utf8(std::mem::take(bytes)).context("request is not valid UTF-8")?,
+            buffered: chunk[line_len..].to_vec(),
+        }));
+    }
+
+    ensure_request_capacity(bytes.len(), chunk.len(), max_request_bytes)?;
+    bytes.extend_from_slice(chunk);
+    Ok(None)
+}
+
+fn ensure_request_capacity(
+    current_len: usize,
+    additional_len: usize,
+    max_request_bytes: usize,
+) -> Result<()> {
+    let Some(next_len) = current_len.checked_add(additional_len) else {
+        bail!("request exceeded {max_request_bytes} bytes");
+    };
+    if next_len > max_request_bytes {
+        bail!("request exceeded {max_request_bytes} bytes");
+    }
+    Ok(())
 }
 
 fn sanitized_preview(value: &str) -> String {
@@ -1542,6 +1619,7 @@ fn handle_attach(
     target: &str,
     rows: u16,
     cols: u16,
+    buffered_input: Vec<u8>,
 ) -> Result<()> {
     let session = match resolve_session(&state, target) {
         Ok(session) => session,
@@ -1583,6 +1661,7 @@ fn handle_attach(
                 return Ok(());
             }
         };
+    let subscription = AttachSubscriptionGuard::new(Arc::clone(&session), subscriber_id);
     // PR #15: 클라이언트가 후속 Resize 요청에서 사용할 subscriber id 를 응답에 실어
     // 보낸다. Response 모양은 그대로 두고 result 필드에만 JSON 객체로 박는다.
     //
@@ -1599,7 +1678,6 @@ fn handle_attach(
     // 진행해 ghost subscriber + output_thread 가 매달려 남는다 — apply_clamped 실패
     // 와 동일한 패턴으로 등록한 sub 를 unsubscribe 한 뒤 에러를 surface 한다.
     if let Err(err) = stream.flush() {
-        session.unsubscribe(subscriber_id);
         return Err(err).context("flush attach ok before output thread");
     }
     let output = stream.try_clone().context("clone output stream")?;
@@ -1614,6 +1692,16 @@ fn handle_attach(
     input
         .set_read_timeout(Some(Duration::from_millis(100)))
         .context("set attach input read timeout")?;
+    if !buffered_input.is_empty()
+        && (!session.alive.load(Ordering::SeqCst)
+            || lock(&session.writer).write_all(&buffered_input).is_err())
+    {
+        // Drop the guard before joining so unsubscribe closes the output
+        // channel and lets the forwarder thread exit.
+        drop(subscription);
+        let _ = output_thread.join();
+        return Ok(());
+    }
     let mut buf = [0_u8; 8192];
     while session.alive.load(Ordering::SeqCst) {
         let n = match input.read(&mut buf) {
@@ -1631,9 +1719,34 @@ fn handle_attach(
             break;
         }
     }
-    session.unsubscribe(subscriber_id);
+    // Drop the guard before joining so unsubscribe closes the output channel
+    // and lets the forwarder thread exit.
+    drop(subscription);
     let _ = output_thread.join();
     Ok(())
+}
+
+struct AttachSubscriptionGuard {
+    session: Arc<Session>,
+    subscriber_id: u64,
+}
+
+impl AttachSubscriptionGuard {
+    fn new(session: Arc<Session>, subscriber_id: u64) -> Self {
+        Self {
+            session,
+            subscriber_id,
+        }
+    }
+}
+
+impl Drop for AttachSubscriptionGuard {
+    fn drop(&mut self) {
+        // `unsubscribe` is idempotent: the output thread may have already
+        // removed this subscriber after a write failure, while early-return
+        // paths rely on this guard to prevent ghost subscribers.
+        self.session.unsubscribe(self.subscriber_id);
+    }
 }
 
 fn remove_session(state: &Arc<State>, session: &Session) {
@@ -2105,14 +2218,16 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALT_SCREEN_ENTER, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS,
-        OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber, TerminalPrefixTracker,
-        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers, forward_attach_output,
-        initial_pty_size, process_group_still_owns_child, validate_terminal_geometry,
+        ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS,
+        MAX_TERMINAL_ROWS, OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber,
+        TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
+        forward_attach_output, initial_pty_size, process_group_still_owns_child,
+        read_request_frame_with_limit, read_request_frame_with_timeout, request_frame_from_chunk,
+        validate_terminal_geometry,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -2129,6 +2244,69 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    #[test]
+    fn request_chunk_parser_preserves_tail_from_same_read_buffer() {
+        let mut bytes = Vec::new();
+
+        let frame =
+            request_frame_from_chunk(&mut bytes, b"{\"type\":\"Ping\"}\nBUFFERED_INPUT\n", 1024)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(frame.line, "{\"type\":\"Ping\"}\n");
+        assert_eq!(frame.buffered, b"BUFFERED_INPUT\n");
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn request_reader_accepts_newline_terminated_header() {
+        let (mut server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
+        client_end
+            .write_all(b"{\"type\":\"Ping\"}\n")
+            .expect("write request");
+
+        let frame =
+            read_request_frame_with_timeout(&mut server_end, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(frame.line, "{\"type\":\"Ping\"}\n");
+        assert!(frame.buffered.is_empty());
+    }
+
+    #[test]
+    fn request_reader_uses_absolute_deadline_for_partial_headers() {
+        let (mut server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
+        client_end.write_all(b"{").expect("write partial request");
+
+        let started = Instant::now();
+        let err = read_request_frame_with_timeout(&mut server_end, Duration::from_millis(50))
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "partial request should honor the absolute deadline"
+        );
+        assert!(
+            err.to_string().contains("timed out before newline"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn request_reader_rejects_oversized_headers_without_newline() {
+        let (mut server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
+        client_end
+            .write_all(b"abcdefghi")
+            .expect("write oversized request");
+
+        let err =
+            read_request_frame_with_limit(&mut server_end, Duration::from_secs(1), 8).unwrap_err();
+
+        assert!(
+            err.to_string().contains("request exceeded 8 bytes"),
+            "unexpected error: {err:#}"
+        );
     }
 
     /// shutdown 호출 횟수를 세는 카운터를 가진 테스트용 Subscriber.
@@ -2472,6 +2650,25 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn attach_subscription_guard_unsubscribes_on_drop() {
+        let session = build_test_session("attach-guard");
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (subscriber_id, _rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe test attach");
+        assert_eq!(session.subscribers.lock().expect("subscribers").len(), 1);
+
+        {
+            let _guard = AttachSubscriptionGuard::new(Arc::clone(&session), subscriber_id);
+        }
+
+        assert!(
+            session.subscribers.lock().expect("subscribers").is_empty(),
+            "dropping the guard should remove the subscriber"
+        );
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
