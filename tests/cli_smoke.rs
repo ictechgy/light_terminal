@@ -1662,7 +1662,7 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
             "-d",
             "-s",
             "keys",
-            "echo READY; read line; echo GOT:$line; sleep 2",
+            "echo READY; read first; echo GOT:$first; read second; echo GOT_COMPACT:$second; sleep 2",
         ])
         .status()?;
     assert!(status.success());
@@ -1670,13 +1670,57 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
     env.capture_until("keys", "READY")?;
     let status = env
         .cmd()
-        .args(["tmux-compat", "send-keys", "-tkeys", "hello", "C-m"])
+        .args(["tmux-compat", "send-keys", "-t", "keys", "hello", "C-m"])
         .status()?;
     assert!(status.success());
 
     let captured = env.capture_until("keys", "GOT:hello")?;
     assert!(captured.contains("READY"), "{captured}");
     assert!(captured.contains("GOT:hello"), "{captured}");
+    let status = env
+        .cmd()
+        .args(["tmux-compat", "send-keys", "-tkeys", "compact", "C-m"])
+        .status()?;
+    assert!(status.success());
+    let captured = env.capture_until("keys", "GOT_COMPACT:compact")?;
+    assert!(captured.contains("GOT_COMPACT:compact"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_send_keys_skips_repeat_count_before_target() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "keys-repeat",
+            "echo READY_REPEAT; read line; echo GOT_REPEAT:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("keys-repeat", "READY_REPEAT")?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "send-keys",
+            "-N",
+            "1",
+            "-t",
+            "keys-repeat",
+            "repeat",
+            "C-m",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("keys-repeat", "GOT_REPEAT:repeat")?;
+    assert!(captured.contains("GOT_REPEAT:repeat"), "{captured}");
     Ok(())
 }
 
@@ -1810,6 +1854,8 @@ fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
         .status()?;
     assert!(status.success());
 
+    // A live default pane is required because display-message expands formats
+    // against the selected pane even when the message itself is literal text.
     let output = env
         .cmd()
         .args(["tmux-compat", "display-message", "-p", "hello", "-t"])
@@ -3857,6 +3903,8 @@ fn tmux_paste_buffer_skips_buffer_name_option_before_target() -> TestResult {
 
     let input = env.temp.path().join("paste-buffer-input.txt");
     std::fs::write(&input, b"PASTE_PAYLOAD\n")?;
+    // lterm exposes one compatibility buffer today. The -b value is parsed
+    // only so it cannot hide the later target flag.
     let load = env
         .cmd()
         .args([

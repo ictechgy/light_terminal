@@ -543,7 +543,8 @@ fn capture_pane(args: &[String]) -> Result<i32> {
 }
 
 fn send_keys(args: &[String]) -> Result<i32> {
-    let target = parse_target(args)?;
+    const VALUE_FLAGS: &[char] = &['N'];
+    let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut literal = false;
     let mut keys = Vec::new();
     let mut i = 0;
@@ -556,11 +557,16 @@ fn send_keys(args: &[String]) -> Result<i32> {
                 literal = true;
                 i += 1;
             }
+            "-N" => {
+                i += 2;
+            }
             "--" => {
                 keys.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS)
+            }
             _ => {
                 keys.extend_from_slice(&args[i..]);
                 break;
@@ -1573,6 +1579,11 @@ mod tests {
         assert_eq!(
             parse_target(&args(["-at=foo"])).unwrap().as_deref(),
             Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["literal-key", "-t", "payload-target"])).unwrap(),
+            None,
+            "positional payloads terminate the generic target scan"
         );
         assert!(parse_target(&args(["-t"])).is_err());
         assert!(parse_target(&args(["-t="])).is_err());
