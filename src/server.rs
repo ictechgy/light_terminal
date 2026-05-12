@@ -1950,11 +1950,6 @@ fn terminate_process_group_for_request(session: &Session) {
         return;
     }
     terminate_verified_process_group_for_request(session);
-    if wait_for_leader_exit_observed(session, Duration::from_millis(50))
-        && !session.leader_reaped.load(Ordering::SeqCst)
-    {
-        terminate_unreaped_process_group(session);
-    }
 }
 
 fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
@@ -1989,17 +1984,6 @@ fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
         );
         return false;
     }
-}
-
-fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if session.leader_exit_observed.load(Ordering::SeqCst) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    session.leader_exit_observed.load(Ordering::SeqCst)
 }
 
 fn terminate_verified_process_group_for_request(session: &Session) {
