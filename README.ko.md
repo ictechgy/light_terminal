@@ -73,6 +73,19 @@ lterm a api
 lterm -a api
 ```
 
+**Agent terminal 명령어 어휘:**
+
+| 작업 | 일반 명령 | 호환 이름 |
+| --- | --- | --- |
+| 영속 프로세스 시작 | `lterm new -n api -- npm run dev` | — |
+| 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
+| 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
+| 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
+| PTY에 텍스트 보내기 | `lterm input api 'echo hello' --enter` | `send` |
+| 세션 종료 | `lterm close api` | `kill` |
+
+호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
+
 `lterm ls`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 사용하려면 `lterm attach --no-status api`를 쓰거나, 상태줄 처리가 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0`을 설정하세요.
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 검정 글자 + bright-blue 배경, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄입니다.
@@ -92,7 +105,7 @@ lterm sessions
 lterm sessions --children
 lterm sessions --all
 lterm ps api
-lterm logs api -S=-80
+lterm logs api --start=-80
 lterm input api 'echo hello' --enter
 ```
 
