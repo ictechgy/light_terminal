@@ -105,6 +105,7 @@ enum Commands {
         children: bool,
     },
     /// Show child process trees for lterm sessions.
+    #[command(visible_alias = "processes")]
     Ps {
         /// Optional session or pane target to inspect.
         target: Option<String>,

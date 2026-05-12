@@ -80,6 +80,7 @@ lterm -a api
 | Start a persistent process | `lterm new -n api -- npm run dev` | — |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
+| Inspect process trees | `lterm processes api --json` | `ps` |
 | Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
 | Send text to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
@@ -104,12 +105,12 @@ When a child application enables the Kitty keyboard protocol through `CSI u` enh
 lterm sessions
 lterm sessions --children
 lterm sessions --all
-lterm ps api
+lterm processes api
 lterm logs api --start=-80
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The tmux-compatible names remain available for scripts and muscle memory: `list` / `ls`, `capture`, and `send`.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The compatibility names remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
 
 **Stop a session:**
 
@@ -250,7 +251,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **Capture output is sanitized for human/AI consumption.** `lterm capture` and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
 
-**Process visibility.** `lterm ps [session]` shows the process tree rooted at each session child, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
+**Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
 **Socket location.** Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
 
@@ -265,7 +266,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats or options may need additional shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
 - The daemon authenticates local clients via OS peer credentials and owner-only socket paths — there are no per-session ACLs yet.
-- Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm kill`; inspect them with `lterm ps` or OS process tools.
+- Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm kill`; inspect them with `lterm processes` / `lterm ps` or OS process tools.
 
 ## Development
 
