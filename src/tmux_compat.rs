@@ -31,6 +31,14 @@ struct CompatPane {
     cmux_surface_id: Option<String>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CapturePaneArgs {
+    target: Option<String>,
+    print: bool,
+    start: Option<i32>,
+    end: Option<i32>,
+}
+
 pub fn ensure_shim() -> Result<PathBuf> {
     let shim_dir = paths::shim_dir()?;
     let tmux_path = shim_dir.join("tmux");
@@ -495,53 +503,10 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    const VALUE_FLAGS: &[char] = &['S', 'E', 'b'];
-    let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
-    let mut print = false;
-    let mut start = None;
-    let mut end = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-p" => {
-                print = true;
-                i += 1;
-            }
-            "-t" => {
-                i += 2;
-            }
-            "-S" => {
-                start = parse_capture_line_value('S', args.get(i + 1).cloned())?;
-                i += 2;
-            }
-            "-E" => {
-                end = parse_capture_line_value('E', args.get(i + 1).cloned())?;
-                i += 2;
-            }
-            "-b" => i += 2,
-            "-e" | "-J" => i += 1,
-            flag if flag.starts_with('-') => {
-                if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
-                    print = true;
-                }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 'S', args, i, VALUE_FLAGS)
-                {
-                    start = parse_capture_line_value('S', value)?;
-                }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 'E', args, i, VALUE_FLAGS)
-                {
-                    end = parse_capture_line_value('E', value)?;
-                }
-                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
-            }
-            _ => i += 1,
-        }
-    }
-    let target = target.unwrap_or_else(default_target);
-    let text = client::capture_range(&target, start, end)?;
-    if print {
+    let parsed = parse_capture_pane_args(args)?;
+    let target = parsed.target.unwrap_or_else(default_target);
+    let text = client::capture_range(&target, parsed.start, parsed.end)?;
+    if parsed.print {
         print!("{text}");
         if !text.ends_with('\n') {
             println!();
@@ -550,6 +515,76 @@ fn capture_pane(args: &[String]) -> Result<i32> {
         fs::write(paths::buffer_path()?, text)?;
     }
     Ok(0)
+}
+
+fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
+    const VALUE_FLAGS: &[char] = &['S', 'E', 'b'];
+    let mut parsed = CapturePaneArgs::default();
+    let mut target_scan_active = true;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => {
+                target_scan_active = false;
+                i += 1;
+            }
+            "-p" => {
+                parsed.print = true;
+                i += 1;
+            }
+            "-t" => {
+                if target_scan_active && parsed.target.is_none() {
+                    parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
+                }
+                i += 2;
+            }
+            "-S" => {
+                parsed.start = parse_capture_line_value('S', args.get(i + 1).cloned())?;
+                i += 2;
+            }
+            "-E" => {
+                parsed.end = parse_capture_line_value('E', args.get(i + 1).cloned())?;
+                i += 2;
+            }
+            "-b" => i += 2,
+            "-e" | "-J" => i += 1,
+            flag if flag.starts_with('-') => {
+                if target_scan_active && parsed.target.is_none() {
+                    if let Some(value) = flag.strip_prefix("-t=") {
+                        parsed.target = target_value(Some(value.to_string()), "-t")?;
+                    } else if flag.starts_with("-t") && flag.len() > 2 {
+                        parsed.target = target_value(Some(flag[2..].to_string()), "-t")?;
+                    } else if let Some((_, value)) =
+                        short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
+                    {
+                        parsed.target = match value {
+                            Some(value) => target_value(Some(value), "-t")?,
+                            None => target_value(args.get(i + 1).cloned(), "-t")?,
+                        };
+                    }
+                }
+                if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
+                    parsed.print = true;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'S', args, i, VALUE_FLAGS)
+                {
+                    parsed.start = parse_capture_line_value('S', value)?;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'E', args, i, VALUE_FLAGS)
+                {
+                    parsed.end = parse_capture_line_value('E', value)?;
+                }
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
+            _ => {
+                target_scan_active = false;
+                i += 1;
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 fn parse_capture_line_value(flag: char, value: Option<String>) -> Result<Option<i32>> {
@@ -1613,6 +1648,61 @@ mod tests {
         );
         assert!(parse_target(&args(["-t"])).is_err());
         assert!(parse_target(&args(["-t="])).is_err());
+    }
+
+    #[test]
+    fn parses_capture_pane_args_in_one_pass() {
+        assert_eq!(
+            parse_capture_pane_args(&args(["-p", "-Stop", "-E", "10", "-t", "capture-second"]))
+                .unwrap(),
+            CapturePaneArgs {
+                target: Some("capture-second".into()),
+                print: true,
+                start: Some(0),
+                end: Some(10),
+            }
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["-p", "-S1", "-E0", "-tcap"])).unwrap(),
+            CapturePaneArgs {
+                target: Some("cap".into()),
+                print: true,
+                start: Some(1),
+                end: Some(0),
+            }
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["-b", "-p", "-t", "cap"])).unwrap(),
+            CapturePaneArgs {
+                target: Some("cap".into()),
+                print: false,
+                start: None,
+                end: None,
+            },
+            "-p after -b is a buffer name, not the print flag"
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["-t", "first", "-t", "second"]))
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("first"),
+            "tmux target parsing uses the first target flag"
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["--", "-t", "ignored"]))
+                .unwrap()
+                .target,
+            None,
+            "`--` terminates target discovery while later options remain command-local"
+        );
+        assert!(
+            parse_capture_pane_args(&args(["-p", "-E", "-t", "cap"]))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid capture-pane -E line value"),
+            "-E must not consume -t as a target when its value is invalid"
+        );
     }
 
     #[test]
