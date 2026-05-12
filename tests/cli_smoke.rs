@@ -440,7 +440,7 @@ fn attach_short_aliases_detach_on_stdin_eof() -> TestResult {
         .status()?;
     assert!(status.success());
 
-    for alias in ["a", "-a"] {
+    for alias in ["a", "-a", "resume"] {
         let started = Instant::now();
         let output = env
             .cmd()
@@ -463,8 +463,8 @@ fn help_shows_common_aliases() -> TestResult {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[aliases: a]"),
-        "attach alias was not visible in help:\n{stdout}"
+        stdout.contains("[aliases: a, resume]"),
+        "attach aliases were not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: ls, sessions]"),
@@ -696,6 +696,14 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
     for (command, expected) in [
         (
             "attach",
+            &[
+                "Session or pane target to attach",
+                "default: %0",
+                "Disable the blue lterm status bar while attached",
+            ][..],
+        ),
+        (
+            "resume",
             &[
                 "Session or pane target to attach",
                 "default: %0",
