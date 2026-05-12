@@ -525,15 +525,14 @@ fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
     while i < args.len() {
         match args[i].as_str() {
             "--" => {
-                target_scan_active = false;
-                i += 1;
+                break;
             }
             "-p" => {
                 parsed.print = true;
                 i += 1;
             }
             "-t" => {
-                if target_scan_active && parsed.target.is_none() {
+                if target_scan_active {
                     parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
                 }
                 i += 2;
@@ -549,7 +548,7 @@ fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
             "-b" => i += 2,
             "-e" | "-J" => i += 1,
             flag if flag.starts_with('-') => {
-                if target_scan_active && parsed.target.is_none() {
+                if target_scan_active {
                     if let Some(value) = flag.strip_prefix("-t=") {
                         parsed.target = target_value(Some(value.to_string()), "-t")?;
                     } else if flag.starts_with("-t") && flag.len() > 2 {
@@ -1686,15 +1685,13 @@ mod tests {
                 .unwrap()
                 .target
                 .as_deref(),
-            Some("first"),
-            "tmux target parsing uses the first target flag"
+            Some("second"),
+            "tmux capture-pane lets later target flags override earlier ones"
         );
         assert_eq!(
-            parse_capture_pane_args(&args(["--", "-t", "ignored"]))
-                .unwrap()
-                .target,
-            None,
-            "`--` terminates target discovery while later options remain command-local"
+            parse_capture_pane_args(&args(["--", "-t", "ignored"])).unwrap(),
+            CapturePaneArgs::default(),
+            "`--` terminates capture-pane option parsing"
         );
         assert!(
             parse_capture_pane_args(&args(["-p", "-E", "-t", "cap"]))
