@@ -113,6 +113,7 @@ enum Commands {
         json: bool,
     },
     /// Kill a session or pane.
+    #[command(visible_alias = "close")]
     Kill {
         /// Session or pane target to kill.
         target: String,
