@@ -64,10 +64,12 @@ lterm new -n api -- npm run dev
 
 ```bash
 lterm new -d -n api -- npm run dev
-lterm attach api
+lterm resume api
 
-# Short aliases — `-a` goes right after `lterm`, separated from the target by a space:
+# Compatibility names remain available:
+lterm attach api
 lterm a api
+# `-a` goes right after `lterm`, separated from the target by a space.
 lterm -a api
 ```
 
