@@ -999,9 +999,10 @@ fn read_request_frame_with_limit(
         if now >= deadline {
             bail!("request timed out before newline");
         }
-        let remaining = deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(100));
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            bail!("request timed out before newline");
+        }
         stream
             .set_read_timeout(Some(remaining))
             .context("set request read timeout")?;
@@ -1025,7 +1026,7 @@ fn read_request_frame_with_limit(
             return Ok(frame);
         }
     }
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+    if !bytes.is_empty() {
         bail!("request missing newline before EOF");
     }
     Ok(RequestFrame {
@@ -1691,7 +1692,12 @@ fn handle_attach(
     input
         .set_read_timeout(Some(Duration::from_millis(100)))
         .context("set attach input read timeout")?;
-    if !buffered_input.is_empty() && lock(&session.writer).write_all(&buffered_input).is_err() {
+    if !buffered_input.is_empty()
+        && (!session.alive.load(Ordering::SeqCst)
+            || lock(&session.writer).write_all(&buffered_input).is_err())
+    {
+        // Drop the guard before joining so unsubscribe closes the output
+        // channel and lets the forwarder thread exit.
         drop(subscription);
         let _ = output_thread.join();
         return Ok(());
@@ -1713,6 +1719,8 @@ fn handle_attach(
             break;
         }
     }
+    // Drop the guard before joining so unsubscribe closes the output channel
+    // and lets the forwarder thread exit.
     drop(subscription);
     let _ = output_thread.join();
     Ok(())
