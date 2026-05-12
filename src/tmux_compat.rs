@@ -319,16 +319,12 @@ fn kill_session(args: &[String]) -> Result<i32> {
 }
 
 fn split_window(args: &[String]) -> Result<i32> {
-    let print = has_flag(args, "-P");
-    let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
-    let target = parse_target(args)?;
-    let mut direction = if has_flag(args, "-v") {
-        "down"
-    } else {
-        "right"
-    };
+    let mut direction = "right";
+    let mut print = false;
+    let mut format = "#{pane_id}".to_string();
+    let mut target = None;
     let mut cwd = None;
-    let mut detached = has_flag(args, "-d");
+    let mut detached = false;
     let mut command = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -345,18 +341,53 @@ fn split_window(args: &[String]) -> Result<i32> {
                 detached = true;
                 i += 1;
             }
+            "-P" => {
+                print = true;
+                i += 1;
+            }
+            "-F" => {
+                format = value_for_option(args.get(i + 1).cloned(), "-F")?;
+                i += 2;
+            }
             "-t" => {
+                target = target_value(args.get(i + 1).cloned(), "-t")?;
                 i += 2;
             }
             "-c" => {
-                cwd = args.get(i + 1).cloned();
+                cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
             "--" => {
                 command.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg(flag, 'h') {
+                    direction = "right";
+                }
+                if has_flag_in_arg(flag, 'v') {
+                    direction = "down";
+                }
+                if has_flag_in_arg(flag, 'd') {
+                    detached = true;
+                }
+                if has_flag_in_arg(flag, 'P') {
+                    print = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                    format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                    target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'c', args, i) {
+                    cwd = Some(value_for_option(
+                        value.or_else(|| args.get(i + 1).cloned()),
+                        "-c",
+                    )?);
+                }
+                i += flag_arg_width(flag, args, i);
+            }
             _ => {
                 command.extend_from_slice(&args[i..]);
                 break;
@@ -401,9 +432,9 @@ fn list_panes(args: &[String]) -> Result<i32> {
 
 fn display_message(args: &[String]) -> Result<i32> {
     let mut print = false;
-    let target = parse_target(args)?;
-    let explicit_target = target.is_some();
-    let mut message = parse_format(args);
+    let mut target = None;
+    let mut explicit_target = false;
+    let mut message = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -412,16 +443,34 @@ fn display_message(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-t" => {
+                target = target_value(args.get(i + 1).cloned(), "-t")?;
+                explicit_target = true;
                 i += 2;
             }
             "-F" => {
+                message = Some(value_for_option(args.get(i + 1).cloned(), "-F")?);
                 i += 2;
             }
             "--" => {
                 message = Some(args[i + 1..].join(" "));
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg(flag, 'p') {
+                    print = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                    target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
+                    explicit_target = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                    message = Some(value_for_option(
+                        value.or_else(|| args.get(i + 1).cloned()),
+                        "-F",
+                    )?);
+                }
+                i += flag_arg_width(flag, args, i);
+            }
             _ => {
                 message = Some(args[i..].join(" "));
                 break;
@@ -866,17 +915,37 @@ fn parse_target(args: &[String]) -> Result<Option<String>> {
         if args[i].starts_with('-') {
             i += flag_arg_width(&args[i], args, i);
         } else {
-            i += 1;
+            break;
         }
     }
     Ok(None)
 }
 
 fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
-    match value {
-        Some(value) if !value.is_empty() => Ok(Some(value)),
-        _ => bail!("tmux target flag {flag} requires a value"),
+    Ok(Some(value_for_option(value, flag)?))
+}
+
+fn value_for_option(value: Option<String>, flag: &str) -> Result<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("tmux option {flag} requires a value"))
+}
+
+fn has_flag_in_arg(arg: &str, needle: char) -> bool {
+    let Some(cluster) = short_cluster(arg) else {
+        return false;
+    };
+    for (pos, flag) in cluster.char_indices() {
+        if flag == needle {
+            return true;
+        }
+        if value_for_short_flag(cluster, pos, flag, &[], 0).is_some()
+            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            break;
+        }
     }
+    false
 }
 
 fn buffer_path_arg(args: &[String]) -> Option<String> {
@@ -885,10 +954,40 @@ fn buffer_path_arg(args: &[String]) -> Option<String> {
         if args[i] == "--" {
             return args.get(i + 1).cloned();
         }
+        if let Some(width) = buffer_option_width(&args[i], args, i) {
+            i += width;
+            continue;
+        }
         if args[i].starts_with('-') {
             i += flag_arg_width(&args[i], args, i);
         } else {
             return Some(args[i].clone());
+        }
+    }
+    None
+}
+
+fn buffer_option_width(arg: &str, args: &[String], i: usize) -> Option<usize> {
+    if arg == "-b" {
+        return Some(if args.get(i + 1).is_some() { 2 } else { 1 });
+    }
+    if arg.strip_prefix("-b=").is_some() || (arg.starts_with("-b") && arg.len() > 2) {
+        return Some(1);
+    }
+    let cluster = short_cluster(arg)?;
+    for (pos, flag) in cluster.char_indices() {
+        if flag == 'b' {
+            let rest = &cluster[pos + flag.len_utf8()..];
+            return Some(if rest.is_empty() && args.get(i + 1).is_some() {
+                2
+            } else {
+                1
+            });
+        }
+        if value_for_short_flag(cluster, pos, flag, args, i).is_some()
+            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            break;
         }
     }
     None
@@ -1062,7 +1161,7 @@ fn short_cluster(arg: &str) -> Option<&str> {
 }
 
 fn is_value_taking_short_flag(flag: char) -> bool {
-    matches!(flag, 'F' | 't' | 'f' | 'c' | 'n' | 'x' | 'y' | 'b')
+    matches!(flag, 'F' | 't' | 'f' | 'c' | 'n' | 'x' | 'y')
 }
 
 fn default_target() -> String {

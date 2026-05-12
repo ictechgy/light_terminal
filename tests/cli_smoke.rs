@@ -1705,6 +1705,83 @@ fn tmux_compat_split_window_supports_clustered_print_format() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_split_window_stops_option_parsing_at_command() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-dP",
+            "sh",
+            "-lc",
+            "echo SPLIT_PAYLOAD_ARG:$1; sleep 2",
+            "sh",
+            "-F",
+            "not-a-format",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        pane.starts_with('%'),
+        "split-window command payload -F should not override the default format: {pane:?}"
+    );
+    let captured = env.capture_until(&pane, "SPLIT_PAYLOAD_ARG:-F")?;
+    assert!(captured.contains("SPLIT_PAYLOAD_ARG:-F"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_treats_b_as_boolean_outside_buffer_commands() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-bdPF",
+            "#{pane_id}",
+            "echo SPLIT_B_READY; sleep 2",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        pane.starts_with('%'),
+        "split-window -bdPF should print the pane id, got {pane:?}"
+    );
+    let captured = env.capture_until(&pane, "SPLIT_B_READY")?;
+    assert!(captured.contains("SPLIT_B_READY"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "display-payload",
+            "sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env
+        .cmd()
+        .args(["tmux-compat", "display-message", "-p", "hello", "-t"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello -t");
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_missing_target_value_does_not_fall_back_to_default() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
