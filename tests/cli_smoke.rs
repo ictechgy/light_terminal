@@ -789,7 +789,6 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             "tmux-compat",
             &["Arguments forwarded to the tmux compatibility parser"][..],
         ),
-        ("shutdown", &["Stop the daemon and all sessions"][..]),
         (
             "notify",
             &[
@@ -830,6 +829,27 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "{command} help should not duplicate clap default text with {phrase:?}:\n{stdout}"
             );
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn help_describes_daemon_lifecycle_commands() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (command, expected) in [
+        ("daemon", "Run the background PTY session daemon"),
+        ("shutdown", "Stop the daemon and all sessions"),
+    ] {
+        let output = env.cmd().args([command, "--help"]).output()?;
+        assert!(output.status.success(), "{command} help failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let normalized = normalize_help(&stdout);
+        assert!(
+            normalized.contains(expected),
+            "{command} help should include {expected:?}:\n{stdout}"
+        );
     }
 
     Ok(())
