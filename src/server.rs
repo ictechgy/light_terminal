@@ -1950,6 +1950,30 @@ fn terminate_process_group_for_request(session: &Session) {
         return;
     }
     terminate_verified_process_group_for_request(session);
+    terminate_observed_unreaped_process_group(session, Duration::from_millis(50));
+}
+
+fn terminate_observed_unreaped_process_group(session: &Session, timeout: Duration) {
+    // Keep a short post-SIGKILL observation window for the waiter to publish
+    // `leader_exit_observed` before it can acquire `child` and reap the leader.
+    // During that unreaped window the stored pgid is still anchored and safe
+    // for the residual group-kill ladder; after reap, we must not rely on it.
+    if wait_for_leader_exit_observed(session, timeout)
+        && !session.leader_reaped.load(Ordering::SeqCst)
+    {
+        terminate_unreaped_process_group(session);
+    }
+}
+
+fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    session.leader_exit_observed.load(Ordering::SeqCst)
 }
 
 fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
@@ -2895,6 +2919,26 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn terminate_tail_cleanup_waits_for_late_observed_leader() {
+        let session = build_test_session("terminate-tail-cleanup");
+        let session_for_waiter = Arc::clone(&session);
+        let waiter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            session_for_waiter
+                .leader_exit_observed
+                .store(true, Ordering::SeqCst);
+        });
+
+        super::terminate_observed_unreaped_process_group(&session, Duration::from_millis(200));
+
+        waiter.join().expect("leader-observed notifier panicked");
+        assert!(
+            session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "late observed-but-unreaped leaders must run the residual process-group cleanup"
+        );
     }
 
     #[test]
