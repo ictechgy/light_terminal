@@ -6,7 +6,7 @@
 
 - **What** — A Rust-based PTY session daemon with a tmux-compatible shim. Persistent sessions you can detach and reattach by name or pane id.
 - **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
-- **How** — `lterm new` to start, `lterm attach` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini` for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
+- **How** — `lterm start` to create, `lterm resume` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini` for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
 - **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
@@ -57,13 +57,13 @@ eval "$(lterm env)"
 **Create a persistent session and attach immediately:**
 
 ```bash
-lterm new -n api -- npm run dev
+lterm start -n api -- npm run dev
 ```
 
 **Create detached, attach later:**
 
 ```bash
-lterm new -d -n api -- npm run dev
+lterm start -d -n api -- npm run dev
 lterm resume api
 
 # Compatibility names remain available:
@@ -77,7 +77,7 @@ lterm -a api
 
 | Task | General command | Compatibility names |
 | --- | --- | --- |
-| Start a persistent process | `lterm new -n api -- npm run dev` | — |
+| Start a persistent process | `lterm start -n api -- npm run dev` | `new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json` | `ps` |
@@ -280,7 +280,7 @@ Use isolated runtime directories for manual testing:
 
 ```bash
 TMP=$(mktemp -d)
-LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- new --name test -- sh -lc 'echo hi; sleep 10'
+LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --name test -- sh -lc 'echo hi; sleep 10'
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- capture test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```

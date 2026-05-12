@@ -467,6 +467,10 @@ fn help_shows_common_aliases() -> TestResult {
         "attach aliases were not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: new]"),
+        "new compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: ls, sessions]"),
         "list aliases were not visible in help:\n{stdout}"
     );
@@ -653,6 +657,12 @@ fn help_describes_session_creation_arguments() -> TestResult {
     let env = TestEnv::new()?;
 
     for (command, tmux_flag, tmux_description, command_description) in [
+        (
+            "start",
+            "--tmux",
+            "Expose the lterm tmux compatibility shim inside the session (off by default)",
+            "Shell command to run in the session; defaults to the user's shell when omitted",
+        ),
         (
             "new",
             "--tmux",
@@ -895,35 +905,34 @@ fn concurrent_new_sessions_get_unique_default_panes() -> TestResult {
 }
 
 #[test]
-fn new_short_name_and_list_aliases_work() -> TestResult {
+fn start_and_new_short_name_list_aliases_work() -> TestResult {
     let env = TestEnv::new()?;
-    let status = env
-        .cmd()
-        .args([
-            "new",
-            "--detach",
-            "-n",
-            "shorty",
-            "--",
-            "sh",
-            "-lc",
-            "echo SHORTY; sleep 2",
-        ])
-        .status()?;
-    assert!(status.success());
 
-    for alias in ["ls", "sessions"] {
-        let listed = env.cmd().arg(alias).output()?;
-        assert!(listed.status.success(), "{alias} failed: {listed:?}");
-        let stdout = String::from_utf8_lossy(&listed.stdout);
-        assert!(
-            stdout.contains("shorty"),
-            "{alias} output missing session:\n{stdout}"
-        );
+    for (command, name, marker) in [
+        ("start", "shorty-start", "SHORTY_START"),
+        ("new", "shorty-new", "SHORTY_NEW"),
+    ] {
+        let script = format!("echo {marker}; sleep 2");
+        let status = env
+            .cmd()
+            .args([command, "--detach", "-n", name, "--", "sh", "-lc", &script])
+            .status()?;
+        assert!(status.success(), "{command} failed to create {name}");
+
+        for alias in ["ls", "sessions"] {
+            let listed = env.cmd().arg(alias).output()?;
+            assert!(listed.status.success(), "{alias} failed: {listed:?}");
+            let stdout = String::from_utf8_lossy(&listed.stdout);
+            assert!(
+                stdout.contains(name),
+                "{alias} output missing session {name}:\n{stdout}"
+            );
+        }
+
+        let captured = env.capture_until(name, marker)?;
+        assert!(captured.contains(marker), "missing output: {captured}");
     }
 
-    let captured = env.capture_until("shorty", "SHORTY")?;
-    assert!(captured.contains("SHORTY"));
     Ok(())
 }
 

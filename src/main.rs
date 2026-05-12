@@ -32,6 +32,7 @@ enum Commands {
     /// Run the background PTY session daemon.
     Daemon,
     /// Create a persistent session and attach to it.
+    #[command(name = "start", visible_alias = "new")]
     New {
         /// Session name to use instead of an auto-generated name.
         #[arg(short, long)]
