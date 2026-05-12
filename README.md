@@ -78,6 +78,7 @@ lterm -a api
 | Task | General command | Compatibility names |
 | --- | --- | --- |
 | Start a persistent process | `lterm start -n api -- npm run dev` | `new` |
+| Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json` | `ps` |
@@ -231,7 +232,7 @@ If `lterm` is installed on a remote machine:
 lterm ssh user@host main
 ```
 
-This expands to `ssh -t user@host 'lterm attach-or-new main'`. Pass SSH flags after `--`:
+This uses the same attach-or-create behavior as `lterm open main` on the remote host; the wire command remains `lterm attach-or-new main` so newer local clients still work with older remote `lterm` installs that do not know `open`. Pass SSH flags after `--`:
 
 ```bash
 lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519

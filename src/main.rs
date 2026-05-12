@@ -84,6 +84,7 @@ enum Commands {
         no_status: bool,
     },
     /// Attach to a session, creating it first when missing.
+    #[command(name = "open", visible_alias = "attach-or-new")]
     AttachOrNew {
         /// Session or pane target to attach or create.
         #[arg(default_value = "main")]
@@ -1049,16 +1050,23 @@ fn ssh_attach(host: &str, target: &str, ssh_args: Vec<String>) -> Result<()> {
     for arg in ssh_args {
         command.arg(arg);
     }
-    command.arg("-t").arg("--").arg(host).arg(format!(
-        "lterm attach-or-new {}",
-        tmux_compat::quote(target)
-    ));
+    command
+        .arg("-t")
+        .arg("--")
+        .arg(host)
+        .arg(ssh_remote_command(target));
     let status = command.status().context("run ssh")?;
     if status.success() {
         Ok(())
     } else {
         bail!("ssh exited with {status}")
     }
+}
+
+fn ssh_remote_command(target: &str) -> String {
+    // Keep the wire command on the older attach-or-new spelling so a newer
+    // local lterm can still reach remote hosts that do not know `lterm open`.
+    format!("lterm attach-or-new {}", tmux_compat::quote(target))
 }
 
 fn validate_ssh_host(host: &str) -> Result<()> {
@@ -1103,6 +1111,19 @@ mod tests {
         assert_eq!(
             expand_attach_short_flag(os_args(&["lterm"])),
             os_args(&["lterm"])
+        );
+    }
+
+    #[test]
+    fn ssh_remote_command_uses_compatibility_name_and_quotes_target() {
+        assert_eq!(ssh_remote_command("main"), "lterm attach-or-new main");
+        assert_eq!(
+            ssh_remote_command("agent main"),
+            "lterm attach-or-new 'agent main'"
+        );
+        assert!(
+            !ssh_remote_command("main").contains("lterm open"),
+            "ssh wire command must remain compatible with older remotes"
         );
     }
 

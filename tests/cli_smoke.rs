@@ -467,6 +467,10 @@ fn help_shows_common_aliases() -> TestResult {
         "attach aliases were not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: attach-or-new]"),
+        "open compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: new]"),
         "new compatibility alias was not visible in help:\n{stdout}"
     );
@@ -727,6 +731,13 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             ][..],
         ),
         (
+            "open",
+            &[
+                "Session or pane target to attach or create",
+                "default: main",
+            ][..],
+        ),
+        (
             "attach-or-new",
             &[
                 "Session or pane target to attach or create",
@@ -793,7 +804,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
 
         let unexpected_defaults = match command {
             "attach" => &["defaults to %0"][..],
-            "attach-or-new" | "ssh" => &["defaults to main"][..],
+            "open" | "attach-or-new" | "ssh" => &["defaults to main"][..],
             _ => &[][..],
         };
         for phrase in unexpected_defaults {
@@ -802,6 +813,87 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "{command} help should not duplicate clap default text with {phrase:?}:\n{stdout}"
             );
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn open_and_attach_or_new_create_missing_session() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (command, target) in [
+        ("open", "open-missing"),
+        ("attach-or-new", "attach-or-new-missing"),
+    ] {
+        let started = Instant::now();
+        let output = env
+            .cmd()
+            .args([command, target, "--no-status"])
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{command} did not detach promptly after stdin EOF: {output:?}"
+        );
+
+        let listed = env.cmd().args(["sessions", "--all"]).output()?;
+        assert!(listed.status.success(), "{listed:?}");
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            stdout.contains(target),
+            "{command} did not create missing session {target}: {stdout}"
+        );
+    }
+
+    for (command, target) in [
+        ("open", "open-existing"),
+        ("attach-or-new", "attach-or-new-existing"),
+    ] {
+        let status = env
+            .cmd()
+            .args([
+                "start",
+                "--detach",
+                "--name",
+                target,
+                "--",
+                "sh",
+                "-lc",
+                "echo READY; sleep 5",
+            ])
+            .status()?;
+        assert!(
+            status.success(),
+            "failed to create existing target {target}"
+        );
+        let captured = env.capture_until(target, "READY")?;
+        assert!(captured.contains("READY"), "missing output: {captured}");
+
+        let started = Instant::now();
+        let output = env
+            .cmd()
+            .args([command, target, "--no-status"])
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{command} did not attach existing session promptly after stdin EOF: {output:?}"
+        );
+
+        let listed = env.cmd().args(["sessions", "--all"]).output()?;
+        assert!(listed.status.success(), "{listed:?}");
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        let rows = stdout
+            .lines()
+            .filter(|line| line.starts_with(&format!("{target}\t")))
+            .count();
+        assert_eq!(
+            rows, 1,
+            "{command} should attach existing {target} without creating duplicates:\n{stdout}"
+        );
     }
 
     Ok(())
