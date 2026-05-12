@@ -88,13 +88,13 @@ lterm -a api
 
 Compatibility names are subcommands unless shown as a leading flag: `-a` is the legacy shortcut form and must be used as `lterm -a <target>`.
 
-`lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal attach, use `lterm attach --no-status api`, or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
+`lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) shows black text on a bright-blue background; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius.
 
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
 
-If `lterm attach` panics or aborts mid-session, a process-wide hook emits a minimal recovery sequence (scroll region reset, cursor visible, alt-screen exit, SGR reset) so the user's terminal isn't left in raw mode or with hidden cursor.
+If `lterm resume` / `lterm attach` panics or aborts mid-session, a process-wide hook emits a minimal recovery sequence (scroll region reset, cursor visible, alt-screen exit, SGR reset) so the user's terminal isn't left in raw mode or with hidden cursor.
 
 Session names containing CJK characters or emoji (including ZWJ families, country flags, and combining marks) are aligned by display width using `unicode-width` and `unicode-segmentation`, so the status bar stays correctly padded across mixed-width content.
 
@@ -151,7 +151,7 @@ lterm gemini --status -- -p "keep lterm status visible"
 Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. Use `lterm run --tmux -- <command>` when you want the generic primitive directly or need to launch an unprofiled future agent.
 
 Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to `claude`, `codex`, `gemini`, `omx`, `omc`, and `agent <profile>`.
-`--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; reattach later with `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
+`--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
 Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not look like a UUID, and are limited to 128 bytes.
 Use `lterm agents` (or `lterm agents --json`) to inspect profile defaults and whether their binaries are currently available in `PATH`. JSON rows use `kind` values of `built-in`, `custom`, or `configured`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom/configured set; availability is a point-in-time PATH probe.
@@ -212,7 +212,7 @@ When `lterm tmux-compat split-window` detects cmux (via `CMUX_WORKSPACE_ID`, `CM
 
 1. Starts a new `lterm` PTY session for the worker command.
 2. Asks cmux to create a native split (`cmux new-split right/down`).
-3. Sends `lterm attach <pane>` into that split.
+3. Sends the compatibility command `lterm attach <pane>` into that split, so cmux panes still work if `LTERM_BIN` points at an older `lterm` build that predates `resume`.
 
 This gives cmux a real pane to decorate while `lterm` retains scrollback capture and `send-keys` compatibility.
 
@@ -248,7 +248,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## Security notes
 
-**Terminal output is forwarded as-is.** `lterm attach` passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
+**Terminal output is forwarded as-is.** `lterm resume` (compatibility name: `lterm attach`) passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
 **Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`) and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
 
