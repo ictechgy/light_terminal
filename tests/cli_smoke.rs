@@ -483,8 +483,8 @@ fn help_shows_common_aliases() -> TestResult {
         "ps alias was not visible in help:\n{stdout}"
     );
     assert!(
-        stdout.contains("[aliases: close]"),
-        "kill alias was not visible in help:\n{stdout}"
+        stdout.contains("[aliases: kill]"),
+        "kill compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: send]"),
@@ -749,8 +749,8 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "default: main",
             ][..],
         ),
-        ("kill", &["Session or pane target to kill"][..]),
-        ("close", &["Session or pane target to kill"][..]),
+        ("close", &["Session or pane target to close"][..]),
+        ("kill", &["Session or pane target to close"][..]),
         (
             "input",
             &[
@@ -953,7 +953,7 @@ fn attached_client_exits_when_session_kills_itself() -> TestResult {
 }
 
 #[test]
-fn close_alias_kills_session() -> TestResult {
+fn close_kills_session() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -961,7 +961,7 @@ fn close_alias_kills_session() -> TestResult {
             "new",
             "--detach",
             "--name",
-            "close-alias",
+            "close-session",
             "--",
             "sh",
             "-lc",
@@ -969,11 +969,36 @@ fn close_alias_kills_session() -> TestResult {
         ])
         .status()?;
     assert!(status.success());
-    wait_for_session_present(&env, "close-alias")?;
+    wait_for_session_present(&env, "close-session")?;
 
-    let status = env.cmd().args(["close", "close-alias"]).status()?;
+    let status = env.cmd().args(["close", "close-session"]).status()?;
     assert!(status.success());
-    wait_for_session_absent(&env, "close-alias")?;
+    wait_for_session_absent(&env, "close-session")?;
+    Ok(())
+}
+
+#[test]
+fn kill_alias_closes_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "kill-alias",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_session_present(&env, "kill-alias")?;
+
+    let status = env.cmd().args(["kill", "kill-alias"]).status()?;
+    assert!(status.success());
+    wait_for_session_absent(&env, "kill-alias")?;
     Ok(())
 }
 

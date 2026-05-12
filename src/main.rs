@@ -115,10 +115,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Kill a session or pane.
-    #[command(visible_alias = "close")]
-    Kill {
-        /// Session or pane target to kill.
+    /// Close a session or pane.
+    #[command(name = "close", visible_alias = "kill")]
+    Close {
+        /// Session or pane target to close.
         target: String,
     },
     /// Write text to a session or pane.
@@ -351,7 +351,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Kill { target } => client::kill(&target),
+        Commands::Close { target } => client::kill(&target),
         Commands::Input {
             target,
             text,
