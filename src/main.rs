@@ -108,8 +108,8 @@ enum Commands {
         children: bool,
     },
     /// Show child process trees for lterm sessions.
-    #[command(visible_alias = "processes")]
-    Ps {
+    #[command(visible_alias = "ps")]
+    Processes {
         /// Optional session or pane target to inspect.
         target: Option<String>,
         /// Print process rows as a JSON array for automation.
@@ -327,7 +327,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Ps { target, json } => {
+        Commands::Processes { target, json } => {
             let processes = client::process_tree(target.as_deref())?;
             if json {
                 println!("{}", client::json_pretty(&processes));

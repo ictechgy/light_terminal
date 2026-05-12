@@ -479,8 +479,8 @@ fn help_shows_common_aliases() -> TestResult {
         "sessions compatibility aliases were not visible in help:\n{stdout}"
     );
     assert!(
-        stdout.contains("[aliases: processes]"),
-        "ps alias was not visible in help:\n{stdout}"
+        stdout.contains("[aliases: ps]"),
+        "ps compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: kill]"),
