@@ -475,8 +475,8 @@ fn help_shows_common_aliases() -> TestResult {
         "new compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
-        stdout.contains("[aliases: ls, sessions]"),
-        "list aliases were not visible in help:\n{stdout}"
+        stdout.contains("[aliases: list, ls]"),
+        "sessions compatibility aliases were not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: processes]"),
@@ -621,22 +621,27 @@ fn help_describes_forwarded_agent_arguments() -> TestResult {
 fn help_describes_machine_readable_session_surfaces() -> TestResult {
     let env = TestEnv::new()?;
 
-    let list = env.cmd().args(["list", "--help"]).output()?;
-    assert!(list.status.success(), "{list:?}");
-    let stdout = String::from_utf8_lossy(&list.stdout);
-    let normalized = normalize_help(&stdout);
-    assert!(
-        normalized.contains("Print sessions as a JSON array for automation"),
-        "list help should describe --json output:\n{stdout}"
-    );
-    assert!(
-        normalized.contains("Include child panes created from inside another lterm session"),
-        "list help should describe --all scope:\n{stdout}"
-    );
-    assert!(
-        normalized.contains("Show only child panes created from inside another lterm session"),
-        "list help should describe --children scope:\n{stdout}"
-    );
+    for command in ["sessions", "list"] {
+        let output = env.cmd().args([command, "--help"]).output()?;
+        assert!(
+            output.status.success(),
+            "{command} --help failed: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let normalized = normalize_help(&stdout);
+        assert!(
+            normalized.contains("Print sessions as a JSON array for automation"),
+            "{command} help should describe --json output:\n{stdout}"
+        );
+        assert!(
+            normalized.contains("Include child panes created from inside another lterm session"),
+            "{command} help should describe --all scope:\n{stdout}"
+        );
+        assert!(
+            normalized.contains("Show only child panes created from inside another lterm session"),
+            "{command} help should describe --children scope:\n{stdout}"
+        );
+    }
 
     for command in ["ps", "processes"] {
         let ps = env.cmd().args([command, "--help"]).output()?;
@@ -1011,7 +1016,7 @@ fn start_and_new_short_name_list_aliases_work() -> TestResult {
             .status()?;
         assert!(status.success(), "{command} failed to create {name}");
 
-        for alias in ["ls", "sessions"] {
+        for alias in ["sessions", "list", "ls"] {
             let listed = env.cmd().arg(alias).output()?;
             assert!(listed.status.success(), "{alias} failed: {listed:?}");
             let stdout = String::from_utf8_lossy(&listed.stdout);
@@ -3544,7 +3549,7 @@ fn kill_reaps_session_process_group_children() -> TestResult {
 //
 // `lterm attach` 는 raw TTY 가 필요해 일반 subprocess 로는 띄울 수 없으므로,
 // 라이브러리 의존 없이 daemon 의 Unix socket 에 직접 JSON 프로토콜로 attach 한다.
-// 두 attach 를 다른 geometry 로 등록한 뒤 `lterm list --json` 으로 PTY rows/cols
+// 두 attach 를 다른 geometry 로 등록한 뒤 `lterm sessions --json` 으로 PTY rows/cols
 // 를 읽어 clamp 가 정확히 적용되는지, 좁은 쪽이 detach 하면 PTY 가 다시 자라는지를
 // 검증한다. 이 테스트는 client-side 가드를 우회해 server 정책 만 직접 보는 것이
 // 목적이라 내부 protocol 모듈을 import 하지 않는다 — wire-level JSON 으로 충분하다.
@@ -3630,12 +3635,12 @@ fn attach_with_geometry(
     Ok((stream, subscriber_id))
 }
 
-/// `lterm list --json` 으로 단일 세션의 (rows, cols) 를 조회한다.
+/// `lterm sessions --json` 으로 단일 세션의 (rows, cols) 를 조회한다.
 #[cfg(unix)]
 fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
-    let output = env.cmd().args(["list", "--json"]).output()?;
+    let output = env.cmd().args(["sessions", "--json"]).output()?;
     if !output.status.success() {
-        return Err(format!("lterm list --json failed: {output:?}").into());
+        return Err(format!("lterm sessions --json failed: {output:?}").into());
     }
     let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
     let session = sessions

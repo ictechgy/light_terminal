@@ -94,8 +94,8 @@ enum Commands {
         no_status: bool,
     },
     /// List sessions.
-    #[command(visible_aliases = ["ls", "sessions"])]
-    List {
+    #[command(name = "sessions", visible_aliases = ["list", "ls"])]
+    Sessions {
         /// Print sessions as a JSON array for automation.
         #[arg(long)]
         json: bool,
@@ -299,7 +299,7 @@ fn run() -> Result<()> {
             !no_status,
             AttachStdinEof::Detach,
         ),
-        Commands::List {
+        Commands::Sessions {
             json,
             all,
             children,
