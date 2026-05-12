@@ -494,6 +494,10 @@ fn help_shows_common_aliases() -> TestResult {
         stdout.contains("[aliases: capture]"),
         "capture compatibility alias was not visible in help:\n{stdout}"
     );
+    assert!(
+        stdout.contains("Compatibility: lterm -a <target> is equivalent to lterm resume <target>."),
+        "legacy -a shortcut was not discoverable in top-level help:\n{stdout}"
+    );
     Ok(())
 }
 
