@@ -2380,6 +2380,9 @@ fn capture_bytes_from_ring(ring: &VecDeque<u8>, start: Option<i32>, end: Option<
         return copy_ring_lines(ring, first, last);
     }
 
+    // Non-negative capture coordinates are absolute line indexes. Avoid the
+    // extra line-count pass here so small bounded captures can stop as soon as
+    // the requested inclusive range has been copied.
     let first = start.unwrap_or(0) as usize;
     let last = end.map(|line| line as usize);
     copy_ring_lines(ring, first, last)
@@ -2406,14 +2409,23 @@ fn copy_ring_lines(ring: &VecDeque<u8>, first: usize, last: Option<usize>) -> Ve
     let mut out = Vec::new();
     let mut line_index = 0;
     for byte in ring.iter().copied() {
-        if line_index >= first && last.is_none_or(|last| line_index <= last) {
+        // `last` is inclusive. Push the final line's terminating newline before
+        // breaking, matching tmux-style capture-pane range semantics.
+        if line_index >= first
+            && match last {
+                Some(last) => line_index <= last,
+                None => true,
+            }
+        {
             out.push(byte);
         }
         if byte == b'\n' {
-            if last.is_some_and(|last| line_index >= last) {
-                break;
-            }
             line_index += 1;
+            if let Some(last) = last {
+                if line_index > last {
+                    break;
+                }
+            }
         }
     }
     out
@@ -3080,6 +3092,26 @@ mod tests {
         assert_eq!(
             super::capture_bytes_from_ring(&ring, None, Some(-2)),
             b"KEEP1\nKEEP2\n".to_vec()
+        );
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, Some(0), Some(0)),
+            b"KEEP1\n".to_vec()
+        );
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, Some(2), Some(2)),
+            b"TAIL".to_vec()
+        );
+        assert!(
+            super::capture_bytes_from_ring(&ring, Some(9), None).is_empty(),
+            "positive start beyond scrollback should capture no lines"
+        );
+        assert!(
+            super::capture_bytes_from_ring(&ring, Some(-1), Some(-2)).is_empty(),
+            "negative end before start should capture no lines"
+        );
+        assert!(
+            super::capture_bytes_from_ring(&VecDeque::new(), Some(0), Some(0)).is_empty(),
+            "empty scrollback should capture no lines"
         );
     }
 
