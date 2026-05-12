@@ -64,10 +64,12 @@ lterm new -n api -- npm run dev
 
 ```bash
 lterm new -d -n api -- npm run dev
-lterm attach api
+lterm resume api
 
-# 짧은 alias도 지원합니다. `-a`는 `lterm` 바로 뒤에 쓰고, target과는 공백으로 구분하세요.
+# 호환 이름도 계속 사용할 수 있습니다.
+lterm attach api
 lterm a api
+# `-a`는 `lterm` 바로 뒤에 쓰고, target과는 공백으로 구분하세요.
 lterm -a api
 ```
 
