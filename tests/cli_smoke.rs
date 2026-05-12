@@ -4403,6 +4403,49 @@ fn pty_size_clamps_to_smallest_attached_client_and_recovers_on_detach() -> TestR
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn attach_preserves_input_buffered_with_request_header() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "attach-tail",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY_TAIL; read line; echo GOT_TAIL:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+    env.capture_until("attach-tail", "READY_TAIL")?;
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "attach",
+        "target": "attach-tail",
+        "rows": 24,
+        "cols": 80,
+    });
+    let mut frame = serde_json::to_vec(&request)?;
+    frame.push(b'\n');
+    frame.extend_from_slice(b"BUFFERED_INPUT\n");
+    stream.write_all(&frame)?;
+
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(response.get("ok").and_then(|v| v.as_bool()), Some(true));
+    let captured = env.capture_until("attach-tail", "GOT_TAIL:BUFFERED_INPUT")?;
+    assert!(captured.contains("GOT_TAIL:BUFFERED_INPUT"), "{captured}");
+    drop(stream);
+    Ok(())
+}
+
 /// stale subscriber id 를 실어 보낸 Resize 는 silent no-op 이 아니라 명시적
 /// 에러로 surface 되어야 한다. 그렇지 않으면 client-side race 가 보이지 않는
 /// 채로 PTY 사이즈가 영원히 어긋난 상태로 남을 수 있다.
