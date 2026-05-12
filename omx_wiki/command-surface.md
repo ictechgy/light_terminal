@@ -12,6 +12,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Task | Preferred command | Compatibility names |
 | --- | --- | --- |
 | Start a persistent process | `lterm start -n api -- npm run dev` | `new` |
+| Run a command with tmux compatibility enabled | `lterm run -- codex exec "summarize"` | none (`--no-tmux` opts out) |
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
@@ -48,6 +49,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - `env` export values are POSIX shell tokens produced by `shlex` quoting when metacharacters require it; the visual quote style is not a stable API.
 - `env` prepends the shim directory to the caller's existing `$PATH` rather than replacing it.
 - `ssh` raw attach can expose local terminal features including OSC 52 clipboard, OSC 8 hyperlinks, title changes, cursor/screen manipulation, bracketed paste toggles, and emulator-specific escapes.
+- `run` is the generic product command for an unprofiled tmux-compatible session; it enables the shim by default, hides the legacy no-op `--tmux` flag from help, and uses `--no-tmux` as the visible opt-out.
 - Remote `lterm ssh` currently keeps its wire command on compatibility spelling where needed so newer local clients can talk to older remote installs.
 - cmux split handoff intentionally sends compatibility `lterm attach <pane>` so stale `LTERM_BIN` builds that predate `resume` still work.
 

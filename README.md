@@ -78,6 +78,7 @@ lterm -a api
 | Task | General command | Compatibility names |
 | --- | --- | --- |
 | Start a persistent process | `lterm start -n api -- npm run dev` | `new` |
+| Run a command with tmux compatibility enabled | `lterm run -- codex exec "summarize"` | None (`--no-tmux` opts out) |
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
@@ -195,7 +196,7 @@ lterm codex --detach --name repo-codex -- exec "summarize this repo"
 lterm gemini --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. Use `lterm run --tmux -- <command>` when you want the generic primitive directly or need to launch an unprofiled future agent.
+Known Claude/Codex/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. Use `lterm run -- <command>` when you want the generic tmux-compatible primitive directly or need to launch an unprofiled future agent; `run` enables the shim by default and `--no-tmux` opts out.
 
 Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to `claude`, `codex`, `gemini`, `omx`, `omc`, and `agent <profile>`.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
@@ -235,9 +236,9 @@ lterm omc --madmax
 **Run any command with tmux compatibility enabled:**
 
 ```bash
-lterm run --tmux -- omx hud --tmux
-lterm run --tmux -- claude
-lterm run --tmux -- codex exec "summarize the repository"
+lterm run -- omx hud --tmux
+lterm run -- claude
+lterm run -- codex exec "summarize the repository"
 ```
 
 Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. This is a compatibility layer, not a second spelling of every `lterm` product command. The shim implements the command subset most AI orchestration scripts rely on:
