@@ -83,22 +83,26 @@ CJK 문자나 이모지(ZWJ family, 국기, 결합 문자 포함)가 들어간 �
 
 child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard protocol을 켜면, lterm은 이를 추적했다가 attach 종료 시 terminal keyboard mode를 best-effort로 복원합니다. 그래서 child가 비정상 종료된 뒤 shell 입력이 `1;1:3u` 같은 escape 조각으로 보이는 상황을 줄입니다.
 
-**세션 확인 및 입력 전송:**
+**세션 확인 및 제어:**
 
 ```bash
-lterm ls
-lterm ls --children
-lterm ls --all
+lterm sessions
+lterm sessions --children
+lterm sessions --all
 lterm ps api
-lterm capture api -S=-80
-lterm send api 'echo hello' --enter
+lterm logs api -S=-80
+lterm input api 'echo hello' --enter
 ```
+
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 스크립트와 기존 사용 습관을 위해 tmux 호환 이름도 계속 사용할 수 있습니다: `list` / `ls`, `capture`, `send`.
 
 **세션 종료:**
 
 ```bash
-lterm kill api
+lterm close api
 ```
+
+`close`는 `kill`의 visible alias입니다. 같은 session/pane 종료 경로를 사용하며, command help에서는 의도적으로 target을 kill한다고 설명합니다.
 
 ## AI 워크플로
 
