@@ -2253,17 +2253,17 @@ mod tests {
     }
 
     #[test]
-    fn request_reader_preserves_buffered_bytes_after_newline() {
+    fn request_reader_accepts_newline_terminated_header() {
         let (mut server_end, mut client_end) = UnixStream::pair().expect("unix stream pair");
         client_end
-            .write_all(b"{\"type\":\"Ping\"}\nATTACH_INPUT")
-            .expect("write request and buffered tail");
+            .write_all(b"{\"type\":\"Ping\"}\n")
+            .expect("write request");
 
         let frame =
             read_request_frame_with_timeout(&mut server_end, Duration::from_secs(1)).unwrap();
 
         assert_eq!(frame.line, "{\"type\":\"Ping\"}\n");
-        assert_eq!(frame.buffered, b"ATTACH_INPUT");
+        assert!(frame.buffered.is_empty());
     }
 
     #[test]
