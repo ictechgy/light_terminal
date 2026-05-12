@@ -46,6 +46,7 @@ const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 type OutputChunk = Arc<[u8]>;
+type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
 
 /// attach 클라이언트 한 명의 lifecycle 단위.
 ///
@@ -193,6 +194,8 @@ struct Session {
     terminal_normal_screen: Mutex<vt100::Screen>,
     subscribers: Mutex<Vec<Subscriber>>,
     output_state: Mutex<()>,
+    #[cfg(test)]
+    backpressure_hook: Mutex<Option<BackpressureHook>>,
     /// Serializes live chunk enqueue order. `append_output` takes this before
     /// `output_state`, so later appenders wait outside the snapshot/resize
     /// state mutex while an earlier chunk is in the subscriber backpressure
@@ -212,7 +215,7 @@ struct Session {
     ///
     /// 락 순서: `geometry_apply > subscribers`,
     /// `geometry_apply > output_state > master/terminal_screen`,
-    /// `append_output: broadcast_order > output_state`. 즉 geometry
+    /// `append_output: broadcast_order > output_state > subscribers`. 즉 geometry
     /// 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야 하며,
     /// PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
     geometry_apply: Mutex<()>,
@@ -289,10 +292,24 @@ impl Session {
             }
             (subscribers, Arc::from(bytes))
         };
-        let disconnected = broadcast_chunk(&subscribers, chunk, BACKPRESSURE_SEND_TIMEOUT);
+        #[cfg(test)]
+        let backpressure_hook = lock(&self.backpressure_hook).clone();
+        #[cfg(not(test))]
+        let backpressure_hook: Option<BackpressureHook> = None;
+        let disconnected = broadcast_chunk(
+            &subscribers,
+            chunk,
+            BACKPRESSURE_SEND_TIMEOUT,
+            backpressure_hook.as_deref(),
+        );
         let shutdowns = if disconnected.is_empty() {
             Vec::new()
         } else {
+            // The slow retry window above intentionally runs without
+            // `output_state`, but the actual subscriber mutation must still
+            // serialize with attach/resize clamp paths that compute geometry
+            // from the current subscriber set under the same state mutex.
+            let _output_guard = lock(&self.output_state);
             // RC-2b: backpressure로 sub를 evict할 때 attach UnixStream 도 같이 닫아
             // input loop를 EOF로 깨운다. 그렇지 않으면 output 만 끊기고 input은
             // 살아있는 zombie attach 가 만들어져 사용자가 frozen으로 인지하는 동안
@@ -895,14 +912,24 @@ fn screen_state_snapshot(
 /// 최악 시 본 함수의 wall time 은 K (pending sub 수) 와 무관하게 `timeout` 이다 —
 /// 정상 sub 들은 pass 1 에서 이미 chunk 를 받았으므로 pass 2 가 길어져도 그들의
 /// 전달은 영향이 없다.
-fn broadcast_chunk(subscribers: &[Subscriber], chunk: OutputChunk, timeout: Duration) -> Vec<u64> {
+fn broadcast_chunk(
+    subscribers: &[Subscriber],
+    chunk: OutputChunk,
+    timeout: Duration,
+    on_backpressure: Option<&(dyn Fn() + Send + Sync)>,
+) -> Vec<u64> {
     let mut disconnected: Vec<u64> = Vec::new();
     let mut pending: Vec<usize> = Vec::new();
     // Pass 1: 모든 sub 에 즉시 try_send. Full 이면 pending 에 보류.
     for (idx, sub) in subscribers.iter().enumerate() {
         match sub.tx.try_send(Arc::clone(&chunk)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => pending.push(idx),
+            Err(TrySendError::Full(_)) => {
+                if let Some(hook) = on_backpressure {
+                    hook();
+                }
+                pending.push(idx);
+            }
             Err(TrySendError::Disconnected(_)) => disconnected.push(sub.id),
         }
     }
@@ -917,7 +944,12 @@ fn broadcast_chunk(subscribers: &[Subscriber], chunk: OutputChunk, timeout: Dura
                     disconnected.push(sub.id);
                     false
                 }
-                Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Full(_)) => {
+                    if let Some(hook) = on_backpressure {
+                        hook();
+                    }
+                    true
+                }
             }
         });
         if !pending.is_empty() {
@@ -1423,6 +1455,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
         subscribers: Mutex::new(Vec::new()),
         output_state: Mutex::new(()),
+        #[cfg(test)]
+        backpressure_hook: Mutex::new(None),
         broadcast_order: Mutex::new(()),
         geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
@@ -2959,6 +2993,7 @@ mod tests {
             terminal_normal_screen: Mutex::new(vt100::Parser::new(24, 80, 0).screen().clone()),
             subscribers: Mutex::new(Vec::new()),
             output_state: Mutex::new(()),
+            backpressure_hook: Mutex::new(None),
             broadcast_order: Mutex::new(()),
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
@@ -3531,51 +3566,47 @@ mod tests {
             cols: 80,
         });
 
-        let done = Arc::new(AtomicBool::new(false));
-        let done_for_thread = Arc::clone(&done);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_for_hook = Arc::clone(&release);
+        let first_backpressure = Arc::new(AtomicBool::new(true));
+        let first_backpressure_for_hook = Arc::clone(&first_backpressure);
+        *super::lock(&session.backpressure_hook) = Some(Arc::new(move || {
+            if first_backpressure_for_hook.swap(false, Ordering::SeqCst) {
+                entered_tx
+                    .send(())
+                    .expect("signal first backpressure entry");
+                let (release_lock, release_cvar) = &*release_for_hook;
+                let released = release_lock.lock().expect("release lock");
+                let (released, _) = release_cvar
+                    .wait_timeout_while(released, Duration::from_secs(1), |released| !*released)
+                    .expect("release wait");
+                assert!(*released, "wait for test release");
+            }
+        }));
+
         let session_for_thread = Arc::clone(&session);
         let append_thread = std::thread::spawn(move || {
             session_for_thread.append_output(b"blocked");
-            done_for_thread.store(true, Ordering::SeqCst);
         });
 
-        let ring_deadline = Instant::now() + Duration::from_secs(1);
-        let mut observed_ring_update = false;
-        while Instant::now() < ring_deadline {
-            let ring_contains_output = {
-                let ring = super::lock(&session.ring);
-                ring.iter().any(|byte| *byte == b'b')
-            };
-            if ring_contains_output {
-                observed_ring_update = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("append should enter broadcast backpressure");
+        let guard = session
+            .output_state
+            .try_lock()
+            .expect("output_state should be available during backpressure wait");
+        drop(guard);
+        {
+            let (release_lock, release_cvar) = &*release;
+            *release_lock.lock().expect("release lock") = true;
+            release_cvar.notify_one();
         }
-        assert!(
-            observed_ring_update,
-            "append_output should update the ring before entering the backpressure wait"
-        );
-        assert!(
-            !done.load(Ordering::SeqCst),
-            "test setup should leave append_output waiting on the full subscriber queue"
-        );
-
-        let unlock_deadline = Instant::now() + BACKPRESSURE_SEND_TIMEOUT / 2;
-        let mut observed_unlocked = false;
-        while Instant::now() < unlock_deadline && !done.load(Ordering::SeqCst) {
-            if let Ok(guard) = session.output_state.try_lock() {
-                observed_unlocked = true;
-                drop(guard);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
         append_thread.join().expect("append thread");
         assert!(
-            observed_unlocked,
-            "output_state should be available while broadcast_order handles subscriber backpressure"
+            !first_backpressure.load(Ordering::SeqCst),
+            "one-shot hook should have observed the backpressure wait"
         );
     }
 
@@ -3594,28 +3625,33 @@ mod tests {
             cols: 80,
         });
 
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_for_hook = Arc::clone(&release);
+        let first_backpressure = Arc::new(AtomicBool::new(true));
+        let first_backpressure_for_hook = Arc::clone(&first_backpressure);
+        *super::lock(&session.backpressure_hook) = Some(Arc::new(move || {
+            if first_backpressure_for_hook.swap(false, Ordering::SeqCst) {
+                entered_tx
+                    .send(())
+                    .expect("signal first backpressure entry");
+                let (release_lock, release_cvar) = &*release_for_hook;
+                let released = release_lock.lock().expect("release lock");
+                let (released, _) = release_cvar
+                    .wait_timeout_while(released, Duration::from_secs(1), |released| !*released)
+                    .expect("release wait");
+                assert!(*released, "wait for test release");
+            }
+        }));
+
         let session_for_first = Arc::clone(&session);
         let first_thread = std::thread::spawn(move || {
             session_for_first.append_output(b"first");
         });
 
-        let ring_deadline = Instant::now() + Duration::from_secs(1);
-        let mut observed_first_update = false;
-        while Instant::now() < ring_deadline {
-            let ring_contains_output = {
-                let ring = super::lock(&session.ring);
-                ring.iter().any(|byte| *byte == b'f')
-            };
-            if ring_contains_output {
-                observed_first_update = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            observed_first_update,
-            "first append should update state before waiting on the full subscriber queue"
-        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first append should enter broadcast backpressure");
 
         let session_for_second = Arc::clone(&session);
         let second_thread = std::thread::spawn(move || {
@@ -3626,6 +3662,11 @@ mod tests {
             &*rx.recv_timeout(Duration::from_secs(1)).expect("seed chunk"),
             b"seed"
         );
+        {
+            let (release_lock, release_cvar) = &*release;
+            *release_lock.lock().expect("release lock") = true;
+            release_cvar.notify_one();
+        }
         assert_eq!(
             &*rx.recv_timeout(Duration::from_secs(1))
                 .expect("first chunk"),
@@ -3885,7 +3926,7 @@ mod tests {
 
         let chunk: OutputChunk = Arc::from(&b"hello"[..]);
         let started = Instant::now();
-        let disconnected = broadcast_chunk(&subs, chunk, Duration::from_millis(50));
+        let disconnected = broadcast_chunk(&subs, chunk, Duration::from_millis(50), None);
         let elapsed = started.elapsed();
 
         // sub#1 은 timeout 끝까지 돌고 evict.
