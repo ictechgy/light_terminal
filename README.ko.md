@@ -88,13 +88,13 @@ lterm -a api
 
 호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
 
-`lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 사용하려면 `lterm attach --no-status api`를 쓰거나, 상태줄 처리가 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0`을 설정하세요.
+`lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 재개하려면 `lterm resume --no-status api`(호환 이름: `lterm attach --no-status api`)를 쓰거나, 상태줄 처리가 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0`을 설정하세요.
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 검정 글자 + bright-blue 배경, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄입니다.
 
 attach된 PTY가 alternate screen buffer로 진입하면(예: `vim`, `less`, `htop`이 `\x1b[?1049h` 사용) lterm은 status bar를 일시 중단해 alt-screen 앱의 UI와 충돌을 피합니다. 앱이 alt-screen을 종료하는 즉시 status bar가 다시 그려집니다.
 
-`lterm attach` 도중 panic 이나 abort 가 발생해도 process-wide hook 이 최소 복구 sequence (scroll region 리셋, 커서 보이기, alt-screen 종료, SGR 리셋) 를 emit 해 사용자 터미널이 raw mode 나 hidden cursor 상태로 남지 않습니다.
+`lterm resume` / `lterm attach` 도중 panic 이나 abort 가 발생해도 process-wide hook 이 최소 복구 sequence (scroll region 리셋, 커서 보이기, alt-screen 종료, SGR 리셋) 를 emit 해 사용자 터미널이 raw mode 나 hidden cursor 상태로 남지 않습니다.
 
 CJK 문자나 이모지(ZWJ family, 국기, 결합 문자 포함)가 들어간 세션 이름은 `unicode-width` / `unicode-segmentation` 으로 디스플레이 폭을 계산해 정렬되므로 wide character가 섞여도 status bar 패딩이 어긋나지 않습니다.
 
@@ -151,7 +151,7 @@ lterm gemini --status -- -p "lterm status를 유지해줘"
 Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. 직접 generic primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run --tmux -- <command>`를 사용하세요.
 
 launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`)입니다. 이 옵션들은 `claude`, `codex`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다.
-`--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
+`--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
 명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
 이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
 `lterm agents` 또는 `lterm agents --json`으로 profile 기본값과 현재 `PATH`에서 binary를 찾을 수 있는지 확인할 수 있습니다. JSON row의 `kind` 값은 `built-in`, `custom`, `configured` 중 하나입니다. `lterm agents codex my-agent --json`처럼 profile 이름을 넘기면 선택한 built-in/custom/configured profile만 확인합니다. availability는 실행 시점의 PATH probe입니다.
@@ -212,7 +212,7 @@ tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니�
 
 1. worker 명령을 위한 새 `lterm` PTY 세션을 시작합니다.
 2. cmux에 native split 생성을 요청합니다 (`cmux new-split right/down`).
-3. 생성된 split에 `lterm attach <pane>`을 보냅니다.
+3. `LTERM_BIN`이 `resume`을 모르는 구버전 `lterm`을 가리켜도 cmux pane이 계속 동작하도록, 생성된 split에는 호환 명령인 `lterm attach <pane>`을 보냅니다.
 
 이렇게 하면 실제 pane은 cmux가 그리고, scrollback capture와 `send-keys` 호환은 `lterm`이 유지합니다.
 
@@ -248,7 +248,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## 보안 메모
 
-**터미널 출력은 그대로 전달됩니다.** `lterm attach`는 full-screen 터미널 프로그램과 cmux/OSC 알림이 정상 동작하도록 PTY byte를 그대로 통과시킵니다. 로컬 상태 바는 클라이언트 쪽 표시 요소일 뿐이며, 완전한 raw 모드 터미널이 필요하면 `--no-status`를 사용하세요. 신뢰할 수 없는 child 프로그램은 tmux/screen에서와 마찬가지로 attach된 터미널에 escape sequence를 출력할 수 있습니다. **`lterm`을 escape-sequence sanitizer나 sandbox로 사용하지 마세요.**
+**터미널 출력은 그대로 전달됩니다.** `lterm resume`(호환 이름: `lterm attach`)은 full-screen 터미널 프로그램과 cmux/OSC 알림이 정상 동작하도록 PTY byte를 그대로 통과시킵니다. 로컬 상태 바는 클라이언트 쪽 표시 요소일 뿐이며, 완전한 raw 모드 터미널이 필요하면 `--no-status`를 사용하세요. 신뢰할 수 없는 child 프로그램은 tmux/screen에서와 마찬가지로 attach된 터미널에 escape sequence를 출력할 수 있습니다. **`lterm`을 escape-sequence sanitizer나 sandbox로 사용하지 마세요.**
 
 **Capture 출력은 사람/AI가 읽기 쉽도록 정제됩니다.** `lterm logs`(호환 이름: `lterm capture`)와 `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다.
 

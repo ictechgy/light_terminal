@@ -73,10 +73,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
-    /// Attach to a persistent session or pane.
-    #[command(visible_aliases = ["a", "resume"])]
-    Attach {
-        /// Session or pane target to attach.
+    /// Resume a persistent session or pane.
+    #[command(name = "resume", visible_aliases = ["attach", "a"])]
+    Resume {
+        /// Session or pane target to resume.
         #[arg(default_value = "%0")]
         target: String,
         /// Disable the blue lterm status bar while attached.
@@ -291,7 +291,7 @@ fn run() -> Result<()> {
             let info = client::new_session(name, Some(command), cwd, HashMap::new(), tmux)?;
             client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
         }
-        Commands::Attach { target, no_status } => {
+        Commands::Resume { target, no_status } => {
             client::attach(&target, !no_status, AttachStdinEof::Detach)
         }
         Commands::AttachOrNew { target, no_status } => client::attach(
@@ -422,10 +422,10 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut argv: Vec<_> = args.into_iter().collect();
-    // `-a` is a thin, pre-clap shortcut for `attach`. Keep it exact and in
-    // argv[1] only so later attach parsing remains the single source of truth.
+    // `-a` is a thin, pre-clap shortcut for `resume`. Keep it exact and in
+    // argv[1] only so later resume parsing remains the single source of truth.
     if argv.get(1).is_some_and(|arg| arg == "-a") {
-        argv[1] = OsString::from("attach");
+        argv[1] = OsString::from("resume");
     }
     argv
 }
@@ -1094,7 +1094,7 @@ mod tests {
     fn expand_attach_short_flag_rewrites_only_first_exact_dash_a() {
         assert_eq!(
             expand_attach_short_flag(os_args(&["lterm", "-a", "api"])),
-            os_args(&["lterm", "attach", "api"])
+            os_args(&["lterm", "resume", "api"])
         );
         assert_eq!(
             expand_attach_short_flag(os_args(&["lterm", "a", "api"])),

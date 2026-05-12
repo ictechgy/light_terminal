@@ -463,8 +463,8 @@ fn help_shows_common_aliases() -> TestResult {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[aliases: a, resume]"),
-        "attach aliases were not visible in help:\n{stdout}"
+        stdout.contains("[aliases: attach, a]"),
+        "resume compatibility aliases were not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: attach-or-new]"),
@@ -720,17 +720,17 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
 
     for (command, expected) in [
         (
-            "attach",
+            "resume",
             &[
-                "Session or pane target to attach",
+                "Session or pane target to resume",
                 "default: %0",
                 "Disable the blue lterm status bar while attached",
             ][..],
         ),
         (
-            "resume",
+            "attach",
             &[
-                "Session or pane target to attach",
+                "Session or pane target to resume",
                 "default: %0",
                 "Disable the blue lterm status bar while attached",
             ][..],
@@ -815,7 +815,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         }
 
         let unexpected_defaults = match command {
-            "attach" => &["defaults to %0"][..],
+            "resume" | "attach" => &["defaults to %0"][..],
             "open" | "attach-or-new" | "ssh" => &["defaults to main"][..],
             _ => &[][..],
         };
