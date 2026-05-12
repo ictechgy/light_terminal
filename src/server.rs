@@ -335,26 +335,10 @@ impl Session {
 
     fn capture_bytes(&self, start: Option<i32>, end: Option<i32>) -> Vec<u8> {
         let ring = lock(&self.ring);
-        let bytes: Vec<u8> = ring.iter().copied().collect();
         if start.is_none() && end.is_none() {
-            return bytes;
+            return ring.iter().copied().collect();
         }
-        let spans = line_spans(&bytes);
-        if spans.is_empty() {
-            return bytes;
-        }
-        let first = capture_line_index(start.unwrap_or(0), spans.len());
-        if first >= spans.len() {
-            return Vec::new();
-        }
-        let Some(end) = end else {
-            return bytes[spans[first].0..].to_vec();
-        };
-        let last = capture_end_line_index(end, spans.len());
-        if last < first {
-            return Vec::new();
-        }
-        bytes[spans[first].0..spans[last].1].to_vec()
+        capture_bytes_from_ring(&ring, start, end)
     }
 
     /// 새 attach client 를 등록한다. 초기 geometry (`rows`, `cols`) 는 attach 요청에
@@ -2382,22 +2366,57 @@ fn now_unix_ms() -> u128 {
         })
 }
 
-fn line_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
-    if bytes.is_empty() {
+fn capture_bytes_from_ring(ring: &VecDeque<u8>, start: Option<i32>, end: Option<i32>) -> Vec<u8> {
+    if ring.is_empty() {
         return Vec::new();
     }
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            spans.push((start, idx + 1));
-            start = idx + 1;
+    if start.is_some_and(|line| line < 0) || end.is_some_and(|line| line < 0) {
+        let line_count = ring_line_count(ring);
+        let first = capture_line_index(start.unwrap_or(0), line_count);
+        if first >= line_count {
+            return Vec::new();
+        }
+        let last = end.map(|line| capture_end_line_index(line, line_count));
+        return copy_ring_lines(ring, first, last);
+    }
+
+    let first = start.unwrap_or(0) as usize;
+    let last = end.map(|line| line as usize);
+    copy_ring_lines(ring, first, last)
+}
+
+fn ring_line_count(ring: &VecDeque<u8>) -> usize {
+    if ring.is_empty() {
+        return 0;
+    }
+    let newline_count = ring.iter().filter(|byte| **byte == b'\n').count();
+    if ring.back() == Some(&b'\n') {
+        newline_count
+    } else {
+        newline_count + 1
+    }
+}
+
+fn copy_ring_lines(ring: &VecDeque<u8>, first: usize, last: Option<usize>) -> Vec<u8> {
+    if let Some(last) = last {
+        if last < first {
+            return Vec::new();
         }
     }
-    if start < bytes.len() {
-        spans.push((start, bytes.len()));
+    let mut out = Vec::new();
+    let mut line_index = 0;
+    for byte in ring.iter().copied() {
+        if line_index >= first && last.is_none_or(|last| line_index <= last) {
+            out.push(byte);
+        }
+        if byte == b'\n' {
+            if last.is_some_and(|last| line_index >= last) {
+                break;
+            }
+            line_index += 1;
+        }
     }
-    spans
+    out
 }
 
 fn capture_line_index(line: i32, line_count: usize) -> usize {
@@ -3034,6 +3053,33 @@ mod tests {
         assert!(
             session.capture_bytes(Some(2), Some(1)).is_empty(),
             "end before start should capture no lines"
+        );
+    }
+
+    #[test]
+    fn capture_bytes_handles_wrapped_ring_ranges() {
+        let mut ring = VecDeque::with_capacity(16);
+        ring.extend(b"DROP\nKEEP1\n");
+        for _ in 0..5 {
+            assert!(ring.pop_front().is_some());
+        }
+        ring.extend(b"KEEP2\nTAIL");
+        assert!(
+            !ring.as_slices().1.is_empty(),
+            "test setup should force VecDeque wraparound"
+        );
+
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, Some(1), Some(1)),
+            b"KEEP2\n".to_vec()
+        );
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, Some(-1), None),
+            b"TAIL".to_vec()
+        );
+        assert_eq!(
+            super::capture_bytes_from_ring(&ring, None, Some(-2)),
+            b"KEEP1\nKEEP2\n".to_vec()
         );
     }
 
