@@ -7,13 +7,14 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -210,7 +211,26 @@ struct Session {
     /// PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
     geometry_apply: Mutex<()>,
     next_subscriber_id: AtomicU64,
+    /// Whether the leader process is still considered live for user-visible
+    /// session state and attach input loops.
     alive: AtomicBool,
+    /// One-shot finalizer gate shared by the leader waiter and explicit
+    /// kill/shutdown paths. `alive` can become false before teardown finishes,
+    /// so cleanup needs its own idempotence and completion state.
+    cleanup_started: AtomicBool,
+    cleanup_completion: (Mutex<bool>, Condvar),
+    cleanup_complete: AtomicBool,
+    /// Set after `waitid(..., WNOWAIT)` observes leader exit but before the
+    /// waiter reaps it. During this window the stored pgid is still anchored by
+    /// the unreaped leader pid and cannot be reused by an unrelated process.
+    leader_exit_observed: AtomicBool,
+    /// Set immediately after the leader wait returns. A concurrent explicit
+    /// kill must not rely on the reaped leader pid to verify the process group.
+    leader_reaped: AtomicBool,
+    /// One-shot gate for the unreaped-leader residual process-group cleanup.
+    /// Both explicit terminate and the waiter can discover the same unreaped
+    /// leader; only one should send the short residual signal ladder.
+    unreaped_cleanup_started: AtomicBool,
     exit_code: AtomicI32,
     rows: Mutex<u16>,
     cols: Mutex<u16>,
@@ -1396,6 +1416,12 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
+        cleanup_started: AtomicBool::new(false),
+        cleanup_completion: (Mutex::new(false), Condvar::new()),
+        cleanup_complete: AtomicBool::new(false),
+        leader_exit_observed: AtomicBool::new(false),
+        leader_reaped: AtomicBool::new(false),
+        unreaped_cleanup_started: AtomicBool::new(false),
         exit_code: AtomicI32::new(i32::MIN),
         rows: Mutex::new(rows),
         cols: Mutex::new(cols),
@@ -1429,20 +1455,32 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let state_for_waiter = Arc::clone(state);
     let session_for_waiter = Arc::clone(&session);
     thread::spawn(move || {
-        let exit_code = match lock(&session_for_waiter.child).wait() {
-            Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
-            Err(err) => {
-                eprintln!("wait error for {}: {err}", session_for_waiter.name);
-                1
+        let leader_exit_observed = wait_for_leader_exit_without_reaping(&session_for_waiter);
+        let exit_code = {
+            let mut child = lock(&session_for_waiter.child);
+            if leader_exit_observed {
+                terminate_unreaped_process_group(&session_for_waiter);
             }
+            let exit_code = match child.wait() {
+                Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
+                Err(err) => {
+                    eprintln!("wait error for {}: {err}", session_for_waiter.name);
+                    1
+                }
+            };
+            session_for_waiter
+                .leader_reaped
+                .store(true, Ordering::SeqCst);
+            exit_code
         };
         session_for_waiter
             .exit_code
             .store(exit_code, Ordering::SeqCst);
-        session_for_waiter.alive.store(false, Ordering::SeqCst);
-        session_for_waiter.close_subscribers();
-        terminate_child_sessions(&state_for_waiter, &session_for_waiter.id);
-        remove_session(&state_for_waiter, &session_for_waiter);
+        finalize_session(
+            &state_for_waiter,
+            &session_for_waiter,
+            SessionFinalizeReason::LeaderExited,
+        );
     });
 
     Ok(session)
@@ -1818,23 +1856,215 @@ fn verified_process_group_id(
     None
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SessionFinalizeReason {
+    LeaderExited,
+    TerminateRequested,
+}
+
 fn terminate_session(state: &Arc<State>, session: &Session) {
-    if !session.alive.swap(false, Ordering::SeqCst) {
-        session.close_subscribers();
-        terminate_child_sessions(state, &session.id);
-        remove_session(state, session);
+    finalize_session(state, session, SessionFinalizeReason::TerminateRequested);
+}
+
+fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
+    session.alive.store(false, Ordering::SeqCst);
+    if session.cleanup_started.swap(true, Ordering::SeqCst) {
+        wait_for_cleanup_complete(session);
         return;
+    }
+
+    let mut completion_guard = CleanupCompletionGuard::new(session);
+    if matches!(reason, SessionFinalizeReason::TerminateRequested) {
+        terminate_process_group_for_request(session);
     }
     session.close_subscribers();
     terminate_child_sessions(state, &session.id);
-    signal_process_group(session, libc::SIGHUP);
-    wait_for_process_group_exit(session, Duration::from_millis(150));
-    signal_process_group(session, libc::SIGTERM);
-    wait_for_process_group_exit(session, Duration::from_millis(350));
-    signal_process_group(session, libc::SIGKILL);
-    wait_for_process_group_exit(session, Duration::from_millis(150));
-    session.close_subscribers();
     remove_session(state, session);
+    mark_cleanup_complete(session);
+    completion_guard.disarm();
+}
+
+struct CleanupCompletionGuard<'a> {
+    session: &'a Session,
+    armed: bool,
+}
+
+impl<'a> CleanupCompletionGuard<'a> {
+    fn new(session: &'a Session) -> Self {
+        Self {
+            session,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CleanupCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && !self.session.cleanup_complete.load(Ordering::SeqCst) {
+            eprintln!(
+                "session cleanup for {} unwound before normal completion; releasing waiters",
+                self.session.name
+            );
+            mark_cleanup_complete(self.session);
+        }
+    }
+}
+
+fn mark_cleanup_complete(session: &Session) {
+    session.cleanup_complete.store(true, Ordering::SeqCst);
+    let (complete, changed) = &session.cleanup_completion;
+    *lock(complete) = true;
+    changed.notify_all();
+}
+
+fn wait_for_cleanup_complete(session: &Session) {
+    if session.cleanup_complete.load(Ordering::SeqCst) {
+        return;
+    }
+    let (complete, changed) = &session.cleanup_completion;
+    let mut complete = lock(complete);
+    while !*complete {
+        complete = match changed.wait(complete) {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("recovering poisoned cleanup completion mutex");
+                poisoned.into_inner()
+            }
+        };
+    }
+}
+
+fn terminate_process_group_for_request(session: &Session) {
+    // Hold the child lock while signaling so the waiter cannot reap the leader
+    // and release the pgid anchor between an unreaped-pgid check and `kill`.
+    let _reap_guard = lock(&session.child);
+    if session.leader_reaped.load(Ordering::SeqCst) {
+        return;
+    }
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        terminate_unreaped_process_group(session);
+        return;
+    }
+    terminate_verified_process_group_for_request(session);
+    if wait_for_leader_exit_observed(session, Duration::from_millis(50))
+        && !session.leader_reaped.load(Ordering::SeqCst)
+    {
+        terminate_unreaped_process_group(session);
+    }
+}
+
+fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
+    let Some(pid) = session
+        .process_id
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+    else {
+        return false;
+    };
+
+    loop {
+        let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            session.leader_exit_observed.store(true, Ordering::SeqCst);
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        eprintln!(
+            "failed to observe leader exit before reap for {}: {}",
+            session.name, err
+        );
+        return false;
+    }
+}
+
+fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    session.leader_exit_observed.load(Ordering::SeqCst)
+}
+
+fn terminate_verified_process_group_for_request(session: &Session) {
+    signal_process_group(session, libc::SIGHUP);
+    match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)) {
+        ProcessGroupWait::LeaderObserved => {
+            terminate_unreaped_process_group(session);
+            return;
+        }
+        ProcessGroupWait::Exited => return,
+        ProcessGroupWait::TimedOut => {}
+    }
+    signal_process_group(session, libc::SIGTERM);
+    match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(350)) {
+        ProcessGroupWait::LeaderObserved => {
+            terminate_unreaped_process_group(session);
+            return;
+        }
+        ProcessGroupWait::Exited => return,
+        ProcessGroupWait::TimedOut => {}
+    }
+    signal_process_group(session, libc::SIGKILL);
+    if matches!(
+        wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)),
+        ProcessGroupWait::LeaderObserved
+    ) {
+        terminate_unreaped_process_group(session);
+    }
+}
+
+fn terminate_unreaped_process_group(session: &Session) {
+    if session
+        .unreaped_cleanup_started
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    // `waitid(..., WNOWAIT)` has observed leader exit, but `child.wait()` has
+    // not reaped it yet. The stored pgid is safe only in this narrow window:
+    // the zombie leader still anchors that pid/pgid number, so the kernel
+    // cannot recycle it for an unrelated process group while we reap residual
+    // PTY holders. Keep this ladder short: the leader already exited, so these
+    // are orphaned residuals rather than an interactive foreground shell.
+    signal_unreaped_process_group(session, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(10));
+    signal_unreaped_process_group(session, libc::SIGTERM);
+    thread::sleep(Duration::from_millis(10));
+    signal_unreaped_process_group(session, libc::SIGKILL);
+}
+
+fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
+    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
+        return;
+    };
+    let rc = unsafe { libc::kill(-pgid, signal) };
+    if rc == 0 {
+        return;
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ESRCH) {
+        eprintln!(
+            "failed to signal unreaped process group {} for {}: {}",
+            pgid, session.name, err
+        );
+    }
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
@@ -1889,18 +2119,42 @@ fn process_group_still_owns_child(process_id: Option<u32>, pgid: i32) -> bool {
     unsafe { libc::getpgid(pid) == pgid }
 }
 
-fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
+enum ProcessGroupWait {
+    Exited,
+    LeaderObserved,
+    TimedOut,
+}
+
+fn wait_for_process_group_exit_or_leader_observed(
+    session: &Session,
+    timeout: Duration,
+) -> ProcessGroupWait {
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        return ProcessGroupWait::LeaderObserved;
+    }
     let Some(pgid) = verified_session_process_group_id(session) else {
         thread::sleep(timeout);
-        return;
+        return if session.leader_exit_observed.load(Ordering::SeqCst) {
+            ProcessGroupWait::LeaderObserved
+        } else {
+            ProcessGroupWait::TimedOut
+        };
     };
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return ProcessGroupWait::LeaderObserved;
+        }
         let rc = unsafe { libc::kill(-pgid, 0) };
         if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
+            return ProcessGroupWait::Exited;
         }
         thread::sleep(Duration::from_millis(25));
+    }
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        ProcessGroupWait::LeaderObserved
+    } else {
+        ProcessGroupWait::TimedOut
     }
 }
 
@@ -2231,7 +2485,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2646,10 +2901,85 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
+            cleanup_started: AtomicBool::new(false),
+            cleanup_completion: (Mutex::new(false), Condvar::new()),
+            cleanup_complete: AtomicBool::new(false),
+            leader_exit_observed: AtomicBool::new(false),
+            leader_reaped: AtomicBool::new(false),
+            unreaped_cleanup_started: AtomicBool::new(false),
             exit_code: AtomicI32::new(i32::MIN),
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn concurrent_finalize_waits_for_single_cleanup_completion() {
+        use std::sync::Barrier;
+
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("finalize-idempotent");
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert(session.name.clone(), Arc::clone(&session));
+            sessions
+                .by_pane
+                .insert(session.pane_id.clone(), Arc::clone(&session));
+            sessions
+                .by_id
+                .insert(session.id.clone(), Arc::clone(&session));
+        }
+
+        // Hold the lock that `close_subscribers` takes so the first finalizer
+        // is definitely inside cleanup while the second caller enters the
+        // cleanup_started/cleanup_complete wait path.
+        let output_guard = super::lock(&session.output_state);
+        let first_ready = Arc::new(Barrier::new(2));
+        let state_for_first = Arc::clone(&state);
+        let session_for_first = Arc::clone(&session);
+        let first_ready_for_thread = Arc::clone(&first_ready);
+        let first = thread::spawn(move || {
+            first_ready_for_thread.wait();
+            super::finalize_session(
+                &state_for_first,
+                &session_for_first,
+                super::SessionFinalizeReason::LeaderExited,
+            );
+        });
+
+        first_ready.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !session.cleanup_started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            session.cleanup_started.load(Ordering::SeqCst),
+            "first finalizer should enter cleanup before the second caller"
+        );
+
+        let state_for_second = Arc::clone(&state);
+        let session_for_second = Arc::clone(&session);
+        let second = thread::spawn(move || {
+            super::terminate_session(&state_for_second, &session_for_second);
+        });
+
+        thread::sleep(Duration::from_millis(25));
+        assert!(
+            !session.cleanup_complete.load(Ordering::SeqCst),
+            "cleanup should still be blocked on the first finalizer"
+        );
+        drop(output_guard);
+
+        first.join().expect("first finalizer panicked");
+        second.join().expect("second finalizer panicked");
+        assert!(!session.alive.load(Ordering::SeqCst));
+        assert!(session.cleanup_complete.load(Ordering::SeqCst));
+        let sessions = super::lock(&state.sessions);
+        assert!(!sessions.by_name.contains_key(&session.name));
+        assert!(!sessions.by_pane.contains_key(&session.pane_id));
+        assert!(!sessions.by_id.contains_key(&session.id));
     }
 
     #[test]

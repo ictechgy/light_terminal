@@ -4147,6 +4147,8 @@ fn custom_socket_refuses_existing_regular_file() -> TestResult {
 #[test]
 fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestResult {
     let env = TestEnv::new()?;
+    let release = env.temp.path().join("leader-reap-release");
+    let release_arg = release.to_string_lossy().to_string();
     let status = env
         .cmd()
         .args([
@@ -4157,22 +4159,26 @@ fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestRe
             "--",
             "sh",
             "-lc",
-            "trap '' HUP; sleep 3 & echo LEADER_DONE",
+            "trap '' HUP TERM; release=$1; sleep 30 & printf 'CHILD:%s\\nCHILD_READY\\n' \"$!\"; while [ ! -f \"$release\" ]; do sleep 0.05; done; echo LEADER_DONE",
+            "sh",
+            &release_arg,
         ])
         .status()?;
     assert!(status.success());
+    let captured = env.capture_until("leader-reap", "CHILD_READY")?;
+    let child_pid = captured
+        .split("CHILD:")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .ok_or("missing background child pid")?;
+    assert!(
+        pid_alive(child_pid)?,
+        "background child should be alive before leader exits"
+    );
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
-        let output = env.cmd().arg("list").output()?;
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.lines().any(|line| line.starts_with("leader-reap	")) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err("session leader exited but lterm kept the pane until background PTY holder exited".into())
+    std::fs::write(&release, b"go")?;
+    wait_for_session_absent_for(&env, "leader-reap", Duration::from_secs(3))?;
+    wait_for_pid_exit(child_pid)
 }
 
 #[test]
