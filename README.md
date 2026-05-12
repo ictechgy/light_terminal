@@ -88,6 +88,35 @@ lterm -a api
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
+Adjacent agent/shim utility commands are also product CLI commands, not tmux
+aliases:
+
+| Task | Product command | Compatibility boundary |
+| --- | --- | --- |
+| Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
+| Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
+| Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
+| Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Fixed `export` lines for trusted shell setup; generated paths are valid POSIX shell tokens from `shlex` quoting, and `PATH` prepends the shim dir to `$PATH` |
+| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls `U+0000..U+001F`, `U+007F`, and `U+0080..U+009F`, replaces semicolons with spaces, and preserves non-control Unicode text |
+| Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
+| Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
+
+`lterm env` is meant for `eval` only when you trust the `lterm` binary on
+your `PATH`; its smoke coverage requires export-only output, verifies that
+generated paths containing spaces, `$`, and `'` round-trip as POSIX shell tokens,
+and confirms the shim directory extends the existing `$PATH` rather than
+replacing it.
+
+`lterm ssh` forwards remote PTY bytes to the local terminal without sanitizing
+terminal control sequences, so a compromised remote can drive terminal features
+that your local emulator permits: OSC 52 clipboard writes, OSC 8 hyperlinks,
+window/title changes, cursor or screen manipulation, bracketed paste toggles, and
+any emulator-specific escape handling. Treat it like direct `ssh` to a trusted
+host and configure terminal features accordingly. "cmux-friendly" notification
+means the fallback path emits the OSC 777 notification format that cmux watches.
+The OSC 777 fallback sanitizer protects protocol framing; it does not normalize
+Unicode bidi, format, or zero-width characters inside trusted title/body text.
+
 Compatibility names are subcommands unless shown as a leading flag: `-a` is the legacy shortcut form and must be used as `lterm -a <target>`.
 
 This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime.

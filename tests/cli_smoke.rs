@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -498,6 +499,66 @@ fn help_shows_common_aliases() -> TestResult {
         stdout.contains("Compatibility: lterm -a <target> is equivalent to lterm resume <target>."),
         "legacy -a shortcut was not discoverable in top-level help:\n{stdout}"
     );
+    Ok(())
+}
+
+#[test]
+fn help_exposes_utility_command_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().arg("--help").output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized = normalize_help(&stdout);
+    let mut exposed = BTreeSet::new();
+    let mut in_commands = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if trimmed == "Commands:" {
+            in_commands = true;
+            continue;
+        }
+        if trimmed.starts_with("Options") {
+            break;
+        }
+        if !in_commands {
+            continue;
+        }
+        if let Some(command) = trimmed.split_whitespace().next() {
+            if command.starts_with('-') {
+                continue;
+            }
+            exposed.insert(command);
+        }
+    }
+    for command in [
+        "install-shim",
+        "env",
+        "tmux-compat",
+        "notify",
+        "agents",
+        "agent",
+        "omx",
+        "omc",
+        "claude",
+        "codex",
+        "gemini",
+        "ssh",
+    ] {
+        assert!(
+            exposed.contains(command),
+            "top-level help should expose utility command {command:?}:\n{stdout}"
+        );
+    }
+    for expected in [
+        "tmux compatibility",
+        "cmux-friendly notification",
+        "remote host",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "top-level help should keep utility command context {expected:?}:\n{stdout}"
+        );
+    }
     Ok(())
 }
 
@@ -3304,6 +3365,61 @@ fn env_outputs_only_shell_exports() -> TestResult {
     );
     assert!(stdout.contains("export PATH="), "{stdout:?}");
     assert!(!stdout.contains("\n/"), "bare shim path leaked: {stdout:?}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn env_quotes_generated_paths_for_posix_shell_eval() -> TestResult {
+    let env = TestEnv::new()?;
+    let runtime = env.temp.path().join("runtime dir with ' quote and $dollar");
+    let data = env.temp.path().join("data dir with ' quote and $dollar");
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(&data)?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let output = env
+        .cmd()
+        .env("LTERM_RUNTIME_DIR", &runtime)
+        .env("LTERM_DATA_DIR", &data)
+        .arg("env")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let exports = String::from_utf8(output.stdout)?;
+
+    let script = format!(
+        "{exports}\nprintf '%s\\n' \"$LTERM_SOCKET\"\nprintf '%s\\n' \"$TMUX\"\nprintf '%s\\n' \"$PATH\"\n"
+    );
+    let eval_output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", "BASE_PATH")
+        .output()?;
+    assert!(eval_output.status.success(), "{eval_output:?}");
+    let eval_stdout = String::from_utf8(eval_output.stdout)?;
+    let lines: Vec<_> = eval_stdout.lines().collect();
+    let expected_socket = runtime.join("lterm.sock").display().to_string();
+    assert_eq!(
+        lines.first(),
+        Some(&expected_socket.as_str()),
+        "{eval_stdout:?}"
+    );
+    assert!(
+        lines.get(1).is_some_and(
+            |tmux| tmux.starts_with(&format!("{expected_socket},")) && tmux.ends_with(",0")
+        ),
+        "{eval_stdout:?}"
+    );
+    let expected_path = format!("{}:BASE_PATH", data.join("shims").display());
+    assert_eq!(
+        lines.get(2),
+        Some(&expected_path.as_str()),
+        "{eval_stdout:?}"
+    );
     Ok(())
 }
 

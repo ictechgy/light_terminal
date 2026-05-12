@@ -22,11 +22,32 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Run the daemon explicitly | `lterm daemon` | none |
 | Stop the daemon and all sessions it owns | `lterm shutdown` | none |
 
+## Utility and agent command surface
+
+These are product CLI commands for agent-terminal setup, remote use, and
+integrations. They are not tmux aliases unless they explicitly enter the
+`tmux-compat` namespace.
+
+| Task | Product command | Compatibility boundary |
+| --- | --- | --- |
+| Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
+| Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
+| Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
+| Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Fixed `export` lines for trusted shell setup; generated paths are valid POSIX shell tokens from `shlex` quoting, and `PATH` prepends the shim dir to `$PATH` |
+| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls `U+0000..U+001F`, `U+007F`, and `U+0080..U+009F`, replaces semicolons with spaces, and preserves non-control Unicode text |
+| Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
+| Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
+
 ## Compatibility rules
 
 - `-a` is a positional legacy shortcut parsed before normal subcommand handling and must appear directly after `lterm`: `lterm -a <target>`.
 - `attach`, `a`, and `-a` are compatibility entry points for `resume`; they must preserve the same raw `client::attach` path.
 - Here, sanitization means escape-sequence/control-byte filtering for non-attached text surfaces such as `logs`, `sessions`, and `processes`; `resume` / raw attach stays a transparent PTY byte stream.
+- `notify`'s OSC 777 fallback sanitizes Unicode scalar values after argument parsing, not UTF-8 bytes; non-control text such as Korean remains intact.
+- `notify`'s OSC 777 fallback protects protocol framing only; it does not normalize Unicode bidi, format, or zero-width characters inside trusted title/body text.
+- `env` export values are POSIX shell tokens produced by `shlex` quoting when metacharacters require it; the visual quote style is not a stable API.
+- `env` prepends the shim directory to the caller's existing `$PATH` rather than replacing it.
+- `ssh` raw attach can expose local terminal features including OSC 52 clipboard, OSC 8 hyperlinks, title changes, cursor/screen manipulation, bracketed paste toggles, and emulator-specific escapes.
 - Remote `lterm ssh` currently keeps its wire command on compatibility spelling where needed so newer local clients can talk to older remote installs.
 - cmux split handoff intentionally sends compatibility `lterm attach <pane>` so stale `LTERM_BIN` builds that predate `resume` still work.
 

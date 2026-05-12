@@ -88,6 +88,34 @@ lterm -a api
 | background daemon 명시 실행 | `lterm daemon` | 없음 |
 | daemon과 모든 세션 종료 | `lterm shutdown` | 없음 |
 
+주변 agent/shim 유틸리티도 제품 CLI 명령이며, tmux alias가 아닙니다:
+
+| 작업 | 제품 명령 | 호환 경계 |
+| --- | --- | --- |
+| profile 기반 agent 세션 실행 | `lterm agent claude -- --help` | sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
+| 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 PATH availability probe |
+| `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
+| tmux 호환 shell export 출력 | `eval "$(lterm env)"` | 신뢰할 수 있는 shell setup용 고정 `export` 행; 생성 path는 `shlex` quoting 기반의 유효한 POSIX shell token이며 `PATH`는 shim dir을 기존 `$PATH` 앞에 추가 |
+| cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 Unicode control `U+0000..U+001F`, `U+007F`, `U+0080..U+009F`를 제거하고 semicolon을 공백으로 치환하며 control이 아닌 Unicode text는 보존 |
+| 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 pass-through |
+| tmux shim namespace 직접 호출 | `lterm tmux-compat list-commands` | 제품 alias 표가 아니라 호환 namespace |
+
+`lterm env`는 `PATH`의 `lterm` binary를 신뢰할 수 있을 때만 `eval`
+용도로 사용하세요. smoke test는 export-only 출력과 space, `$`, `'`가
+포함된 생성 path가 POSIX shell token으로 round-trip되는지, 그리고 shim
+directory가 기존 `$PATH`를 대체하지 않고 앞에 추가되는지 검증합니다.
+
+`lterm ssh`는 remote PTY bytes를 local terminal로 정제 없이 전달하므로,
+compromised remote는 local terminal emulator가 허용하는 control sequence를
+구동할 수 있습니다. 예를 들어 OSC 52 clipboard 쓰기, OSC 8 hyperlink,
+window/title 변경, cursor/screen 조작, bracketed paste 토글, emulator별
+escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있는 host에만
+사용하고 terminal feature 설정도 그에 맞게 관리하세요. "cmux-friendly"
+알림은 fallback 경로가 cmux가 감시하는 OSC 777 notification 형식을
+출력한다는 뜻입니다. OSC 777 fallback sanitizer는 protocol framing을
+보호하는 범위이며, 신뢰된 title/body 내부의 Unicode bidi/format/zero-width
+문자를 normalize하지 않습니다.
+
 호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
 
 이 표는 사람과 agent가 직접 쓰는 제품 CLI 표면입니다. `lterm tmux-compat ...`는 이미 tmux 명령을 사용하는 스크립트를 위한 별도 shim namespace이며, 모든 제품 명령에 tmux 호환 이름이 있는 것은 아닙니다. 런타임에 지원되는 shim subset은 `lterm tmux-compat list-commands`로 확인하세요.
