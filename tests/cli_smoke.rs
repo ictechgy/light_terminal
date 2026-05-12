@@ -3793,6 +3793,26 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
         .args([
             "tmux-compat",
             "capture-pane",
+            "-p",
+            "-S0",
+            "-E0",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_LINE"), "{stdout:?}");
+    assert!(
+        !stdout.contains("SECOND_LINE"),
+        "compact capture-pane -E value should set the inclusive end line: {stdout:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
             "-b",
             "named-buffer",
             "-S",

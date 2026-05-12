@@ -58,6 +58,8 @@ pub enum Request {
     Capture {
         target: String,
         start: Option<i32>,
+        #[serde(default)]
+        end: Option<i32>,
     },
     Resize {
         target: String,
