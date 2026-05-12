@@ -133,8 +133,8 @@ enum Commands {
         enter: bool,
     },
     /// Capture scrollback from a session or pane.
-    #[command(visible_alias = "logs")]
-    Capture {
+    #[command(name = "logs", visible_alias = "capture")]
+    Logs {
         /// Session or pane target to capture.
         target: String,
         /// Starting scrollback line offset, matching tmux -S semantics.
@@ -363,7 +363,7 @@ fn run() -> Result<()> {
             }
             client::send(&target, bytes)
         }
-        Commands::Capture { target, start } => {
+        Commands::Logs { target, start } => {
             print!("{}", client::capture(&target, start)?);
             Ok(())
         }

@@ -250,7 +250,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **터미널 출력은 그대로 전달됩니다.** `lterm attach`는 full-screen 터미널 프로그램과 cmux/OSC 알림이 정상 동작하도록 PTY byte를 그대로 통과시킵니다. 로컬 상태 바는 클라이언트 쪽 표시 요소일 뿐이며, 완전한 raw 모드 터미널이 필요하면 `--no-status`를 사용하세요. 신뢰할 수 없는 child 프로그램은 tmux/screen에서와 마찬가지로 attach된 터미널에 escape sequence를 출력할 수 있습니다. **`lterm`을 escape-sequence sanitizer나 sandbox로 사용하지 마세요.**
 
-**Capture 출력은 사람/AI가 읽기 쉽도록 정제됩니다.** `lterm capture`와 `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다.
+**Capture 출력은 사람/AI가 읽기 쉽도록 정제됩니다.** `lterm logs`(호환 이름: `lterm capture`)와 `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다.
 
 **프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 각 세션 child 아래의 process tree를 보여 줍니다. Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인하는 용도입니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
 
@@ -282,7 +282,7 @@ cargo build --locked
 ```bash
 TMP=$(mktemp -d)
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --name test -- sh -lc 'echo hi; sleep 10'
-LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- capture test -S=-20
+LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- logs test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
 

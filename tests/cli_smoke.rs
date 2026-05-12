@@ -32,7 +32,7 @@ impl TestEnv {
     }
 
     fn capture_until(&self, target: &str, needle: &str) -> TestResult<String> {
-        self.capture_command_until("capture", target, needle)
+        self.capture_command_until("logs", target, needle)
     }
 
     fn capture_command_until(
@@ -339,7 +339,7 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
-fn logs_alias_captures_output() -> TestResult {
+fn capture_alias_captures_output() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -347,17 +347,17 @@ fn logs_alias_captures_output() -> TestResult {
             "new",
             "--detach",
             "--name",
-            "log-alias",
+            "capture-alias",
             "--",
             "sh",
             "-lc",
-            "echo LOG_ALIAS_READY; sleep 2",
+            "echo CAPTURE_ALIAS_READY; sleep 2",
         ])
         .status()?;
     assert!(status.success());
 
-    let captured = env.capture_command_until("logs", "log-alias", "LOG_ALIAS_READY")?;
-    assert!(captured.contains("LOG_ALIAS_READY"));
+    let captured = env.capture_command_until("capture", "capture-alias", "CAPTURE_ALIAS_READY")?;
+    assert!(captured.contains("CAPTURE_ALIAS_READY"));
     Ok(())
 }
 
@@ -491,8 +491,8 @@ fn help_shows_common_aliases() -> TestResult {
         "send alias was not visible in help:\n{stdout}"
     );
     assert!(
-        stdout.contains("[aliases: logs]"),
-        "capture alias was not visible in help:\n{stdout}"
+        stdout.contains("[aliases: capture]"),
+        "capture compatibility alias was not visible in help:\n{stdout}"
     );
     Ok(())
 }
@@ -765,6 +765,13 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "Session or pane target to receive input",
                 "Text to send to the target PTY",
                 "Append Enter after the text",
+            ][..],
+        ),
+        (
+            "logs",
+            &[
+                "Session or pane target to capture",
+                "Starting scrollback line offset, matching tmux -S semantics",
             ][..],
         ),
         (
