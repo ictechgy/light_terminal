@@ -3567,7 +3567,7 @@ mod tests {
         });
 
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let release_for_hook = Arc::clone(&release);
         let first_backpressure = Arc::new(AtomicBool::new(true));
         let first_backpressure_for_hook = Arc::clone(&first_backpressure);
@@ -3626,7 +3626,7 @@ mod tests {
         });
 
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
-        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let release_for_hook = Arc::clone(&release);
         let first_backpressure = Arc::new(AtomicBool::new(true));
         let first_backpressure_for_hook = Arc::clone(&first_backpressure);
