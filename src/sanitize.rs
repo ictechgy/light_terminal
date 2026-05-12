@@ -90,6 +90,12 @@ mod tests {
     #[test]
     fn osc_field_drops_c0_and_c1_controls() {
         assert_eq!(osc_field("a\u{001b};\u{009c}b"), "a b");
+        assert_eq!(osc_field("a\u{007f}b"), "ab");
+    }
+
+    #[test]
+    fn osc_field_preserves_non_control_unicode_text() {
+        assert_eq!(osc_field("완료;테스트 ✅"), "완료 테스트 ✅");
     }
 
     #[test]
