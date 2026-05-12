@@ -73,7 +73,7 @@ enum Commands {
         command: Vec<String>,
     },
     /// Attach to a persistent session or pane.
-    #[command(visible_alias = "a")]
+    #[command(visible_aliases = ["a", "resume"])]
     Attach {
         /// Session or pane target to attach.
         #[arg(default_value = "%0")]
