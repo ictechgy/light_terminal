@@ -119,7 +119,7 @@ The generic aliases above are meant for day-to-day agent-terminal use: `sessions
 lterm close api
 ```
 
-`close` is a visible alias for `kill`; it uses the same session/pane termination path and is intentionally still described as killing the target in command help.
+`kill` is a visible compatibility alias for `close`; both names use the same session/pane termination path.
 
 ## AI workflows
 
@@ -267,7 +267,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats or options may need additional shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
 - The daemon authenticates local clients via OS peer credentials and owner-only socket paths — there are no per-session ACLs yet.
-- Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm kill`; inspect them with `lterm processes` / `lterm ps` or OS process tools.
+- Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm close` / `lterm kill`; inspect them with `lterm processes` / `lterm ps` or OS process tools.
 
 ## Development
 

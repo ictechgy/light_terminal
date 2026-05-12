@@ -119,7 +119,7 @@ lterm input api 'echo hello' --enter
 lterm close api
 ```
 
-`close`는 `kill`의 visible alias입니다. 같은 session/pane 종료 경로를 사용하며, command help에서는 의도적으로 target을 kill한다고 설명합니다.
+`kill`은 `close`의 visible compatibility alias입니다. 두 이름 모두 같은 session/pane 종료 경로를 사용합니다.
 
 ## AI 워크플로
 
@@ -267,7 +267,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - 이 프로젝트는 완전한 tmux server가 아니라 호환 subset만 제공합니다. 고급 tmux format/option을 사용하는 스크립트는 shim 명령 추가가 필요할 수 있습니다.
 - cmux pane capture는 cmux scrollback API가 아니라 `lterm` 세션을 통해 처리합니다.
 - 데몬은 로컬 클라이언트를 OS peer credential과 소유자 전용 socket 경로로 인증합니다. 세션별 ACL은 아직 없습니다.
-- 세션 종료는 verified process-group signaling을 사용하므로 `shell → OMX → Codex → MCP` 같은 child tree는 가능한 한 함께 정리됩니다. 의도적으로 다른 session/process group으로 detach한 프로세스는 `lterm kill` 이후에도 살아 있을 수 있으니, `lterm processes` / `lterm ps`나 OS process 도구로 확인하세요.
+- 세션 종료는 verified process-group signaling을 사용하므로 `shell → OMX → Codex → MCP` 같은 child tree는 가능한 한 함께 정리됩니다. 의도적으로 다른 session/process group으로 detach한 프로세스는 `lterm close` / `lterm kill` 이후에도 살아 있을 수 있으니, `lterm processes` / `lterm ps`나 OS process 도구로 확인하세요.
 
 ## 개발
 
