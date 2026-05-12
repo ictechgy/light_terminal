@@ -1459,7 +1459,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         let exit_code = {
             let mut child = lock(&session_for_waiter.child);
             if leader_exit_observed {
-                terminate_unreaped_process_group(&session_for_waiter);
+                terminate_unreaped_process_group(&session_for_waiter, &child);
             }
             let exit_code = match child.wait() {
                 Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
@@ -1941,20 +1941,48 @@ fn wait_for_cleanup_complete(session: &Session) {
 fn terminate_process_group_for_request(session: &Session) {
     // Hold the child lock while signaling so the waiter cannot reap the leader
     // and release the pgid anchor between an unreaped-pgid check and `kill`.
-    let _reap_guard = lock(&session.child);
+    let reap_guard = lock(&session.child);
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
     if session.leader_exit_observed.load(Ordering::SeqCst) {
-        terminate_unreaped_process_group(session);
+        terminate_unreaped_process_group(session, &reap_guard);
         return;
     }
-    terminate_verified_process_group_for_request(session);
-    if wait_for_leader_exit_observed(session, Duration::from_millis(50))
+    terminate_verified_process_group_for_request(session, &reap_guard);
+    maybe_terminate_observed_unreaped_process_group(
+        session,
+        Duration::from_millis(50),
+        &reap_guard,
+    );
+}
+
+fn maybe_terminate_observed_unreaped_process_group(
+    session: &Session,
+    timeout: Duration,
+    reap_guard: &MutexGuard<'_, Box<dyn Child + Send + Sync>>,
+) {
+    // Keep a short post-SIGKILL observation window for the waiter to publish
+    // `leader_exit_observed` before it can acquire `child` and reap the leader.
+    // During that unreaped window the stored pgid is still anchored and safe
+    // for the residual group-kill ladder; after reap, we must not rely on it.
+    // The guard parameter makes that lock requirement explicit at call sites.
+    if wait_for_leader_exit_observed(session, timeout)
         && !session.leader_reaped.load(Ordering::SeqCst)
     {
-        terminate_unreaped_process_group(session);
+        terminate_unreaped_process_group(session, reap_guard);
     }
+}
+
+fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    session.leader_exit_observed.load(Ordering::SeqCst)
 }
 
 fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
@@ -1991,22 +2019,14 @@ fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
     }
 }
 
-fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if session.leader_exit_observed.load(Ordering::SeqCst) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    session.leader_exit_observed.load(Ordering::SeqCst)
-}
-
-fn terminate_verified_process_group_for_request(session: &Session) {
+fn terminate_verified_process_group_for_request(
+    session: &Session,
+    reap_guard: &MutexGuard<'_, Box<dyn Child + Send + Sync>>,
+) {
     signal_process_group(session, libc::SIGHUP);
     match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)) {
         ProcessGroupWait::LeaderObserved => {
-            terminate_unreaped_process_group(session);
+            terminate_unreaped_process_group(session, reap_guard);
             return;
         }
         ProcessGroupWait::Exited => return,
@@ -2015,7 +2035,7 @@ fn terminate_verified_process_group_for_request(session: &Session) {
     signal_process_group(session, libc::SIGTERM);
     match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(350)) {
         ProcessGroupWait::LeaderObserved => {
-            terminate_unreaped_process_group(session);
+            terminate_unreaped_process_group(session, reap_guard);
             return;
         }
         ProcessGroupWait::Exited => return,
@@ -2026,11 +2046,17 @@ fn terminate_verified_process_group_for_request(session: &Session) {
         wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)),
         ProcessGroupWait::LeaderObserved
     ) {
-        terminate_unreaped_process_group(session);
+        terminate_unreaped_process_group(session, reap_guard);
     }
 }
 
-fn terminate_unreaped_process_group(session: &Session) {
+fn terminate_unreaped_process_group(
+    session: &Session,
+    _reap_guard: &MutexGuard<'_, Box<dyn Child + Send + Sync>>,
+) {
+    if session.leader_reaped.load(Ordering::SeqCst) {
+        return;
+    }
     if session
         .unreaped_cleanup_started
         .swap(true, Ordering::SeqCst)
@@ -2911,6 +2937,31 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn terminate_tail_cleanup_waits_for_late_observed_leader() {
+        let session = build_test_session("terminate-tail-cleanup");
+        let session_for_waiter = Arc::clone(&session);
+        let waiter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            session_for_waiter
+                .leader_exit_observed
+                .store(true, Ordering::SeqCst);
+        });
+
+        let reap_guard = super::lock(&session.child);
+        super::maybe_terminate_observed_unreaped_process_group(
+            &session,
+            Duration::from_millis(200),
+            &reap_guard,
+        );
+
+        waiter.join().expect("leader-observed notifier panicked");
+        assert!(
+            session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "late observed-but-unreaped leaders must run the residual process-group cleanup"
+        );
     }
 
     #[test]
