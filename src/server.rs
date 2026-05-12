@@ -1468,6 +1468,10 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                     1
                 }
             };
+            // Writer-side half of the stored-PGID invariant: callers may use
+            // the unreaped process-group cleanup only while holding this same
+            // child lock, so the flag cannot flip between their guard check
+            // and residual signal ladder.
             session_for_waiter
                 .leader_reaped
                 .store(true, Ordering::SeqCst);
@@ -2054,6 +2058,10 @@ fn terminate_unreaped_process_group(
     session: &Session,
     _reap_guard: &MutexGuard<'_, Box<dyn Child + Send + Sync>>,
 ) {
+    // The guard is a witness that callers hold this session's `child` lock:
+    // the waiter cannot set `leader_reaped` while this function decides
+    // whether the stored pgid is still anchored by the unreaped zombie leader.
+    // Keep the explicit reaped check as defense-in-depth for future call paths.
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
@@ -2961,6 +2969,48 @@ mod tests {
         assert!(
             session.unreaped_cleanup_started.load(Ordering::SeqCst),
             "late observed-but-unreaped leaders must run the residual process-group cleanup"
+        );
+    }
+
+    #[test]
+    fn terminate_unreaped_cleanup_skips_after_leader_reaped() {
+        let session = build_test_session("terminate-reaped-skip");
+        session.leader_exit_observed.store(true, Ordering::SeqCst);
+        session.leader_reaped.store(true, Ordering::SeqCst);
+        let observed_before = session.leader_exit_observed.load(Ordering::SeqCst);
+        let reaped_before = session.leader_reaped.load(Ordering::SeqCst);
+
+        let reap_guard = super::lock(&session.child);
+        super::terminate_unreaped_process_group(&session, &reap_guard);
+
+        assert!(
+            !session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "reaped leaders must not start residual stored-pgid cleanup"
+        );
+        assert_eq!(
+            session.leader_exit_observed.load(Ordering::SeqCst),
+            observed_before,
+            "reaped cleanup skip should not mutate leader-exit observation"
+        );
+        assert_eq!(
+            session.leader_reaped.load(Ordering::SeqCst),
+            reaped_before,
+            "reaped cleanup skip should not mutate leader-reaped state"
+        );
+    }
+
+    #[test]
+    fn terminate_unreaped_cleanup_starts_before_leader_reaped() {
+        let session = build_test_session("terminate-unreaped-start");
+        session.leader_exit_observed.store(true, Ordering::SeqCst);
+        session.leader_reaped.store(false, Ordering::SeqCst);
+
+        let reap_guard = super::lock(&session.child);
+        super::terminate_unreaped_process_group(&session, &reap_guard);
+
+        assert!(
+            session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "unreaped leaders should start residual stored-pgid cleanup"
         );
     }
 
