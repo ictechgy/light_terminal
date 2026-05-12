@@ -6,7 +6,7 @@
 
 - **무엇** — Rust로 만든 PTY 세션 데몬 + tmux 호환 shim. 이름이나 pane id로 detach·reattach할 수 있는 영속 세션을 제공합니다.
 - **대상** — Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent와, 그것을 `cmux` 안에서 돌리는 사용자.
-- **사용법** — `lterm new`로 만들고 `lterm attach`로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
+- **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도 escape-sequence sanitizer도 완전한 tmux 대체품도 아닙니다.**
 
 ---
@@ -57,13 +57,13 @@ eval "$(lterm env)"
 **세션을 만들고 바로 attach:**
 
 ```bash
-lterm new -n api -- npm run dev
+lterm start -n api -- npm run dev
 ```
 
 **먼저 detached로 만든 뒤 나중에 attach:**
 
 ```bash
-lterm new -d -n api -- npm run dev
+lterm start -d -n api -- npm run dev
 lterm resume api
 
 # 호환 이름도 계속 사용할 수 있습니다.
@@ -77,7 +77,7 @@ lterm -a api
 
 | 작업 | 일반 명령 | 호환 이름 |
 | --- | --- | --- |
-| 영속 프로세스 시작 | `lterm new -n api -- npm run dev` | — |
+| 영속 프로세스 시작 | `lterm start -n api -- npm run dev` | `new` |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
 | 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
@@ -280,7 +280,7 @@ cargo build --locked
 
 ```bash
 TMP=$(mktemp -d)
-LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- new --name test -- sh -lc 'echo hi; sleep 10'
+LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --name test -- sh -lc 'echo hi; sleep 10'
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- capture test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
