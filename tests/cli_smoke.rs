@@ -3742,11 +3742,11 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
             "-d",
             "-s",
             "capture-start",
-            "printf 'FIRST_LINE\\nSECOND_LINE\\n'; sleep 2",
+            "printf 'FIRST_LINE\\nSECOND_LINE\\nTHIRD_LINE\\n'; sleep 2",
         ])
         .status()?;
     assert!(status.success());
-    env.capture_until("capture-start", "SECOND_LINE")?;
+    env.capture_until("capture-start", "THIRD_LINE")?;
 
     let output = env
         .cmd()
@@ -3786,6 +3786,90 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
     assert!(
         !stdout.contains("FIRST_LINE"),
         "compact capture-pane -S value should set the start line: {stdout:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-p",
+            "-S0",
+            "-E0",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_LINE"), "{stdout:?}");
+    assert!(
+        !stdout.contains("SECOND_LINE"),
+        "compact capture-pane -E value should set the inclusive end line: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("THIRD_LINE"),
+        "compact capture-pane -E value should stop at the inclusive end line: {stdout:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-p",
+            "-S0",
+            "-E-1",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_LINE"), "{stdout:?}");
+    assert!(stdout.contains("SECOND_LINE"), "{stdout:?}");
+    assert!(stdout.contains("THIRD_LINE"), "{stdout:?}");
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-p",
+            "-E",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "missing -E value must fail instead of consuming -t as a line value: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid capture-pane -E line value"),
+        "{stderr:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-p",
+            "-Ewat",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "invalid compact -E value must fail: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid capture-pane -E line value"),
+        "{stderr:?}"
     );
 
     let output = env

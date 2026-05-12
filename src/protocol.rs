@@ -58,6 +58,8 @@ pub enum Request {
     Capture {
         target: String,
         start: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end: Option<i32>,
     },
     Resize {
         target: String,
@@ -155,7 +157,7 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionInfo;
+    use super::{Request, SessionInfo};
 
     #[test]
     fn session_info_accepts_pre_process_metadata_json() {
@@ -180,5 +182,29 @@ mod tests {
         assert_eq!(info.parent_pane_id, None);
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
+    }
+
+    #[test]
+    fn capture_request_end_is_optional_on_the_wire() {
+        let request = Request::Capture {
+            target: "%0".to_string(),
+            start: None,
+            end: None,
+        };
+        let value = serde_json::to_value(&request).expect("serialize capture request");
+
+        assert!(
+            value.get("end").is_none(),
+            "new clients should omit absent capture end fields for older daemons: {value}"
+        );
+
+        let legacy_request: Request = serde_json::from_value(serde_json::json!({
+            "type": "capture",
+            "target": "%0",
+            "start": null
+        }))
+        .expect("deserialize capture request without end");
+
+        assert!(matches!(legacy_request, Request::Capture { end: None, .. }));
     }
 }

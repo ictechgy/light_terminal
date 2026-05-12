@@ -230,10 +230,15 @@ pub fn send(target: &str, data: Vec<u8>) -> Result<()> {
 }
 
 pub fn capture(target: &str, start: Option<i32>) -> Result<String> {
+    capture_range(target, start, None)
+}
+
+pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Result<String> {
     ensure_server()?;
     rpc(&Request::Capture {
         target: target.to_string(),
         start,
+        end,
     })
 }
 

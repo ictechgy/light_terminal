@@ -304,31 +304,32 @@ impl Session {
         }
     }
 
-    fn capture(&self, start: Option<i32>) -> String {
-        sanitize::terminal_capture(&self.capture_bytes(start))
+    fn capture(&self, start: Option<i32>, end: Option<i32>) -> String {
+        sanitize::terminal_capture(&self.capture_bytes(start, end))
     }
 
-    fn capture_bytes(&self, start: Option<i32>) -> Vec<u8> {
+    fn capture_bytes(&self, start: Option<i32>, end: Option<i32>) -> Vec<u8> {
         let ring = lock(&self.ring);
         let bytes: Vec<u8> = ring.iter().copied().collect();
-        let Some(start) = start else {
+        if start.is_none() && end.is_none() {
             return bytes;
-        };
+        }
         let spans = line_spans(&bytes);
         if spans.is_empty() {
             return bytes;
         }
-        if start < 0 {
-            let keep = (-start) as usize;
-            let first = spans.len().saturating_sub(keep);
-            let begin = spans[first].0;
-            return bytes[begin..].to_vec();
-        }
-        let first = start as usize;
+        let first = capture_line_index(start.unwrap_or(0), spans.len());
         if first >= spans.len() {
             return Vec::new();
         }
-        bytes[spans[first].0..].to_vec()
+        let Some(end) = end else {
+            return bytes[spans[first].0..].to_vec();
+        };
+        let last = capture_end_line_index(end, spans.len());
+        if last < first {
+            return Vec::new();
+        }
+        bytes[spans[first].0..spans[last].1].to_vec()
     }
 
     /// 새 attach client 를 등록한다. 초기 geometry (`rows`, `cols`) 는 attach 요청에
@@ -1186,9 +1187,9 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 .context("write to pty")?;
             Ok(Response::empty())
         }
-        Request::Capture { target, start } => {
+        Request::Capture { target, start, end } => {
             let session = resolve_session(state, &target)?;
-            Ok(Response::ok(session.capture(start)))
+            Ok(Response::ok(session.capture(start, end)))
         }
         Request::Resize {
             target,
@@ -2355,6 +2356,22 @@ fn line_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
     spans
 }
 
+fn capture_line_index(line: i32, line_count: usize) -> usize {
+    if line < 0 {
+        line_count.saturating_sub(line.unsigned_abs() as usize)
+    } else {
+        line as usize
+    }
+}
+
+fn capture_end_line_index(line: i32, line_count: usize) -> usize {
+    if line < 0 {
+        line_count.saturating_sub(line.unsigned_abs() as usize)
+    } else {
+        (line as usize).min(line_count.saturating_sub(1))
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -2945,6 +2962,33 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn capture_bytes_applies_inclusive_end_line() {
+        let session = build_test_session("capture-range");
+        super::lock(&session.ring).extend(b"ONE\nTWO\nTHREE\n");
+
+        assert_eq!(
+            session.capture_bytes(Some(0), Some(1)),
+            b"ONE\nTWO\n".to_vec()
+        );
+        assert_eq!(
+            session.capture_bytes(Some(1), Some(99)),
+            b"TWO\nTHREE\n".to_vec()
+        );
+        assert_eq!(
+            session.capture_bytes(Some(-2), Some(-1)),
+            b"TWO\nTHREE\n".to_vec()
+        );
+        assert_eq!(
+            session.capture_bytes(None, Some(-2)),
+            b"ONE\nTWO\n".to_vec()
+        );
+        assert!(
+            session.capture_bytes(Some(2), Some(1)).is_empty(),
+            "end before start should capture no lines"
+        );
     }
 
     #[test]

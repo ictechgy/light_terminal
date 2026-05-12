@@ -499,6 +499,7 @@ fn capture_pane(args: &[String]) -> Result<i32> {
     let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut print = false;
     let mut start = None;
+    let mut end = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -510,10 +511,14 @@ fn capture_pane(args: &[String]) -> Result<i32> {
                 i += 2;
             }
             "-S" => {
-                start = args.get(i + 1).and_then(|s| s.parse::<i32>().ok());
+                start = parse_capture_line_value('S', args.get(i + 1).cloned())?;
                 i += 2;
             }
-            "-E" | "-b" => i += 2,
+            "-E" => {
+                end = parse_capture_line_value('E', args.get(i + 1).cloned())?;
+                i += 2;
+            }
+            "-b" => i += 2,
             "-e" | "-J" => i += 1,
             flag if flag.starts_with('-') => {
                 if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
@@ -522,7 +527,12 @@ fn capture_pane(args: &[String]) -> Result<i32> {
                 if let Some((_, value)) =
                     short_cluster_flag_value_with_extra(flag, 'S', args, i, VALUE_FLAGS)
                 {
-                    start = value.and_then(|s| s.parse::<i32>().ok());
+                    start = parse_capture_line_value('S', value)?;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'E', args, i, VALUE_FLAGS)
+                {
+                    end = parse_capture_line_value('E', value)?;
                 }
                 i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
             }
@@ -530,7 +540,7 @@ fn capture_pane(args: &[String]) -> Result<i32> {
         }
     }
     let target = target.unwrap_or_else(default_target);
-    let text = client::capture(&target, start)?;
+    let text = client::capture_range(&target, start, end)?;
     if print {
         print!("{text}");
         if !text.ends_with('\n') {
@@ -540,6 +550,22 @@ fn capture_pane(args: &[String]) -> Result<i32> {
         fs::write(paths::buffer_path()?, text)?;
     }
     Ok(0)
+}
+
+fn parse_capture_line_value(flag: char, value: Option<String>) -> Result<Option<i32>> {
+    let Some(value) = value else {
+        bail!("capture-pane -{flag} requires a line value");
+    };
+    if value == "-" {
+        return Ok(None);
+    }
+    if flag == 'S' && value.eq_ignore_ascii_case("top") {
+        return Ok(Some(0));
+    }
+    value
+        .parse::<i32>()
+        .map(Some)
+        .with_context(|| format!("invalid capture-pane -{flag} line value: {value}"))
 }
 
 fn send_keys(args: &[String]) -> Result<i32> {
