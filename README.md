@@ -83,7 +83,7 @@ lterm -a api
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json` | `ps` |
 | Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
-| Send text to a PTY | `lterm input api 'echo hello' --enter` | `send` |
+| Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
 
 Compatibility names are subcommands unless shown as a leading flag: `-a` is the legacy shortcut form and must be used as `lterm -a <target>`.
@@ -111,7 +111,7 @@ lterm logs api --start=-80
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The compatibility names remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
 
 **Stop a session:**
 

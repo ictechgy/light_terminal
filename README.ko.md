@@ -83,7 +83,7 @@ lterm -a api
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
 | 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
-| PTY에 텍스트 보내기 | `lterm input api 'echo hello' --enter` | `send` |
+| PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
 
 호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
@@ -111,7 +111,7 @@ lterm logs api --start=-80
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 스크립트와 기존 사용 습관을 위해 호환 이름도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `send`.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 호환 이름은 visible alias로 유지되어 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `send`.
 
 **세션 종료:**
 
