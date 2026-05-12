@@ -20,7 +20,8 @@ use uuid::Uuid;
 #[command(
     name = "lterm",
     version,
-    about = "Light Terminal: a lightweight tmux-compatible session daemon"
+    about = "Light Terminal: a lightweight tmux-compatible session daemon",
+    after_help = "Compatibility: lterm -a <target> is equivalent to lterm resume <target>."
 )]
 struct Cli {
     #[command(subcommand)]
