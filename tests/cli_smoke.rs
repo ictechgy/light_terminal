@@ -4436,6 +4436,10 @@ fn attach_preserves_input_buffered_with_request_header() -> TestResult {
     let mut frame = serde_json::to_vec(&request)?;
     frame.push(b'\n');
     frame.extend_from_slice(b"BUFFERED_INPUT\n");
+    // This is an end-to-end smoke for clients that pipeline attach input behind
+    // the request header. Unix streams have no message boundaries, so the
+    // deterministic same-read-buffer invariant is locked by the
+    // `request_chunk_parser_preserves_tail_from_same_read_buffer` unit test.
     stream.write_all(&frame)?;
 
     let response = read_response_line(&mut stream)?;

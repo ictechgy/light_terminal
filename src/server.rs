@@ -1001,8 +1001,7 @@ fn read_request_frame_with_limit(
         }
         let remaining = deadline
             .saturating_duration_since(now)
-            .min(Duration::from_millis(100))
-            .max(Duration::from_millis(10));
+            .min(Duration::from_millis(100));
         stream
             .set_read_timeout(Some(remaining))
             .context("set request read timeout")?;
@@ -1022,19 +1021,8 @@ fn read_request_frame_with_limit(
         if n == 0 {
             break;
         }
-        if let Some(pos) = buf[..n].iter().position(|byte| *byte == b'\n') {
-            bytes.extend_from_slice(&buf[..=pos]);
-            if bytes.len() > max_request_bytes {
-                bail!("request exceeded {max_request_bytes} bytes");
-            }
-            return Ok(RequestFrame {
-                line: String::from_utf8(bytes).context("request is not valid UTF-8")?,
-                buffered: buf[pos + 1..n].to_vec(),
-            });
-        }
-        bytes.extend_from_slice(&buf[..n]);
-        if bytes.len() > max_request_bytes {
-            bail!("request exceeded {max_request_bytes} bytes");
+        if let Some(frame) = request_frame_from_chunk(&mut bytes, &buf[..n], max_request_bytes)? {
+            return Ok(frame);
         }
     }
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
@@ -1044,6 +1032,40 @@ fn read_request_frame_with_limit(
         line: String::from_utf8(bytes).context("request is not valid UTF-8")?,
         buffered: Vec::new(),
     })
+}
+
+fn request_frame_from_chunk(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    max_request_bytes: usize,
+) -> Result<Option<RequestFrame>> {
+    if let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') {
+        let line_len = pos + 1;
+        ensure_request_capacity(bytes.len(), line_len, max_request_bytes)?;
+        bytes.extend_from_slice(&chunk[..line_len]);
+        return Ok(Some(RequestFrame {
+            line: String::from_utf8(std::mem::take(bytes)).context("request is not valid UTF-8")?,
+            buffered: chunk[line_len..].to_vec(),
+        }));
+    }
+
+    ensure_request_capacity(bytes.len(), chunk.len(), max_request_bytes)?;
+    bytes.extend_from_slice(chunk);
+    Ok(None)
+}
+
+fn ensure_request_capacity(
+    current_len: usize,
+    additional_len: usize,
+    max_request_bytes: usize,
+) -> Result<()> {
+    let Some(next_len) = current_len.checked_add(additional_len) else {
+        bail!("request exceeded {max_request_bytes} bytes");
+    };
+    if next_len > max_request_bytes {
+        bail!("request exceeded {max_request_bytes} bytes");
+    }
+    Ok(())
 }
 
 fn sanitized_preview(value: &str) -> String {
@@ -2192,7 +2214,8 @@ mod tests {
         MAX_TERMINAL_ROWS, OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber,
         TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
         forward_attach_output, initial_pty_size, process_group_still_owns_child,
-        read_request_frame_with_limit, read_request_frame_with_timeout, validate_terminal_geometry,
+        read_request_frame_with_limit, read_request_frame_with_timeout, request_frame_from_chunk,
+        validate_terminal_geometry,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
@@ -2213,6 +2236,20 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    #[test]
+    fn request_chunk_parser_preserves_tail_from_same_read_buffer() {
+        let mut bytes = Vec::new();
+
+        let frame =
+            request_frame_from_chunk(&mut bytes, b"{\"type\":\"Ping\"}\nBUFFERED_INPUT\n", 1024)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(frame.line, "{\"type\":\"Ping\"}\n");
+        assert_eq!(frame.buffered, b"BUFFERED_INPUT\n");
+        assert!(bytes.is_empty());
     }
 
     #[test]
