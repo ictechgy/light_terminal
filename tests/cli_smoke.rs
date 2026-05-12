@@ -1670,13 +1670,74 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
     env.capture_until("keys", "READY")?;
     let status = env
         .cmd()
-        .args(["tmux-compat", "send-keys", "-t", "keys", "hello", "C-m"])
+        .args(["tmux-compat", "send-keys", "-tkeys", "hello", "C-m"])
         .status()?;
     assert!(status.success());
 
     let captured = env.capture_until("keys", "GOT:hello")?;
     assert!(captured.contains("READY"), "{captured}");
     assert!(captured.contains("GOT:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_supports_clustered_print_format() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-dPF",
+            "#{pane_id}",
+            "echo SPLIT_CLUSTER_READY; sleep 2",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        pane.starts_with('%'),
+        "split-window -dPF should print the pane id, got {pane:?}"
+    );
+    let captured = env.capture_until(&pane, "SPLIT_CLUSTER_READY")?;
+    assert!(captured.contains("SPLIT_CLUSTER_READY"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_missing_target_value_does_not_fall_back_to_default() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "target-required",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_session_present(&env, "target-required")?;
+
+    let output = env
+        .cmd()
+        .args(["tmux-compat", "kill-pane", "-t"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "missing -t value must be rejected instead of killing the default pane: {output:?}"
+    );
+    let listed = env.cmd().args(["sessions", "--all"]).output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("target-required\t")),
+        "session should survive rejected kill-pane -t: {stdout:?}"
+    );
     Ok(())
 }
 
@@ -3459,6 +3520,47 @@ fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
         .output()?;
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("CAPTURE_ME"));
+    Ok(())
+}
+
+#[test]
+fn tmux_buffer_commands_skip_buffer_name_options_before_path() -> TestResult {
+    let env = TestEnv::new()?;
+    let input = env.temp.path().join("buffer-input.txt");
+    let output_path = env.temp.path().join("buffer-output.txt");
+    std::fs::write(&input, b"BUFFER_OPTION_PAYLOAD")?;
+
+    let load = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "load-buffer",
+            "-b",
+            "named-buffer",
+            input.to_str().ok_or("input path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(load.status.success(), "{load:?}");
+
+    let save = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "save-buffer",
+            "-b",
+            "named-buffer",
+            output_path.to_str().ok_or("output path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(save.status.success(), "{save:?}");
+    assert_eq!(std::fs::read(&output_path)?, b"BUFFER_OPTION_PAYLOAD");
+
+    let stdout = env
+        .cmd()
+        .args(["tmux-compat", "save-buffer", "--", "-"])
+        .output()?;
+    assert!(stdout.status.success(), "{stdout:?}");
+    assert_eq!(stdout.stdout, b"BUFFER_OPTION_PAYLOAD");
     Ok(())
 }
 

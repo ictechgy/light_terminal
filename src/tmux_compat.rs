@@ -193,13 +193,13 @@ fn new_session(args: &[String]) -> Result<i32> {
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::attach(&target, true, AttachStdinEof::Detach)?;
     Ok(0)
 }
 
 fn has_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     match client::info(&target) {
         Ok(_) => Ok(0),
         Err(_) => Ok(1),
@@ -224,7 +224,7 @@ fn list_windows(args: &[String]) -> Result<i32> {
             println!("{}", expand_format(&format, &pane));
         }
     } else {
-        let target = parse_target(args).unwrap_or_else(default_target);
+        let target = parse_target(args)?.unwrap_or_else(default_target);
         let pane = window_row_for_target(&target)?;
         println!("{}", expand_format(&format, &pane));
     }
@@ -234,7 +234,7 @@ fn list_windows(args: &[String]) -> Result<i32> {
 fn list_clients(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{client_name}".to_string());
-    let panes = if let Some(target) = parse_target(args) {
+    let panes = if let Some(target) = parse_target(args)? {
         vec![window_row_for_target(&target)?]
     } else {
         root_session_rows()?
@@ -313,18 +313,22 @@ fn window_row_for_target(target: &str) -> Result<SessionInfo> {
 }
 
 fn kill_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::kill(&target)?;
     Ok(0)
 }
 
 fn split_window(args: &[String]) -> Result<i32> {
-    let mut direction = "right";
-    let mut print = false;
-    let mut format = "#{pane_id}".to_string();
-    let mut target = None;
+    let print = has_flag(args, "-P");
+    let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
+    let target = parse_target(args)?;
+    let mut direction = if has_flag(args, "-v") {
+        "down"
+    } else {
+        "right"
+    };
     let mut cwd = None;
-    let mut detached = false;
+    let mut detached = has_flag(args, "-d");
     let mut command = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -341,16 +345,7 @@ fn split_window(args: &[String]) -> Result<i32> {
                 detached = true;
                 i += 1;
             }
-            "-P" => {
-                print = true;
-                i += 1;
-            }
-            "-F" => {
-                format = args.get(i + 1).cloned().unwrap_or(format);
-                i += 2;
-            }
             "-t" => {
-                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-c" => {
@@ -389,7 +384,7 @@ fn split_window(args: &[String]) -> Result<i32> {
 fn list_panes(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
-    if let Some(target) = parse_target(args) {
+    if let Some(target) = parse_target(args)? {
         let pane = client::info(&target)?;
         println!("{}", expand_format(&format, &pane));
         return Ok(0);
@@ -406,9 +401,9 @@ fn list_panes(args: &[String]) -> Result<i32> {
 
 fn display_message(args: &[String]) -> Result<i32> {
     let mut print = false;
-    let mut target = None;
-    let mut explicit_target = false;
-    let mut message = None;
+    let target = parse_target(args)?;
+    let explicit_target = target.is_some();
+    let mut message = parse_format(args);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -417,12 +412,9 @@ fn display_message(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-t" => {
-                target = args.get(i + 1).cloned();
-                explicit_target = true;
                 i += 2;
             }
             "-F" => {
-                message = args.get(i + 1).cloned();
                 i += 2;
             }
             "--" => {
@@ -454,7 +446,7 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    let mut target = None;
+    let target = parse_target(args)?;
     let mut print = false;
     let mut start = None;
     let mut i = 0;
@@ -465,7 +457,6 @@ fn capture_pane(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-t" => {
-                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-S" => {
@@ -491,14 +482,13 @@ fn capture_pane(args: &[String]) -> Result<i32> {
 }
 
 fn send_keys(args: &[String]) -> Result<i32> {
-    let mut target = None;
+    let target = parse_target(args)?;
     let mut literal = false;
     let mut keys = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-t" => {
-                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-l" => {
@@ -523,13 +513,13 @@ fn send_keys(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::kill(&target)?;
     Ok(0)
 }
 
 fn resize_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     let mut rows = None;
     let mut cols = None;
     let mut i = 0;
@@ -644,7 +634,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
 }
 
 fn load_buffer(args: &[String]) -> Result<i32> {
-    let source = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let source = buffer_path_arg(args);
     let mut data = Vec::new();
     if let Some(path) = source {
         if path == "-" {
@@ -661,7 +651,7 @@ fn load_buffer(args: &[String]) -> Result<i32> {
 
 fn save_buffer(args: &[String]) -> Result<i32> {
     let data = read_buffer_or_empty()?;
-    let dest = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let dest = buffer_path_arg(args);
     if let Some(path) = dest {
         if path == "-" {
             std::io::stdout().write_all(&data)?;
@@ -675,7 +665,7 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     let data = read_buffer_or_empty()?;
     client::send(&target, data)?;
     Ok(0)
@@ -852,31 +842,53 @@ impl Drop for StoreLock {
     }
 }
 
-fn parse_target(args: &[String]) -> Option<String> {
+fn parse_target(args: &[String]) -> Result<Option<String>> {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
             break;
         }
         if args[i] == "-t" {
-            return args.get(i + 1).cloned();
+            return target_value(args.get(i + 1).cloned(), "-t");
         }
         if let Some(value) = args[i].strip_prefix("-t=") {
-            return Some(value.to_string());
+            return target_value(Some(value.to_string()), "-t");
         }
         if args[i].starts_with("-t") && args[i].len() > 2 {
-            return Some(args[i][2..].to_string());
+            return target_value(Some(args[i][2..].to_string()), "-t");
         }
         if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
             if let Some(value) = value {
-                return Some(value);
+                return target_value(Some(value), "-t");
             }
-            return args.get(i + 1).cloned();
+            return target_value(args.get(i + 1).cloned(), "-t");
         }
         if args[i].starts_with('-') {
             i += flag_arg_width(&args[i], args, i);
         } else {
             i += 1;
+        }
+    }
+    Ok(None)
+}
+
+fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(Some(value)),
+        _ => bail!("tmux target flag {flag} requires a value"),
+    }
+}
+
+fn buffer_path_arg(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            return args.get(i + 1).cloned();
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            return Some(args[i].clone());
         }
     }
     None
@@ -1050,7 +1062,7 @@ fn short_cluster(arg: &str) -> Option<&str> {
 }
 
 fn is_value_taking_short_flag(flag: char) -> bool {
-    matches!(flag, 'F' | 't' | 'f' | 'c' | 'n' | 'x' | 'y')
+    matches!(flag, 'F' | 't' | 'f' | 'c' | 'n' | 'x' | 'y' | 'b')
 }
 
 fn default_target() -> String {
@@ -1376,22 +1388,53 @@ mod tests {
     #[test]
     fn parses_target_without_confusing_format_values() {
         assert_eq!(
-            parse_target(&args(["-F", "-t#{session_name}"])),
+            parse_target(&args(["-F", "-t#{session_name}"])).unwrap(),
             None,
             "-F values that look like targets must remain format literals"
         );
         assert_eq!(
-            parse_target(&args(["-F", "-t#{session_name}", "-t", "real"])).as_deref(),
+            parse_target(&args(["-F", "-t#{session_name}", "-t", "real"]))
+                .unwrap()
+                .as_deref(),
             Some("real")
         );
         assert_eq!(
-            parse_target(&args(["-aF", "-t#{session_name}", "-tfoo"])).as_deref(),
+            parse_target(&args(["-aF", "-t#{session_name}", "-tfoo"]))
+                .unwrap()
+                .as_deref(),
             Some("foo")
         );
-        assert_eq!(parse_target(&args(["--", "-tfoo"])), None);
-        assert_eq!(parse_target(&args(["-at", "foo"])).as_deref(), Some("foo"));
-        assert_eq!(parse_target(&args(["-atfoo"])).as_deref(), Some("foo"));
-        assert_eq!(parse_target(&args(["-at=foo"])).as_deref(), Some("foo"));
+        assert_eq!(parse_target(&args(["--", "-tfoo"])).unwrap(), None);
+        assert_eq!(
+            parse_target(&args(["-at", "foo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["-atfoo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["-at=foo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert!(parse_target(&args(["-t"])).is_err());
+        assert!(parse_target(&args(["-t="])).is_err());
+    }
+
+    #[test]
+    fn parses_buffer_path_after_buffer_options() {
+        assert_eq!(
+            buffer_path_arg(&args(["-b", "named", "/tmp/input"])).as_deref(),
+            Some("/tmp/input")
+        );
+        assert_eq!(
+            buffer_path_arg(&args(["-abnamed", "/tmp/input"])).as_deref(),
+            Some("/tmp/input")
+        );
+        assert_eq!(
+            buffer_path_arg(&args(["--", "-literal-path"])).as_deref(),
+            Some("-literal-path")
+        );
     }
 
     #[test]
