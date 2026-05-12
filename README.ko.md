@@ -78,6 +78,7 @@ lterm -a api
 | 작업 | 일반 명령 | 호환 이름 |
 | --- | --- | --- |
 | 영속 프로세스 시작 | `lterm start -n api -- npm run dev` | `new` |
+| tmux 호환을 켠 상태로 명령 실행 | `lterm run -- codex exec "요약해줘"` | 없음 (`--no-tmux`로 opt out) |
 | 세션 열기 또는 생성 | `lterm open main` | `attach-or-new` |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
@@ -194,7 +195,7 @@ lterm codex --detach --name repo-codex -- exec "이 저장소를 요약해줘"
 lterm gemini --status -- -p "lterm status를 유지해줘"
 ```
 
-Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. 직접 generic primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run --tmux -- <command>`를 사용하세요.
+Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. 직접 generic tmux-compatible primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run -- <command>`를 사용하세요. `run`은 shim을 기본으로 켜며 `--no-tmux`로 끌 수 있습니다.
 
 launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`)입니다. 이 옵션들은 `claude`, `codex`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
@@ -234,9 +235,9 @@ lterm omc --madmax
 **임의의 명령을 tmux 호환 모드로 실행:**
 
 ```bash
-lterm run --tmux -- omx hud --tmux
-lterm run --tmux -- claude
-lterm run --tmux -- codex exec "저장소를 요약해줘"
+lterm run -- omx hud --tmux
+lterm run -- claude
+lterm run -- codex exec "저장소를 요약해줘"
 ```
 
 이 세션 안에서는 `tmux`가 `lterm tmux-compat` shim으로 해석됩니다. 이 shim은 호환 계층이지 모든 `lterm` 제품 명령의 두 번째 철자가 아닙니다. 현재 shim은 AI orchestration 스크립트가 자주 사용하는 다음 명령 subset을 구현합니다.

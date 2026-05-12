@@ -770,6 +770,12 @@ fn help_describes_session_creation_arguments() -> TestResult {
             normalized.contains(tmux_description),
             "{command} help should describe the tmux compatibility flag:\n{stdout}"
         );
+        if command == "run" {
+            assert!(
+                !normalized.contains(" --tmux "),
+                "run help should not expose the hidden legacy --tmux no-op:\n{stdout}"
+            );
+        }
         assert!(
             normalized.contains(command_description),
             "{command} help should describe trailing command args:\n{stdout}"
