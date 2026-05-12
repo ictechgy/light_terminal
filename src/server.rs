@@ -1450,14 +1450,18 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let state_for_waiter = Arc::clone(state);
     let session_for_waiter = Arc::clone(&session);
     thread::spawn(move || {
-        if wait_for_leader_exit_without_reaping(&session_for_waiter) {
-            terminate_unreaped_process_group(&session_for_waiter);
-        }
-        let exit_code = match lock(&session_for_waiter.child).wait() {
-            Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
-            Err(err) => {
-                eprintln!("wait error for {}: {err}", session_for_waiter.name);
-                1
+        let leader_exit_observed = wait_for_leader_exit_without_reaping(&session_for_waiter);
+        let exit_code = {
+            let mut child = lock(&session_for_waiter.child);
+            if leader_exit_observed {
+                terminate_unreaped_process_group(&session_for_waiter);
+            }
+            match child.wait() {
+                Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
+                Err(err) => {
+                    eprintln!("wait error for {}: {err}", session_for_waiter.name);
+                    1
+                }
             }
         };
         session_for_waiter
@@ -1929,6 +1933,9 @@ fn wait_for_cleanup_complete(session: &Session) {
 }
 
 fn terminate_process_group_for_request(session: &Session) {
+    // Hold the child lock while signaling so the waiter cannot reap the leader
+    // and release the pgid anchor between an unreaped-pgid check and `kill`.
+    let _reap_guard = lock(&session.child);
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
