@@ -227,6 +227,10 @@ struct Session {
     /// Set immediately after the leader wait returns. A concurrent explicit
     /// kill must not rely on the reaped leader pid to verify the process group.
     leader_reaped: AtomicBool,
+    /// One-shot gate for the unreaped-leader residual process-group cleanup.
+    /// Both explicit terminate and the waiter can discover the same unreaped
+    /// leader; only one should send the short residual signal ladder.
+    unreaped_cleanup_started: AtomicBool,
     exit_code: AtomicI32,
     rows: Mutex<u16>,
     cols: Mutex<u16>,
@@ -1417,6 +1421,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cleanup_complete: AtomicBool::new(false),
         leader_exit_observed: AtomicBool::new(false),
         leader_reaped: AtomicBool::new(false),
+        unreaped_cleanup_started: AtomicBool::new(false),
         exit_code: AtomicI32::new(i32::MIN),
         rows: Mutex::new(rows),
         cols: Mutex::new(cols),
@@ -1456,17 +1461,18 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
             if leader_exit_observed {
                 terminate_unreaped_process_group(&session_for_waiter);
             }
-            match child.wait() {
+            let exit_code = match child.wait() {
                 Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
                 Err(err) => {
                     eprintln!("wait error for {}: {err}", session_for_waiter.name);
                     1
                 }
-            }
+            };
+            session_for_waiter
+                .leader_reaped
+                .store(true, Ordering::SeqCst);
+            exit_code
         };
-        session_for_waiter
-            .leader_reaped
-            .store(true, Ordering::SeqCst);
         session_for_waiter
             .exit_code
             .store(exit_code, Ordering::SeqCst);
@@ -1943,7 +1949,7 @@ fn terminate_process_group_for_request(session: &Session) {
         terminate_unreaped_process_group(session);
         return;
     }
-    terminate_verified_process_group(session);
+    terminate_verified_process_group_for_request(session);
     if wait_for_leader_exit_observed(session, Duration::from_millis(50))
         && !session.leader_reaped.load(Ordering::SeqCst)
     {
@@ -1996,16 +2002,41 @@ fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
     session.leader_exit_observed.load(Ordering::SeqCst)
 }
 
-fn terminate_verified_process_group(session: &Session) {
+fn terminate_verified_process_group_for_request(session: &Session) {
     signal_process_group(session, libc::SIGHUP);
-    wait_for_process_group_exit(session, Duration::from_millis(150));
+    match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)) {
+        ProcessGroupWait::LeaderObserved => {
+            terminate_unreaped_process_group(session);
+            return;
+        }
+        ProcessGroupWait::Exited => return,
+        ProcessGroupWait::TimedOut => {}
+    }
     signal_process_group(session, libc::SIGTERM);
-    wait_for_process_group_exit(session, Duration::from_millis(350));
+    match wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(350)) {
+        ProcessGroupWait::LeaderObserved => {
+            terminate_unreaped_process_group(session);
+            return;
+        }
+        ProcessGroupWait::Exited => return,
+        ProcessGroupWait::TimedOut => {}
+    }
     signal_process_group(session, libc::SIGKILL);
-    wait_for_process_group_exit(session, Duration::from_millis(150));
+    if matches!(
+        wait_for_process_group_exit_or_leader_observed(session, Duration::from_millis(150)),
+        ProcessGroupWait::LeaderObserved
+    ) {
+        terminate_unreaped_process_group(session);
+    }
 }
 
 fn terminate_unreaped_process_group(session: &Session) {
+    if session
+        .unreaped_cleanup_started
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
     // `waitid(..., WNOWAIT)` has observed leader exit, but `child.wait()` has
     // not reaped it yet. The stored pgid is safe only in this narrow window:
     // the zombie leader still anchors that pid/pgid number, so the kernel
@@ -2088,18 +2119,42 @@ fn process_group_still_owns_child(process_id: Option<u32>, pgid: i32) -> bool {
     unsafe { libc::getpgid(pid) == pgid }
 }
 
-fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
+enum ProcessGroupWait {
+    Exited,
+    LeaderObserved,
+    TimedOut,
+}
+
+fn wait_for_process_group_exit_or_leader_observed(
+    session: &Session,
+    timeout: Duration,
+) -> ProcessGroupWait {
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        return ProcessGroupWait::LeaderObserved;
+    }
     let Some(pgid) = verified_session_process_group_id(session) else {
         thread::sleep(timeout);
-        return;
+        return if session.leader_exit_observed.load(Ordering::SeqCst) {
+            ProcessGroupWait::LeaderObserved
+        } else {
+            ProcessGroupWait::TimedOut
+        };
     };
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return ProcessGroupWait::LeaderObserved;
+        }
         let rc = unsafe { libc::kill(-pgid, 0) };
         if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
+            return ProcessGroupWait::Exited;
         }
         thread::sleep(Duration::from_millis(25));
+    }
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        ProcessGroupWait::LeaderObserved
+    } else {
+        ProcessGroupWait::TimedOut
     }
 }
 
@@ -2851,6 +2906,7 @@ mod tests {
             cleanup_complete: AtomicBool::new(false),
             leader_exit_observed: AtomicBool::new(false),
             leader_reaped: AtomicBool::new(false),
+            unreaped_cleanup_started: AtomicBool::new(false),
             exit_code: AtomicI32::new(i32::MIN),
             rows: Mutex::new(24),
             cols: Mutex::new(80),
