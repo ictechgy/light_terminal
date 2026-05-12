@@ -3680,8 +3680,9 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
             "tmux-compat",
             "capture-pane",
             "-p",
-            "-S",
-            "0",
+            "-Stop",
+            "-E",
+            "10",
             "-t",
             "capture-second",
         ])
@@ -3703,6 +3704,8 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
             "named-buffer",
             "-S",
             "0",
+            "-E",
+            "10",
             "-t",
             "capture-second",
         ])
@@ -3797,8 +3800,9 @@ fn tmux_paste_buffer_skips_buffer_name_option_before_target() -> TestResult {
         .args([
             "tmux-compat",
             "paste-buffer",
-            "-b",
-            "named-buffer",
+            "-btfoo",
+            "-s",
+            "",
             "-t",
             "paste-second",
         ])

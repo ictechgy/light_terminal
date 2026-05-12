@@ -495,7 +495,7 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target_with_value_flags(args, &['S', 'b'])?;
+    let target = parse_target_with_value_flags(args, &['S', 'E', 'b'])?;
     let mut print = false;
     let mut start = None;
     let mut i = 0;
@@ -714,7 +714,7 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
-    let target = parse_target_with_value_flags(args, &['b'])?.unwrap_or_else(default_target);
+    let target = parse_target_with_value_flags(args, &['b', 's'])?.unwrap_or_else(default_target);
     let data = read_buffer_or_empty()?;
     client::send(&target, data)?;
     Ok(0)
@@ -914,10 +914,12 @@ fn parse_target_with_value_flags(
             return target_value(Some(args[i][2..].to_string()), "-t");
         }
         if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
-            if let Some(value) = value {
-                return target_value(Some(value), "-t");
+            if !value_flag_consumes_before(&args[i], 't', extra_value_flags) {
+                if let Some(value) = value {
+                    return target_value(Some(value), "-t");
+                }
+                return target_value(args.get(i + 1).cloned(), "-t");
             }
-            return target_value(args.get(i + 1).cloned(), "-t");
         }
         if args[i].starts_with('-') {
             i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
@@ -926,6 +928,26 @@ fn parse_target_with_value_flags(
         }
     }
     Ok(None)
+}
+
+fn value_flag_consumes_before(arg: &str, needle: char, extra_value_flags: &[char]) -> bool {
+    let Some(cluster) = short_cluster(arg) else {
+        return false;
+    };
+    for (pos, flag) in cluster.char_indices() {
+        if flag == needle {
+            return false;
+        }
+        if extra_value_flags.contains(&flag) {
+            return true;
+        }
+        if value_for_short_flag(cluster, pos, flag, &[], 0).is_some()
+            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            return false;
+        }
+    }
+    false
 }
 
 fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
