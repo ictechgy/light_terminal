@@ -7,6 +7,7 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -219,9 +220,12 @@ struct Session {
     cleanup_started: AtomicBool,
     cleanup_completion: (Mutex<bool>, Condvar),
     cleanup_complete: AtomicBool,
+    /// Set after `waitid(..., WNOWAIT)` observes leader exit but before the
+    /// waiter reaps it. During this window the stored pgid is still anchored by
+    /// the unreaped leader pid and cannot be reused by an unrelated process.
+    leader_exit_observed: AtomicBool,
     /// Set immediately after the leader wait returns. A concurrent explicit
-    /// kill must not rely on the reaped leader pid to verify the process group;
-    /// it needs the stored-pgid cleanup path for residual PTY holders.
+    /// kill must not rely on the reaped leader pid to verify the process group.
     leader_reaped: AtomicBool,
     exit_code: AtomicI32,
     rows: Mutex<u16>,
@@ -1411,6 +1415,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cleanup_started: AtomicBool::new(false),
         cleanup_completion: (Mutex::new(false), Condvar::new()),
         cleanup_complete: AtomicBool::new(false),
+        leader_exit_observed: AtomicBool::new(false),
         leader_reaped: AtomicBool::new(false),
         exit_code: AtomicI32::new(i32::MIN),
         rows: Mutex::new(rows),
@@ -1445,6 +1450,9 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let state_for_waiter = Arc::clone(state);
     let session_for_waiter = Arc::clone(&session);
     thread::spawn(move || {
+        if wait_for_leader_exit_without_reaping(&session_for_waiter) {
+            terminate_unreaped_process_group(&session_for_waiter);
+        }
         let exit_code = match lock(&session_for_waiter.child).wait() {
             Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
             Err(err) => {
@@ -1856,14 +1864,11 @@ fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinali
     }
 
     let mut completion_guard = CleanupCompletionGuard::new(session);
+    if matches!(reason, SessionFinalizeReason::TerminateRequested) {
+        terminate_process_group_for_request(session);
+    }
     session.close_subscribers();
     terminate_child_sessions(state, &session.id);
-    match reason {
-        SessionFinalizeReason::LeaderExited => {
-            cleanup_stored_process_group_after_leader_exit(session)
-        }
-        SessionFinalizeReason::TerminateRequested => terminate_process_group_for_request(session),
-    }
     remove_session(state, session);
     mark_cleanup_complete(session);
     completion_guard.disarm();
@@ -1925,13 +1930,63 @@ fn wait_for_cleanup_complete(session: &Session) {
 
 fn terminate_process_group_for_request(session: &Session) {
     if session.leader_reaped.load(Ordering::SeqCst) {
-        cleanup_stored_process_group_after_leader_exit(session);
+        return;
+    }
+    if session.leader_exit_observed.load(Ordering::SeqCst) {
+        terminate_unreaped_process_group(session);
         return;
     }
     terminate_verified_process_group(session);
-    if session.leader_reaped.load(Ordering::SeqCst) {
-        cleanup_stored_process_group_after_leader_exit(session);
+    if wait_for_leader_exit_observed(session, Duration::from_millis(50))
+        && !session.leader_reaped.load(Ordering::SeqCst)
+    {
+        terminate_unreaped_process_group(session);
     }
+}
+
+fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
+    let Some(pid) = session
+        .process_id
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+    else {
+        return false;
+    };
+
+    loop {
+        let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            session.leader_exit_observed.store(true, Ordering::SeqCst);
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        eprintln!(
+            "failed to observe leader exit before reap for {}: {}",
+            session.name, err
+        );
+        return false;
+    }
+}
+
+fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if session.leader_exit_observed.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    session.leader_exit_observed.load(Ordering::SeqCst)
 }
 
 fn terminate_verified_process_group(session: &Session) {
@@ -1943,30 +1998,35 @@ fn terminate_verified_process_group(session: &Session) {
     wait_for_process_group_exit(session, Duration::from_millis(150));
 }
 
-fn cleanup_stored_process_group_after_leader_exit(session: &Session) {
-    // The leader pid no longer verifies the process group after `wait()`
-    // returns, but the pgid was captured and verified at spawn time. Use that
-    // stored pgid only after the waiter has recorded leader exit, as close to
-    // that exit as possible, to reap residual PTY holders that would otherwise
-    // outlive the lterm session.
-    // Once a probe observes ESRCH the original group is gone, so do not send
-    // later escalation signals to the stale numeric pgid.
-    if !signal_stored_process_group(session, libc::SIGHUP) {
+fn terminate_unreaped_process_group(session: &Session) {
+    // `waitid(..., WNOWAIT)` has observed leader exit, but `child.wait()` has
+    // not reaped it yet. The stored pgid is safe only in this narrow window:
+    // the zombie leader still anchors that pid/pgid number, so the kernel
+    // cannot recycle it for an unrelated process group while we reap residual
+    // PTY holders.
+    signal_unreaped_process_group(session, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(150));
+    signal_unreaped_process_group(session, libc::SIGTERM);
+    thread::sleep(Duration::from_millis(350));
+    signal_unreaped_process_group(session, libc::SIGKILL);
+    thread::sleep(Duration::from_millis(150));
+}
+
+fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
+    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
+        return;
+    };
+    let rc = unsafe { libc::kill(-pgid, signal) };
+    if rc == 0 {
         return;
     }
-    if !wait_for_stored_process_group_exit(session, Duration::from_millis(150)) {
-        return;
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ESRCH) {
+        eprintln!(
+            "failed to signal unreaped process group {} for {}: {}",
+            pgid, session.name, err
+        );
     }
-    if !signal_stored_process_group(session, libc::SIGTERM) {
-        return;
-    }
-    if !wait_for_stored_process_group_exit(session, Duration::from_millis(350)) {
-        return;
-    }
-    if !signal_stored_process_group(session, libc::SIGKILL) {
-        return;
-    }
-    let _ = wait_for_stored_process_group_exit(session, Duration::from_millis(150));
 }
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
@@ -2034,40 +2094,6 @@ fn wait_for_process_group_exit(session: &Session, timeout: Duration) {
         }
         thread::sleep(Duration::from_millis(25));
     }
-}
-
-fn signal_stored_process_group(session: &Session, signal: libc::c_int) -> bool {
-    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
-        return false;
-    };
-    let rc = unsafe { libc::kill(-pgid, signal) };
-    if rc == 0 {
-        return true;
-    }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        return false;
-    }
-    eprintln!(
-        "failed to signal stored process group {} for {} after leader exit: {}",
-        pgid, session.name, err
-    );
-    true
-}
-
-fn wait_for_stored_process_group_exit(session: &Session, timeout: Duration) -> bool {
-    let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
-        return false;
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        let rc = unsafe { libc::kill(-pgid, 0) };
-        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    true
 }
 
 fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
@@ -2816,6 +2842,7 @@ mod tests {
             cleanup_started: AtomicBool::new(false),
             cleanup_completion: (Mutex::new(false), Condvar::new()),
             cleanup_complete: AtomicBool::new(false),
+            leader_exit_observed: AtomicBool::new(false),
             leader_reaped: AtomicBool::new(false),
             exit_code: AtomicI32::new(i32::MIN),
             rows: Mutex::new(24),
@@ -2842,6 +2869,9 @@ mod tests {
                 .insert(session.id.clone(), Arc::clone(&session));
         }
 
+        // Hold the lock that `close_subscribers` takes so the first finalizer
+        // is definitely inside cleanup while the second caller enters the
+        // cleanup_started/cleanup_complete wait path.
         let output_guard = super::lock(&session.output_state);
         let first_ready = Arc::new(Barrier::new(2));
         let state_for_first = Arc::clone(&state);

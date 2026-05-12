@@ -4159,7 +4159,7 @@ fn session_reaps_when_leader_exits_even_if_background_keeps_pty_open() -> TestRe
             "--",
             "sh",
             "-lc",
-            "trap '' HUP; release=$1; sleep 30 & printf 'CHILD:%s\\nCHILD_READY\\n' \"$!\"; while [ ! -f \"$release\" ]; do sleep 0.05; done; echo LEADER_DONE",
+            "trap '' HUP TERM; release=$1; sleep 30 & printf 'CHILD:%s\\nCHILD_READY\\n' \"$!\"; while [ ! -f \"$release\" ]; do sleep 0.05; done; echo LEADER_DONE",
             "sh",
             &release_arg,
         ])
