@@ -789,6 +789,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             "tmux-compat",
             &["Arguments forwarded to the tmux compatibility parser"][..],
         ),
+        ("shutdown", &["Stop the daemon and all sessions"][..]),
         (
             "notify",
             &[

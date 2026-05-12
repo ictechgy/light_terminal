@@ -85,6 +85,7 @@ lterm -a api
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
+| daemon과 모든 세션 종료 | `lterm shutdown` | 없음 |
 
 호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
 
@@ -120,6 +121,13 @@ lterm close api
 ```
 
 `kill`은 `close`의 visible compatibility alias입니다. 두 이름 모두 같은 session/pane 종료 경로를 사용합니다.
+
+**daemon과 그 daemon이 소유한 모든 세션 종료:**
+
+```bash
+# 단일 세션 close가 아니라 daemon-wide 종료입니다.
+lterm shutdown
+```
 
 ## AI 워크플로
 
