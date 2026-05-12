@@ -518,9 +518,8 @@ fn capture_pane(args: &[String]) -> Result<i32> {
 }
 
 fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
-    const VALUE_FLAGS: &[char] = &['S', 'E', 'b'];
+    const VALUE_FLAGS: &[char] = &['S', 'E', 'b', 't'];
     let mut parsed = CapturePaneArgs::default();
-    let mut target_scan_active = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -532,9 +531,7 @@ fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
                 i += 1;
             }
             "-t" => {
-                if target_scan_active {
-                    parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
-                }
+                parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
                 i += 2;
             }
             "-S" => {
@@ -548,19 +545,17 @@ fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
             "-b" => i += 2,
             "-e" | "-J" => i += 1,
             flag if flag.starts_with('-') => {
-                if target_scan_active {
-                    if let Some(value) = flag.strip_prefix("-t=") {
-                        parsed.target = target_value(Some(value.to_string()), "-t")?;
-                    } else if flag.starts_with("-t") && flag.len() > 2 {
-                        parsed.target = target_value(Some(flag[2..].to_string()), "-t")?;
-                    } else if let Some((_, value)) =
-                        short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
-                    {
-                        parsed.target = match value {
-                            Some(value) => target_value(Some(value), "-t")?,
-                            None => target_value(args.get(i + 1).cloned(), "-t")?,
-                        };
-                    }
+                if let Some(value) = flag.strip_prefix("-t=") {
+                    parsed.target = target_value(Some(value.to_string()), "-t")?;
+                } else if flag.starts_with("-t") && flag.len() > 2 {
+                    parsed.target = target_value(Some(flag[2..].to_string()), "-t")?;
+                } else if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
+                {
+                    parsed.target = match value {
+                        Some(value) => target_value(Some(value), "-t")?,
+                        None => target_value(args.get(i + 1).cloned(), "-t")?,
+                    };
                 }
                 if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
                     parsed.print = true;
@@ -578,7 +573,6 @@ fn parse_capture_pane_args(args: &[String]) -> Result<CapturePaneArgs> {
                 i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
             }
             _ => {
-                target_scan_active = false;
                 i += 1;
             }
         }
@@ -1671,6 +1665,25 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_capture_pane_args(&args(["-t=cap"])).unwrap(),
+            CapturePaneArgs {
+                target: Some("cap".into()),
+                print: false,
+                start: None,
+                end: None,
+            }
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["-tS1"])).unwrap(),
+            CapturePaneArgs {
+                target: Some("S1".into()),
+                print: false,
+                start: None,
+                end: None,
+            },
+            "attached target values must not be reinterpreted as -S/-E/-p flags"
+        );
+        assert_eq!(
             parse_capture_pane_args(&args(["-b", "-p", "-t", "cap"])).unwrap(),
             CapturePaneArgs {
                 target: Some("cap".into()),
@@ -1687,6 +1700,16 @@ mod tests {
                 .as_deref(),
             Some("second"),
             "tmux capture-pane lets later target flags override earlier ones"
+        );
+        assert_eq!(
+            parse_capture_pane_args(&args(["-pt", "first", "-t", "second"])).unwrap(),
+            CapturePaneArgs {
+                target: Some("second".into()),
+                print: true,
+                start: None,
+                end: None,
+            },
+            "clustered -t values should be consumed before later target overrides"
         );
         assert_eq!(
             parse_capture_pane_args(&args(["--", "-t", "ignored"])).unwrap(),
