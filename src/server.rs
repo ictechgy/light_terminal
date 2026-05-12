@@ -2003,13 +2003,14 @@ fn terminate_unreaped_process_group(session: &Session) {
     // not reaped it yet. The stored pgid is safe only in this narrow window:
     // the zombie leader still anchors that pid/pgid number, so the kernel
     // cannot recycle it for an unrelated process group while we reap residual
-    // PTY holders.
+    // PTY holders. Keep this ladder short: the leader already exited, so these
+    // are orphaned residuals rather than an interactive foreground shell.
     signal_unreaped_process_group(session, libc::SIGHUP);
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(50));
     signal_unreaped_process_group(session, libc::SIGTERM);
-    thread::sleep(Duration::from_millis(350));
+    thread::sleep(Duration::from_millis(50));
     signal_unreaped_process_group(session, libc::SIGKILL);
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(50));
 }
 
 fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
