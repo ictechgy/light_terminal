@@ -495,7 +495,8 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target_with_value_flags(args, &['S', 'E', 'b'])?;
+    const VALUE_FLAGS: &[char] = &['S', 'E', 'b'];
+    let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut print = false;
     let mut start = None;
     let mut i = 0;
@@ -512,8 +513,19 @@ fn capture_pane(args: &[String]) -> Result<i32> {
                 start = args.get(i + 1).and_then(|s| s.parse::<i32>().ok());
                 i += 2;
             }
+            "-E" | "-b" => i += 2,
             "-e" | "-J" => i += 1,
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
+                    print = true;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'S', args, i, VALUE_FLAGS)
+                {
+                    start = value.and_then(|s| s.parse::<i32>().ok());
+                }
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
             _ => i += 1,
         }
     }
@@ -913,13 +925,13 @@ fn parse_target_with_value_flags(
         if args[i].starts_with("-t") && args[i].len() > 2 {
             return target_value(Some(args[i][2..].to_string()), "-t");
         }
-        if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
-            if !value_flag_consumes_before(&args[i], 't', extra_value_flags) {
-                if let Some(value) = value {
-                    return target_value(Some(value), "-t");
-                }
-                return target_value(args.get(i + 1).cloned(), "-t");
+        if let Some((_, value)) =
+            short_cluster_flag_value_with_extra(&args[i], 't', args, i, extra_value_flags)
+        {
+            if let Some(value) = value {
+                return target_value(Some(value), "-t");
             }
+            return target_value(args.get(i + 1).cloned(), "-t");
         }
         if args[i].starts_with('-') {
             i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
@@ -928,26 +940,6 @@ fn parse_target_with_value_flags(
         }
     }
     Ok(None)
-}
-
-fn value_flag_consumes_before(arg: &str, needle: char, extra_value_flags: &[char]) -> bool {
-    let Some(cluster) = short_cluster(arg) else {
-        return false;
-    };
-    for (pos, flag) in cluster.char_indices() {
-        if flag == needle {
-            return false;
-        }
-        if extra_value_flags.contains(&flag) {
-            return true;
-        }
-        if value_for_short_flag(cluster, pos, flag, &[], 0).is_some()
-            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
-        {
-            return false;
-        }
-    }
-    false
 }
 
 fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
@@ -962,6 +954,10 @@ fn value_for_option(value: Option<String>, flag: &str) -> Result<String> {
 }
 
 fn has_flag_in_arg(arg: &str, needle: char) -> bool {
+    has_flag_in_arg_with_value_flags(arg, needle, &[])
+}
+
+fn has_flag_in_arg_with_value_flags(arg: &str, needle: char, extra_value_flags: &[char]) -> bool {
     let Some(cluster) = short_cluster(arg) else {
         return false;
     };
@@ -969,8 +965,9 @@ fn has_flag_in_arg(arg: &str, needle: char) -> bool {
         if flag == needle {
             return true;
         }
-        if value_for_short_flag(cluster, pos, flag, &[], 0).is_some()
-            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        if value_for_short_flag_with_extra(cluster, pos, flag, &[], 0, extra_value_flags).is_some()
+            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+                && cluster[pos + flag.len_utf8()..].is_empty())
         {
             break;
         }
@@ -1158,14 +1155,25 @@ fn short_cluster_flag_value(
     args: &[String],
     i: usize,
 ) -> Option<(usize, Option<String>)> {
+    short_cluster_flag_value_with_extra(arg, needle, args, i, &[])
+}
+
+fn short_cluster_flag_value_with_extra(
+    arg: &str,
+    needle: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> Option<(usize, Option<String>)> {
     let cluster = short_cluster(arg)?;
     for (pos, flag) in cluster.char_indices() {
-        let value = value_for_short_flag(cluster, pos, flag, args, i);
+        let value = value_for_short_flag_with_extra(cluster, pos, flag, args, i, extra_value_flags);
         if flag == needle {
             return Some((pos, value));
         }
         if value.is_some()
-            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+                && cluster[pos + flag.len_utf8()..].is_empty())
         {
             break;
         }
@@ -1180,7 +1188,18 @@ fn value_for_short_flag(
     args: &[String],
     i: usize,
 ) -> Option<String> {
-    if !is_value_taking_short_flag(flag) {
+    value_for_short_flag_with_extra(cluster, pos, flag, args, i, &[])
+}
+
+fn value_for_short_flag_with_extra(
+    cluster: &str,
+    pos: usize,
+    flag: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> Option<String> {
+    if !is_value_taking_short_flag(flag) && !extra_value_flags.contains(&flag) {
         return None;
     }
     let rest = &cluster[pos + flag.len_utf8()..];

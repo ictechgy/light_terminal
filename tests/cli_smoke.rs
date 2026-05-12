@@ -3673,6 +3673,19 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
         assert!(status.success());
         env.capture_until(name, marker)?;
     }
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "capture-start",
+            "printf 'FIRST_LINE\\nSECOND_LINE\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("capture-start", "SECOND_LINE")?;
 
     let output = env
         .cmd()
@@ -3700,6 +3713,25 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
         .args([
             "tmux-compat",
             "capture-pane",
+            "-p",
+            "-S1",
+            "-t",
+            "capture-start",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SECOND_LINE"), "{stdout:?}");
+    assert!(
+        !stdout.contains("FIRST_LINE"),
+        "compact capture-pane -S value should set the start line: {stdout:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
             "-b",
             "named-buffer",
             "-S",
@@ -3712,6 +3744,31 @@ fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
         .output()?;
     assert!(output.status.success(), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
+    let buffer = env
+        .cmd()
+        .args(["tmux-compat", "save-buffer", "-"])
+        .output()?;
+    assert!(buffer.status.success(), "{buffer:?}");
+    let stdout = String::from_utf8_lossy(&buffer.stdout);
+    assert!(stdout.contains("SECOND_MARK"), "{stdout:?}");
+    assert!(!stdout.contains("FIRST_MARK"), "{stdout:?}");
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-b",
+            "-p",
+            "-t",
+            "capture-second",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "capture-pane -b -p must treat -p as the buffer name, not print flag: {output:?}"
+    );
     let buffer = env
         .cmd()
         .args(["tmux-compat", "save-buffer", "-"])
