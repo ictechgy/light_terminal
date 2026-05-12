@@ -326,7 +326,7 @@ impl Session {
             return bytes[spans[first].0..].to_vec();
         };
         let last = capture_end_line_index(end, spans.len());
-        if last < first || last >= spans.len() {
+        if last < first {
             return Vec::new();
         }
         bytes[spans[first].0..spans[last].1].to_vec()
@@ -2976,6 +2976,14 @@ mod tests {
         assert_eq!(
             session.capture_bytes(Some(1), Some(99)),
             b"TWO\nTHREE\n".to_vec()
+        );
+        assert_eq!(
+            session.capture_bytes(Some(-2), Some(-1)),
+            b"TWO\nTHREE\n".to_vec()
+        );
+        assert_eq!(
+            session.capture_bytes(None, Some(-2)),
+            b"ONE\nTWO\n".to_vec()
         );
         assert!(
             session.capture_bytes(Some(2), Some(1)).is_empty(),
