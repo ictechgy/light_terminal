@@ -471,6 +471,10 @@ fn help_shows_common_aliases() -> TestResult {
         "list aliases were not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: close]"),
+        "kill alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: input]"),
         "send alias was not visible in help:\n{stdout}"
     );
@@ -706,6 +710,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             ][..],
         ),
         ("kill", &["Session or pane target to kill"][..]),
+        ("close", &["Session or pane target to kill"][..]),
         (
             "send",
             &[
@@ -816,6 +821,31 @@ fn attached_client_exits_when_session_kills_itself() -> TestResult {
         !stdout.contains("AFTER"),
         "attach kept streaming after self-kill began: {stdout:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn close_alias_kills_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "close-alias",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    wait_for_session_present(&env, "close-alias")?;
+
+    let status = env.cmd().args(["close", "close-alias"]).status()?;
+    assert!(status.success());
+    wait_for_session_absent(&env, "close-alias")?;
     Ok(())
 }
 
