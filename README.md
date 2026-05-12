@@ -85,6 +85,7 @@ lterm -a api
 | Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
+| Stop the daemon and all sessions | `lterm shutdown` | None |
 
 Compatibility names are subcommands unless shown as a leading flag: `-a` is the legacy shortcut form and must be used as `lterm -a <target>`.
 
@@ -120,6 +121,13 @@ lterm close api
 ```
 
 `kill` is a visible compatibility alias for `close`; both names use the same session/pane termination path.
+
+**Stop the daemon and every session it owns:**
+
+```bash
+# This is daemon-wide, not a single-session close.
+lterm shutdown
+```
 
 ## AI workflows
 
