@@ -250,7 +250,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **Terminal output is forwarded as-is.** `lterm attach` passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
-**Capture output is sanitized for human/AI consumption.** `lterm capture` and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
+**Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`) and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
 
 **Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
@@ -282,7 +282,7 @@ Use isolated runtime directories for manual testing:
 ```bash
 TMP=$(mktemp -d)
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --name test -- sh -lc 'echo hi; sleep 10'
-LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- capture test -S=-20
+LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- logs test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
 
