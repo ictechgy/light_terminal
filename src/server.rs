@@ -2006,11 +2006,10 @@ fn terminate_unreaped_process_group(session: &Session) {
     // PTY holders. Keep this ladder short: the leader already exited, so these
     // are orphaned residuals rather than an interactive foreground shell.
     signal_unreaped_process_group(session, libc::SIGHUP);
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(10));
     signal_unreaped_process_group(session, libc::SIGTERM);
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(10));
     signal_unreaped_process_group(session, libc::SIGKILL);
-    thread::sleep(Duration::from_millis(50));
 }
 
 fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
