@@ -121,9 +121,9 @@ enum Commands {
         /// Session or pane target to kill.
         target: String,
     },
-    /// Send text to a session or pane.
-    #[command(visible_alias = "input")]
-    Send {
+    /// Write text to a session or pane.
+    #[command(name = "input", visible_alias = "send")]
+    Input {
         /// Session or pane target to receive input.
         target: String,
         /// Text to send to the target PTY.
@@ -352,7 +352,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Kill { target } => client::kill(&target),
-        Commands::Send {
+        Commands::Input {
             target,
             text,
             enter,

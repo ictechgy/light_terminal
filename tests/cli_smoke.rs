@@ -487,8 +487,8 @@ fn help_shows_common_aliases() -> TestResult {
         "kill alias was not visible in help:\n{stdout}"
     );
     assert!(
-        stdout.contains("[aliases: input]"),
-        "send alias was not visible in help:\n{stdout}"
+        stdout.contains("[aliases: send]"),
+        "send compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
         stdout.contains("[aliases: capture]"),
@@ -752,7 +752,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         ("kill", &["Session or pane target to kill"][..]),
         ("close", &["Session or pane target to kill"][..]),
         (
-            "send",
+            "input",
             &[
                 "Session or pane target to receive input",
                 "Text to send to the target PTY",
@@ -760,7 +760,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             ][..],
         ),
         (
-            "input",
+            "send",
             &[
                 "Session or pane target to receive input",
                 "Text to send to the target PTY",
@@ -1564,7 +1564,7 @@ fn tmux_compat_send_keys_reaches_pty() -> TestResult {
 }
 
 #[test]
-fn input_alias_sends_text_to_pty() -> TestResult {
+fn input_sends_text_to_pty() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -1591,6 +1591,37 @@ fn input_alias_sends_text_to_pty() -> TestResult {
     let captured = env.capture_until("input-alias", "INPUT:hello")?;
     assert!(captured.contains("READY"), "{captured}");
     assert!(captured.contains("INPUT:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn send_alias_sends_text_to_pty() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "send-alias",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo SEND:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("send-alias", "READY")?;
+    let status = env
+        .cmd()
+        .args(["send", "send-alias", "hello", "--enter"])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("send-alias", "SEND:hello")?;
+    assert!(captured.contains("READY"), "{captured}");
+    assert!(captured.contains("SEND:hello"), "{captured}");
     Ok(())
 }
 
@@ -3934,9 +3965,9 @@ fn attach_replays_screen_state_before_live_output() -> TestResult {
         String::from_utf8_lossy(&snapshot_head)
     );
 
-    // 그 다음 라이브 stream 을 트리거하기 위해 send 로 새 데이터를 쏘아 넣는다 —
-    // `lterm send` 는 PTY writer 로 직접 쓰므로 PTY echo + reader 경로를 거쳐 attach
-    // stdout 으로 흘러나온다.
+    // 그 다음 라이브 stream 을 트리거하기 위해 호환 명령인 send 로 새 데이터를
+    // 쏘아 넣는다 — `lterm send` 는 PTY writer 로 직접 쓰므로 PTY echo + reader
+    // 경로를 거쳐 attach stdout 으로 흘러나온다.
     let send_status = env
         .cmd()
         .args(["send", "snap-order", "AFTER_PRELUDE\n"])
