@@ -193,13 +193,13 @@ fn new_session(args: &[String]) -> Result<i32> {
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::attach(&target, true, AttachStdinEof::Detach)?;
     Ok(0)
 }
 
 fn has_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     match client::info(&target) {
         Ok(_) => Ok(0),
         Err(_) => Ok(1),
@@ -224,7 +224,7 @@ fn list_windows(args: &[String]) -> Result<i32> {
             println!("{}", expand_format(&format, &pane));
         }
     } else {
-        let target = parse_target(args).unwrap_or_else(default_target);
+        let target = parse_target(args)?.unwrap_or_else(default_target);
         let pane = window_row_for_target(&target)?;
         println!("{}", expand_format(&format, &pane));
     }
@@ -234,7 +234,7 @@ fn list_windows(args: &[String]) -> Result<i32> {
 fn list_clients(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{client_name}".to_string());
-    let panes = if let Some(target) = parse_target(args) {
+    let panes = if let Some(target) = parse_target(args)? {
         vec![window_row_for_target(&target)?]
     } else {
         root_session_rows()?
@@ -313,7 +313,7 @@ fn window_row_for_target(target: &str) -> Result<SessionInfo> {
 }
 
 fn kill_session(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::kill(&target)?;
     Ok(0)
 }
@@ -346,22 +346,48 @@ fn split_window(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-F" => {
-                format = args.get(i + 1).cloned().unwrap_or(format);
+                format = value_for_option(args.get(i + 1).cloned(), "-F")?;
                 i += 2;
             }
             "-t" => {
-                target = args.get(i + 1).cloned();
+                target = target_value(args.get(i + 1).cloned(), "-t")?;
                 i += 2;
             }
             "-c" => {
-                cwd = args.get(i + 1).cloned();
+                cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
             "--" => {
                 command.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg(flag, 'h') {
+                    direction = "right";
+                }
+                if has_flag_in_arg(flag, 'v') {
+                    direction = "down";
+                }
+                if has_flag_in_arg(flag, 'd') {
+                    detached = true;
+                }
+                if has_flag_in_arg(flag, 'P') {
+                    print = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                    format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                    target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'c', args, i) {
+                    cwd = Some(value_for_option(
+                        value.or_else(|| args.get(i + 1).cloned()),
+                        "-c",
+                    )?);
+                }
+                i += flag_arg_width(flag, args, i);
+            }
             _ => {
                 command.extend_from_slice(&args[i..]);
                 break;
@@ -389,7 +415,7 @@ fn split_window(args: &[String]) -> Result<i32> {
 fn list_panes(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
-    if let Some(target) = parse_target(args) {
+    if let Some(target) = parse_target(args)? {
         let pane = client::info(&target)?;
         println!("{}", expand_format(&format, &pane));
         return Ok(0);
@@ -417,19 +443,34 @@ fn display_message(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-t" => {
-                target = args.get(i + 1).cloned();
+                target = target_value(args.get(i + 1).cloned(), "-t")?;
                 explicit_target = true;
                 i += 2;
             }
             "-F" => {
-                message = args.get(i + 1).cloned();
+                message = Some(value_for_option(args.get(i + 1).cloned(), "-F")?);
                 i += 2;
             }
             "--" => {
                 message = Some(args[i + 1..].join(" "));
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg(flag, 'p') {
+                    print = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                    target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
+                    explicit_target = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                    message = Some(value_for_option(
+                        value.or_else(|| args.get(i + 1).cloned()),
+                        "-F",
+                    )?);
+                }
+                i += flag_arg_width(flag, args, i);
+            }
             _ => {
                 message = Some(args[i..].join(" "));
                 break;
@@ -454,7 +495,8 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    let mut target = None;
+    const VALUE_FLAGS: &[char] = &['S', 'E', 'b'];
+    let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut print = false;
     let mut start = None;
     let mut i = 0;
@@ -465,15 +507,25 @@ fn capture_pane(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-t" => {
-                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-S" => {
                 start = args.get(i + 1).and_then(|s| s.parse::<i32>().ok());
                 i += 2;
             }
+            "-E" | "-b" => i += 2,
             "-e" | "-J" => i += 1,
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg_with_value_flags(flag, 'p', VALUE_FLAGS) {
+                    print = true;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'S', args, i, VALUE_FLAGS)
+                {
+                    start = value.and_then(|s| s.parse::<i32>().ok());
+                }
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
             _ => i += 1,
         }
     }
@@ -491,25 +543,30 @@ fn capture_pane(args: &[String]) -> Result<i32> {
 }
 
 fn send_keys(args: &[String]) -> Result<i32> {
-    let mut target = None;
+    const VALUE_FLAGS: &[char] = &['N'];
+    let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut literal = false;
     let mut keys = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-t" => {
-                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-l" => {
                 literal = true;
                 i += 1;
             }
+            "-N" => {
+                i += 2;
+            }
             "--" => {
                 keys.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS)
+            }
             _ => {
                 keys.extend_from_slice(&args[i..]);
                 break;
@@ -523,13 +580,13 @@ fn send_keys(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     client::kill(&target)?;
     Ok(0)
 }
 
 fn resize_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target(args)?.unwrap_or_else(default_target);
     let mut rows = None;
     let mut cols = None;
     let mut i = 0;
@@ -644,7 +701,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
 }
 
 fn load_buffer(args: &[String]) -> Result<i32> {
-    let source = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let source = buffer_path_arg(args);
     let mut data = Vec::new();
     if let Some(path) = source {
         if path == "-" {
@@ -661,7 +718,7 @@ fn load_buffer(args: &[String]) -> Result<i32> {
 
 fn save_buffer(args: &[String]) -> Result<i32> {
     let data = read_buffer_or_empty()?;
-    let dest = args.iter().find(|a| !a.starts_with('-')).cloned();
+    let dest = buffer_path_arg(args);
     if let Some(path) = dest {
         if path == "-" {
             std::io::stdout().write_all(&data)?;
@@ -675,7 +732,7 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
-    let target = parse_target(args).unwrap_or_else(default_target);
+    let target = parse_target_with_value_flags(args, &['b', 's'])?.unwrap_or_else(default_target);
     let data = read_buffer_or_empty()?;
     client::send(&target, data)?;
     Ok(0)
@@ -852,31 +909,118 @@ impl Drop for StoreLock {
     }
 }
 
-fn parse_target(args: &[String]) -> Option<String> {
+fn parse_target(args: &[String]) -> Result<Option<String>> {
+    parse_target_with_value_flags(args, &[])
+}
+
+fn parse_target_with_value_flags(
+    args: &[String],
+    extra_value_flags: &[char],
+) -> Result<Option<String>> {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
             break;
         }
         if args[i] == "-t" {
-            return args.get(i + 1).cloned();
+            return target_value(args.get(i + 1).cloned(), "-t");
         }
         if let Some(value) = args[i].strip_prefix("-t=") {
-            return Some(value.to_string());
+            return target_value(Some(value.to_string()), "-t");
         }
         if args[i].starts_with("-t") && args[i].len() > 2 {
-            return Some(args[i][2..].to_string());
+            return target_value(Some(args[i][2..].to_string()), "-t");
         }
-        if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
+        if let Some((_, value)) =
+            short_cluster_flag_value_with_extra(&args[i], 't', args, i, extra_value_flags)
+        {
             if let Some(value) = value {
-                return Some(value);
+                return target_value(Some(value), "-t");
             }
+            return target_value(args.get(i + 1).cloned(), "-t");
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
+        } else {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(Some(value)),
+        _ => bail!("tmux target flag {flag} requires a value"),
+    }
+}
+
+fn value_for_option(value: Option<String>, flag: &str) -> Result<String> {
+    value.with_context(|| format!("tmux option {flag} requires a value"))
+}
+
+fn has_flag_in_arg(arg: &str, needle: char) -> bool {
+    has_flag_in_arg_with_value_flags(arg, needle, &[])
+}
+
+fn has_flag_in_arg_with_value_flags(arg: &str, needle: char, extra_value_flags: &[char]) -> bool {
+    let Some(cluster) = short_cluster(arg) else {
+        return false;
+    };
+    for (pos, flag) in cluster.char_indices() {
+        if flag == needle {
+            return true;
+        }
+        if value_for_short_flag_with_extra(cluster, pos, flag, &[], 0, extra_value_flags).is_some()
+            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+                && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            break;
+        }
+    }
+    false
+}
+
+fn buffer_path_arg(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
             return args.get(i + 1).cloned();
+        }
+        if let Some(width) = buffer_option_width(&args[i], args, i) {
+            i += width;
+            continue;
         }
         if args[i].starts_with('-') {
             i += flag_arg_width(&args[i], args, i);
         } else {
-            i += 1;
+            return Some(args[i].clone());
+        }
+    }
+    None
+}
+
+fn buffer_option_width(arg: &str, args: &[String], i: usize) -> Option<usize> {
+    if arg == "-b" {
+        return Some(if args.get(i + 1).is_some() { 2 } else { 1 });
+    }
+    if arg.strip_prefix("-b=").is_some() || (arg.starts_with("-b") && arg.len() > 2) {
+        return Some(1);
+    }
+    let cluster = short_cluster(arg)?;
+    for (pos, flag) in cluster.char_indices() {
+        if flag == 'b' {
+            let rest = &cluster[pos + flag.len_utf8()..];
+            return Some(if rest.is_empty() && args.get(i + 1).is_some() {
+                2
+            } else {
+                1
+            });
+        }
+        if value_for_short_flag(cluster, pos, flag, args, i).is_some()
+            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+        {
+            break;
         }
     }
     None
@@ -987,9 +1131,18 @@ fn needle_char(short: &str) -> char {
 }
 
 fn flag_arg_width(flag: &str, args: &[String], i: usize) -> usize {
+    flag_arg_width_with_extra(flag, args, i, &[])
+}
+
+fn flag_arg_width_with_extra(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> usize {
     if let Some(cluster) = short_cluster(flag) {
         for (pos, short_flag) in cluster.char_indices() {
-            if is_value_taking_short_flag(short_flag) {
+            if is_value_taking_short_flag(short_flag) || extra_value_flags.contains(&short_flag) {
                 let rest = &cluster[pos + short_flag.len_utf8()..];
                 return if rest.is_empty() && args.get(i + 1).is_some() {
                     2
@@ -1008,14 +1161,25 @@ fn short_cluster_flag_value(
     args: &[String],
     i: usize,
 ) -> Option<(usize, Option<String>)> {
+    short_cluster_flag_value_with_extra(arg, needle, args, i, &[])
+}
+
+fn short_cluster_flag_value_with_extra(
+    arg: &str,
+    needle: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> Option<(usize, Option<String>)> {
     let cluster = short_cluster(arg)?;
     for (pos, flag) in cluster.char_indices() {
-        let value = value_for_short_flag(cluster, pos, flag, args, i);
+        let value = value_for_short_flag_with_extra(cluster, pos, flag, args, i, extra_value_flags);
         if flag == needle {
             return Some((pos, value));
         }
         if value.is_some()
-            || (is_value_taking_short_flag(flag) && cluster[pos + flag.len_utf8()..].is_empty())
+            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+                && cluster[pos + flag.len_utf8()..].is_empty())
         {
             break;
         }
@@ -1030,7 +1194,18 @@ fn value_for_short_flag(
     args: &[String],
     i: usize,
 ) -> Option<String> {
-    if !is_value_taking_short_flag(flag) {
+    value_for_short_flag_with_extra(cluster, pos, flag, args, i, &[])
+}
+
+fn value_for_short_flag_with_extra(
+    cluster: &str,
+    pos: usize,
+    flag: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> Option<String> {
+    if !is_value_taking_short_flag(flag) && !extra_value_flags.contains(&flag) {
         return None;
     }
     let rest = &cluster[pos + flag.len_utf8()..];
@@ -1376,22 +1551,58 @@ mod tests {
     #[test]
     fn parses_target_without_confusing_format_values() {
         assert_eq!(
-            parse_target(&args(["-F", "-t#{session_name}"])),
+            parse_target(&args(["-F", "-t#{session_name}"])).unwrap(),
             None,
             "-F values that look like targets must remain format literals"
         );
         assert_eq!(
-            parse_target(&args(["-F", "-t#{session_name}", "-t", "real"])).as_deref(),
+            parse_target(&args(["-F", "-t#{session_name}", "-t", "real"]))
+                .unwrap()
+                .as_deref(),
             Some("real")
         );
         assert_eq!(
-            parse_target(&args(["-aF", "-t#{session_name}", "-tfoo"])).as_deref(),
+            parse_target(&args(["-aF", "-t#{session_name}", "-tfoo"]))
+                .unwrap()
+                .as_deref(),
             Some("foo")
         );
-        assert_eq!(parse_target(&args(["--", "-tfoo"])), None);
-        assert_eq!(parse_target(&args(["-at", "foo"])).as_deref(), Some("foo"));
-        assert_eq!(parse_target(&args(["-atfoo"])).as_deref(), Some("foo"));
-        assert_eq!(parse_target(&args(["-at=foo"])).as_deref(), Some("foo"));
+        assert_eq!(parse_target(&args(["--", "-tfoo"])).unwrap(), None);
+        assert_eq!(
+            parse_target(&args(["-at", "foo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["-atfoo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["-at=foo"])).unwrap().as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["literal-key", "-t", "payload-target"])).unwrap(),
+            None,
+            "positional payloads terminate the generic target scan"
+        );
+        assert!(parse_target(&args(["-t"])).is_err());
+        assert!(parse_target(&args(["-t="])).is_err());
+    }
+
+    #[test]
+    fn parses_buffer_path_after_buffer_options() {
+        assert_eq!(
+            buffer_path_arg(&args(["-b", "named", "/tmp/input"])).as_deref(),
+            Some("/tmp/input")
+        );
+        assert_eq!(
+            buffer_path_arg(&args(["-abnamed", "/tmp/input"])).as_deref(),
+            Some("/tmp/input")
+        );
+        assert_eq!(
+            buffer_path_arg(&args(["--", "-literal-path"])).as_deref(),
+            Some("-literal-path")
+        );
     }
 
     #[test]
