@@ -1757,6 +1757,29 @@ fn tmux_compat_split_window_treats_b_as_boolean_outside_buffer_commands() -> Tes
 }
 
 #[test]
+fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-dP",
+            "-F",
+            "",
+            "echo SPLIT_EMPTY_FORMAT_READY; sleep 2",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\n",
+        "empty split-window format should be accepted and print one newline"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -1778,6 +1801,35 @@ fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
         .output()?;
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello -t");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_display_message_accepts_empty_format_value() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "display-empty-format",
+            "sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let output = env
+        .cmd()
+        .args(["tmux-compat", "display-message", "-p", "-F", ""])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\n",
+        "empty display-message format should print one newline"
+    );
     Ok(())
 }
 
@@ -3601,6 +3653,74 @@ fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
 }
 
 #[test]
+fn tmux_capture_pane_skips_value_options_before_target() -> TestResult {
+    let env = TestEnv::new()?;
+    for (name, marker) in [
+        ("capture-first", "FIRST_MARK"),
+        ("capture-second", "SECOND_MARK"),
+    ] {
+        let status = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                &format!("echo {marker}; sleep 2"),
+            ])
+            .status()?;
+        assert!(status.success());
+        env.capture_until(name, marker)?;
+    }
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-p",
+            "-S",
+            "0",
+            "-t",
+            "capture-second",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SECOND_MARK"), "{stdout:?}");
+    assert!(
+        !stdout.contains("FIRST_MARK"),
+        "capture-pane -S value should not hide the later -t target: {stdout:?}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-b",
+            "named-buffer",
+            "-S",
+            "0",
+            "-t",
+            "capture-second",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let buffer = env
+        .cmd()
+        .args(["tmux-compat", "save-buffer", "-"])
+        .output()?;
+    assert!(buffer.status.success(), "{buffer:?}");
+    let stdout = String::from_utf8_lossy(&buffer.stdout);
+    assert!(stdout.contains("SECOND_MARK"), "{stdout:?}");
+    assert!(!stdout.contains("FIRST_MARK"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn tmux_buffer_commands_skip_buffer_name_options_before_path() -> TestResult {
     let env = TestEnv::new()?;
     let input = env.temp.path().join("buffer-input.txt");
@@ -3638,6 +3758,59 @@ fn tmux_buffer_commands_skip_buffer_name_options_before_path() -> TestResult {
         .output()?;
     assert!(stdout.status.success(), "{stdout:?}");
     assert_eq!(stdout.stdout, b"BUFFER_OPTION_PAYLOAD");
+    Ok(())
+}
+
+#[test]
+fn tmux_paste_buffer_skips_buffer_name_option_before_target() -> TestResult {
+    let env = TestEnv::new()?;
+    for (name, label) in [("paste-first", "FIRST"), ("paste-second", "SECOND")] {
+        let status = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                &format!("echo READY_{label}; read line; echo {label}:$line; sleep 2"),
+            ])
+            .status()?;
+        assert!(status.success());
+        env.capture_until(name, &format!("READY_{label}"))?;
+    }
+
+    let input = env.temp.path().join("paste-buffer-input.txt");
+    std::fs::write(&input, b"PASTE_PAYLOAD\n")?;
+    let load = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "load-buffer",
+            input.to_str().ok_or("input path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(load.status.success(), "{load:?}");
+
+    let paste = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "paste-buffer",
+            "-b",
+            "named-buffer",
+            "-t",
+            "paste-second",
+        ])
+        .output()?;
+    assert!(paste.status.success(), "{paste:?}");
+    let second = env.capture_until("paste-second", "SECOND:PASTE_PAYLOAD")?;
+    assert!(second.contains("SECOND:PASTE_PAYLOAD"), "{second}");
+    let first = env.capture_until("paste-first", "READY_FIRST")?;
+    assert!(
+        !first.contains("FIRST:PASTE_PAYLOAD"),
+        "paste-buffer -b value should not hide the later -t target: {first:?}"
+    );
     Ok(())
 }
 

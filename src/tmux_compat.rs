@@ -495,7 +495,7 @@ fn display_message(args: &[String]) -> Result<i32> {
 }
 
 fn capture_pane(args: &[String]) -> Result<i32> {
-    let target = parse_target(args)?;
+    let target = parse_target_with_value_flags(args, &['S', 'b'])?;
     let mut print = false;
     let mut start = None;
     let mut i = 0;
@@ -714,7 +714,7 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
-    let target = parse_target(args)?.unwrap_or_else(default_target);
+    let target = parse_target_with_value_flags(args, &['b'])?.unwrap_or_else(default_target);
     let data = read_buffer_or_empty()?;
     client::send(&target, data)?;
     Ok(0)
@@ -892,6 +892,13 @@ impl Drop for StoreLock {
 }
 
 fn parse_target(args: &[String]) -> Result<Option<String>> {
+    parse_target_with_value_flags(args, &[])
+}
+
+fn parse_target_with_value_flags(
+    args: &[String],
+    extra_value_flags: &[char],
+) -> Result<Option<String>> {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
@@ -913,7 +920,7 @@ fn parse_target(args: &[String]) -> Result<Option<String>> {
             return target_value(args.get(i + 1).cloned(), "-t");
         }
         if args[i].starts_with('-') {
-            i += flag_arg_width(&args[i], args, i);
+            i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
         } else {
             break;
         }
@@ -922,13 +929,14 @@ fn parse_target(args: &[String]) -> Result<Option<String>> {
 }
 
 fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
-    Ok(Some(value_for_option(value, flag)?))
+    match value {
+        Some(value) if !value.is_empty() => Ok(Some(value)),
+        _ => bail!("tmux target flag {flag} requires a value"),
+    }
 }
 
 fn value_for_option(value: Option<String>, flag: &str) -> Result<String> {
-    value
-        .filter(|value| !value.is_empty())
-        .with_context(|| format!("tmux option {flag} requires a value"))
+    value.with_context(|| format!("tmux option {flag} requires a value"))
 }
 
 fn has_flag_in_arg(arg: &str, needle: char) -> bool {
@@ -1098,9 +1106,18 @@ fn needle_char(short: &str) -> char {
 }
 
 fn flag_arg_width(flag: &str, args: &[String], i: usize) -> usize {
+    flag_arg_width_with_extra(flag, args, i, &[])
+}
+
+fn flag_arg_width_with_extra(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+) -> usize {
     if let Some(cluster) = short_cluster(flag) {
         for (pos, short_flag) in cluster.char_indices() {
-            if is_value_taking_short_flag(short_flag) {
+            if is_value_taking_short_flag(short_flag) || extra_value_flags.contains(&short_flag) {
                 let rest = &cluster[pos + short_flag.len_utf8()..];
                 return if rest.is_empty() && args.get(i + 1).is_some() {
                     2
