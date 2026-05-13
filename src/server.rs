@@ -187,12 +187,29 @@ struct Session {
     terminal_screen: Mutex<vt100::Parser>,
     /// `terminal_screen` 이 아직 완성되지 않은 control sequence 를 들고 있는 경우,
     /// 새 attach snapshot 끝에 같은 prefix 를 붙여 이후 live raw suffix 가 기존 PTY
-    /// parser 상태와 같은 방식으로 해석되게 한다.
+    /// parser 상태와 같은 방식으로 해석되게 한다. 이 값은 snapshot 정확도 계약의
+    /// 일부이므로 `terminal_screen` / `terminal_normal_screen` 과 함께
+    /// `output_state` 아래에서 갱신·조회한다.
     terminal_pending: Mutex<TerminalPrefixTracker>,
     /// active alt-screen snapshot 이 나중에 `1049l` 을 받았을 때 session 의 normal
     /// buffer 로 돌아갈 수 있도록, 마지막으로 관찰한 normal-screen frame 을 보관한다.
     terminal_normal_screen: Mutex<vt100::Screen>,
     subscribers: Mutex<Vec<Subscriber>>,
+    /// Coarse state mutex for operations that must observe a coherent output
+    /// image. `append_output` holds it while appending to the raw ring,
+    /// updating `terminal_screen`, `terminal_pending`, and
+    /// `terminal_normal_screen`, then cloning the subscriber list for the live
+    /// chunk. Attach snapshot paths hold the same mutex while reading those
+    /// terminal fields and queueing the initial snapshot. Resize paths hold it
+    /// while resizing the PTY and parser state.
+    ///
+    /// Individual fields still keep their own mutexes for narrow readers such
+    /// as capture. Per-subscriber rows/cols edits are also allowed under
+    /// `geometry_apply > subscribers` alone because they do not combine with
+    /// terminal parser state. Paths that combine terminal parser state,
+    /// pending escape bytes, subscriber list snapshots or add/remove
+    /// membership, or PTY resize must go through this guard to preserve the
+    /// snapshot/live-output order contract.
     output_state: Mutex<()>,
     #[cfg(test)]
     backpressure_hook: Mutex<Option<BackpressureHook>>,
@@ -213,11 +230,23 @@ struct Session {
     ///
     /// 결과적으로 살아있는 attach 가 wide 한데 PTY 가 narrow 인 stale 상태가 된다.
     ///
-    /// 락 순서: `geometry_apply > subscribers`,
-    /// `geometry_apply > output_state > master/terminal_screen`,
-    /// `append_output: broadcast_order > output_state > subscribers`. 즉 geometry
-    /// 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야 하며,
-    /// PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
+    /// Canonical lock order:
+    /// - attach/resize/detach geometry paths enter through `geometry_apply`
+    ///   first;
+    /// - per-subscriber geometry edits may then take `subscribers` directly
+    ///   only to update that subscriber's rows/cols;
+    /// - clamp/apply-resize work takes `output_state`, reads `subscribers` to
+    ///   compute the clamp target, releases `subscribers`, then touches
+    ///   `master`, `rows`/`cols`, and `terminal_screen`;
+    /// - `append_output` takes `broadcast_order > output_state`, updates
+    ///   ring/parser/`terminal_pending`/normal-screen state, snapshots
+    ///   `subscribers`, then drops `output_state` before slow backpressure
+    ///   waits.
+    /// - `broadcast_order` and `geometry_apply` are disjoint entry locks; no
+    ///   path should hold both without defining a new order here first.
+    ///
+    /// 즉 geometry 변경/clamp/resize 경로의 임의 함수는 본 락을 가장 먼저 잡아야
+    /// 하며, PTY resize 와 parser resize 는 output broadcast/snapshot 과 직렬화한다.
     geometry_apply: Mutex<()>,
     next_subscriber_id: AtomicU64,
     /// Whether the leader process is still considered live for user-visible
@@ -280,6 +309,13 @@ impl Session {
                     ring.push_back(*byte);
                 }
             }
+            // Keep the raw ring, vt100 parser, pending escape-prefix tracker,
+            // normal-screen fallback, and subscriber snapshot under one
+            // `output_state` critical section. Otherwise a new attach could
+            // synthesize a screen snapshot from parser state that does not
+            // match the pending bytes that will prefix the next live chunk.
+            // The section ends before `broadcast_chunk`, so slow subscriber
+            // sends/backpressure waits do not block attach snapshots or resize.
             let normal_screen = self.process_terminal_screen(bytes);
             if let Some(normal_screen) = normal_screen {
                 *lock(&self.terminal_normal_screen) = normal_screen;
@@ -386,7 +422,8 @@ impl Session {
         };
         // 빈 ring 일 때는 None 으로 두어 의미 없는 clear/reset snapshot 을 채널에
         // 넣지 않는다. 한 번이라도 PTY output 이 있었던 세션만 현재 screen state 를
-        // 합성해 첫 chunk 로 보낸다.
+        // 합성해 첫 chunk 로 보낸다. pending escape prefix 도 같은 `output_state`
+        // 아래에서 읽어 parser state 와 live raw suffix 의 경계가 어긋나지 않게 한다.
         let initial_chunk: Option<OutputChunk> = if has_output {
             let (snapshot_rows, snapshot_cols) = {
                 let subscribers = lock(&self.subscribers);
@@ -551,17 +588,20 @@ impl Session {
     /// (PR #15 quad-review HIGH: Codex+Forge+Claude 의 race 시나리오).
     /// 가드를 컴파일타임에 강제하기 위해 인자로 `&MutexGuard<()>` 를 받는다.
     ///
-    /// **하위 lock 순서**: 본 함수 내부에서는 subscribers lock 을 짧게 잡아 min 만
-    /// 계산하고 즉시 해제한 뒤, `apply_pty_size` 가 `output_state` 아래에서 master
-    /// resize 와 parser resize 를 직렬화한다. subscribers lock 과 master/parser lock 을
-    /// 동시에 잡지 않는 이유는 `append_output` 의 broadcast 경로와 lock 순서를
-    /// 어긋나게 하지 않기 위함이다. lock-order 표기:
-    /// `geometry_apply > subscribers`, `geometry_apply > output_state > master`,
+    /// **하위 lock 순서**: public helper 는 먼저 `output_state` 를 잡고, 그 아래에서
+    /// subscribers lock 을 짧게 잡아 min 만 계산한 뒤 즉시 해제한다. 이후 같은
+    /// `output_state` 가드 아래에서 master resize, cached rows/cols 갱신, parser
+    /// resize 를 적용한다. 즉 subscribers lock 과 master/parser lock 은 동시에 잡지
+    /// 않지만, 전체 clamp/apply 구간은 `append_output` 과 같은 `output_state` 로
+    /// 직렬화된다. lock-order 표기:
+    /// `geometry_apply > output_state > subscribers`,
+    /// `geometry_apply > output_state > master`,
     /// `geometry_apply > output_state > terminal_screen`.
     ///
-    /// **`output_state` 와의 관계**: 이 함수는 `output_state` 가 잡혀 있지 **않은**
-    /// 상태에서 호출되어야 한다. `subscribe_with_snapshot` 의 caller 는 그 함수가
-    /// 반환된 *후* 에 본 helper 를 호출해 lock 충돌을 피한다.
+    /// **`output_state` 와의 관계**: 이 public helper 는 `output_state` 가 잡혀
+    /// 있지 **않은** 상태에서 호출되어야 한다. 이미 `output_state` 를 들고 있는
+    /// attach path 는 `apply_clamped_pty_size_under_output_guard` 를 호출해야 하며,
+    /// `subscribe_with_snapshot_and_apply_clamp` 가 그 예다.
     fn apply_clamped_pty_size(&self, _geometry_guard: &MutexGuard<'_, ()>) -> Result<()> {
         let _output_guard = lock(&self.output_state);
         self.apply_clamped_pty_size_under_output_guard(_geometry_guard)
