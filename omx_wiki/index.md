@@ -11,6 +11,7 @@ Repository-native notes for durable product and implementation context.
 ## Reference
 
 - [[command-surface]] — canonical CLI vocabulary, compatibility aliases, and tmux shim boundary.
+- [[tmux-compat-capture]] — `logs` versus `capture-pane` behavior, range semantics, and parser invariants.
 
 ## Conventions
 

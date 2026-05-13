@@ -65,10 +65,17 @@ to inspect the supported shim subset at runtime.
 
 The shim covers the tmux subset used by common AI orchestration scripts, including session commands, query commands, pane operations, buffers/popups, and deliberate no-op compatibility commands such as `select-pane` and `set-option`. Product-only lifecycle commands such as `daemon` and `shutdown` do not imply tmux-compatible aliases.
 
+Capture has a product surface and a tmux shim surface with different defaults:
+`lterm logs` always prints sanitized scrollback, while `lterm tmux-compat
+capture-pane` writes the compatibility buffer unless `-p` is passed. Detailed
+range and parser expectations live in [[tmux-compat-capture]].
+
 ## Update policy
 
 When changing command names, aliases, help text, README command tables, or tmux shim command coverage:
 
 1. Verify `README.md` and `README.ko.md` already describe the new product vocabulary; update both together when their user-facing text needs changes.
-2. Add or adjust smoke tests in `tests/cli_smoke.rs` for help discoverability and compatibility aliases.
-3. Preserve backwards-compatible aliases unless a deliberate deprecation plan exists.
+2. Update focused wiki references such as [[tmux-compat-capture]] when capture
+   ranges, parser rules, buffers, or shim behavior changes.
+3. Add or adjust smoke tests in `tests/cli_smoke.rs` for help discoverability and compatibility aliases.
+4. Preserve backwards-compatible aliases unless a deliberate deprecation plan exists.
