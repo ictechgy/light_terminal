@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Maximum decoded byte length accepted for `Request::Send` payloads.
+///
+/// The daemon request-frame cap is 1 MiB, while the compact on-wire format is
+/// base64 inside JSON. Keep the decoded cap below that frame limit with margin
+/// for base64 expansion plus the request envelope.
+pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -53,6 +60,7 @@ pub enum Request {
     },
     Send {
         target: String,
+        #[serde(with = "send_data_serde")]
         data: Vec<u8>,
     },
     Capture {
@@ -117,6 +125,177 @@ pub enum Request {
     Shutdown,
 }
 
+mod send_data_serde {
+    use super::MAX_SEND_DATA_BYTES;
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn serialize<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&encode_base64(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SendDataVisitor)
+    }
+
+    struct SendDataVisitor;
+
+    impl<'de> Visitor<'de> for SendDataVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("base64 string or legacy byte array for send data")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            decode_base64(value).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_SEND_DATA_BYTES));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if bytes.len() >= MAX_SEND_DATA_BYTES {
+                    return Err(de::Error::custom(format!(
+                        "send data exceeds {MAX_SEND_DATA_BYTES} bytes"
+                    )));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn encode_base64(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+
+            out.push(BASE64[(b0 >> 2) as usize] as char);
+            out.push(BASE64[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(BASE64[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(BASE64[(b2 & 0b0011_1111) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+        if !value.is_ascii() {
+            return Err("base64 data must be ASCII".to_string());
+        }
+        let trimmed = value.trim_end_matches('=');
+        let padding = value.len() - trimmed.len();
+        if value[..trimmed.len()].contains('=') {
+            return Err("base64 padding may only appear at the end".to_string());
+        }
+        if padding > 2 || (padding > 0 && value.len() % 4 != 0) || trimmed.len() % 4 == 1 {
+            return Err("invalid base64 length".to_string());
+        }
+
+        let max_decoded = (trimmed.len() / 4) * 3
+            + match trimmed.len() % 4 {
+                0 => 0,
+                2 => 1,
+                3 => 2,
+                _ => return Err("invalid base64 length".to_string()),
+            };
+        if max_decoded > MAX_SEND_DATA_BYTES {
+            return Err(format!("send data exceeds {MAX_SEND_DATA_BYTES} bytes"));
+        }
+
+        let mut out = Vec::with_capacity(max_decoded);
+        let mut quartet = [0_u8; 4];
+        let mut quartet_len = 0;
+        for byte in trimmed.bytes() {
+            quartet[quartet_len] = decode_char(byte)?;
+            quartet_len += 1;
+            if quartet_len == 4 {
+                push_decoded_quartet(&mut out, quartet, 3)?;
+                quartet_len = 0;
+            }
+        }
+
+        match quartet_len {
+            0 => {}
+            2 => {
+                if quartet[1] & 0x0f != 0 {
+                    return Err("non-canonical base64 tail bits".to_string());
+                }
+                push_decoded_quartet(&mut out, quartet, 1)?;
+            }
+            3 => {
+                if quartet[2] & 0x03 != 0 {
+                    return Err("non-canonical base64 tail bits".to_string());
+                }
+                push_decoded_quartet(&mut out, quartet, 2)?;
+            }
+            _ => return Err("invalid base64 length".to_string()),
+        }
+        Ok(out)
+    }
+
+    fn push_decoded_quartet(
+        out: &mut Vec<u8>,
+        quartet: [u8; 4],
+        bytes: usize,
+    ) -> Result<(), String> {
+        if out.len() + bytes > MAX_SEND_DATA_BYTES {
+            return Err(format!("send data exceeds {MAX_SEND_DATA_BYTES} bytes"));
+        }
+        out.push((quartet[0] << 2) | (quartet[1] >> 4));
+        if bytes > 1 {
+            out.push((quartet[1] << 4) | (quartet[2] >> 2));
+        }
+        if bytes > 2 {
+            out.push((quartet[2] << 6) | quartet[3]);
+        }
+        Ok(())
+    }
+
+    fn decode_char(byte: u8) -> Result<u8, String> {
+        match byte {
+            b'A'..=b'Z' => Ok(byte - b'A'),
+            b'a'..=b'z' => Ok(byte - b'a' + 26),
+            b'0'..=b'9' => Ok(byte - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 character 0x{byte:02x}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
@@ -157,7 +336,7 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, SessionInfo};
+    use super::{MAX_SEND_DATA_BYTES, Request, SessionInfo};
 
     #[test]
     fn session_info_accepts_pre_process_metadata_json() {
@@ -182,6 +361,76 @@ mod tests {
         assert_eq!(info.parent_pane_id, None);
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
+    }
+
+    #[test]
+    fn send_request_serializes_data_as_base64_string() {
+        let request = Request::Send {
+            target: "%0".to_string(),
+            data: b"hello\r\n\0".to_vec(),
+        };
+        let value = serde_json::to_value(&request).expect("serialize send request");
+        assert_eq!(value["data"], "aGVsbG8NCgA=");
+
+        let round_trip: Request = serde_json::from_value(value).expect("deserialize send request");
+        assert!(matches!(
+            round_trip,
+            Request::Send { data, .. } if data == b"hello\r\n\0"
+        ));
+    }
+
+    #[test]
+    fn send_request_deserializes_legacy_byte_array() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "type": "send",
+            "target": "%0",
+            "data": [104, 105, 13]
+        }))
+        .expect("deserialize legacy send array");
+
+        assert!(matches!(request, Request::Send { data, .. } if data == b"hi\r"));
+    }
+
+    #[test]
+    fn send_request_rejects_oversized_base64_data() {
+        let oversized = "A".repeat(((MAX_SEND_DATA_BYTES + 1).div_ceil(3)) * 4);
+        let err = serde_json::from_value::<Request>(serde_json::json!({
+            "type": "send",
+            "target": "%0",
+            "data": oversized
+        }))
+        .expect_err("oversized send data should fail");
+
+        assert!(err.to_string().contains("send data exceeds"));
+    }
+
+    #[test]
+    fn send_request_rejects_non_canonical_base64_tail_bits() {
+        for data in ["AB==", "AAB="] {
+            let err = serde_json::from_value::<Request>(serde_json::json!({
+                "type": "send",
+                "target": "%0",
+                "data": data
+            }))
+            .expect_err("non-canonical base64 tail bits should fail");
+
+            assert!(
+                err.to_string().contains("non-canonical base64 tail bits"),
+                "unexpected error for {data:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_request_rejects_non_ascii_base64_data() {
+        let err = serde_json::from_value::<Request>(serde_json::json!({
+            "type": "send",
+            "target": "%0",
+            "data": "안녕"
+        }))
+        .expect_err("non-ascii base64 should fail");
+
+        assert!(err.to_string().contains("base64 data must be ASCII"));
     }
 
     #[test]

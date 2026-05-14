@@ -98,7 +98,7 @@ aliases:
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Fixed `export` lines for trusted shell setup; generated paths are valid POSIX shell tokens from `shlex` quoting, and `PATH` prepends the shim dir to `$PATH` |
-| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls `U+0000..U+001F`, `U+007F`, and `U+0080..U+009F`, replaces semicolons with spaces, and preserves non-control Unicode text |
+| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls except the C0 whitespace controls `\n`, `\r`, and `\t`, replaces those controls and semicolons with spaces, drops `U+007F`/`U+0080..U+009F`, and preserves non-control Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
 | Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
 
@@ -270,7 +270,7 @@ This gives cmux a real pane to decorate while `lterm` retains scrollback capture
 lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
-`lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC.
+`lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC; subtitle/body separators such as newlines are normalized to spaces rather than concatenated.
 
 ## Remote access
 
@@ -293,6 +293,10 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - **Attach protocol** — the CLI sends JSON over the Unix socket, optionally reserves the bottom row for a local status bar, then streams PTY bytes.
 - **tmux shim** — a small shell script named `tmux` forwards commands to `lterm tmux-compat`.
 - **cmux bridge** — optional; uses the cmux CLI when detected.
+
+After upgrading the `lterm` binary, restart any already-running daemon before
+relying on newly added wire-protocol behavior; existing daemon processes keep
+the old code until they are stopped.
 
 ## Security notes
 

@@ -6,8 +6,8 @@ pub fn osc_field(value: &str) -> String {
     value
         .chars()
         .filter_map(|ch| match ch {
+            '\n' | '\r' | '\t' | ';' => Some(' '),
             ch if is_c0_or_c1(ch) => None,
-            ';' => Some(' '),
             _ => Some(ch),
         })
         .collect()
@@ -91,6 +91,14 @@ mod tests {
     fn osc_field_drops_c0_and_c1_controls() {
         assert_eq!(osc_field("a\u{001b};\u{009c}b"), "a b");
         assert_eq!(osc_field("a\u{007f}b"), "ab");
+    }
+
+    #[test]
+    fn osc_field_replaces_field_separators_and_spacing_controls_with_spaces() {
+        assert_eq!(
+            osc_field("sub\nbody\rnext\ttail;semi"),
+            "sub body next tail semi"
+        );
     }
 
     #[test]

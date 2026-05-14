@@ -1,5 +1,5 @@
 use crate::paths;
-use crate::protocol::{Request, Response, SessionInfo};
+use crate::protocol::{MAX_SEND_DATA_BYTES, Request, Response, SessionInfo};
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -222,6 +222,9 @@ pub fn kill(target: &str) -> Result<()> {
 
 pub fn send(target: &str, data: Vec<u8>) -> Result<()> {
     ensure_server()?;
+    if data.len() > MAX_SEND_DATA_BYTES {
+        bail!("send data exceeds {} bytes", MAX_SEND_DATA_BYTES);
+    }
     rpc::<serde_json::Value>(&Request::Send {
         target: target.to_string(),
         data,
@@ -485,6 +488,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .context("set attach handshake read timeout")?;
+    stream
+        .set_write_timeout(Some(RPC_TIMEOUT))
+        .context("set attach handshake write timeout")?;
     // PR #15: attach 시점의 클라이언트 geometry 를 함께 보낸다. server 는 이 값을
     // 바로 Subscriber 에 박아 clamp-to-smallest 정책의 인풋으로 쓴다.
     let request = Request::Attach {
@@ -528,6 +537,13 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         .and_then(|v| v.get("subscriber_id"))
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow::anyhow!("attach response missing subscriber_id"))?;
+
+    stream
+        .set_write_timeout(None)
+        .context("clear attach stream write timeout")?;
+    stream
+        .set_read_timeout(None)
+        .context("clear attach stream read timeout")?;
 
     // RawModeGuard 먼저 → AttachActiveGuard 가 raw mode가 실제 세팅된 이후에만 활성.
     // Drop 역순: status_bar → _attach_active(flag false) → _raw(raw mode 복원).

@@ -51,7 +51,8 @@ tmux shim additions:
 
 - `--` terminates option parsing.
 - Later `-t` values override earlier target values, matching tmux-style command
-  behavior.
+  behavior. This is also the shared target-parser policy for other supported
+  tmux commands before `--`.
 - `-t target`, `-ttarget`, and `-t=target` are accepted.
 - `-S value`, `-Svalue`, `-S=value`, `-E value`, `-Evalue`, and `-E=value`
   are accepted.

@@ -35,7 +35,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Fixed `export` lines for trusted shell setup; generated paths are valid POSIX shell tokens from `shlex` quoting, and `PATH` prepends the shim dir to `$PATH` |
-| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls `U+0000..U+001F`, `U+007F`, and `U+0080..U+009F`, replaces semicolons with spaces, and preserves non-control Unicode text |
+| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls except the C0 whitespace controls `\n`, `\r`, and `\t`, replaces those controls and semicolons with spaces, drops `U+007F`/`U+0080..U+009F`, and preserves non-control Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
 | Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
 
@@ -45,6 +45,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - `attach`, `a`, and `-a` are compatibility entry points for `resume`; they must preserve the same raw `client::attach` path.
 - Here, sanitization means escape-sequence/control-byte filtering for non-attached text surfaces such as `logs`, `sessions`, and `processes`; `resume` / raw attach stays a transparent PTY byte stream.
 - `notify`'s OSC 777 fallback sanitizes Unicode scalar values after argument parsing, not UTF-8 bytes; non-control text such as Korean remains intact.
+- `notify`'s OSC 777 fallback preserves human-visible separation by converting newline, carriage return, tab, and semicolon separators to spaces before emitting OSC fields.
 - `notify`'s OSC 777 fallback protects protocol framing only; it does not normalize Unicode bidi, format, or zero-width characters inside trusted title/body text.
 - `env` export values are POSIX shell tokens produced by `shlex` quoting when metacharacters require it; the visual quote style is not a stable API.
 - `env` prepends the shim directory to the caller's existing `$PATH` rather than replacing it.
@@ -64,6 +65,19 @@ lterm tmux-compat list-commands
 to inspect the supported shim subset at runtime.
 
 The shim covers the tmux subset used by common AI orchestration scripts, including session commands, query commands, pane operations, buffers/popups, and deliberate no-op compatibility commands such as `select-pane` and `set-option`. Product-only lifecycle commands such as `daemon` and `shutdown` do not imply tmux-compatible aliases.
+
+Generic tmux target parsing is left-to-right and treats later `-t` target
+values as overrides before `--`. Value-taking flags such as `-F`, `-c`, `-x`,
+and `-y` consume their own following/attached values so target-looking payloads
+inside those values are not reinterpreted.
+
+After changing wire-protocol behavior, restart any already-running daemon before
+depending on that behavior; old daemon processes continue running old code until
+stopped.
+
+Parser strictness follows tmux more closely for value-taking options: for example,
+`new-session -s`/`-c` and `resize-pane -x`/`-y` now report missing or invalid
+values instead of silently falling back to defaults or no-op behavior.
 
 Capture has a product surface and a tmux shim surface with different defaults:
 `lterm logs` always prints sanitized scrollback, while `lterm tmux-compat

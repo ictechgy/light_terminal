@@ -2,7 +2,7 @@ use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::sanitize;
 use anyhow::{Context, Result, bail};
-use libc::c_int;
+use libc::{c_int, mode_t};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -82,8 +82,7 @@ struct Subscriber {
 pub fn serve_forever() -> Result<()> {
     let socket = paths::socket_path()?;
     prepare_socket_path(&socket)?;
-    let listener =
-        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    let listener = bind_private_socket(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", socket.display()))?;
     eprintln!("lterm daemon listening on {}", socket.display());
@@ -192,7 +191,10 @@ struct Session {
     /// `output_state` 아래에서 갱신·조회한다.
     terminal_pending: Mutex<TerminalPrefixTracker>,
     /// active alt-screen snapshot 이 나중에 `1049l` 을 받았을 때 session 의 normal
-    /// buffer 로 돌아갈 수 있도록, 마지막으로 관찰한 normal-screen frame 을 보관한다.
+    /// buffer 로 돌아갈 수 있도록, alt-screen 진입/종료 경계에서 관찰한 normal-screen
+    /// frame 을 보관한다. 일반 normal-screen attach snapshot 은 이 cache 가 아니라
+    /// `terminal_screen` 의 현재 parser state 에서 직접 합성하므로, hot path 는 평상시
+    /// normal output 마다 screen clone 을 만들지 않는다.
     terminal_normal_screen: Mutex<vt100::Screen>,
     subscribers: Mutex<Vec<Subscriber>>,
     /// Coarse state mutex for operations that must observe a coherent output
@@ -302,12 +304,7 @@ impl Session {
             let _output_guard = lock(&self.output_state);
             {
                 let mut ring = lock(&self.ring);
-                for byte in bytes {
-                    if ring.len() >= RING_LIMIT {
-                        ring.pop_front();
-                    }
-                    ring.push_back(*byte);
-                }
+                append_ring_bytes(&mut ring, bytes);
             }
             // Keep the raw ring, vt100 parser, pending escape-prefix tracker,
             // normal-screen fallback, and subscriber snapshot under one
@@ -316,7 +313,8 @@ impl Session {
             // match the pending bytes that will prefix the next live chunk.
             // The section ends before `broadcast_chunk`, so slow subscriber
             // sends/backpressure waits do not block attach snapshots or resize.
-            let normal_screen = self.process_terminal_screen(bytes);
+            let pending_before = lock(&self.terminal_pending).pending_bytes();
+            let normal_screen = self.process_terminal_screen(bytes, &pending_before);
             if let Some(normal_screen) = normal_screen {
                 *lock(&self.terminal_normal_screen) = normal_screen;
             }
@@ -661,13 +659,20 @@ impl Session {
             .set_size(rows, cols);
     }
 
-    fn process_terminal_screen(&self, bytes: &[u8]) -> Option<vt100::Screen> {
+    fn process_terminal_screen(
+        &self,
+        bytes: &[u8],
+        pending_control_prefix: &[u8],
+    ) -> Option<vt100::Screen> {
         let mut terminal_screen = lock(&self.terminal_screen);
-        if !terminal_screen.screen().alternate_screen() && bytes.contains(&b'h') {
+        let started_alt = terminal_screen.screen().alternate_screen();
+
+        if !started_alt && should_scan_for_alt_enter(bytes, pending_control_prefix) {
+            let mut detector = AltEnterDetector::from_pending_prefix(pending_control_prefix);
             let mut normal_before_alt = None;
             for byte in bytes {
                 let was_alt = terminal_screen.screen().alternate_screen();
-                let before_final_h = if !was_alt && *byte == b'h' {
+                let before_alt_enter = if !was_alt && *byte == b'h' && detector.is_alt_enter_csi() {
                     Some(terminal_screen.screen().clone())
                 } else {
                     None
@@ -675,20 +680,104 @@ impl Session {
                 terminal_screen.process(std::slice::from_ref(byte));
                 let is_alt = terminal_screen.screen().alternate_screen();
                 if !was_alt && is_alt {
-                    normal_before_alt = before_final_h;
+                    normal_before_alt = before_alt_enter;
                 }
+                detector.process(*byte);
             }
             if terminal_screen.screen().alternate_screen() {
                 normal_before_alt
             } else {
-                Some(terminal_screen.screen().clone())
+                // Still in the normal screen. New attach snapshots use
+                // `terminal_screen` directly in this state, so avoid cloning the
+                // full screen just to refresh the alt-screen fallback cache.
+                None
             }
         } else {
             terminal_screen.process(bytes);
-            if terminal_screen.screen().alternate_screen() {
-                None
-            } else {
+            if started_alt && !terminal_screen.screen().alternate_screen() {
                 Some(terminal_screen.screen().clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn append_ring_bytes(ring: &mut VecDeque<u8>, bytes: &[u8]) {
+    if bytes.len() >= RING_LIMIT {
+        ring.clear();
+        ring.extend(bytes[bytes.len() - RING_LIMIT..].iter().copied());
+        return;
+    }
+
+    let overflow = ring
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(RING_LIMIT);
+    if overflow > 0 {
+        ring.drain(..overflow);
+    }
+    ring.extend(bytes.iter().copied());
+}
+
+fn should_scan_for_alt_enter(bytes: &[u8], pending_control_prefix: &[u8]) -> bool {
+    bytes.contains(&b'h')
+        && (bytes.contains(&0x1b) || bytes.contains(&0x9b) || !pending_control_prefix.is_empty())
+}
+
+enum AltEnterDetector {
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+}
+
+impl AltEnterDetector {
+    fn from_pending_prefix(pending_control_prefix: &[u8]) -> Self {
+        if pending_control_prefix.starts_with(&[0x9b]) {
+            return Self::Csi(pending_control_prefix[1..].to_vec());
+        }
+        if pending_control_prefix.starts_with(b"\x1b[") {
+            return Self::Csi(pending_control_prefix[2..].to_vec());
+        }
+        if pending_control_prefix == [0x1b] {
+            return Self::Escape;
+        }
+        Self::Ground
+    }
+
+    fn is_alt_enter_csi(&self) -> bool {
+        let Self::Csi(params) = self else {
+            return false;
+        };
+        let Some(private_modes) = params.strip_prefix(b"?") else {
+            return false;
+        };
+        private_modes
+            .split(|byte| *byte == b';')
+            .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
+    }
+
+    fn process(&mut self, byte: u8) {
+        match self {
+            Self::Ground => match byte {
+                0x1b => *self = Self::Escape,
+                0x9b => *self = Self::Csi(Vec::new()),
+                _ => {}
+            },
+            Self::Escape => match byte {
+                b'[' => *self = Self::Csi(Vec::new()),
+                0x1b => *self = Self::Escape,
+                0x9b => *self = Self::Csi(Vec::new()),
+                _ => *self = Self::Ground,
+            },
+            Self::Csi(params) => {
+                if byte == 0x1b {
+                    *self = Self::Escape;
+                } else if (0x40..=0x7e).contains(&byte) {
+                    *self = Self::Ground;
+                } else {
+                    params.push(byte);
+                }
             }
         }
     }
@@ -1231,8 +1320,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::ok(session.info()))
         }
         Request::List => {
-            let sessions = lock(&state.sessions);
-            let mut infos: Vec<_> = sessions.by_pane.values().map(|s| s.info()).collect();
+            let sessions: Vec<_> = {
+                let sessions = lock(&state.sessions);
+                sessions.by_pane.values().cloned().collect()
+            };
+            let mut infos: Vec<_> = sessions.iter().map(|s| s.info()).collect();
             infos.sort_by(|a, b| a.created_unix_ms.cmp(&b.created_unix_ms));
             Ok(Response::ok(infos))
         }
@@ -2281,7 +2373,10 @@ fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
             return Ok(Arc::clone(session));
         }
     }
-    bail!("no such lterm session or pane: {target}")
+    bail!(
+        "no such lterm session or pane: {}",
+        sanitized_preview(&target)
+    )
 }
 
 fn validate_session_name_syntax(name: &str) -> Result<()> {
@@ -2497,6 +2592,33 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+struct UmaskGuard {
+    previous: mode_t,
+}
+
+impl UmaskGuard {
+    fn set(mask: mode_t) -> Self {
+        Self {
+            previous: unsafe { libc::umask(mask) },
+        }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.previous);
+        }
+    }
+}
+
+fn bind_private_socket(socket: &Path) -> Result<UnixListener> {
+    let umask_guard = UmaskGuard::set(0o177);
+    let listener = UnixListener::bind(socket).with_context(|| format!("bind {}", socket.display()));
+    drop(umask_guard);
+    listener
+}
+
 fn prepare_socket_path(socket: &Path) -> Result<()> {
     let parent = socket
         .parent()
@@ -2515,8 +2637,21 @@ fn prepare_socket_path(socket: &Path) -> Result<()> {
                     socket.display()
                 );
             }
-            if ping_socket(socket).unwrap_or(false) {
-                bail!("lterm daemon already running at {}", socket.display());
+            match ping_socket(socket) {
+                Ok(true) => bail!("lterm daemon already running at {}", socket.display()),
+                Ok(false) => bail!(
+                    "lterm daemon at {} returned an unsuccessful ping; refusing to remove socket",
+                    socket.display()
+                ),
+                Err(err) if is_stale_socket_ping_error(&err) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "ping existing socket {} failed after connecting or with an unsafe error",
+                            socket.display()
+                        )
+                    });
+                }
             }
             fs::remove_file(socket)
                 .with_context(|| format!("remove stale socket {}", socket.display()))?;
@@ -2525,6 +2660,16 @@ fn prepare_socket_path(socket: &Path) -> Result<()> {
         Err(err) => return Err(err).with_context(|| format!("lstat {}", socket.display())),
     }
     Ok(())
+}
+
+fn is_stale_socket_ping_error(err: &anyhow::Error) -> bool {
+    let Some(io_err) = err.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    matches!(
+        io_err.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+    )
 }
 
 fn ping_socket(socket: &Path) -> Result<bool> {
@@ -3419,6 +3564,30 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_with_snapshot_uses_parser_state_for_normal_screen_output() {
+        let session = build_test_session("snap-normal-parser-state");
+        session.append_output(b"shell-normal-here");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        let rendered = String::from_utf8_lossy(&first);
+        assert!(
+            rendered.contains("shell-normal-here"),
+            "normal-screen snapshot should come from live parser state, got: {rendered:?}",
+        );
+        assert!(
+            find_bytes(first.as_ref(), ALT_SCREEN_ENTER).is_none(),
+            "normal-screen snapshot must not enter alternate screen: {rendered:?}",
+        );
+    }
+
+    #[test]
     fn subscribe_with_snapshot_preserves_alt_screen_state() {
         let session = build_test_session("snap-alt-screen");
         session.append_output(b"\x1b[?1049hALT-FRAME");
@@ -3466,6 +3635,102 @@ mod tests {
             normal_pos < alt_enter_pos && alt_enter_pos < alt_pos,
             "snapshot must render normal buffer before entering alt screen: {:?}",
             String::from_utf8_lossy(&first)
+        );
+    }
+
+    #[test]
+    fn append_output_preserves_normal_buffer_when_alt_enter_shares_chunk() {
+        let session = build_test_session("snap-alt-single-chunk");
+        session.append_output(b"NORMAL-here\x1b[?1049hALT-FRAME");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        let normal_pos = find_bytes(first.as_ref(), b"NORMAL-here")
+            .expect("snapshot should seed session normal buffer");
+        let alt_enter_pos =
+            find_bytes(first.as_ref(), ALT_SCREEN_ENTER).expect("snapshot should enter alt buffer");
+        let alt_pos =
+            find_bytes(first.as_ref(), b"ALT-FRAME").expect("snapshot should render alt buffer");
+        assert!(
+            normal_pos < alt_enter_pos && alt_enter_pos < alt_pos,
+            "snapshot must render same-chunk normal buffer before entering alt screen: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+    }
+
+    #[test]
+    fn append_output_detects_grouped_alt_enter_private_modes() {
+        let session = build_test_session("snap-alt-grouped-private");
+        session.append_output(b"NORMAL-GROUP\x1b[?25;1049hALT-GROUP");
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe");
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first chunk");
+        let normal_pos = find_bytes(first.as_ref(), b"NORMAL-GROUP")
+            .expect("snapshot should seed normal buffer for grouped private modes");
+        let alt_enter_pos =
+            find_bytes(first.as_ref(), ALT_SCREEN_ENTER).expect("snapshot should enter alt buffer");
+        let alt_pos =
+            find_bytes(first.as_ref(), b"ALT-GROUP").expect("snapshot should render alt buffer");
+        assert!(
+            normal_pos < alt_enter_pos && alt_enter_pos < alt_pos,
+            "grouped private modes must preserve normal buffer before alt screen: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+    }
+
+    #[test]
+    fn alt_enter_detector_seeds_split_c1_csi_params() {
+        let detector = super::AltEnterDetector::from_pending_prefix(b"\x9b?25;1049");
+
+        assert!(
+            detector.is_alt_enter_csi(),
+            "split C1 CSI prefixes should seed already-read private-mode params"
+        );
+    }
+
+    #[test]
+    fn append_ring_bytes_preserves_limit_after_large_extend() {
+        let mut ring = VecDeque::new();
+        ring.extend(std::iter::repeat_n(b'x', super::RING_LIMIT - 4));
+
+        let bytes = vec![b'y'; 16];
+        super::append_ring_bytes(&mut ring, &bytes);
+
+        assert_eq!(ring.len(), super::RING_LIMIT);
+        assert_eq!(
+            ring.iter().filter(|byte| **byte == b'y').count(),
+            bytes.len(),
+            "new bytes should be appended after draining overflow in one batch"
+        );
+    }
+
+    #[test]
+    fn resolve_session_sanitizes_missing_target() {
+        let state = Arc::new(super::State::default());
+        let err = match super::resolve_session(&state, "\x1b]52;c;secret\x07missing") {
+            Ok(_) => panic!("target should be missing"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            !err.contains("\x1b]52"),
+            "missing-target error must not include raw terminal controls: {err:?}"
+        );
+        assert!(
+            err.contains("missing"),
+            "sanitized error should retain safe target context: {err:?}"
         );
     }
 

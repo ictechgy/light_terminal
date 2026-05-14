@@ -97,7 +97,7 @@ lterm -a api
 | 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 PATH availability probe |
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
 | tmux 호환 shell export 출력 | `eval "$(lterm env)"` | 신뢰할 수 있는 shell setup용 고정 `export` 행; 생성 path는 `shlex` quoting 기반의 유효한 POSIX shell token이며 `PATH`는 shim dir을 기존 `$PATH` 앞에 추가 |
-| cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 Unicode control `U+0000..U+001F`, `U+007F`, `U+0080..U+009F`를 제거하고 semicolon을 공백으로 치환하며 control이 아닌 Unicode text는 보존 |
+| cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 C0 whitespace control `\n`, `\r`, `\t`를 제외한 Unicode control을 제거하고, 이 세 control과 semicolon은 공백으로 바꾸며, `U+007F`/`U+0080..U+009F`는 제거하고, control이 아닌 Unicode text는 보존 |
 | 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 pass-through |
 | tmux shim namespace 직접 호출 | `lterm tmux-compat list-commands` | 제품 alias 표가 아니라 호환 namespace |
 
@@ -269,7 +269,7 @@ tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니�
 lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
-`lterm notify`는 먼저 `cmux notify`를 시도합니다. 사용할 수 없으면 OSC 777을 출력해 cmux나 호환 터미널이 알림을 표시할 수 있도록 합니다. fallback OSC에 들어가는 알림 필드는 터미널 제어 문자를 제거한 뒤 출력합니다.
+`lterm notify`는 먼저 `cmux notify`를 시도합니다. 사용할 수 없으면 OSC 777을 출력해 cmux나 호환 터미널이 알림을 표시할 수 있도록 합니다. fallback OSC에 들어가는 알림 필드는 터미널 제어 문자를 제거한 뒤 출력하며, subtitle/body 구분용 newline 같은 문자는 서로 붙지 않도록 공백으로 정규화합니다.
 
 ## 원격 접속
 
@@ -292,6 +292,10 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 - **Attach protocol** — CLI가 Unix socket으로 JSON을 보낸 뒤, 선택적으로 로컬 상태 바를 위해 아래쪽 한 줄을 예약하고 PTY byte stream을 전달합니다.
 - **tmux shim** — `tmux`라는 작은 shell script가 명령을 `lterm tmux-compat`으로 넘깁니다.
 - **cmux bridge** — cmux가 감지되면 cmux CLI를 사용합니다 (선택).
+
+`lterm` binary를 업그레이드한 뒤 새 wire-protocol 동작에 의존하려면 이미
+떠 있는 daemon을 재시작하세요. 실행 중인 daemon process는 종료 전까지
+기존 코드를 계속 사용합니다.
 
 ## 보안 메모
 

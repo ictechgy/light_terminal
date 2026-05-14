@@ -171,11 +171,11 @@ fn new_session(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-s" => {
-                name = args.get(i + 1).cloned();
+                name = Some(value_for_option(args.get(i + 1).cloned(), "-s")?);
                 i += 2;
             }
             "-c" => {
-                cwd = args.get(i + 1).cloned();
+                cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
             "--" => {
@@ -645,23 +645,35 @@ fn resize_pane(args: &[String]) -> Result<i32> {
     let mut cols = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "-x" => {
-                cols = args.get(i + 1).and_then(|s| s.parse::<u16>().ok());
-                i += 2;
-            }
-            "-y" => {
-                rows = args.get(i + 1).and_then(|s| s.parse::<u16>().ok());
-                i += 2;
-            }
-            _ => i += 1,
+        if args[i] == "--" {
+            break;
+        }
+        if let Some((width, value)) = short_cluster_flag_value(&args[i], 'x', args, i) {
+            cols = Some(parse_resize_dimension(
+                'x',
+                value.or_else(|| args.get(i + 1).cloned()),
+            )?);
+            i += width_for_value_flag(width, &args[i], args, i, 'x');
+            continue;
+        }
+        if let Some((width, value)) = short_cluster_flag_value(&args[i], 'y', args, i) {
+            rows = Some(parse_resize_dimension(
+                'y',
+                value.or_else(|| args.get(i + 1).cloned()),
+            )?);
+            i += width_for_value_flag(width, &args[i], args, i, 'y');
+            continue;
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            i += 1;
         }
     }
     // tmux-compat shim 은 attach 가 아닌 컨트롤 채널이므로 subscriber_id = None.
     // server 는 per-client geometry 추적을 거치지 않고 즉시 master.resize 한다
     // (PR #15 legacy 경로).
     match (rows, cols) {
-        (Some(0), _) | (_, Some(0)) => bail!("resize dimensions must be at least 1"),
         (Some(rows), Some(cols)) => client::resize(&target, rows, cols, None)?,
         (Some(rows), None) => {
             let info = client::info(&target)?;
@@ -674,6 +686,29 @@ fn resize_pane(args: &[String]) -> Result<i32> {
         (None, None) => {}
     }
     Ok(0)
+}
+
+fn width_for_value_flag(pos: usize, arg: &str, args: &[String], i: usize, flag: char) -> usize {
+    let Some(cluster) = short_cluster(arg) else {
+        return 1;
+    };
+    let rest = &cluster[pos + flag.len_utf8()..];
+    if rest.is_empty() && args.get(i + 1).is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+fn parse_resize_dimension(flag: char, value: Option<String>) -> Result<u16> {
+    let value = value.with_context(|| format!("resize-pane -{flag} requires a dimension value"))?;
+    let dimension = value
+        .parse::<u16>()
+        .with_context(|| format!("invalid resize-pane -{flag} dimension value: {value}"))?;
+    if dimension == 0 {
+        bail!("resize dimensions must be at least 1");
+    }
+    Ok(dimension)
 }
 
 fn show_option(args: &[String]) -> Result<i32> {
@@ -971,27 +1006,37 @@ fn parse_target_with_value_flags(
     args: &[String],
     extra_value_flags: &[char],
 ) -> Result<Option<String>> {
+    let mut target = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
             break;
         }
         if args[i] == "-t" {
-            return target_value(args.get(i + 1).cloned(), "-t");
+            target = target_value(args.get(i + 1).cloned(), "-t")?;
+            i += 2;
+            continue;
         }
         if let Some(value) = args[i].strip_prefix("-t=") {
-            return target_value(Some(value.to_string()), "-t");
+            target = target_value(Some(value.to_string()), "-t")?;
+            i += 1;
+            continue;
         }
         if args[i].starts_with("-t") && args[i].len() > 2 {
-            return target_value(Some(args[i][2..].to_string()), "-t");
+            target = target_value(Some(args[i][2..].to_string()), "-t")?;
+            i += 1;
+            continue;
         }
         if let Some((_, value)) =
             short_cluster_flag_value_with_extra(&args[i], 't', args, i, extra_value_flags)
         {
-            if let Some(value) = value {
-                return target_value(Some(value), "-t");
-            }
-            return target_value(args.get(i + 1).cloned(), "-t");
+            target = if let Some(value) = value {
+                target_value(Some(value), "-t")?
+            } else {
+                target_value(args.get(i + 1).cloned(), "-t")?
+            };
+            i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
+            continue;
         }
         if args[i].starts_with('-') {
             i += flag_arg_width_with_extra(&args[i], args, i, extra_value_flags);
@@ -999,7 +1044,7 @@ fn parse_target_with_value_flags(
             break;
         }
     }
-    Ok(None)
+    Ok(target)
 }
 
 fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
@@ -1623,8 +1668,36 @@ mod tests {
         );
         assert_eq!(parse_target(&args(["--", "-tfoo"])).unwrap(), None);
         assert_eq!(
+            parse_target(&args(["-t", "first", "-t", "second"]))
+                .unwrap()
+                .as_deref(),
+            Some("second"),
+            "later target flags override earlier ones before --"
+        );
+        assert_eq!(
+            parse_target_with_value_flags(&args(["-S", "-tformat", "-t", "real"]), &['S'])
+                .unwrap()
+                .as_deref(),
+            Some("real"),
+            "value-taking flags must hide target-looking values during the scan"
+        );
+        assert_eq!(
+            parse_target(&args(["-c", "/tmp", "-t", "real"]))
+                .unwrap()
+                .as_deref(),
+            Some("real"),
+            "built-in value-taking flags must hide target-looking values during the scan"
+        );
+        assert_eq!(
             parse_target(&args(["-at", "foo"])).unwrap().as_deref(),
             Some("foo")
+        );
+        assert_eq!(
+            parse_target(&args(["-at", "first", "-t", "second"]))
+                .unwrap()
+                .as_deref(),
+            Some("second"),
+            "later targets must override clustered -t values"
         );
         assert_eq!(
             parse_target(&args(["-atfoo"])).unwrap().as_deref(),
@@ -1641,6 +1714,44 @@ mod tests {
         );
         assert!(parse_target(&args(["-t"])).is_err());
         assert!(parse_target(&args(["-t="])).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_new_session_option_values() {
+        assert!(
+            new_session(&args(["-d", "-s"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux option -s requires a value")
+        );
+        assert!(
+            new_session(&args(["-d", "-c"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux option -c requires a value")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_resize_pane_dimensions() {
+        assert!(
+            resize_pane(&args(["-x"]))
+                .unwrap_err()
+                .to_string()
+                .contains("resize-pane -x requires a dimension value")
+        );
+        assert!(
+            resize_pane(&args(["-y", "wat"]))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid resize-pane -y dimension value")
+        );
+        assert!(
+            resize_pane(&args(["-x", "0"]))
+                .unwrap_err()
+                .to_string()
+                .contains("resize dimensions must be at least 1")
+        );
     }
 
     #[test]
