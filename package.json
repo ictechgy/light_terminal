@@ -1,0 +1,41 @@
+{
+  "name": "lterm",
+  "version": "0.1.0",
+  "description": "Lightweight tmux-compatible terminal session daemon with cmux-friendly notifications.",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/ictechgy/light_terminal#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ictechgy/light_terminal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ictechgy/light_terminal/issues"
+  },
+  "keywords": [
+    "terminal",
+    "tmux",
+    "pty",
+    "cmux",
+    "multiplexer"
+  ],
+  "bin": {
+    "lterm": "bin/lterm.js"
+  },
+  "files": [
+    "bin/lterm.js",
+    "README.md",
+    "README.ko.md",
+    "LICENSE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "optionalDependencies": {
+    "lterm-darwin-arm64": "0.1.0",
+    "lterm-darwin-x64": "0.1.0",
+    "lterm-linux-arm64": "0.1.0",
+    "lterm-linux-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

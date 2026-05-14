@@ -29,12 +29,30 @@ The project addresses three constraints:
 
 cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and a tmux shim that maps tmux commands into native cmux panes.
 
-## Install from this checkout
+## Install
 
-Requires Rust 1.85 or newer.
+With Homebrew:
 
 ```bash
-cargo build --release
+brew install ictechgy/tap/lterm
+```
+
+With npm on supported macOS/Linux platforms:
+
+```bash
+npm install -g lterm
+```
+
+With Cargo from GitHub:
+
+```bash
+cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
+```
+
+From this checkout, use Rust 1.85 or newer:
+
+```bash
+cargo build --release --locked
 ./target/release/lterm --help
 ```
 

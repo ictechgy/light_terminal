@@ -31,10 +31,28 @@ cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux
 
 ## 설치
 
-Rust 1.85 이상이 필요합니다.
+Homebrew로 설치:
 
 ```bash
-cargo build --release
+brew install ictechgy/tap/lterm
+```
+
+지원되는 macOS/Linux 플랫폼에서는 npm으로 설치할 수 있습니다.
+
+```bash
+npm install -g lterm
+```
+
+GitHub에서 Cargo로 설치:
+
+```bash
+cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
+```
+
+이 체크아웃에서 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
+
+```bash
+cargo build --release --locked
 ./target/release/lterm --help
 ```
 

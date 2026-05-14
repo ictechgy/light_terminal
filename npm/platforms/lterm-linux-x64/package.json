@@ -1,0 +1,13 @@
+{
+  "name": "lterm-linux-x64",
+  "version": "0.1.0",
+  "description": "Native lterm binary for Linux x64.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ictechgy/light_terminal.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin/lterm"]
+}
