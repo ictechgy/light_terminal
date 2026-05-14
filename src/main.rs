@@ -122,6 +122,13 @@ enum Commands {
         /// Session or pane target to close.
         target: String,
     },
+    /// Rename an existing session or pane target.
+    Rename {
+        /// Session or pane target to rename.
+        target: String,
+        /// New session name.
+        name: String,
+    },
     /// Write text to a session or pane.
     #[command(name = "input", visible_alias = "send")]
     Input {
@@ -353,6 +360,15 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Close { target } => client::kill(&target),
+        Commands::Rename { target, name } => {
+            let info = client::rename_session(&target, &name)?;
+            println!(
+                "{}\t{}",
+                sanitize::terminal_text(&info.name),
+                sanitize::terminal_text(&info.pane_id)
+            );
+            Ok(())
+        }
         Commands::Input {
             target,
             text,
@@ -443,7 +459,7 @@ fn normalize_command(mut command: Vec<String>) -> Result<Option<String>> {
 }
 
 fn collapse_aliases(mut sessions: Vec<protocol::SessionInfo>) -> Vec<protocol::SessionInfo> {
-    sessions.sort_by(|a, b| a.created_unix_ms.cmp(&b.created_unix_ms));
+    sessions.sort_by_key(|session| session.created_unix_ms);
     let mut seen = std::collections::HashSet::new();
     sessions.retain(|s| seen.insert(s.pane_id.clone()));
     sessions

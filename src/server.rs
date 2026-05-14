@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::sanitize;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use libc::{c_int, mode_t};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -164,7 +164,7 @@ struct SessionMaps {
 
 struct Session {
     id: String,
-    name: String,
+    name: Mutex<String>,
     pane_id: String,
     parent_pane_id: Mutex<Option<String>>,
     parent_session_id: Mutex<Option<String>>,
@@ -277,11 +277,15 @@ struct Session {
 }
 
 impl Session {
+    fn name(&self) -> String {
+        lock(&self.name).clone()
+    }
+
     fn info(&self) -> SessionInfo {
         let exit = self.exit_code.load(Ordering::SeqCst);
         SessionInfo {
             id: self.id.clone(),
-            name: self.name.clone(),
+            name: self.name(),
             pane_id: self.pane_id.clone(),
             parent_pane_id: lock(&self.parent_pane_id).clone(),
             parent_session_id: lock(&self.parent_session_id).clone(),
@@ -532,7 +536,7 @@ impl Session {
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_LIMIT);
         let mut subscribers = lock(&self.subscribers);
         if subscribers.len() >= MAX_SUBSCRIBERS_PER_SESSION {
-            bail!("too many attached subscribers for session {}", self.name);
+            bail!("too many attached subscribers for session {}", self.name());
         }
         subscribers.push(Subscriber {
             id,
@@ -1325,10 +1329,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 sessions.by_pane.values().cloned().collect()
             };
             let mut infos: Vec<_> = sessions.iter().map(|s| s.info()).collect();
-            infos.sort_by(|a, b| a.created_unix_ms.cmp(&b.created_unix_ms));
+            infos.sort_by_key(|info| info.created_unix_ms);
             Ok(Response::ok(infos))
         }
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
+        Request::Rename { target, name } => Ok(Response::ok(rename_session(state, &target, name)?)),
         Request::Kill { target } => {
             let session = resolve_session(state, &target)?;
             terminate_session(state, &session);
@@ -1551,7 +1556,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
 
     let session = Arc::new(Session {
         id,
-        name: name.clone(),
+        name: Mutex::new(name.clone()),
         pane_id,
         parent_pane_id: Mutex::new(None),
         parent_session_id: Mutex::new(None),
@@ -1605,7 +1610,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    eprintln!("pty read error for {}: {err}", session_for_reader.name);
+                    eprintln!("pty read error for {}: {err}", session_for_reader.name());
                     break;
                 }
             }
@@ -1625,7 +1630,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
             let exit_code = match child.wait() {
                 Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
                 Err(err) => {
-                    eprintln!("wait error for {}: {err}", session_for_waiter.name);
+                    eprintln!("wait error for {}: {err}", session_for_waiter.name());
                     1
                 }
             };
@@ -1727,7 +1732,7 @@ impl SessionReservation {
         {
             bail!("internal session reservation missing");
         }
-        if sessions.by_name.contains_key(&session.name)
+        if sessions.by_name.contains_key(&self.name)
             || sessions.by_pane.contains_key(&session.pane_id)
             || sessions.by_id.contains_key(&session.id)
         {
@@ -1748,7 +1753,7 @@ impl SessionReservation {
         sessions.reserved_panes.remove(&self.pane_id);
         sessions
             .by_name
-            .insert(session.name.clone(), Arc::clone(&session));
+            .insert(self.name.clone(), Arc::clone(&session));
         sessions
             .by_pane
             .insert(session.pane_id.clone(), Arc::clone(&session));
@@ -1952,15 +1957,60 @@ impl Drop for AttachSubscriptionGuard {
     }
 }
 
+fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<SessionInfo> {
+    validate_session_name_syntax(&new_name)?;
+
+    let target = normalize_target(target);
+    let session = {
+        let mut sessions = lock(&state.sessions);
+        let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
+            anyhow!(
+                "no such lterm session or pane: {}",
+                sanitized_preview(&target)
+            )
+        })?;
+
+        let mut current_name = lock(&session.name);
+        if *current_name == new_name {
+            if sessions
+                .by_name
+                .get(&new_name)
+                .is_some_and(|candidate| candidate.id == session.id)
+            {
+                drop(current_name);
+                Arc::clone(&session)
+            } else {
+                bail!("internal session name index missing: {new_name}");
+            }
+        } else if sessions.reserved_names.contains(&new_name)
+            || sessions
+                .by_name
+                .get(&new_name)
+                .is_some_and(|candidate| candidate.id != session.id)
+        {
+            bail!("session name already exists: {new_name}");
+        } else {
+            if sessions
+                .by_name
+                .get(current_name.as_str())
+                .is_some_and(|candidate| candidate.id == session.id)
+            {
+                sessions.by_name.remove(current_name.as_str());
+            }
+            sessions
+                .by_name
+                .insert(new_name.clone(), Arc::clone(&session));
+            *current_name = new_name;
+            Arc::clone(&session)
+        }
+    };
+
+    Ok(session.info())
+}
+
 fn remove_session(state: &Arc<State>, session: &Session) {
     let mut sessions = lock(&state.sessions);
-    if sessions
-        .by_name
-        .get(&session.name)
-        .is_some_and(|s| s.id == session.id)
-    {
-        sessions.by_name.remove(&session.name);
-    }
+    sessions.by_name.retain(|_, s| s.id != session.id);
     if sessions
         .by_pane
         .get(&session.pane_id)
@@ -2072,7 +2122,7 @@ impl Drop for CleanupCompletionGuard<'_> {
         if self.armed && !self.session.cleanup_complete.load(Ordering::SeqCst) {
             eprintln!(
                 "session cleanup for {} unwound before normal completion; releasing waiters",
-                self.session.name
+                self.session.name()
             );
             mark_cleanup_complete(self.session);
         }
@@ -2178,7 +2228,8 @@ fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
         }
         eprintln!(
             "failed to observe leader exit before reap for {}: {}",
-            session.name, err
+            session.name(),
+            err
         );
         return false;
     }
@@ -2257,7 +2308,9 @@ fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
     if err.raw_os_error() != Some(libc::ESRCH) {
         eprintln!(
             "failed to signal unreaped process group {} for {}: {}",
-            pgid, session.name, err
+            pgid,
+            session.name(),
+            err
         );
     }
 }
@@ -2272,7 +2325,9 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
         if err.raw_os_error() != Some(libc::ESRCH) {
             eprintln!(
                 "failed to signal process group {} for {}: {}",
-                pgid, session.name, err
+                pgid,
+                session.name(),
+                err
             );
         }
     }
@@ -2288,7 +2343,9 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
             if err.raw_os_error() != Some(libc::ESRCH) {
                 eprintln!(
                     "failed to signal child process {} for {}: {}",
-                    pid, session.name, err
+                    pid,
+                    session.name(),
+                    err
                 );
             }
         }
@@ -2302,7 +2359,9 @@ fn verified_session_process_group_id(session: &Session) -> Option<i32> {
     }
     eprintln!(
         "not signaling process group {} for {}: child pid {:?} no longer verifies that group",
-        pgid, session.name, session.process_id
+        pgid,
+        session.name(),
+        session.process_id
     );
     None
 }
@@ -2356,27 +2415,34 @@ fn wait_for_process_group_exit_or_leader_observed(
 fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
     let target = normalize_target(target);
     let sessions = lock(&state.sessions);
-    if target.starts_with('%') {
-        if let Some(session) = sessions.by_pane.get(&target) {
-            return Ok(Arc::clone(session));
-        }
-    }
-    if let Some(session) = sessions.by_name.get(&target) {
-        return Ok(Arc::clone(session));
-    }
-    if let Some(session) = sessions.by_id.get(&target) {
-        return Ok(Arc::clone(session));
-    }
-    if !target.starts_with('%') {
-        let pane = format!("%{target}");
-        if let Some(session) = sessions.by_pane.get(&pane) {
-            return Ok(Arc::clone(session));
-        }
+    if let Some(session) = resolve_session_locked(&sessions, &target) {
+        return Ok(session);
     }
     bail!(
         "no such lterm session or pane: {}",
         sanitized_preview(&target)
     )
+}
+
+fn resolve_session_locked(sessions: &SessionMaps, target: &str) -> Option<Arc<Session>> {
+    if target.starts_with('%') {
+        if let Some(session) = sessions.by_pane.get(target) {
+            return Some(Arc::clone(session));
+        }
+    }
+    if let Some(session) = sessions.by_name.get(target) {
+        return Some(Arc::clone(session));
+    }
+    if let Some(session) = sessions.by_id.get(target) {
+        return Some(Arc::clone(session));
+    }
+    if !target.starts_with('%') {
+        let pane = format!("%{target}");
+        if let Some(session) = sessions.by_pane.get(&pane) {
+            return Some(Arc::clone(session));
+        }
+    }
+    None
 }
 
 fn validate_session_name_syntax(name: &str) -> Result<()> {
@@ -3189,7 +3255,7 @@ mod tests {
         let writer = pair.master.take_writer().expect("take pty writer");
         Arc::new(Session {
             id: format!("test-{name}"),
-            name: name.to_string(),
+            name: Mutex::new(name.to_string()),
             pane_id: format!("%test-{name}"),
             parent_pane_id: Mutex::new(None),
             parent_session_id: Mutex::new(None),
@@ -3375,9 +3441,10 @@ mod tests {
         let session = build_test_session("finalize-idempotent");
         {
             let mut sessions = super::lock(&state.sessions);
+            let session_name = session.name();
             sessions
                 .by_name
-                .insert(session.name.clone(), Arc::clone(&session));
+                .insert(session_name.clone(), Arc::clone(&session));
             sessions
                 .by_pane
                 .insert(session.pane_id.clone(), Arc::clone(&session));
@@ -3431,7 +3498,7 @@ mod tests {
         assert!(!session.alive.load(Ordering::SeqCst));
         assert!(session.cleanup_complete.load(Ordering::SeqCst));
         let sessions = super::lock(&state.sessions);
-        assert!(!sessions.by_name.contains_key(&session.name));
+        assert!(!sessions.by_name.contains_key(&session.name()));
         assert!(!sessions.by_pane.contains_key(&session.pane_id));
         assert!(!sessions.by_id.contains_key(&session.id));
     }

@@ -823,6 +823,10 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         ("close", &["Session or pane target to close"][..]),
         ("kill", &["Session or pane target to close"][..]),
         (
+            "rename",
+            &["Session or pane target to rename", "New session name"][..],
+        ),
+        (
             "input",
             &[
                 "Session or pane target to receive input",
@@ -1154,6 +1158,106 @@ fn start_and_new_short_name_list_aliases_work() -> TestResult {
         assert!(captured.contains(marker), "missing output: {captured}");
     }
 
+    Ok(())
+}
+
+#[test]
+fn rename_existing_session_updates_targets() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = "RENAME_READY";
+    let create = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "rename-old",
+            "--",
+            "sh",
+            "-lc",
+            &format!("echo {marker}; sleep 60"),
+        ])
+        .output()?;
+    assert!(create.status.success(), "{create:?}");
+    let create_stdout = String::from_utf8_lossy(&create.stdout);
+    let pane_id = create_stdout
+        .split('\t')
+        .nth(1)
+        .ok_or_else(|| format!("missing pane id in create output: {create_stdout:?}"))?
+        .to_string();
+    env.capture_until("rename-old", marker)?;
+
+    let rename = env
+        .cmd()
+        .args(["rename", "rename-old", "rename-new"])
+        .output()?;
+    assert!(rename.status.success(), "{rename:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&rename.stdout).trim(),
+        format!("rename-new\t{pane_id}")
+    );
+
+    let listed = env.cmd().arg("sessions").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(list_row(&stdout, "rename-new").is_some(), "{stdout}");
+    assert!(list_row(&stdout, "rename-old").is_none(), "{stdout}");
+
+    let old_logs = env.cmd().args(["logs", "rename-old"]).output()?;
+    assert!(!old_logs.status.success(), "{old_logs:?}");
+    assert!(env.capture_until("rename-new", marker)?.contains(marker));
+    assert!(env.capture_until(&pane_id, marker)?.contains(marker));
+
+    let close = env.cmd().args(["close", "rename-new"]).output()?;
+    assert!(close.status.success(), "{close:?}");
+    wait_for_session_absent(&env, "rename-new")?;
+    Ok(())
+}
+
+#[test]
+fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
+    let env = TestEnv::new()?;
+    for name in ["rename-keep", "rename-taken"] {
+        let created = env
+            .cmd()
+            .args(["new", "--detach", "-n", name, "--", "sleep", "60"])
+            .output()?;
+        assert!(
+            created.status.success(),
+            "failed to create {name}: {created:?}"
+        );
+    }
+
+    let conflict = env
+        .cmd()
+        .args(["rename", "rename-keep", "rename-taken"])
+        .output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("session name already exists"),
+        "{conflict:?}"
+    );
+
+    let invalid = env
+        .cmd()
+        .args(["rename", "rename-keep", "bad/name"])
+        .output()?;
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("session name"),
+        "{invalid:?}"
+    );
+
+    let listed = env.cmd().arg("sessions").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(list_row(&stdout, "rename-keep").is_some(), "{stdout}");
+    assert!(list_row(&stdout, "rename-taken").is_some(), "{stdout}");
+
+    env.cmd().args(["close", "rename-keep"]).status()?;
+    env.cmd().args(["close", "rename-taken"]).status()?;
+    wait_for_session_absent(&env, "rename-keep")?;
+    wait_for_session_absent(&env, "rename-taken")?;
     Ok(())
 }
 
@@ -2668,6 +2772,67 @@ fn tmux_compat_list_windows_resolves_child_target_to_root_window() -> TestResult
 }
 
 #[test]
+fn tmux_compat_rename_session_updates_session_name() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "tmux-rename-old",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let renamed = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "rename-session",
+            "-t",
+            "tmux-rename-old",
+            "tmux-rename-new",
+        ])
+        .output()?;
+    assert!(renamed.status.success(), "{renamed:?}");
+
+    let listed = env
+        .cmd()
+        .args(["tmux-compat", "list-sessions", "-F", "#{session_name}"])
+        .output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.lines().any(|line| line == "tmux-rename-new"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line == "tmux-rename-old"),
+        "{stdout}"
+    );
+
+    let old = env
+        .cmd()
+        .args(["tmux-compat", "has-session", "-t", "tmux-rename-old"])
+        .status()?;
+    assert!(!old.success());
+    let new = env
+        .cmd()
+        .args(["tmux-compat", "has-session", "-t", "tmux-rename-new"])
+        .status()?;
+    assert!(new.success());
+
+    env.cmd()
+        .args(["tmux-compat", "kill-session", "-t", "tmux-rename-new"])
+        .status()?;
+    wait_for_session_absent(&env, "tmux-rename-new")?;
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -2723,6 +2888,7 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
         ("list-commands", "lscm"),
         ("attach-session", "attach"),
         ("has-session", "has"),
+        ("rename-session", "rename"),
         ("set-environment", "setenv"),
         ("show-environment", "showenv"),
     ] {
@@ -2752,6 +2918,7 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
     for (alias, expected) in [
         ("has", "has-session:has"),
         ("a", "attach-session:attach"),
+        ("rename", "rename-session:rename"),
         ("show-option", "show-options:show"),
         ("show-window-option", "show-window-options:showw"),
     ] {

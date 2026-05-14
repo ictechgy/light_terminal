@@ -17,6 +17,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json` | `ps` |
+| Rename a session | `lterm rename api api-renamed` | none |
 | Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session or pane | `lterm close api` | `kill` |
@@ -65,6 +66,8 @@ lterm tmux-compat list-commands
 to inspect the supported shim subset at runtime.
 
 The shim covers the tmux subset used by common AI orchestration scripts, including session commands, query commands, pane operations, buffers/popups, and deliberate no-op compatibility commands such as `select-pane` and `set-option`. Product-only lifecycle commands such as `daemon` and `shutdown` do not imply tmux-compatible aliases.
+
+Session rename is available through the product command `lterm rename <target> <new-name>` and the tmux shim command `lterm tmux-compat rename-session [-t target-session] <new-name>`. Rename changes lterm metadata and target lookup only; it does not restart the PTY or mutate the child process environment.
 
 Generic tmux target parsing is left-to-right and treats later `-t` target
 values as overrides before `--`. Value-taking flags such as `-F`, `-c`, `-x`,

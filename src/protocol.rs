@@ -55,6 +55,10 @@ pub enum Request {
     Info {
         target: String,
     },
+    Rename {
+        target: String,
+        name: String,
+    },
     Kill {
         target: String,
     },
