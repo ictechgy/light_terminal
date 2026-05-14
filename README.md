@@ -4,19 +4,15 @@
 
 ## TL;DR
 
-- **What** — A Rust-based PTY session daemon with a tmux-compatible shim. Persistent sessions you can detach and reattach by name or pane id.
+- **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI agent tooling. Detach and reattach by name or pane id.
 - **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
 - **How** — `lterm start` to create, `lterm resume` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini` for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
 - **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
 
-A lightweight terminal session daemon with a tmux-compatible shim, built for AI-agent workflows.
-
 `lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by terminal-first agent tooling.
 
-> **Status:** alpha MVP. Usable for local detached sessions and compatibility testing — not yet a full tmux replacement.
->
 > **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
 
 ## Why this exists
@@ -43,7 +39,9 @@ With npm on supported macOS/Linux platforms:
 npm install -g @ictechgy/lterm
 ```
 
-With Cargo from GitHub:
+Homebrew and npm both install the `lterm` command on your `PATH`; verify with `lterm --version`.
+
+With Cargo from GitHub (replace `v0.1.0` with the latest release tag when newer versions are available):
 
 ```bash
 cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
@@ -107,24 +105,20 @@ lterm -a api
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
-Adjacent agent/shim utility commands are also product CLI commands, not tmux
-aliases:
+Agent and shim utilities are also product CLI commands, not tmux aliases:
 
 | Task | Product command | Compatibility boundary |
 | --- | --- | --- |
 | Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
-| Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Fixed `export` lines for trusted shell setup; generated paths are valid POSIX shell tokens from `shlex` quoting, and `PATH` prepends the shim dir to `$PATH` |
-| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback drops Unicode controls except the C0 whitespace controls `\n`, `\r`, and `\t`, replaces those controls and semicolons with spaces, drops `U+007F`/`U+0080..U+009F`, and preserves non-control Unicode text |
+| Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Emits trusted `export` lines that prepend the shim dir to `$PATH` |
+| Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
 | Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
 
-`lterm env` is meant for `eval` only when you trust the `lterm` binary on
-your `PATH`; its smoke coverage requires export-only output, verifies that
-generated paths containing spaces, `$`, and `'` round-trip as POSIX shell tokens,
-and confirms the shim directory extends the existing `$PATH` rather than
-replacing it.
+Use `eval "$(lterm env)"` only when you trust the `lterm` binary on your `PATH`.
+It emits fixed `export` lines that prepend the shim directory to `$PATH`.
 
 `lterm ssh` forwards remote PTY bytes to the local terminal without sanitizing
 terminal control sequences, so a compromised remote can drive terminal features
@@ -153,6 +147,8 @@ Session names containing CJK characters or emoji (including ZWJ families, countr
 When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
 **Inspect or control a session:**
+
+`--children` includes managed child panes; `--all` includes sessions that are normally hidden from the default list.
 
 ```bash
 lterm sessions
