@@ -4,19 +4,15 @@
 
 ## TL;DR
 
-- **무엇** — Rust로 만든 PTY 세션 데몬 + tmux 호환 shim. 이름이나 pane id로 detach·reattach할 수 있는 영속 세션을 제공합니다.
-- **대상** — Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent와, 그것을 `cmux` 안에서 돌리는 사용자.
+- **무엇** — tmux 같은 영속 터미널 세션 데몬을 더 작게 만든 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
+- **대상** — Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
-- **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도 escape-sequence sanitizer도 완전한 tmux 대체품도 아닙니다.**
+- **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스, escape-sequence sanitizer, 완전한 tmux 대체품 모두 아닙니다.**
 
 ---
 
-AI 에이전트 워크플로를 위해 만든 가벼운 터미널 세션 데몬입니다. tmux 호환 shim을 함께 제공합니다.
-
 `lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, terminal-first agent 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.
 
-> **상태:** alpha MVP. 로컬 detached 세션과 호환성 테스트에는 사용할 수 있지만, 아직 완전한 tmux 대체품은 아닙니다.
->
 > **보안 모델:** `lterm`은 같은 OS 사용자 안에서 쓰는 편의용 데몬이며 샌드박스가 아닙니다. 다른 사용자의 Unix socket 접근은 거부하고 런타임 디렉터리는 소유자 전용 권한으로 만들지만, 같은 OS 사용자 권한으로 실행되는 프로세스는 세션을 제어할 수 있다고 보아야 합니다.
 
 ## 왜 만들었나
@@ -27,7 +23,7 @@ AI 에이전트 워크플로를 위해 만든 가벼운 터미널 세션 데몬�
 2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, tmux shim은 가능한 경우 worker pane을 cmux native split으로 엽니다.
 3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
 
-cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux pane으로 매핑하는 oh-my-codex 통합을 제공합니다.
+cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux native pane으로 매핑하는 tmux shim 모델을 문서화하고 있습니다.
 
 ## 설치
 
@@ -43,13 +39,15 @@ brew install ictechgy/tap/lterm
 npm install -g @ictechgy/lterm
 ```
 
-GitHub에서 Cargo로 설치:
+Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --version`으로 확인하세요.
+
+GitHub에서 Cargo로 설치 (새 버전이 나오면 `v0.1.0`을 최신 릴리스 태그로 바꾸세요):
 
 ```bash
 cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
 ```
 
-이 체크아웃에서 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
+저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
 
 ```bash
 cargo build --release --locked
@@ -91,7 +89,7 @@ lterm a api
 lterm -a api
 ```
 
-**Agent terminal 명령어 어휘:**
+**Agent terminal 명령어:**
 
 | 작업 | 일반 명령 | 호환 이름 |
 | --- | --- | --- |
@@ -104,25 +102,23 @@ lterm -a api
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
-| background daemon 명시 실행 | `lterm daemon` | 없음 |
-| daemon과 모든 세션 종료 | `lterm shutdown` | 없음 |
+| 백그라운드 데몬 명시 실행 | `lterm daemon` | 없음 |
+| 데몬과 모든 세션 종료 | `lterm shutdown` | 없음 |
 
-주변 agent/shim 유틸리티도 제품 CLI 명령이며, tmux alias가 아닙니다:
+에이전트·shim 유틸리티도 제품 CLI 명령이며, tmux alias가 아닙니다:
 
 | 작업 | 제품 명령 | 호환 경계 |
 | --- | --- | --- |
 | profile 기반 agent 세션 실행 | `lterm agent claude -- --help` | sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
-| 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 PATH availability probe |
+| 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 `PATH` 사용 가능 여부 확인 |
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
-| tmux 호환 shell export 출력 | `eval "$(lterm env)"` | 신뢰할 수 있는 shell setup용 고정 `export` 행; 생성 path는 `shlex` quoting 기반의 유효한 POSIX shell token이며 `PATH`는 shim dir을 기존 `$PATH` 앞에 추가 |
-| cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 C0 whitespace control `\n`, `\r`, `\t`를 제외한 Unicode control을 제거하고, 이 세 control과 semicolon은 공백으로 바꾸며, `U+007F`/`U+0080..U+009F`는 제거하고, control이 아닌 Unicode text는 보존 |
-| 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 pass-through |
+| tmux 호환 shell export 출력 | `eval "$(lterm env)"` | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
+| cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 터미널 제어 문자를 제거하고 Unicode text는 보존 |
+| 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 전달 |
 | tmux shim namespace 직접 호출 | `lterm tmux-compat list-commands` | 제품 alias 표가 아니라 호환 namespace |
 
-`lterm env`는 `PATH`의 `lterm` binary를 신뢰할 수 있을 때만 `eval`
-용도로 사용하세요. smoke test는 export-only 출력과 space, `$`, `'`가
-포함된 생성 path가 POSIX shell token으로 round-trip되는지, 그리고 shim
-directory가 기존 `$PATH`를 대체하지 않고 앞에 추가되는지 검증합니다.
+`eval "$(lterm env)"`는 `PATH`의 `lterm` binary를 신뢰할 수 있을 때만 사용하세요.
+이 명령은 shim directory를 `$PATH` 앞에 추가하는 고정 `export` 행을 출력합니다.
 
 `lterm ssh`는 remote PTY bytes를 local terminal로 정제 없이 전달하므로,
 compromised remote는 local terminal emulator가 허용하는 control sequence를
@@ -145,13 +141,15 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 attach된 PTY가 alternate screen buffer로 진입하면(예: `vim`, `less`, `htop`이 `\x1b[?1049h` 사용) lterm은 status bar를 일시 중단해 alt-screen 앱의 UI와 충돌을 피합니다. 앱이 alt-screen을 종료하는 즉시 status bar가 다시 그려집니다.
 
-`lterm resume` / `lterm attach` 도중 panic 이나 abort 가 발생해도 process-wide hook 이 최소 복구 sequence (scroll region 리셋, 커서 보이기, alt-screen 종료, SGR 리셋) 를 emit 해 사용자 터미널이 raw mode 나 hidden cursor 상태로 남지 않습니다.
+`lterm resume` / `lterm attach` 도중 panic이나 abort가 발생해도 process-wide hook이 최소 복구 sequence(scroll region 리셋, 커서 보이기, alt-screen 종료, SGR 리셋)를 emit해 사용자 터미널이 raw mode나 hidden cursor 상태로 남지 않습니다.
 
 CJK 문자나 이모지(ZWJ family, 국기, 결합 문자 포함)가 들어간 세션 이름은 `unicode-width` / `unicode-segmentation` 으로 디스플레이 폭을 계산해 정렬되므로 wide character가 섞여도 status bar 패딩이 어긋나지 않습니다.
 
 child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard protocol을 켜면, lterm은 이를 추적했다가 attach 종료 시 terminal keyboard mode를 best-effort로 복원합니다. 그래서 child가 비정상 종료된 뒤 shell 입력이 `1;1:3u` 같은 escape 조각으로 보이는 상황을 줄입니다.
 
 **세션 확인 및 제어:**
+
+`--children`는 관리되는 자식 pane을 포함하고, `--all`은 기본 목록에서 숨겨지는 세션까지 포함합니다.
 
 ```bash
 lterm sessions
