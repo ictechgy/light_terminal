@@ -1990,7 +1990,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 session.info()
             } else {
                 bail!(
-                    "internal session name index missing: {}",
+                    "internal session name index inconsistent for: {}",
                     sanitized_preview(&new_name)
                 );
             }
@@ -2035,6 +2035,10 @@ fn remove_session(state: &Arc<State>, session: &Session) {
     {
         sessions.by_name.remove(&name);
     }
+    debug_assert!(
+        !sessions.by_name.values().any(|s| s.id == session.id),
+        "stale session name index after remove_session"
+    );
     if sessions
         .by_pane
         .get(&session.pane_id)
