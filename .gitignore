@@ -30,3 +30,6 @@ HANDOFF.md
 # npm platform package staging binaries
 npm/platforms/*/bin/lterm
 npm/platforms/*/bin/lterm.exe
+
+# Local release artifact staging
+/dist/
