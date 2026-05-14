@@ -122,11 +122,11 @@ enum Commands {
         /// Session or pane target to close.
         target: String,
     },
-    /// Rename an existing session or pane target.
+    /// Rename an existing session without restarting its PTY.
     Rename {
-        /// Session or pane target to rename.
+        /// Session or pane target whose session metadata should be renamed.
         target: String,
-        /// New session name.
+        /// New session name for future target lookup.
         name: String,
     },
     /// Write text to a session or pane.

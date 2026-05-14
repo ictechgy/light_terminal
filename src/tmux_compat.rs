@@ -327,6 +327,7 @@ fn kill_session(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+/// Implements the tmux-compatible `rename-session [-t target] new-name` shim.
 fn rename_session(args: &[String]) -> Result<i32> {
     let mut target = None;
     let mut name = None;
