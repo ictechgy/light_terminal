@@ -14,6 +14,10 @@ use std::os::unix::net::UnixStream;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const ERR_BARE_PANE_ID: &str = "bare pane id";
+const ERR_SESSION_EXISTS: &str = "session name already exists";
+const ERR_SESSION_NAME: &str = "session name";
+
 struct TestEnv {
     temp: tempfile::TempDir,
 }
@@ -107,6 +111,23 @@ fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
         .lines()
         .find(|line| line.starts_with(&format!("{name}\t")))
         .map(|line| line.split('\t').collect())
+}
+
+fn session_names_json(env: &TestEnv) -> TestResult<BTreeSet<String>> {
+    let output = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    Ok(sessions
+        .iter()
+        .filter_map(|row| row.get("name").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn assert_stderr_contains(output: &std::process::Output, expected: &str) {
+    // These fragments are part of lterm's user-facing CLI error contract.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(expected), "{stderr:?}");
 }
 
 fn wait_for_pid_exit(pid: &str) -> TestResult {
@@ -1243,6 +1264,11 @@ fn rename_existing_session_updates_targets() -> TestResult {
     assert!(list_row(&stdout, "rename-new").is_none(), "{stdout}");
     assert!(list_row(&stdout, "rename-old").is_none(), "{stdout}");
 
+    let names = session_names_json(&env)?;
+    assert!(names.contains("rename-final"), "{names:?}");
+    assert!(!names.contains("rename-new"), "{names:?}");
+    assert!(!names.contains("rename-old"), "{names:?}");
+
     let old_logs = env.cmd().args(["logs", "rename-old"]).output()?;
     assert!(!old_logs.status.success(), "{old_logs:?}");
     let previous_logs = env.cmd().args(["logs", "rename-new"]).output()?;
@@ -1275,26 +1301,30 @@ fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
         .args(["rename", "rename-keep", "rename-taken"])
         .output()?;
     assert!(!conflict.status.success(), "{conflict:?}");
-    assert!(
-        String::from_utf8_lossy(&conflict.stderr).contains("session name already exists"),
-        "{conflict:?}"
-    );
+    assert_stderr_contains(&conflict, ERR_SESSION_EXISTS);
 
     let invalid = env
         .cmd()
         .args(["rename", "rename-keep", "bad/name"])
         .output()?;
     assert!(!invalid.status.success(), "{invalid:?}");
-    assert!(
-        String::from_utf8_lossy(&invalid.stderr).contains("session name"),
-        "{invalid:?}"
-    );
-    let numeric = env.cmd().args(["rename", "rename-keep", "0"]).output()?;
-    assert!(!numeric.status.success(), "{numeric:?}");
-    assert!(
-        String::from_utf8_lossy(&numeric.stderr).contains("bare pane id"),
-        "{numeric:?}"
-    );
+    assert_stderr_contains(&invalid, ERR_SESSION_NAME);
+
+    let leading_dash = env
+        .cmd()
+        .args(["rename", "rename-keep", "--", "-bad"])
+        .output()?;
+    assert!(!leading_dash.status.success(), "{leading_dash:?}");
+    assert_stderr_contains(&leading_dash, ERR_SESSION_NAME);
+
+    for numeric_name in ["0", "123", "007"] {
+        let numeric = env
+            .cmd()
+            .args(["rename", "rename-keep", numeric_name])
+            .output()?;
+        assert!(!numeric.status.success(), "{numeric:?}");
+        assert_stderr_contains(&numeric, ERR_BARE_PANE_ID);
+    }
 
     let listed = env.cmd().arg("sessions").output()?;
     assert!(listed.status.success(), "{listed:?}");
@@ -2847,6 +2877,18 @@ fn tmux_compat_rename_session_updates_session_name() -> TestResult {
         .output()?;
     assert!(renamed.status.success(), "{renamed:?}");
 
+    let renamed_again = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "rename-session",
+            "tmux-rename-final",
+            "-t",
+            "tmux-rename-new",
+        ])
+        .output()?;
+    assert!(renamed_again.status.success(), "{renamed_again:?}");
+
     let listed = env
         .cmd()
         .args(["tmux-compat", "list-sessions", "-F", "#{session_name}"])
@@ -2854,11 +2896,15 @@ fn tmux_compat_rename_session_updates_session_name() -> TestResult {
     assert!(listed.status.success(), "{listed:?}");
     let stdout = String::from_utf8_lossy(&listed.stdout);
     assert!(
-        stdout.lines().any(|line| line == "tmux-rename-new"),
+        stdout.lines().any(|line| line == "tmux-rename-final"),
         "{stdout}"
     );
     assert!(
         !stdout.lines().any(|line| line == "tmux-rename-old"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line == "tmux-rename-new"),
         "{stdout}"
     );
 
@@ -2867,16 +2913,21 @@ fn tmux_compat_rename_session_updates_session_name() -> TestResult {
         .args(["tmux-compat", "has-session", "-t", "tmux-rename-old"])
         .status()?;
     assert!(!old.success());
-    let new = env
+    let previous = env
         .cmd()
         .args(["tmux-compat", "has-session", "-t", "tmux-rename-new"])
+        .status()?;
+    assert!(!previous.success());
+    let new = env
+        .cmd()
+        .args(["tmux-compat", "has-session", "-t", "tmux-rename-final"])
         .status()?;
     assert!(new.success());
 
     env.cmd()
-        .args(["tmux-compat", "kill-session", "-t", "tmux-rename-new"])
+        .args(["tmux-compat", "kill-session", "-t", "tmux-rename-final"])
         .status()?;
-    wait_for_session_absent(&env, "tmux-rename-new")?;
+    wait_for_session_absent(&env, "tmux-rename-final")?;
     Ok(())
 }
 
@@ -4308,16 +4359,21 @@ fn rejects_control_characters_in_session_names() -> TestResult {
         .args(["new", "--name", "bad\u{1b}name", "--", "true"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("session name"), "{stderr}");
+    assert_stderr_contains(&output, ERR_SESSION_NAME);
+    Ok(())
+}
 
-    let numeric = env
-        .cmd()
-        .args(["new", "--name", "0", "--", "true"])
-        .output()?;
-    assert!(!numeric.status.success());
-    let stderr = String::from_utf8_lossy(&numeric.stderr);
-    assert!(stderr.contains("bare pane id"), "{stderr}");
+#[test]
+fn rejects_bare_numeric_session_names() -> TestResult {
+    let env = TestEnv::new()?;
+    for numeric_name in ["0", "123", "007"] {
+        let numeric = env
+            .cmd()
+            .args(["new", "--name", numeric_name, "--", "true"])
+            .output()?;
+        assert!(!numeric.status.success());
+        assert_stderr_contains(&numeric, ERR_BARE_PANE_ID);
+    }
     Ok(())
 }
 

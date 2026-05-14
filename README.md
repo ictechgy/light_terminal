@@ -137,6 +137,8 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
 
+`lterm rename <target> <new-name>` changes only lterm metadata and target lookup; it does not restart the PTY or mutate the child process environment. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error.
+
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) shows black text on a bright-blue background; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius.
 
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
