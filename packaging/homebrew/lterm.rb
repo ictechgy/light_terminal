@@ -3,7 +3,7 @@ class Lterm < Formula
   homepage "https://github.com/ictechgy/light_terminal"
   url "https://github.com/ictechgy/light_terminal/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "e1b8b663e89dae3f70f96f444e93851dd8031c4e6b78039808ea94b62b810485"
-  license "MIT OR Apache-2.0"
+  license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/ictechgy/light_terminal.git", branch: "main"
 
   depends_on "rust" => :build
