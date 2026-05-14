@@ -99,6 +99,7 @@ lterm -a api
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
 | 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
+| 세션 이름 변경 | `lterm rename api api-renamed` | 없음 |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
@@ -258,7 +259,7 @@ lterm run -- codex exec "저장소를 요약해줘"
 
 이 세션 안에서는 `tmux`가 `lterm tmux-compat` shim으로 해석됩니다. 이 shim은 호환 계층이지 모든 `lterm` 제품 명령의 두 번째 철자가 아닙니다. 현재 shim은 AI orchestration 스크립트가 자주 사용하는 다음 명령 subset을 구현합니다.
 
-- **세션** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
+- **세션** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
 - **조회** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Pane** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffer / popup** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`

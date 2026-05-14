@@ -99,6 +99,7 @@ lterm -a api
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json` | `ps` |
+| Rename a session | `lterm rename api api-renamed` | None |
 | Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
@@ -257,7 +258,7 @@ lterm run -- codex exec "summarize the repository"
 
 Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. This is a compatibility layer, not a second spelling of every `lterm` product command. The shim implements the command subset most AI orchestration scripts rely on:
 
-- **Sessions** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `kill-session`
+- **Sessions** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
 - **Queries** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Panes** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffers / popups** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`

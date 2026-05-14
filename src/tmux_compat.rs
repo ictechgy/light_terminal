@@ -100,6 +100,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "list-clients" | "lsc" => list_clients(rest),
         "list-commands" | "lscm" => list_commands(rest),
         "kill-session" => kill_session(rest),
+        "rename-session" | "rename" => rename_session(rest),
         "split-window" | "splitw" => split_window(rest),
         "list-panes" | "lsp" => list_panes(rest),
         "display-message" | "display" => display_message(rest),
@@ -323,6 +324,51 @@ fn window_row_for_target(target: &str) -> Result<SessionInfo> {
 fn kill_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
     client::kill(&target)?;
+    Ok(0)
+}
+
+fn rename_session(args: &[String]) -> Result<i32> {
+    let mut target = None;
+    let mut name = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                target = target_value(args.get(i + 1).cloned(), "-t")?;
+                i += 2;
+            }
+            "--" => {
+                if let Some(value) = args.get(i + 1) {
+                    name = Some(value.clone());
+                    if i + 2 < args.len() {
+                        bail!("tmux rename-session accepts exactly one new session name");
+                    }
+                }
+                break;
+            }
+            flag if flag.starts_with("-t=") => {
+                target = target_value(Some(flag[3..].to_string()), "-t")?;
+                i += 1;
+            }
+            flag if flag.starts_with("-t") && flag.len() > 2 => {
+                target = target_value(Some(flag[2..].to_string()), "-t")?;
+                i += 1;
+            }
+            flag if flag.starts_with('-') => {
+                bail!("unsupported tmux rename-session option: {flag}");
+            }
+            value => {
+                name = Some(value.to_string());
+                if i + 1 < args.len() {
+                    bail!("tmux rename-session accepts exactly one new session name");
+                }
+                break;
+            }
+        }
+    }
+    let name = name.context("tmux rename-session requires a new session name")?;
+    let target = target.unwrap_or_else(default_target);
+    client::rename_session(&target, &name)?;
     Ok(0)
 }
 
@@ -1475,6 +1521,7 @@ const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
     ("load-buffer", Some("loadb"), &[]),
     ("new-session", Some("new"), &[]),
     ("paste-buffer", Some("pasteb"), &[]),
+    ("rename-session", Some("rename"), &[]),
     ("resize-pane", Some("resizep"), &[]),
     ("save-buffer", Some("saveb"), &[]),
     ("select-layout", Some("selectl"), &[]),
@@ -1511,6 +1558,7 @@ fn command_usage(command: &str) -> &'static str {
         "load-buffer" => "path",
         "new-session" => "[-d] [-c start-directory] [-s session-name] [shell-command]",
         "paste-buffer" => "[-t target-pane]",
+        "rename-session" => "[-t target-session] new-name",
         "resize-pane" => "[-x width] [-y height] [-t target-pane]",
         "save-buffer" => "path",
         "select-layout" => "[-t target-pane] [layout-name]",
@@ -1729,6 +1777,28 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("tmux option -c requires a value")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_rename_session_values_before_rpc() {
+        assert!(
+            rename_session(&args(["-t"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux target flag -t requires a value")
+        );
+        assert!(
+            rename_session(&args(["-t", "old"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux rename-session requires a new session name")
+        );
+        assert!(
+            rename_session(&args(["old", "extra"]))
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one new session name")
         );
     }
 

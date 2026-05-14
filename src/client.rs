@@ -212,6 +212,14 @@ pub fn info(target: &str) -> Result<SessionInfo> {
     })
 }
 
+pub fn rename_session(target: &str, name: &str) -> Result<SessionInfo> {
+    ensure_server()?;
+    rpc(&Request::Rename {
+        target: target.to_string(),
+        name: name.to_string(),
+    })
+}
+
 pub fn kill(target: &str) -> Result<()> {
     ensure_server()?;
     rpc::<serde_json::Value>(&Request::Kill {
@@ -1056,7 +1064,7 @@ impl StatusBar {
         self.drawn_status_rows
             .iter()
             .copied()
-            .filter(|previous| *previous != rows && *previous <= rows)
+            .filter(|previous| *previous < rows)
             .collect()
     }
 
