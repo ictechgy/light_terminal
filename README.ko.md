@@ -40,7 +40,7 @@ brew install ictechgy/tap/lterm
 지원되는 macOS/Linux 플랫폼에서는 npm으로 설치할 수 있습니다.
 
 ```bash
-npm install -g lterm
+npm install -g @ictechgy/lterm
 ```
 
 GitHub에서 Cargo로 설치:

@@ -12,6 +12,15 @@ on:
         required: true
         type: boolean
         default: true
+      source_ref:
+        description: "Git ref to build and publish from"
+        required: true
+        default: "main"
+      publish_platforms:
+        description: "Build and publish platform packages before the wrapper"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -30,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.source_ref }}
 
       - name: Validate package versions
         id: meta
@@ -57,6 +66,7 @@ jobs:
   build:
     name: Build ${{ matrix.package }}
     needs: metadata
+    if: ${{ inputs.publish_platforms }}
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.source_ref }}
 
       - uses: actions/setup-node@v6
         with:
@@ -118,12 +128,13 @@ jobs:
   publish:
     name: Publish npm packages
     needs: [metadata, build]
+    if: ${{ always() && needs.metadata.result == 'success' && (!inputs.publish_platforms || needs.build.result == 'success') }}
     runs-on: ubuntu-latest
     environment: npm
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.source_ref }}
 
       - uses: actions/setup-node@v6
         with:
@@ -132,10 +143,12 @@ jobs:
           package-manager-cache: false
 
       - uses: actions/download-artifact@v7
+        if: ${{ inputs.publish_platforms }}
         with:
           path: artifacts
 
       - name: Stage downloaded platform binaries
+        if: ${{ inputs.publish_platforms }}
         shell: bash
         run: |
           set -euo pipefail
@@ -151,6 +164,7 @@ jobs:
         run: npm --version
 
       - name: Publish platform packages first
+        if: ${{ inputs.publish_platforms }}
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -169,6 +183,11 @@ jobs:
           for package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
             (
               cd "npm/platforms/${package}"
+              version=$(node -p 'require("./package.json").version')
+              if [[ "${{ inputs.dry_run }}" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
+                echo "${package}@${version} already exists; skipping publish"
+                exit 0
+              fi
               npm publish "${publish_flags[@]}"
             )
           done
@@ -184,5 +203,11 @@ jobs:
             publish_flags+=(--dry-run)
           else
             publish_flags+=(--provenance)
+          fi
+          package=$(node -p 'require("./package.json").name')
+          version=$(node -p 'require("./package.json").version')
+          if [[ "${{ inputs.dry_run }}" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
+            echo "${package}@${version} already exists; skipping publish"
+            exit 0
           fi
           npm publish "${publish_flags[@]}"

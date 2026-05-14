@@ -40,7 +40,7 @@ brew install ictechgy/tap/lterm
 With npm on supported macOS/Linux platforms:
 
 ```bash
-npm install -g lterm
+npm install -g @ictechgy/lterm
 ```
 
 With Cargo from GitHub:
