@@ -1,0 +1,188 @@
+name: Publish npm packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to publish, e.g. v0.1.0"
+        required: true
+        default: "v0.1.0"
+      dry_run:
+        description: "Run npm publish --dry-run instead of publishing"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Check npm metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Validate package versions
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./package.json").version')
+          expected_tag="v${version}"
+          if [[ "${{ inputs.tag }}" != "$expected_tag" ]]; then
+            echo "input tag ${{ inputs.tag }} does not match package version $version" >&2
+            exit 64
+          fi
+
+          for dir in npm/platforms/lterm-darwin-arm64 npm/platforms/lterm-darwin-x64 npm/platforms/lterm-linux-arm64 npm/platforms/lterm-linux-x64; do
+            package_version=$(node -p "require('./${dir}/package.json').version")
+            if [[ "$package_version" != "$version" ]]; then
+              echo "${dir} version ${package_version} does not match root version ${version}" >&2
+              exit 65
+            fi
+          done
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.package }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: lterm-darwin-arm64
+            target: darwin-arm64
+            runner: macos-latest
+          - package: lterm-darwin-x64
+            target: darwin-x64
+            runner: macos-15-intel
+          - package: lterm-linux-arm64
+            target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - package: lterm-linux-x64
+            target: linux-x64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Build lterm release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          ./target/release/lterm --version
+          ./target/release/lterm --help >/dev/null
+
+      - name: Stage and dry-run pack platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/prepare-npm-platform-package.sh "${{ matrix.target }}" target/release/lterm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: npm/platforms/${{ matrix.package }}/bin/lterm
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish npm packages
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage downloaded platform binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
+            install -d "npm/platforms/${package}/bin"
+            test -s "artifacts/${package}/lterm"
+            install -m 0755 "artifacts/${package}/lterm" "npm/platforms/${package}/bin/lterm"
+            ls -lh "npm/platforms/${package}/bin/lterm"
+          done
+
+      - name: Show npm version
+        shell: bash
+        run: npm --version
+
+      - name: Publish platform packages first
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          publish_flags=()
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            publish_flags+=(--dry-run)
+          else
+            publish_flags+=(--provenance)
+            if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+              echo "NPM_TOKEN secret is empty; npm will try trusted publishing/OIDC. This only works after trusted publishers are configured for existing packages." >&2
+            fi
+          fi
+
+          for package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
+            (
+              cd "npm/platforms/${package}"
+              npm publish "${publish_flags[@]}"
+            )
+          done
+
+      - name: Publish wrapper package last
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          publish_flags=()
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            publish_flags+=(--dry-run)
+          else
+            publish_flags+=(--provenance)
+          fi
+          npm publish "${publish_flags[@]}"
