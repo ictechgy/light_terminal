@@ -360,6 +360,9 @@ fn rename_session(args: &[String]) -> Result<i32> {
                 bail!("unsupported tmux rename-session option: {flag}");
             }
             value => {
+                // tmux accepts `rename-session new-name -t target` as well as
+                // `rename-session -t target new-name`, so keep parsing after
+                // the positional name and reject only a second positional.
                 if name.replace(value.to_string()).is_some() {
                     bail!("tmux rename-session accepts exactly one new session name");
                 }
@@ -1800,6 +1803,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("exactly one new session name")
+        );
+        assert!(
+            rename_session(&args(["-t", "old", "--"]))
+                .unwrap_err()
+                .to_string()
+                .contains("requires a new session name")
         );
     }
 

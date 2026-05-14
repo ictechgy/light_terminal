@@ -15,6 +15,9 @@ use std::os::unix::net::UnixStream;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const ERR_BARE_PANE_ID: &str = "bare pane id";
+const ERR_EMPTY_SESSION_NAME: &str = "session name cannot be empty";
+const ERR_INVALID_SESSION_CHARS: &str = "may only contain ASCII";
+const ERR_LEADING_DASH_NAME: &str = "cannot start with '-'";
 const ERR_SESSION_EXISTS: &str = "session name already exists";
 const ERR_SESSION_NAME: &str = "session name";
 
@@ -1308,14 +1311,14 @@ fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
         .args(["rename", "rename-keep", "bad/name"])
         .output()?;
     assert!(!invalid.status.success(), "{invalid:?}");
-    assert_stderr_contains(&invalid, ERR_SESSION_NAME);
+    assert_stderr_contains(&invalid, ERR_INVALID_SESSION_CHARS);
 
     let leading_dash = env
         .cmd()
         .args(["rename", "rename-keep", "--", "-bad"])
         .output()?;
     assert!(!leading_dash.status.success(), "{leading_dash:?}");
-    assert_stderr_contains(&leading_dash, ERR_SESSION_NAME);
+    assert_stderr_contains(&leading_dash, ERR_LEADING_DASH_NAME);
 
     for numeric_name in ["0", "123", "007"] {
         let numeric = env
@@ -2889,6 +2892,18 @@ fn tmux_compat_rename_session_updates_session_name() -> TestResult {
         .output()?;
     assert!(renamed_again.status.success(), "{renamed_again:?}");
 
+    let idempotent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "rename-session",
+            "-t",
+            "tmux-rename-final",
+            "tmux-rename-final",
+        ])
+        .output()?;
+    assert!(idempotent.status.success(), "{idempotent:?}");
+
     let listed = env
         .cmd()
         .args(["tmux-compat", "list-sessions", "-F", "#{session_name}"])
@@ -4360,6 +4375,8 @@ fn rejects_control_characters_in_session_names() -> TestResult {
         .output()?;
     assert!(!output.status.success());
     assert_stderr_contains(&output, ERR_SESSION_NAME);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
     Ok(())
 }
 
@@ -4374,6 +4391,43 @@ fn rejects_bare_numeric_session_names() -> TestResult {
         assert!(!numeric.status.success());
         assert_stderr_contains(&numeric, ERR_BARE_PANE_ID);
     }
+    Ok(())
+}
+
+#[test]
+fn rejects_empty_session_names() -> TestResult {
+    let env = TestEnv::new()?;
+    let empty_new = env
+        .cmd()
+        .args(["new", "--name", "", "--", "true"])
+        .output()?;
+    assert!(!empty_new.status.success(), "{empty_new:?}");
+    assert_stderr_contains(&empty_new, ERR_EMPTY_SESSION_NAME);
+
+    let created = env
+        .cmd()
+        .args(["new", "--detach", "-n", "empty-rename", "--", "sleep", "60"])
+        .output()?;
+    assert!(created.status.success(), "{created:?}");
+
+    let empty_rename = env.cmd().args(["rename", "empty-rename", ""]).output()?;
+    assert!(!empty_rename.status.success(), "{empty_rename:?}");
+    assert_stderr_contains(&empty_rename, ERR_EMPTY_SESSION_NAME);
+
+    env.cmd().args(["close", "empty-rename"]).status()?;
+    wait_for_session_absent(&env, "empty-rename")?;
+    Ok(())
+}
+
+#[test]
+fn rejects_flag_like_session_names() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args(["new", "--name=-bad", "--", "true"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, ERR_LEADING_DASH_NAME);
     Ok(())
 }
 
