@@ -1989,7 +1989,10 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 drop(current_name);
                 session.info()
             } else {
-                bail!("internal session name index missing: {new_name}");
+                bail!(
+                    "internal session name index missing: {}",
+                    sanitized_preview(&new_name)
+                );
             }
         } else if sessions.reserved_names.contains(&new_name)
             || sessions
@@ -2024,10 +2027,14 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
 
 fn remove_session(state: &Arc<State>, session: &Session) {
     let mut sessions = lock(&state.sessions);
-    // Rename is expected to leave one `by_name` entry per session, but sweeping
-    // by id makes cleanup resilient if a future alias/migration path ever leaves
-    // a stale name index behind.
-    sessions.by_name.retain(|_, s| s.id != session.id);
+    let name = session.name();
+    if sessions
+        .by_name
+        .get(&name)
+        .is_some_and(|s| s.id == session.id)
+    {
+        sessions.by_name.remove(&name);
+    }
     if sessions
         .by_pane
         .get(&session.pane_id)
@@ -2474,13 +2481,28 @@ fn validate_session_name_syntax(name: &str) -> Result<()> {
         bail!("session name cannot exceed 128 bytes");
     }
     if name.starts_with('%') {
-        bail!("session name cannot look like a pane id: {name}");
+        bail!(
+            "session name cannot look like a pane id: {}",
+            sanitized_preview(name)
+        );
+    }
+    if name.starts_with('-') {
+        bail!(
+            "session name cannot start with '-': {}",
+            sanitized_preview(name)
+        );
     }
     if session_name_looks_like_bare_pane_id(name) {
-        bail!("session name cannot look like a bare pane id: {name}");
+        bail!(
+            "session name cannot look like a bare pane id: {}",
+            sanitized_preview(name)
+        );
     }
     if Uuid::parse_str(name).is_ok() {
-        bail!("session name cannot look like a UUID: {name}");
+        bail!(
+            "session name cannot look like a UUID: {}",
+            sanitized_preview(name)
+        );
     }
     if !name
         .chars()
@@ -2493,7 +2515,7 @@ fn validate_session_name_syntax(name: &str) -> Result<()> {
 
 /// Returns true when a name would shadow lterm's bare pane-number target syntax.
 fn session_name_looks_like_bare_pane_id(name: &str) -> bool {
-    name.chars().all(|ch| ch.is_ascii_digit())
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, String>> {

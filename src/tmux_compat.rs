@@ -339,11 +339,12 @@ fn rename_session(args: &[String]) -> Result<i32> {
                 i += 2;
             }
             "--" => {
-                if let Some(value) = args.get(i + 1) {
+                let remaining = &args[i + 1..];
+                if remaining.len() > 1 || (remaining.len() == 1 && name.is_some()) {
+                    bail!("tmux rename-session accepts exactly one new session name");
+                }
+                if let Some(value) = remaining.first() {
                     name = Some(value.clone());
-                    if i + 2 < args.len() {
-                        bail!("tmux rename-session accepts exactly one new session name");
-                    }
                 }
                 break;
             }
@@ -359,11 +360,10 @@ fn rename_session(args: &[String]) -> Result<i32> {
                 bail!("unsupported tmux rename-session option: {flag}");
             }
             value => {
-                name = Some(value.to_string());
-                if i + 1 < args.len() {
+                if name.replace(value.to_string()).is_some() {
                     bail!("tmux rename-session accepts exactly one new session name");
                 }
-                break;
+                i += 1;
             }
         }
     }

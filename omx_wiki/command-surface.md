@@ -67,7 +67,7 @@ to inspect the supported shim subset at runtime.
 
 The shim covers the tmux subset used by common AI orchestration scripts, including session commands, query commands, pane operations, buffers/popups, and deliberate no-op compatibility commands such as `select-pane` and `set-option`. Product-only lifecycle commands such as `daemon` and `shutdown` do not imply tmux-compatible aliases.
 
-Session rename is available through the product command `lterm rename <target> <new-name>` and the tmux shim command `lterm tmux-compat rename-session [-t target-session] <new-name>`. Rename changes lterm metadata and target lookup only; it does not restart the PTY or mutate the child process environment.
+Session rename is available through the product command `lterm rename <target> <new-name>` and the tmux shim command `lterm tmux-compat rename-session [-t target-session] <new-name>`. Rename changes lterm metadata and target lookup only; it does not restart the PTY or mutate the child process environment. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error.
 
 Generic tmux target parsing is left-to-right and treats later `-t` target
 values as overrides before `--`. Value-taking flags such as `-F`, `-c`, `-x`,
