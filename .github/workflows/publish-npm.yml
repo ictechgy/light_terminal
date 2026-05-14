@@ -156,7 +156,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          publish_flags=()
+          publish_flags=(--access public)
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             publish_flags+=(--dry-run)
           else
@@ -179,7 +179,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          publish_flags=()
+          publish_flags=(--access public)
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             publish_flags+=(--dry-run)
           else
