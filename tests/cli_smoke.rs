@@ -824,7 +824,10 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
         ("kill", &["Session or pane target to close"][..]),
         (
             "rename",
-            &["Session or pane target to rename", "New session name"][..],
+            &[
+                "Session or pane target whose session metadata should be renamed",
+                "New session name for future target lookup",
+            ][..],
         ),
         (
             "input",
@@ -1184,12 +1187,28 @@ fn rename_existing_session_updates_targets() -> TestResult {
         .split('\t')
         .nth(1)
         .ok_or_else(|| format!("missing pane id in create output: {create_stdout:?}"))?
+        .trim()
         .to_string();
     env.capture_until("rename-old", marker)?;
 
+    let sessions_json = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions_json.status.success(), "{sessions_json:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions_json.stdout)?;
+    let session_id = sessions
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find_map(|row| {
+                (row.get("name").and_then(serde_json::Value::as_str) == Some("rename-old"))
+                    .then(|| row.get("id").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| format!("missing rename-old session id: {sessions:?}"))?
+        .to_string();
+
     let rename = env
         .cmd()
-        .args(["rename", "rename-old", "rename-new"])
+        .args(["rename", &pane_id, "rename-new"])
         .output()?;
     assert!(rename.status.success(), "{rename:?}");
     assert_eq!(
@@ -1197,20 +1216,43 @@ fn rename_existing_session_updates_targets() -> TestResult {
         format!("rename-new\t{pane_id}")
     );
 
+    let idempotent = env
+        .cmd()
+        .args(["rename", "rename-new", "rename-new"])
+        .output()?;
+    assert!(idempotent.status.success(), "{idempotent:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&idempotent.stdout).trim(),
+        format!("rename-new\t{pane_id}")
+    );
+
+    let rename_by_id = env
+        .cmd()
+        .args(["rename", &session_id, "rename-final"])
+        .output()?;
+    assert!(rename_by_id.status.success(), "{rename_by_id:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&rename_by_id.stdout).trim(),
+        format!("rename-final\t{pane_id}")
+    );
+
     let listed = env.cmd().arg("sessions").output()?;
     assert!(listed.status.success(), "{listed:?}");
     let stdout = String::from_utf8_lossy(&listed.stdout);
-    assert!(list_row(&stdout, "rename-new").is_some(), "{stdout}");
+    assert!(list_row(&stdout, "rename-final").is_some(), "{stdout}");
+    assert!(list_row(&stdout, "rename-new").is_none(), "{stdout}");
     assert!(list_row(&stdout, "rename-old").is_none(), "{stdout}");
 
     let old_logs = env.cmd().args(["logs", "rename-old"]).output()?;
     assert!(!old_logs.status.success(), "{old_logs:?}");
-    assert!(env.capture_until("rename-new", marker)?.contains(marker));
+    let previous_logs = env.cmd().args(["logs", "rename-new"]).output()?;
+    assert!(!previous_logs.status.success(), "{previous_logs:?}");
+    assert!(env.capture_until("rename-final", marker)?.contains(marker));
     assert!(env.capture_until(&pane_id, marker)?.contains(marker));
 
-    let close = env.cmd().args(["close", "rename-new"]).output()?;
+    let close = env.cmd().args(["close", "rename-final"]).output()?;
     assert!(close.status.success(), "{close:?}");
-    wait_for_session_absent(&env, "rename-new")?;
+    wait_for_session_absent(&env, "rename-final")?;
     Ok(())
 }
 
@@ -1246,6 +1288,12 @@ fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
     assert!(
         String::from_utf8_lossy(&invalid.stderr).contains("session name"),
         "{invalid:?}"
+    );
+    let numeric = env.cmd().args(["rename", "rename-keep", "0"]).output()?;
+    assert!(!numeric.status.success(), "{numeric:?}");
+    assert!(
+        String::from_utf8_lossy(&numeric.stderr).contains("bare pane id"),
+        "{numeric:?}"
     );
 
     let listed = env.cmd().arg("sessions").output()?;
@@ -4262,6 +4310,14 @@ fn rejects_control_characters_in_session_names() -> TestResult {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session name"), "{stderr}");
+
+    let numeric = env
+        .cmd()
+        .args(["new", "--name", "0", "--", "true"])
+        .output()?;
+    assert!(!numeric.status.success());
+    let stderr = String::from_utf8_lossy(&numeric.stderr);
+    assert!(stderr.contains("bare pane id"), "{stderr}");
     Ok(())
 }
 

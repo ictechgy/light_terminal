@@ -212,6 +212,7 @@ pub fn info(target: &str) -> Result<SessionInfo> {
     })
 }
 
+/// Rename an existing session target and return its updated metadata.
 pub fn rename_session(target: &str, name: &str) -> Result<SessionInfo> {
     ensure_server()?;
     rpc(&Request::Rename {

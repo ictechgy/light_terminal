@@ -164,6 +164,10 @@ struct SessionMaps {
 
 struct Session {
     id: String,
+    // Lock order: when a code path needs both the global session map and this
+    // mutable display/target name, take `State.sessions` before `Session.name`.
+    // Plain metadata reads may lock `name` alone, but must not call back into
+    // session-map operations while holding that guard.
     name: Mutex<String>,
     pane_id: String,
     parent_pane_id: Mutex<Option<String>>,
@@ -1957,11 +1961,16 @@ impl Drop for AttachSubscriptionGuard {
     }
 }
 
+/// Renames an existing session metadata entry without touching its PTY or child process.
+///
+/// The daemon performs target resolution and index mutation while holding the
+/// global session-map lock so that `by_name` stays consistent with the mutable
+/// `Session.name` field. Pane ids and UUID session ids remain stable.
 fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<SessionInfo> {
     validate_session_name_syntax(&new_name)?;
 
     let target = normalize_target(target);
-    let session = {
+    let info = {
         let mut sessions = lock(&state.sessions);
         let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
             anyhow!(
@@ -1978,7 +1987,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 .is_some_and(|candidate| candidate.id == session.id)
             {
                 drop(current_name);
-                Arc::clone(&session)
+                session.info()
             } else {
                 bail!("internal session name index missing: {new_name}");
             }
@@ -1988,28 +1997,36 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 .get(&new_name)
                 .is_some_and(|candidate| candidate.id != session.id)
         {
-            bail!("session name already exists: {new_name}");
+            bail!(
+                "session name already exists: {}",
+                sanitized_preview(&new_name)
+            );
         } else {
+            let old_name = current_name.clone();
             if sessions
                 .by_name
-                .get(current_name.as_str())
+                .get(&old_name)
                 .is_some_and(|candidate| candidate.id == session.id)
             {
-                sessions.by_name.remove(current_name.as_str());
+                sessions.by_name.remove(&old_name);
             }
             sessions
                 .by_name
                 .insert(new_name.clone(), Arc::clone(&session));
             *current_name = new_name;
-            Arc::clone(&session)
+            drop(current_name);
+            session.info()
         }
     };
 
-    Ok(session.info())
+    Ok(info)
 }
 
 fn remove_session(state: &Arc<State>, session: &Session) {
     let mut sessions = lock(&state.sessions);
+    // Rename is expected to leave one `by_name` entry per session, but sweeping
+    // by id makes cleanup resilient if a future alias/migration path ever leaves
+    // a stale name index behind.
     sessions.by_name.retain(|_, s| s.id != session.id);
     if sessions
         .by_pane
@@ -2424,6 +2441,10 @@ fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
     )
 }
 
+/// Resolves a session target while the caller already holds `State.sessions`.
+///
+/// Target precedence matches the public resolver: explicit pane id, session
+/// name, UUID session id, then bare pane number fallback.
 fn resolve_session_locked(sessions: &SessionMaps, target: &str) -> Option<Arc<Session>> {
     if target.starts_with('%') {
         if let Some(session) = sessions.by_pane.get(target) {
@@ -2455,6 +2476,9 @@ fn validate_session_name_syntax(name: &str) -> Result<()> {
     if name.starts_with('%') {
         bail!("session name cannot look like a pane id: {name}");
     }
+    if session_name_looks_like_bare_pane_id(name) {
+        bail!("session name cannot look like a bare pane id: {name}");
+    }
     if Uuid::parse_str(name).is_ok() {
         bail!("session name cannot look like a UUID: {name}");
     }
@@ -2465,6 +2489,11 @@ fn validate_session_name_syntax(name: &str) -> Result<()> {
         bail!("session name may only contain ASCII letters, numbers, '.', '_' and '-'");
     }
     Ok(())
+}
+
+/// Returns true when a name would shadow lterm's bare pane-number target syntax.
+fn session_name_looks_like_bare_pane_id(name: &str) -> bool {
+    name.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, String>> {
