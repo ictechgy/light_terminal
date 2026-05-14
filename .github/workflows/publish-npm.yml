@@ -108,7 +108,7 @@ jobs:
           set -euo pipefail
           scripts/prepare-npm-platform-package.sh "${{ matrix.target }}" target/release/lterm
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.package }}
           path: npm/platforms/${{ matrix.package }}/bin/lterm
@@ -131,7 +131,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
 
