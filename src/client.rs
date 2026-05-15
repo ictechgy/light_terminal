@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
-static VERSION_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
+static VERSION_STATUS_CHECKED: AtomicBool = AtomicBool::new(false);
 /// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
 /// 리셋되어도 사용자 인지 한계(약 100~300ms) 안에 scroll region을 재확립하고 status를
 /// 재그린다. PTY가 활발히 출력 중일 때 idle heartbeat는 status_dirty가 클리어되어야 발화하므로,
@@ -90,20 +90,29 @@ pub fn daemon_status() -> Result<DaemonStatus> {
 }
 
 fn warn_daemon_version_mismatch() {
-    if VERSION_MISMATCH_WARNED.swap(true, Ordering::SeqCst) {
+    if VERSION_STATUS_CHECKED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Ok(status) = daemon_status() else {
-        return;
-    };
-    if status.version != env!("CARGO_PKG_VERSION") || status.protocol_version != PROTOCOL_VERSION {
-        eprintln!(
-            "warning: lterm client {} (protocol {}) is talking to daemon {} (protocol {}); run `lterm shutdown` and retry after upgrades",
-            env!("CARGO_PKG_VERSION"),
-            PROTOCOL_VERSION,
-            status.version,
-            status.protocol_version
-        );
+    match daemon_status() {
+        Ok(status) => {
+            if status.version != env!("CARGO_PKG_VERSION")
+                || status.protocol_version != PROTOCOL_VERSION
+            {
+                eprintln!(
+                    "warning: lterm client {} (protocol {}) is talking to daemon {} (protocol {}); run `lterm shutdown` and retry after upgrades",
+                    env!("CARGO_PKG_VERSION"),
+                    PROTOCOL_VERSION,
+                    sanitize::terminal_text(&status.version),
+                    status.protocol_version
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: lterm daemon answered ping but did not return status ({}); it may be from an older lterm build; run `lterm shutdown` and retry after upgrades",
+                sanitize::terminal_text(&err.to_string())
+            );
+        }
     }
 }
 

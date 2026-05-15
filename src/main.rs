@@ -471,8 +471,8 @@ struct DoctorReport {
     daemon_version: Option<String>,
     daemon_protocol_version: Option<u32>,
     version_match: Option<bool>,
-    daemon_session_count: Option<usize>,
-    daemon_active_connections: Option<usize>,
+    daemon_session_count: Option<u64>,
+    daemon_active_connections: Option<u64>,
     daemon_shutting_down: Option<bool>,
     daemon_error: Option<String>,
     runtime_dir: String,
@@ -528,7 +528,11 @@ fn print_doctor_report(json: bool) -> Result<()> {
         println!("daemon_reachable\t{}", yes_no(report.daemon_reachable));
         println!(
             "daemon_version\t{}",
-            report.daemon_version.as_deref().unwrap_or("-")
+            report
+                .daemon_version
+                .as_deref()
+                .map(sanitize::terminal_text)
+                .unwrap_or_else(|| "-".to_string())
         );
         println!(
             "daemon_protocol_version\t{}",

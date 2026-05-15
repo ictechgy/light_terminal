@@ -1276,8 +1276,8 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::ok(DaemonStatus {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION,
-                session_count,
-                active_connections: state.active_connections.load(Ordering::SeqCst),
+                session_count: session_count as u64,
+                active_connections: state.active_connections.load(Ordering::SeqCst) as u64,
                 shutting_down: state.shutting_down.load(Ordering::SeqCst),
             }))
         }

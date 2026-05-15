@@ -420,6 +420,19 @@ fn logs_supports_inclusive_end_range() -> TestResult {
         !stdout.contains("THIRD_LINE"),
         "logs --end should stop at the inclusive end line: {stdout:?}"
     );
+
+    let tail_output = env
+        .cmd()
+        .args(["logs", "logs-end", "-S-2", "--end", "-1"])
+        .output()?;
+    assert!(tail_output.status.success(), "{tail_output:?}");
+    let tail_stdout = String::from_utf8_lossy(&tail_output.stdout);
+    assert!(
+        !tail_stdout.contains("FIRST_LINE"),
+        "negative logs --end should keep the bounded tail range: {tail_stdout:?}"
+    );
+    assert!(tail_stdout.contains("SECOND_LINE"), "{tail_stdout:?}");
+    assert!(tail_stdout.contains("THIRD_LINE"), "{tail_stdout:?}");
     Ok(())
 }
 

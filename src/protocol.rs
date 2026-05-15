@@ -37,8 +37,8 @@ pub struct SessionInfo {
 pub struct DaemonStatus {
     pub version: String,
     pub protocol_version: u32,
-    pub session_count: usize,
-    pub active_connections: usize,
+    pub session_count: u64,
+    pub active_connections: u64,
     pub shutting_down: bool,
 }
 
