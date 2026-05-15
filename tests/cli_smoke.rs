@@ -1350,7 +1350,7 @@ fn status_theme_is_stored_and_mutable_per_session() -> TestResult {
             "--name",
             "themed",
             "--status-color",
-            "green",
+            "yellow",
             "--",
             "sh",
             "-lc",
@@ -1373,8 +1373,8 @@ fn status_theme_is_stored_and_mutable_per_session() -> TestResult {
         themed
             .get("status_theme")
             .and_then(serde_json::Value::as_str),
-        Some("green"),
-        "session JSON should expose the stored status theme: {sessions:?}"
+        Some("amber"),
+        "session JSON should expose canonical status theme tokens: {sessions:?}"
     );
 
     let update = env.cmd().args(["status-theme", "themed", "red"]).output()?;
@@ -1383,6 +1383,18 @@ fn status_theme_is_stored_and_mutable_per_session() -> TestResult {
         String::from_utf8_lossy(&update.stdout).trim(),
         "themed	%0	red"
     );
+
+    let invalid = env
+        .cmd()
+        .args(["status-theme", "themed", "orange"])
+        .output()?;
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert_stderr_contains(&invalid, "invalid status theme");
+    assert_stderr_contains(&invalid, "amber (yellow)");
+
+    let missing = env.cmd().args(["status-theme", "ghost", "red"]).output()?;
+    assert!(!missing.status.success(), "{missing:?}");
+    assert_stderr_contains(&missing, "no such lterm session or pane");
 
     let clear = env.cmd().args(["theme", "themed", "default"]).output()?;
     assert!(clear.status.success(), "{clear:?}");

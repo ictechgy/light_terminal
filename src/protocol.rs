@@ -51,7 +51,7 @@ impl StatusTheme {
     }
 
     pub fn allowed_values() -> &'static str {
-        "blue, green, magenta, cyan, amber, red, gray, plain"
+        "blue, green, magenta (purple), cyan, amber (yellow), red, gray (grey), plain (minimal)"
     }
 }
 

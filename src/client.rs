@@ -36,6 +36,7 @@ const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 /// 사용자 보고: cmux pane swap 후 status가 회복 안 되는 증상 회복용. 500ms = 2× heartbeat.
 const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_millis(500);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
+const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 
 pub fn ensure_server() -> Result<()> {
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
@@ -180,6 +181,9 @@ pub fn new_session(
     tmux: bool,
 ) -> Result<SessionInfo> {
     ensure_server()?;
+    if status_theme.is_some() {
+        require_status_theme_protocol()?;
+    }
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
     rpc(&Request::New {
@@ -210,9 +214,27 @@ pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
 
 pub fn set_status_theme(target: &str, status_theme: Option<StatusTheme>) -> Result<SessionInfo> {
     ensure_server()?;
+    require_status_theme_protocol()?;
     rpc(&Request::SetStatusTheme {
         target: target.to_string(),
         status_theme,
+    })
+}
+
+fn require_status_theme_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for status themes")?;
+    if let Some(message) = status_theme_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
+fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support status themes (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version, STATUS_THEME_PROTOCOL_VERSION
+        )
     })
 }
 
@@ -989,7 +1011,7 @@ fn matches_env_bool(value: &str, expected: bool) -> bool {
 }
 
 /// Status bar 시각 스타일. cmux/iTerm처럼 SGR을 잘 처리하는 데스크톱 환경에서는
-/// Full(검정 글자 + bright-blue 배경)로 강조하고, Termius 같은 모바일 SSH에서는
+/// Full(theme별 allowlisted SGR)로 강조하고, Termius 같은 모바일 SSH에서는
 /// Minimal(plain text)로 폴백해 색 매핑 충돌과 시각 노이즈를 줄인다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusStyle {
@@ -1151,8 +1173,8 @@ impl StatusBar {
         let line = format_status_line(&self.session_name, &self.pane_id, safe_width);
         // \x1b[2K로 행을 먼저 비워야 옛 상태(긴 세션명 잔재)가 남지 않는다.
         // 두 모드 모두 \x1b[0m로 시작해 이전 PTY rendition(bold/italic/inverse 등)이
-        // status line으로 새는 것을 차단한다. Full은 reset 뒤 검정 글자 + bright-blue
-        // 배경을 단일 CSI(\x1b[0;30;104m)로 적용해 바이트를 줄인다.
+        // status line으로 새는 것을 차단한다. Full은 theme enum에서 고른 고정 SGR만
+        // 적용하므로 사용자 입력 escape sequence가 status row에 주입되지 않는다.
         // (bold(1)은 두 모드 모두에서 사용하지 않는다: bold+black을 흰색으로 렌더하는 터미널이 있다.)
         let sgr = match self.style {
             Some(style) => style.sgr(),
@@ -1822,13 +1844,13 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
-        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle,
-        StatusTheme, TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
-        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
-        resolve_status_style,
+        ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, DaemonStatus,
+        KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
+        StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
+        attach_pty_rows, cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
+        format_status_line, handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes,
+        matches_env_bool, observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_style, resolve_status_style, status_theme_protocol_error,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2509,6 +2531,28 @@ mod tests {
     }
 
     #[test]
+    fn status_theme_protocol_guard_rejects_old_daemon() {
+        let old = DaemonStatus {
+            version: "0.1.2".to_string(),
+            protocol_version: 1,
+            session_count: 0,
+            active_connections: 0,
+            shutting_down: false,
+        };
+        let current = DaemonStatus {
+            protocol_version: super::STATUS_THEME_PROTOCOL_VERSION,
+            ..old.clone()
+        };
+
+        assert!(
+            status_theme_protocol_error(&old)
+                .expect("old daemon should be rejected")
+                .contains("does not support status themes")
+        );
+        assert_eq!(status_theme_protocol_error(&current), None);
+    }
+
+    #[test]
     fn status_style_env_takes_precedence_over_ssh() {
         // 다른 env-touching 테스트와 충돌하지 않도록 모듈 공유 ENV_LOCK으로 직렬화한 뒤,
         // EnvGuard로 테스트가 끝나면 원래 환경 변수를 복원한다.
@@ -2613,8 +2657,12 @@ mod tests {
             StatusStyle::Full(StatusTheme::Green).sgr(),
             "\x1b[0;30;102m"
         );
-        assert_eq!(StatusStyle::Full(StatusTheme::Plain).sgr(), "\x1b[0m");
+        assert_eq!(
+            StatusStyle::Full(StatusTheme::Plain).sgr(),
+            StatusStyle::Minimal.sgr()
+        );
         assert_eq!(StatusTheme::parse("purple"), Some(StatusTheme::Magenta));
+        assert_eq!(StatusTheme::parse("yellow"), Some(StatusTheme::Amber));
         assert_eq!(StatusTheme::parse("\x1b[31m"), None);
     }
 

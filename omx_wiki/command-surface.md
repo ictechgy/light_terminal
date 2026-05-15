@@ -57,7 +57,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - Remote `lterm ssh` currently keeps its wire command on compatibility spelling where needed so newer local clients can talk to older remote installs.
 - cmux split handoff intentionally sends compatibility `lterm attach <pane>` so stale `LTERM_BIN` builds that predate `resume` still work.
 - `doctor` / `status` does not start a missing daemon; it reports the current socket, version/protocol compatibility, and shim/PATH state.
-- `status-theme` / `theme` updates stored status-bar metadata only; it must not restart or resize the PTY, mutate the child process environment, or sanitize attached PTY bytes.
+- `status-theme` / `theme` updates stored status-bar metadata only; it must not restart or resize the PTY, mutate the child process environment, or sanitize attached PTY bytes. Pane ids resolve to their session, and already-attached clients repaint after detach/reattach rather than live metadata push.
 - `processes --orphans` includes same-process-group rows that are no longer descendants of the recorded session root, and text/JSON rows expose process-group ids.
 
 ## tmux-compat boundary
