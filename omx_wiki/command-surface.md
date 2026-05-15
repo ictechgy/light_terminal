@@ -5,7 +5,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 
 ## Purpose
 
-`lterm` is a general agent-terminal surface for persistent PTY sessions. Human and agent workflows should prefer product-facing commands such as `start`, `resume`, `open`, `sessions`, `processes`, `logs`, `input`, and `close`. Compatibility names remain available for existing scripts and muscle memory.
+`lterm` is a general agent-terminal surface for persistent PTY sessions. Human and agent workflows should prefer product-facing commands such as `start`, `resume`, `open`, `sessions`, `processes`, `logs`, `wait`, `watch`, `input`, and `close`. Compatibility names remain available for existing scripts and muscle memory.
 
 ## Product CLI vocabulary
 
@@ -20,6 +20,8 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Rename a session | `lterm rename api api-renamed` | none |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | none |
+| Watch a session and notify on completion | `lterm watch api --exit --notify` | none |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session or pane | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
@@ -59,6 +61,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - `doctor` / `status` does not start a missing daemon; it reports the current socket, version/protocol compatibility, and shim/PATH state.
 - `status-theme` / `theme` updates stored status-bar metadata only; it must not restart or resize the PTY, mutate the child process environment, or sanitize attached PTY bytes. Pane ids resolve to their session, and already-attached clients repaint after detach/reattach rather than live metadata push.
 - `processes --orphans` includes same-process-group rows that are no longer descendants of the recorded session root, and text/JSON rows expose process-group ids.
+- `wait` and `watch` observe sanitized scrollback or session exit state only; they must not subscribe to or transform attached PTY streams. Timeout exits with code 124 and `timed_out=true` in JSON. `watch --notify` sanitizes the generated notification body before invoking the shared notification path, and `watch --json --notify` keeps stdout as parseable JSON even when OSC fallback is needed.
 
 ## tmux-compat boundary
 
@@ -88,7 +91,8 @@ inside those values are not reinterpreted.
 
 After changing wire-protocol behavior, restart any already-running daemon before
 depending on that behavior; old daemon processes continue running old code until
-stopped. Status-theme metadata is wire-protocol v2 behavior.
+stopped. Status-theme metadata is wire-protocol v2 behavior. Server-side
+`wait --exit` / `watch --exit` is wire-protocol v3 behavior.
 
 Parser strictness follows tmux more closely for value-taking options: for example,
 `new-session -s`/`-c` and `resize-pane -x`/`-y` now report missing or invalid

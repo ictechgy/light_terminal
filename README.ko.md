@@ -32,8 +32,8 @@ agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
 - **cmux-friendly 설계** — notification과 tmux shim call이 generic desktop
   multiplexer보다 cmux/agent pane orchestration에 맞춰져 있습니다.
 - **내장 관측성** — `doctor` / `status`, bounded `logs --start/--end`,
-  `processes --orphans`로 daemon, scrollback, subprocess 상태를 사람이나 agent가
-  쉽게 확인할 수 있습니다.
+  `wait` / `watch`, `processes --orphans`로 daemon, scrollback, 완료 조건,
+  subprocess 상태를 사람이나 agent가 쉽게 확인할 수 있습니다.
 
 ## 왜 만들었나
 
@@ -127,6 +127,8 @@ lterm -a api
 | 세션 이름 변경 | `lterm rename api api-renamed` | 없음 |
 | 세션 status theme 설정 | `lterm status-theme api green` | `theme` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80 --end=-1` | `capture` |
+| 세션 출력 또는 종료 대기 | `lterm wait api --contains READY --timeout 30s --json` | 없음 |
+| 세션을 감시하고 완료 시 알림 | `lterm watch api --exit --notify` | 없음 |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
 | 데몬과 shim 상태 진단 | `lterm doctor --json` | `status` |
@@ -172,6 +174,8 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 `lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
 
 `lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text이며, attach된 PTY stream은 raw 그대로 유지됩니다.
+
+`lterm wait <target> --exit|--contains <text>`는 세션이 종료되거나 정제된 scrollback에 marker가 나타날 때까지 block합니다. 자동화용 health check에는 `--timeout 250ms|2s|5m|1h`, `--tail N`, `--json`을 함께 쓰세요. Timeout 시 `wait` / `watch`는 exit code `124`를 반환하고 JSON에는 `timed_out: true`가 들어갑니다. `lterm watch`는 같은 조건을 쓰며, `--notify`를 더하면 attach된 PTY bytes는 건드리지 않고 cmux-friendly 완료 알림을 보냅니다. `--json`을 함께 쓸 때는 notification fallback이 필요해도 stdout을 machine-readable JSON으로 유지합니다.
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 색이 있는 bar를 그리고, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄이지만, 세션 또는 환경 theme을 명시하면 색이 유지됩니다.
 
@@ -224,10 +228,12 @@ lterm sessions --children
 lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
+lterm wait api --contains READY --timeout 30s --json
+lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `input`은 대상 PTY에 텍스트를 씁니다. 호환 이름은 visible alias로 유지되어 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `send`.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하며, `input`은 대상 PTY에 텍스트를 씁니다. 호환 이름은 visible alias로 유지되어 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `send`.
 
 **세션 종료:**
 
@@ -358,6 +364,8 @@ lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
 `lterm notify`는 먼저 `cmux notify`를 시도합니다. 사용할 수 없으면 OSC 777을 출력해 cmux나 호환 터미널이 알림을 표시할 수 있도록 합니다. fallback OSC에 들어가는 알림 필드는 터미널 제어 문자를 제거한 뒤 출력하며, subtitle/body 구분용 newline 같은 문자는 서로 붙지 않도록 공백으로 정규화합니다.
+
+Agent workflow에서 특정 세션 조건에 묶인 알림이 필요하면 `lterm watch <target> --exit --notify` 또는 `lterm watch <target> --contains DONE --notify`를 우선 사용하세요.
 
 ## 원격 접속
 
