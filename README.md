@@ -98,11 +98,12 @@ lterm -a api
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
-| Inspect process trees | `lterm processes api --json` | `ps` |
+| Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
-| Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
+| Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
+| Diagnose daemon and shim state | `lterm doctor --json` | `status` |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -139,6 +140,10 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 
 `lterm rename <target> <new-name>` renames a running session without restarting its process. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. `<target>` accepts a session name, session id, pane id (`%0`), or bare pane number (`0`); `<new-name>` follows the same syntax rules as `--name`.
 
+`lterm doctor` (compatibility name: `lterm status`) reports client/daemon versions, protocol compatibility, runtime/data/socket/shim paths, and whether the shim directory is on `PATH`. It does not start the daemon; `daemon_reachable=no` / `false` means no compatible daemon answered on the current socket. Normal client operations warn on stderr when a reachable daemon reports a different lterm or protocol version, which usually means an old daemon survived a binary upgrade.
+
+`lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text; attached PTY streams remain raw.
+
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) shows black text on a bright-blue background; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius.
 
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
@@ -157,8 +162,8 @@ When a child application enables the Kitty keyboard protocol through `CSI u` enh
 lterm sessions
 lterm sessions --children
 lterm sessions --all
-lterm processes api
-lterm logs api --start=-80
+lterm processes api --orphans
+lterm logs api --start=-80 --end=-1
 lterm input api 'echo hello' --enter
 ```
 
@@ -270,6 +275,7 @@ Compatibility notes: lterm models each root session as one pseudo-window
 (`window_index=0`, `window_panes=1`). `client_pid` and `client_tty` expand to
 empty strings because lterm does not expose per-client process or TTY metadata.
 tmux `-f` filters are intentionally rejected instead of being silently ignored.
+Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`, alias, support tier, and usage fields, or `--json` for machine-readable rows. Support tiers are `full`, `partial`, and `noop` within lterm's compatibility boundary. Set `LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when an unsupported tmux command reaches the shim.
 
 ## cmux behavior
 
@@ -321,7 +327,7 @@ the old code until they are stopped.
 
 **Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`) and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
 
-**Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
+**Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, including process-group ids. Add `--orphans` to also include same-process-group rows that are no longer descendants of the recorded session root, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
 **Socket location.** Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
 

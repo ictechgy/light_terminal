@@ -98,11 +98,12 @@ lterm -a api
 | 세션 열기 또는 생성 | `lterm open main` | `attach-or-new` |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
-| 프로세스 트리 확인 | `lterm processes api --json` | `ps` |
+| 프로세스 트리 확인 | `lterm processes api --json --orphans` | `ps` |
 | 세션 이름 변경 | `lterm rename api api-renamed` | 없음 |
-| 정제된 scrollback 읽기 | `lterm logs api --start=-80` | `capture` |
+| 정제된 scrollback 읽기 | `lterm logs api --start=-80 --end=-1` | `capture` |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
 | 세션 종료 | `lterm close api` | `kill` |
+| 데몬과 shim 상태 진단 | `lterm doctor --json` | `status` |
 | 백그라운드 데몬 명시 실행 | `lterm daemon` | 없음 |
 | 데몬과 모든 세션 종료 | `lterm shutdown` | 없음 |
 
@@ -140,6 +141,10 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm rename <target> <new-name>`은 실행 중인 세션의 프로세스를 재시작하지 않고 이름만 바꿉니다. 현재 이름과 동일한 이름으로 바꾸면 no-op success이고, 다른 세션이 이미 쓰는 이름으로 바꾸면 conflict error로 실패합니다. `<target>`은 세션 이름, session id, pane id(`%0`), 또는 bare pane 번호(`0`)를 받으며, `<new-name>`은 `--name`과 같은 이름 규칙을 따릅니다.
 
+`lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
+
+`lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text이며, attach된 PTY stream은 raw 그대로 유지됩니다.
+
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 검정 글자 + bright-blue 배경, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄입니다.
 
 attach된 PTY가 alternate screen buffer로 진입하면(예: `vim`, `less`, `htop`이 `\x1b[?1049h` 사용) lterm은 status bar를 일시 중단해 alt-screen 앱의 UI와 충돌을 피합니다. 앱이 alt-screen을 종료하는 즉시 status bar가 다시 그려집니다.
@@ -158,8 +163,8 @@ child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard proto
 lterm sessions
 lterm sessions --children
 lterm sessions --all
-lterm processes api
-lterm logs api --start=-80
+lterm processes api --orphans
+lterm logs api --start=-80 --end=-1
 lterm input api 'echo hello' --enter
 ```
 
@@ -270,6 +275,11 @@ lterm run -- codex exec "저장소를 요약해줘"
 호환성 참고: lterm은 각 root session을 하나의 pseudo-window로 모델링합니다
 (`window_index=0`, `window_panes=1`). lterm은 client별 process/TTY metadata를
 노출하지 않기 때문에 `client_pid`와 `client_tty`는 빈 문자열로 확장됩니다.
+`lterm tmux-compat list-commands --verbose`는 `command`, alias, support tier,
+usage를 tab-separated로 출력하고, `--json`은 machine-readable row를 출력합니다.
+Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`
+중 하나입니다. `LTERM_DEBUG_TMUX=1`을 설정하면 지원하지 않는 tmux command가
+shim에 도달했을 때 opt-in stderr diagnostic row를 출력합니다.
 tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니다.
 
 ## cmux 동작
@@ -322,7 +332,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **Capture 출력은 사람/AI가 읽기 쉽도록 정제됩니다.** `lterm logs`(호환 이름: `lterm capture`)와 `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다.
 
-**프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 각 세션 child 아래의 process tree를 보여 줍니다. Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인하는 용도입니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
+**프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 process-group id와 함께 각 세션 child 아래의 process tree를 보여 줍니다. `--orphans`를 추가하면 기록된 session root의 descendant가 아니지만 같은 process group에 남아 있는 row도 함께 보여 주므로, Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인할 수 있습니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
 
 **Socket 위치.** 커스텀 `LTERM_SOCKET` 경로는 소유자 전용 디렉터리 안에 있어야 합니다. 격리된 socket 위치가 필요할 때는 `LTERM_RUNTIME_DIR`를 우선 사용하세요.
 

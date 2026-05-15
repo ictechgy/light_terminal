@@ -127,10 +127,12 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
             // environment store yet, so they are accepted as compatibility no-ops.
             Ok(0)
         }
-        unknown => bail!(
-            "unsupported tmux command in lterm compat: {unknown} {}",
-            rest.join(" ")
-        ),
+        unknown => {
+            debug_unsupported_command(unknown, rest);
+            let command = sanitize::terminal_text(unknown);
+            let args = sanitize::terminal_text(&rest.join(" "));
+            bail!("unsupported tmux command in lterm compat: {command} {args}")
+        }
     }
 }
 
@@ -260,17 +262,54 @@ fn list_clients(args: &[String]) -> Result<i32> {
 
 fn list_commands(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
-    let format = parse_format(args).unwrap_or_else(|| "#{command_name}".to_string());
+    let format = parse_format(args);
     let requested = parse_command_filter(args);
-    for (command, alias, extra_aliases) in SUPPORTED_COMMANDS {
-        if let Some(requested) = requested.as_deref() {
-            let alias_matches = alias.is_some_and(|alias| requested == alias);
-            let extra_alias_matches = extra_aliases.contains(&requested);
-            if requested != *command && !alias_matches && !extra_alias_matches {
-                continue;
+    let json = has_flag(args, "--json");
+    let verbose = has_flag(args, "--verbose");
+    let rows: Vec<_> = SUPPORTED_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(command, alias, extra_aliases)| {
+            if let Some(requested) = requested.as_deref() {
+                let alias_matches = alias.is_some_and(|alias| requested == alias);
+                let extra_alias_matches = extra_aliases.contains(&requested);
+                requested == *command || alias_matches || extra_alias_matches
+            } else {
+                true
             }
+        })
+        .collect();
+    if json {
+        let json_rows: Vec<_> = rows
+            .iter()
+            .map(|(command, alias, extra_aliases)| {
+                serde_json::json!({
+                    "name": command,
+                    "alias": alias.unwrap_or_default(),
+                    "aliases": extra_aliases,
+                    "usage": command_usage(command),
+                    "support": command_support_tier(command),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        return Ok(0);
+    }
+    if verbose && format.is_none() {
+        for (command, alias, _) in rows {
+            println!(
+                "{}\t{}\t{}\t{}",
+                sanitize::terminal_text(command),
+                sanitize::terminal_text(alias.unwrap_or_default()),
+                command_support_tier(command),
+                sanitize::terminal_text(command_usage(command))
+            );
         }
-        println!("{}", expand_command_format(&format, command, *alias));
+        return Ok(0);
+    }
+    let format = format.unwrap_or_else(|| "#{command_name}".to_string());
+    for (command, alias, _) in rows {
+        println!("{}", expand_command_format(&format, command, alias));
     }
     Ok(0)
 }
@@ -1507,6 +1546,32 @@ fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> St
         .replace("#{command_list_usage}", &usage)
         .replace("#{command_name}", &command)
         .replace("#{command_alias}", &alias)
+}
+
+fn command_support_tier(command: &str) -> &'static str {
+    match command {
+        "select-layout" | "select-pane" | "set-environment" | "set-option"
+        | "set-window-option" | "show-environment" => "noop",
+        "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
+        | "list-commands" | "list-sessions" | "rename-session" | "send-keys" => "full",
+        _ => "partial",
+    }
+}
+
+fn debug_unsupported_command(command: &str, args: &[String]) {
+    if !std::env::var("LTERM_DEBUG_TMUX").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return;
+    }
+    eprintln!(
+        "lterm_tmux_compat\tunsupported_command\t{}\t{}",
+        sanitize::terminal_text(command),
+        sanitize::terminal_text(&args.join(" "))
+    );
 }
 
 const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[

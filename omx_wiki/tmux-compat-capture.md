@@ -14,7 +14,7 @@ changes.
 
 | Surface | Command | Output behavior | Range support |
 | --- | --- | --- | --- |
-| Product CLI | `lterm logs <target>` | Always prints sanitized scrollback to stdout. `capture` is the compatibility alias. | Optional `-S` / `--start` only. |
+| Product CLI | `lterm logs <target>` | Always prints sanitized scrollback to stdout. `capture` is the compatibility alias. | Optional `-S` / `--start` and inclusive `-E` / `--end`. |
 | tmux shim | `lterm tmux-compat capture-pane` | `-p` prints sanitized scrollback; without `-p`, capture is silent and writes the compatibility buffer read by `save-buffer`. `capturep` is the tmux alias. | Optional `-S start-line` and `-E end-line`; end is inclusive. |
 
 Attach/resume is intentionally different: raw attach forwards PTY bytes as-is so
@@ -33,8 +33,10 @@ Shared numeric rules for `lterm logs -S` / `--start` and
 Product CLI constraints:
 
 - `lterm logs` accepts integer `-S` / `--start` values only.
-- `lterm logs` has no end-line option today; use `tmux-compat capture-pane`
-  when a bounded end line is required.
+- `lterm logs` accepts integer `-E` / `--end` values. The end boundary is
+  inclusive, so `lterm logs target -S0 -E0` captures only the first line.
+- If the inclusive `-E` boundary resolves before the start, `lterm logs`
+  returns no lines.
 
 tmux shim additions:
 
@@ -69,11 +71,13 @@ tmux shim additions:
 
 Behavior is covered by:
 
-- `src/main.rs`: `Commands::Logs` product command and `capture` visible alias.
+- `src/main.rs`: `Commands::Logs` product command with `--start` / `--end`
+  and `capture` visible alias.
 - `src/tmux_compat.rs`: `parse_capture_pane_args`,
   `parse_capture_line_value`, and `capture_pane`.
 - `src/server.rs`: `capture_bytes_from_ring` and inclusive end-line tests.
 - `tests/cli_smoke.rs`: product `logs` / `capture` help coverage,
-  `capture_alias_captures_output`, and the shared `-S=-20` polling helper.
+  `capture_alias_captures_output`, `logs_supports_inclusive_end_range`, and
+  the shared `-S=-20` polling helper.
 - `tests/cli_smoke.rs`: `tmux_capture_without_print_is_silent_and_saves_buffer`
   and `tmux_capture_pane_skips_value_options_before_target`.

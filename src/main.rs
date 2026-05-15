@@ -115,6 +115,16 @@ enum Commands {
         /// Print process rows as a JSON array for automation.
         #[arg(long)]
         json: bool,
+        /// Include same-process-group rows that escaped the child tree.
+        #[arg(long)]
+        orphans: bool,
+    },
+    /// Diagnose daemon, shim, and version state.
+    #[command(visible_alias = "status")]
+    Doctor {
+        /// Print the diagnostic report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Close a session or pane.
     #[command(name = "close", visible_alias = "kill")]
@@ -148,6 +158,9 @@ enum Commands {
         /// Starting scrollback line offset, matching tmux -S semantics.
         #[arg(short = 'S', long, allow_hyphen_values = true)]
         start: Option<i32>,
+        /// Inclusive ending scrollback line offset, matching tmux -E semantics.
+        #[arg(short = 'E', long, allow_hyphen_values = true)]
+        end: Option<i32>,
     },
     /// Stop the daemon and all sessions.
     Shutdown,
@@ -334,20 +347,30 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Processes { target, json } => {
-            let processes = client::process_tree(target.as_deref())?;
+        Commands::Processes {
+            target,
+            json,
+            orphans,
+        } => {
+            let processes = client::process_tree(target.as_deref(), orphans)?;
             if json {
                 println!("{}", client::json_pretty(&processes));
             } else {
-                println!("SESSION\tPANE\tPID\tPPID\tCPU\tMEM\tRSS_KIB\tETIME\tCOMMAND");
+                println!(
+                    "SESSION\tPANE\tPID\tPPID\tPGID\tORPHAN\tCPU\tMEM\tRSS_KIB\tETIME\tCOMMAND"
+                );
                 for process in processes {
                     let indent = "  ".repeat(process.depth);
                     println!(
-                        "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}{}",
                         sanitize::terminal_text(&process.session),
                         sanitize::terminal_text(&process.pane_id),
                         process.pid,
                         process.ppid,
+                        process
+                            .process_group_id
+                            .map_or_else(|| "-".to_string(), |pgid| pgid.to_string()),
+                        if process.orphan { "yes" } else { "no" },
                         process.cpu_percent,
                         process.mem_percent,
                         process.rss_kib,
@@ -359,6 +382,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Doctor { json } => print_doctor_report(json),
         Commands::Close { target } => client::kill(&target),
         Commands::Rename { target, name } => {
             let info = client::rename_session(&target, &name)?;
@@ -380,8 +404,13 @@ fn run() -> Result<()> {
             }
             client::send(&target, bytes)
         }
-        Commands::Logs { target, start } => {
-            print!("{}", client::capture(&target, start)?);
+        Commands::Logs { target, start, end } => {
+            let output = if end.is_some() {
+                client::capture_range(&target, start, end)?
+            } else {
+                client::capture(&target, start)?
+            };
+            print!("{output}");
             Ok(())
         }
         Commands::Shutdown => client::shutdown(),
@@ -432,6 +461,143 @@ fn run() -> Result<()> {
             ssh_args,
         } => ssh_attach(&host, &target, ssh_args),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    client_version: &'static str,
+    client_protocol_version: u32,
+    daemon_reachable: bool,
+    daemon_version: Option<String>,
+    daemon_protocol_version: Option<u32>,
+    version_match: Option<bool>,
+    daemon_session_count: Option<u64>,
+    daemon_active_connections: Option<u64>,
+    daemon_shutting_down: Option<bool>,
+    daemon_error: Option<String>,
+    runtime_dir: String,
+    data_dir: String,
+    socket_path: String,
+    shim_dir: String,
+    tmux_shim_path: String,
+    tmux_shim_exists: bool,
+    shim_dir_in_path: bool,
+}
+
+fn print_doctor_report(json: bool) -> Result<()> {
+    let runtime_dir = paths::runtime_dir()?;
+    let data_dir = paths::data_dir()?;
+    let socket_path = paths::socket_path()?;
+    let shim_dir = paths::shim_dir()?;
+    let tmux_shim_path = shim_dir.join("tmux");
+    let (daemon, daemon_reachable, daemon_error) = match client::daemon_status() {
+        Ok(status) => (Some(status), true, None),
+        Err(err) => {
+            let reachable = client::daemon_ping().is_ok();
+            (None, reachable, Some(err.to_string()))
+        }
+    };
+    let report = DoctorReport {
+        client_version: env!("CARGO_PKG_VERSION"),
+        client_protocol_version: protocol::PROTOCOL_VERSION,
+        daemon_reachable,
+        daemon_version: daemon.as_ref().map(|status| status.version.clone()),
+        daemon_protocol_version: daemon.as_ref().map(|status| status.protocol_version),
+        version_match: daemon.as_ref().map(|status| {
+            status.version == env!("CARGO_PKG_VERSION")
+                && status.protocol_version == protocol::PROTOCOL_VERSION
+        }),
+        daemon_session_count: daemon.as_ref().map(|status| status.session_count),
+        daemon_active_connections: daemon.as_ref().map(|status| status.active_connections),
+        daemon_shutting_down: daemon.as_ref().map(|status| status.shutting_down),
+        daemon_error,
+        runtime_dir: runtime_dir.display().to_string(),
+        data_dir: data_dir.display().to_string(),
+        socket_path: socket_path.display().to_string(),
+        shim_dir: shim_dir.display().to_string(),
+        tmux_shim_path: tmux_shim_path.display().to_string(),
+        tmux_shim_exists: tmux_shim_path.is_file(),
+        shim_dir_in_path: path_contains_dir(&shim_dir),
+    };
+
+    if json {
+        println!("{}", client::json_pretty(&report));
+    } else {
+        println!("client_version\t{}", report.client_version);
+        println!(
+            "client_protocol_version\t{}",
+            report.client_protocol_version
+        );
+        println!("daemon_reachable\t{}", yes_no(report.daemon_reachable));
+        println!(
+            "daemon_version\t{}",
+            report
+                .daemon_version
+                .as_deref()
+                .map(sanitize::terminal_text)
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "daemon_protocol_version\t{}",
+            report
+                .daemon_protocol_version
+                .map_or_else(|| "-".to_string(), |version| version.to_string())
+        );
+        println!(
+            "version_match\t{}",
+            report
+                .version_match
+                .map_or("-", |matches| if matches { "yes" } else { "no" })
+        );
+        println!(
+            "daemon_session_count\t{}",
+            report
+                .daemon_session_count
+                .map_or_else(|| "-".to_string(), |count| count.to_string())
+        );
+        println!(
+            "daemon_active_connections\t{}",
+            report
+                .daemon_active_connections
+                .map_or_else(|| "-".to_string(), |count| count.to_string())
+        );
+        println!(
+            "daemon_shutting_down\t{}",
+            report
+                .daemon_shutting_down
+                .map_or("-", |value| if value { "yes" } else { "no" })
+        );
+        if let Some(error) = &report.daemon_error {
+            println!("daemon_error\t{}", sanitize::terminal_text(error));
+        }
+        println!(
+            "runtime_dir\t{}",
+            sanitize::terminal_text(&report.runtime_dir)
+        );
+        println!("data_dir\t{}", sanitize::terminal_text(&report.data_dir));
+        println!(
+            "socket_path\t{}",
+            sanitize::terminal_text(&report.socket_path)
+        );
+        println!("shim_dir\t{}", sanitize::terminal_text(&report.shim_dir));
+        println!(
+            "tmux_shim_path\t{}",
+            sanitize::terminal_text(&report.tmux_shim_path)
+        );
+        println!("tmux_shim_exists\t{}", yes_no(report.tmux_shim_exists));
+        println!("shim_dir_in_path\t{}", yes_no(report.shim_dir_in_path));
+    }
+    Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn path_contains_dir(dir: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|entry| entry == dir))
+        .unwrap_or(false)
 }
 
 fn expand_attach_short_flag<I>(args: I) -> Vec<OsString>
