@@ -145,10 +145,10 @@ enum Commands {
         /// New session name for future target lookup.
         name: String,
     },
-    /// Set or clear the stored status bar theme for an existing session.
+    /// Set or clear a session status bar theme for future attaches.
     #[command(name = "status-theme", visible_alias = "theme")]
     StatusTheme {
-        /// Session or pane target to update.
+        /// Session or pane target to update; pane ids resolve to their session.
         target: String,
         /// Theme name, or `default` to use the attaching client's default.
         theme: String,
@@ -675,6 +675,7 @@ fn parse_status_theme_setting(value: &str) -> Result<Option<protocol::StatusThem
 }
 
 fn format_status_theme(theme: Option<protocol::StatusTheme>) -> &'static str {
+    // Safe to print directly: StatusTheme is a fixed allowlist, never user-provided text.
     theme.map_or("default", protocol::StatusTheme::as_str)
 }
 

@@ -167,7 +167,7 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm rename <target> <new-name>`은 실행 중인 세션의 프로세스를 재시작하지 않고 이름만 바꿉니다. 현재 이름과 동일한 이름으로 바꾸면 no-op success이고, 다른 세션이 이미 쓰는 이름으로 바꾸면 conflict error로 실패합니다. `<target>`은 세션 이름, session id, pane id(`%0`), 또는 bare pane 번호(`0`)를 받으며, `<new-name>`은 `--name`과 같은 이름 규칙을 따릅니다.
 
-`lterm status-theme <target> <theme>`(alias: `lterm theme`)은 PTY를 재시작하지 않고 세션별 status bar theme을 저장합니다. `default`, `clear`, `none`을 쓰면 세션 override를 지우고 attach하는 client의 기본값으로 돌아갑니다. 새 세션은 `lterm start --status-theme green -n api -- npm run dev`(또는 alias `--status-color`)처럼 생성 시점에 같은 metadata를 저장할 수 있습니다.
+`lterm status-theme <target> <theme>`(alias: `lterm theme`)은 PTY를 재시작하지 않고 세션별 status bar theme을 저장합니다. pane id를 지정하면 해당 pane이 속한 세션에 적용됩니다. `default`, `clear`, `none`을 쓰면 세션 override를 지우고 attach하는 client의 기본값으로 돌아갑니다. 이미 attach된 client는 detach 후 다시 attach할 때 새 색을 반영합니다. 새 세션은 `lterm start --status-theme green -n api -- npm run dev`(또는 alias `--status-color`)처럼 생성 시점에 같은 metadata를 저장할 수 있습니다.
 
 `lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
 
@@ -175,7 +175,7 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 색이 있는 bar를 그리고, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄이지만, 세션 또는 환경 theme을 명시하면 색이 유지됩니다.
 
-`LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` 으로 attach client의 기본 status bar 색을 바꿀 수 있습니다. 세션별 override가 환경값보다 우선합니다: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, `lterm status-theme api plain`. Theme 이름은 고정 allowlist에서만 파싱되며, lterm은 사용자 입력 escape sequence를 status row에 임의 삽입하지 않습니다.
+`LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` 으로 attach client의 기본 status bar 색을 바꿀 수 있습니다. 세션별 override가 환경값보다 우선합니다: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, `lterm status-theme api plain`. 이 변수를 shell startup 파일에서 export하면 SSH attach도 colored status bar로 opt-in됩니다. 모바일 SSH client에서 plain text가 필요하면 unset하거나 `LTERM_STATUS_STYLE=minimal`을 설정하세요. Theme 이름은 고정 allowlist에서만 파싱되며, lterm은 사용자 입력 escape sequence를 status row에 임의 삽입하지 않습니다.
 
 attach된 PTY가 alternate screen buffer로 진입하면(예: `vim`, `less`, `htop`이 `\x1b[?1049h` 사용) lterm은 status bar를 일시 중단해 alt-screen 앱의 UI와 충돌을 피합니다. 앱이 alt-screen을 종료하는 즉시 status bar가 다시 그려집니다.
 
