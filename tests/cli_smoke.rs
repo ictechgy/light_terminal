@@ -387,6 +387,276 @@ fn capture_alias_captures_output() -> TestResult {
 }
 
 #[test]
+fn wait_exit_json_reports_session_exit() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-exit",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; exit 7",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-exit");
+
+    let output = env
+        .cmd()
+        .args(["wait", "wait-exit", "--exit", "--timeout", "5s", "--json"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "exit");
+    assert_eq!(result["matched"], true);
+    assert_eq!(result["timed_out"], false);
+    assert_eq!(result["exit_code"], 7);
+    assert_eq!(result["session"]["name"], "wait-exit");
+    Ok(())
+}
+
+#[test]
+fn wait_contains_succeeds_against_sanitized_capture_text() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-contains",
+            "--",
+            "sh",
+            "-lc",
+            "printf '\\033]52;c;secret\\007'; echo AGENT_READY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-contains");
+
+    let output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-contains",
+            "--contains",
+            "AGENT_READY",
+            "--timeout",
+            "5s",
+            "--tail",
+            "20",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("secret"), "{stdout}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "contains");
+    assert_eq!(result["matched"], true);
+    assert_eq!(result["timed_out"], false);
+    assert_eq!(result["needle"], "AGENT_READY");
+    Ok(())
+}
+
+#[test]
+fn wait_contains_matches_fast_exit_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-fast-exit",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; echo FAST_READY",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-fast-exit");
+
+    let output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-fast-exit",
+            "--contains",
+            "FAST_READY",
+            "--timeout",
+            "5s",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "contains");
+    assert_eq!(result["matched"], true);
+    assert_eq!(result["timed_out"], false);
+    assert!(result["exited"].is_boolean(), "{result:?}");
+    assert_eq!(result["needle"], "FAST_READY");
+    Ok(())
+}
+
+#[test]
+fn wait_contains_timeout_returns_nonzero_and_json_timeout_status() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-timeout",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-timeout");
+
+    let output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-timeout",
+            "--contains",
+            "NEVER_READY",
+            "--timeout",
+            "200ms",
+            "--json",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(124), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "contains");
+    assert_eq!(result["matched"], false);
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["needle"], "NEVER_READY");
+    Ok(())
+}
+
+#[test]
+fn watch_exit_notify_invokes_cmux_with_sanitized_message() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\necho SHOULD_NOT_POLLUTE_JSON_STDOUT\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let mut paths = vec![fake_bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths)?;
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-notify",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; exit 0",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-notify");
+
+    let mut watch = env.cmd();
+    watch.env("PATH", path);
+    let output = watch
+        .args([
+            "watch",
+            "watch-notify",
+            "--exit",
+            "--timeout",
+            "5s",
+            "--notify",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "exit");
+    assert_eq!(result["matched"], true);
+
+    let cmux = wait_for_file_contents(&cmux_log)?;
+    assert!(cmux.contains("notify"), "{cmux:?}");
+    assert!(cmux.contains("--title"), "{cmux:?}");
+    assert!(cmux.contains("lterm watch matched"), "{cmux:?}");
+    assert!(cmux.contains("--body"), "{cmux:?}");
+    assert!(
+        cmux.contains("session watch-notify exited with status 0"),
+        "{cmux:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn watch_json_notify_without_cmux_keeps_stdout_machine_readable() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-json-no-cmux",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; exit 0",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-json-no-cmux");
+
+    let no_cmux_path = env.temp.path().join("no-cmux-bin");
+    std::fs::create_dir(&no_cmux_path)?;
+    let mut watch = env.cmd();
+    watch.env("PATH", &no_cmux_path);
+    let output = watch
+        .args([
+            "watch",
+            "watch-json-no-cmux",
+            "--exit",
+            "--timeout",
+            "5s",
+            "--notify",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "exit");
+    assert_eq!(result["matched"], true);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\u{1b}]777;notify;"),
+        "OSC fallback should move to stderr when stdout is JSON: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn logs_supports_inclusive_end_range() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -679,6 +949,8 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "install-shim",
         "env",
         "tmux-compat",
+        "wait",
+        "watch",
         "notify",
         "agents",
         "agent",
@@ -696,6 +968,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
     }
     for expected in [
         "tmux compatibility",
+        "sanitized output",
         "cmux-friendly notification",
         "remote host",
     ] {
@@ -1030,6 +1303,29 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "Session or pane target to capture",
                 "Starting scrollback line offset, matching tmux -S semantics",
                 "Inclusive ending scrollback line offset, matching tmux -E semantics",
+            ][..],
+        ),
+        (
+            "wait",
+            &[
+                "Session or pane target to observe",
+                "Wait until the session leader exits",
+                "Wait until sanitized scrollback contains this text",
+                "Maximum wait time",
+                "Limit --contains scans to the last N sanitized scrollback lines",
+                "Print a machine-readable JSON result",
+            ][..],
+        ),
+        (
+            "watch",
+            &[
+                "Session or pane target to observe",
+                "Watch until the session leader exits",
+                "Watch until sanitized scrollback contains this text",
+                "Maximum watch time",
+                "Limit --contains scans to the last N sanitized scrollback lines",
+                "Print a machine-readable JSON result",
+                "Send a cmux-friendly notification when the condition is met",
             ][..],
         ),
         (

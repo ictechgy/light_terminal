@@ -6,7 +6,7 @@ mod server;
 mod tmux_compat;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use client::AttachStdinEof;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -175,6 +176,59 @@ enum Commands {
         /// Inclusive ending scrollback line offset, matching tmux -E semantics.
         #[arg(short = 'E', long, allow_hyphen_values = true)]
         end: Option<i32>,
+    },
+    /// Wait until a session exits or sanitized output contains text.
+    #[command(group(
+        ArgGroup::new("wait_condition")
+            .required(true)
+            .args(["wait_for_exit", "contains"])
+    ))]
+    Wait {
+        /// Session or pane target to observe.
+        target: String,
+        /// Wait until the session leader exits.
+        #[arg(long = "exit", conflicts_with = "contains")]
+        wait_for_exit: bool,
+        /// Wait until sanitized scrollback contains this text.
+        #[arg(long, value_name = "TEXT", conflicts_with = "wait_for_exit")]
+        contains: Option<String>,
+        /// Maximum wait time, e.g. 250ms, 2s, 5m, 1h. Bare numbers are seconds.
+        #[arg(long, value_name = "DURATION", value_parser = parse_wait_duration_arg)]
+        timeout: Option<Duration>,
+        /// Limit --contains scans to the last N sanitized scrollback lines.
+        #[arg(long, value_parser = parse_wait_tail_arg, requires = "contains", conflicts_with = "wait_for_exit")]
+        tail: Option<usize>,
+        /// Print a machine-readable JSON result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Watch a session and optionally send a notification when the condition is met.
+    #[command(group(
+        ArgGroup::new("watch_condition")
+            .required(true)
+            .args(["wait_for_exit", "contains"])
+    ))]
+    Watch {
+        /// Session or pane target to observe.
+        target: String,
+        /// Watch until the session leader exits.
+        #[arg(long = "exit", conflicts_with = "contains")]
+        wait_for_exit: bool,
+        /// Watch until sanitized scrollback contains this text.
+        #[arg(long, value_name = "TEXT", conflicts_with = "wait_for_exit")]
+        contains: Option<String>,
+        /// Maximum watch time, e.g. 250ms, 2s, 5m, 1h. Bare numbers are seconds.
+        #[arg(long, value_name = "DURATION", value_parser = parse_wait_duration_arg)]
+        timeout: Option<Duration>,
+        /// Limit --contains scans to the last N sanitized scrollback lines.
+        #[arg(long, value_parser = parse_wait_tail_arg, requires = "contains", conflicts_with = "wait_for_exit")]
+        tail: Option<usize>,
+        /// Print a machine-readable JSON result.
+        #[arg(long)]
+        json: bool,
+        /// Send a cmux-friendly notification when the condition is met.
+        #[arg(long)]
+        notify: bool,
     },
     /// Stop the daemon and all sessions.
     Shutdown,
@@ -441,6 +495,39 @@ fn run() -> Result<()> {
             print!("{output}");
             Ok(())
         }
+        Commands::Wait {
+            target,
+            wait_for_exit,
+            contains,
+            timeout,
+            tail,
+            json,
+        } => run_wait_command(
+            &target,
+            wait_for_exit,
+            contains.as_deref(),
+            timeout,
+            tail,
+            json,
+            false,
+        ),
+        Commands::Watch {
+            target,
+            wait_for_exit,
+            contains,
+            timeout,
+            tail,
+            json,
+            notify,
+        } => run_wait_command(
+            &target,
+            wait_for_exit,
+            contains.as_deref(),
+            timeout,
+            tail,
+            json,
+            notify,
+        ),
         Commands::Shutdown => client::shutdown(),
         Commands::InstallShim => tmux_compat::install_shim(),
         Commands::Env => tmux_compat::print_env_exports(),
@@ -489,6 +576,178 @@ fn run() -> Result<()> {
             ssh_args,
         } => ssh_attach(&host, &target, ssh_args),
     }
+}
+
+const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
+
+#[derive(Debug, Serialize)]
+struct WaitOutcome {
+    target: String,
+    event: &'static str,
+    matched: bool,
+    timed_out: bool,
+    elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<protocol::SessionInfo>,
+}
+
+fn run_wait_command(
+    target: &str,
+    wait_for_exit: bool,
+    contains: Option<&str>,
+    timeout: Option<Duration>,
+    tail: Option<usize>,
+    json: bool,
+    notify_on_match: bool,
+) -> Result<()> {
+    let started = Instant::now();
+    let outcome = if wait_for_exit {
+        wait_for_exit_condition(target, timeout, started)?
+    } else if let Some(needle) = contains {
+        wait_for_contains_condition(target, needle, timeout, tail, started)?
+    } else {
+        bail!("wait/watch requires either --exit or --contains");
+    };
+
+    print_wait_outcome(&outcome, json);
+    if notify_on_match && outcome.matched && !outcome.timed_out {
+        notify_wait_outcome(&outcome, json)?;
+    }
+    if outcome.timed_out {
+        std::process::exit(WAIT_TIMEOUT_EXIT_CODE);
+    }
+    if !outcome.matched {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn wait_for_exit_condition(
+    target: &str,
+    timeout: Option<Duration>,
+    started: Instant,
+) -> Result<WaitOutcome> {
+    let result = client::wait_exit(target, timeout)?;
+    Ok(WaitOutcome {
+        target: target.to_string(),
+        event: "exit",
+        matched: result.exited,
+        timed_out: result.timed_out,
+        elapsed_ms: elapsed_millis(started),
+        exited: Some(result.exited),
+        exit_code: result.session.exit_code,
+        needle: None,
+        session: Some(result.session),
+    })
+}
+
+fn wait_for_contains_condition(
+    target: &str,
+    needle: &str,
+    timeout: Option<Duration>,
+    tail: Option<usize>,
+    started: Instant,
+) -> Result<WaitOutcome> {
+    let needle = validate_wait_needle(needle)?;
+    let start_line = wait_tail_start(tail)?;
+    let result = client::wait_contains(target, needle, start_line, timeout)?;
+    Ok(WaitOutcome {
+        target: target.to_string(),
+        event: "contains",
+        matched: result.matched,
+        timed_out: result.timed_out,
+        elapsed_ms: elapsed_millis(started),
+        exited: Some(result.exited),
+        exit_code: result.session.exit_code,
+        needle: Some(needle.to_string()),
+        session: None,
+    })
+}
+
+fn validate_wait_needle(needle: &str) -> Result<&str> {
+    if needle.is_empty() {
+        bail!("--contains text cannot be empty");
+    }
+    Ok(needle)
+}
+
+fn wait_tail_start(tail: Option<usize>) -> Result<Option<i32>> {
+    let Some(tail) = tail else {
+        return Ok(None);
+    };
+    let tail = i32::try_from(tail).context("--tail exceeds supported scrollback range")?;
+    Ok(Some(-tail))
+}
+
+fn print_wait_outcome(outcome: &WaitOutcome, json: bool) {
+    if json {
+        println!("{}", client::json_pretty(outcome));
+        return;
+    }
+
+    println!("STATUS\tEVENT\tTARGET\tELAPSED_MS\tDETAIL");
+    let status = if outcome.timed_out {
+        "timeout"
+    } else if outcome.matched {
+        "matched"
+    } else if outcome.exited == Some(true) {
+        "exited"
+    } else {
+        "pending"
+    };
+    let detail = if outcome.event == "exit" {
+        outcome
+            .exit_code
+            .map(|code| format!("exit_code={code}"))
+            .unwrap_or_else(|| "exit_code=unknown".to_string())
+    } else {
+        outcome
+            .needle
+            .as_deref()
+            .map(|needle| format!("contains={}", sanitize::terminal_text(needle)))
+            .unwrap_or_else(|| "contains=<none>".to_string())
+    };
+    println!(
+        "{}\t{}\t{}\t{}\t{}",
+        status,
+        outcome.event,
+        sanitize::terminal_text(&outcome.target),
+        outcome.elapsed_ms,
+        detail
+    );
+}
+
+fn notify_wait_outcome(outcome: &WaitOutcome, preserve_stdout: bool) -> Result<()> {
+    let body = if outcome.event == "exit" {
+        let status = outcome
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("session {} exited with status {status}", outcome.target)
+    } else {
+        let needle = outcome.needle.as_deref().unwrap_or_default();
+        format!("session {} output matched {needle}", outcome.target)
+    };
+    notify_with_fallback(
+        "lterm watch matched",
+        Some(outcome.event),
+        &sanitize::osc_field(&body),
+        if preserve_stdout {
+            NotificationFallback::Stderr
+        } else {
+            NotificationFallback::Stdout
+        },
+    )
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Serialize)]
@@ -659,6 +918,53 @@ fn parse_status_theme_arg(value: &str) -> std::result::Result<protocol::StatusTh
             protocol::StatusTheme::allowed_values()
         )
     })
+}
+
+fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration cannot be empty".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("duration must be positive".to_string());
+    }
+
+    let lower = value.to_ascii_lowercase();
+    let (number, unit_millis) = if let Some(number) = lower.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = lower.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else if let Some(number) = lower.strip_suffix('m') {
+        (number, 60_000_u64)
+    } else if let Some(number) = lower.strip_suffix('h') {
+        (number, 3_600_000_u64)
+    } else {
+        (lower.as_str(), 1_000_u64)
+    };
+
+    let number = number.parse::<u64>().map_err(|_| {
+        format!(
+            "invalid duration {value:?}; expected a positive integer with optional ms/s/m/h suffix"
+        )
+    })?;
+    if number == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    let millis = number
+        .checked_mul(unit_millis)
+        .ok_or_else(|| format!("duration {value:?} is too large"))?;
+    Ok(Duration::from_millis(millis))
+}
+
+fn parse_wait_tail_arg(value: &str) -> std::result::Result<usize, String> {
+    let value = value.trim();
+    let tail = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid tail {value:?}; expected a positive integer"))?;
+    if tail == 0 {
+        return Err("--tail must be greater than zero".to_string());
+    }
+    Ok(tail)
 }
 
 fn parse_status_theme_setting(value: &str) -> Result<Option<protocol::StatusTheme>> {
@@ -1259,7 +1565,22 @@ fn next_agent_session_name(base_name: &str) -> Result<String> {
     bail!("no available session name for {base_name}");
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NotificationFallback {
+    Stdout,
+    Stderr,
+}
+
 fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {
+    notify_with_fallback(title, subtitle, body, NotificationFallback::Stdout)
+}
+
+fn notify_with_fallback(
+    title: &str,
+    subtitle: Option<&str>,
+    body: &str,
+    fallback: NotificationFallback,
+) -> Result<()> {
     if client::command_exists("cmux") {
         let mut cmd = Command::new("cmux");
         cmd.arg("notify")
@@ -1270,23 +1591,37 @@ fn notify(title: &str, subtitle: Option<&str>, body: &str) -> Result<()> {
         if let Some(subtitle) = subtitle {
             cmd.arg("--subtitle").arg(subtitle);
         }
+        if matches!(fallback, NotificationFallback::Stderr) {
+            cmd.stdout(std::process::Stdio::null());
+        }
         if cmd.status().is_ok_and(|s| s.success()) {
             return Ok(());
         }
     }
 
-    // cmux and several terminals understand OSC 777. This is intentionally
-    // written to stdout so it passes through lterm attach unchanged.
+    // cmux and several terminals understand OSC 777. The standalone `notify`
+    // command writes fallback OSC to stdout so it passes through lterm attach
+    // unchanged; JSON-producing watch commands use stderr to keep stdout
+    // machine-readable.
     let fallback_body = subtitle
         .filter(|subtitle| !subtitle.is_empty())
         .map(|subtitle| format!("{subtitle}\n{body}"))
         .unwrap_or_else(|| body.to_string());
-    print!(
+    let message = format!(
         "\x1b]777;notify;{};{}\x07",
         sanitize::osc_field(title),
         sanitize::osc_field(&fallback_body)
     );
-    std::io::stdout().flush().ok();
+    match fallback {
+        NotificationFallback::Stdout => {
+            std::io::stdout().write_all(message.as_bytes()).ok();
+            std::io::stdout().flush().ok();
+        }
+        NotificationFallback::Stderr => {
+            std::io::stderr().write_all(message.as_bytes()).ok();
+            std::io::stderr().flush().ok();
+        }
+    }
     Ok(())
 }
 
@@ -1357,6 +1692,118 @@ mod tests {
         assert_eq!(
             expand_attach_short_flag(os_args(&["lterm"])),
             os_args(&["lterm"])
+        );
+    }
+
+    #[test]
+    fn wait_duration_parser_accepts_documented_units() {
+        assert_eq!(
+            parse_wait_duration_arg("250ms").expect("ms duration"),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            parse_wait_duration_arg("2").expect("bare seconds duration"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_wait_duration_arg("3s").expect("seconds duration"),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            parse_wait_duration_arg("4m").expect("minutes duration"),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            parse_wait_duration_arg("1h").expect("hours duration"),
+            Duration::from_secs(3_600)
+        );
+    }
+
+    #[test]
+    fn wait_duration_parser_rejects_invalid_values() {
+        for value in ["", "0", "-1s", "1x", "1.5s"] {
+            assert!(
+                parse_wait_duration_arg(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_requires_exactly_one_condition() {
+        assert!(Cli::try_parse_from(["lterm", "wait", "main"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lterm", "wait", "main", "--exit", "--contains", "READY"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["lterm", "wait", "main", "--exit"]).is_ok());
+        assert!(Cli::try_parse_from(["lterm", "wait", "main", "--contains", "READY"]).is_ok());
+    }
+
+    #[test]
+    fn watch_accepts_wait_conditions_and_notify() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "watch",
+            "main",
+            "--contains",
+            "READY",
+            "--timeout",
+            "250ms",
+            "--tail",
+            "10",
+            "--json",
+            "--notify",
+        ])
+        .expect("watch command should parse");
+        let Commands::Watch {
+            target,
+            wait_for_exit,
+            contains,
+            timeout,
+            tail,
+            json,
+            notify,
+        } = cli.command
+        else {
+            panic!("expected watch command");
+        };
+        assert_eq!(target, "main");
+        assert!(!wait_for_exit);
+        assert_eq!(contains.as_deref(), Some("READY"));
+        assert_eq!(timeout, Some(Duration::from_millis(250)));
+        assert_eq!(tail, Some(10));
+        assert!(json);
+        assert!(notify);
+    }
+
+    #[test]
+    fn wait_tail_applies_only_to_contains() {
+        assert!(
+            Cli::try_parse_from([
+                "lterm",
+                "wait",
+                "main",
+                "--contains",
+                "READY",
+                "--tail",
+                "1"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["lterm", "wait", "main", "--exit", "--tail", "1"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "watch", "main", "--exit", "--tail", "1"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "lterm",
+                "wait",
+                "main",
+                "--contains",
+                "READY",
+                "--tail",
+                "0"
+            ])
+            .is_err()
         );
     }
 

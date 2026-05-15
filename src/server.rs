@@ -1,6 +1,7 @@
 use crate::paths;
 use crate::protocol::{
     DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
+    WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -46,6 +47,7 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 /// `BACKPRESSURE_SEND_TIMEOUT` 하나로 묶인다.
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const WAIT_CONTAINS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
@@ -164,6 +166,12 @@ struct SessionMaps {
     reserved_panes: HashSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct OutputProgress {
+    revision: u64,
+    closed: bool,
+}
+
 struct Session {
     id: String,
     // Lock order: when a code path needs both the global session map and this
@@ -220,6 +228,7 @@ struct Session {
     /// membership, or PTY resize must go through this guard to preserve the
     /// snapshot/live-output order contract.
     output_state: Mutex<()>,
+    output_progress: (Mutex<OutputProgress>, Condvar),
     #[cfg(test)]
     backpressure_hook: Mutex<Option<BackpressureHook>>,
     /// Serializes live chunk enqueue order. `append_output` takes this before
@@ -331,6 +340,7 @@ impl Session {
                 *lock(&self.terminal_normal_screen) = normal_screen;
             }
             lock(&self.terminal_pending).process(bytes);
+            self.mark_output_changed();
 
             let subscribers = lock(&self.subscribers).clone();
             if subscribers.is_empty() {
@@ -373,6 +383,21 @@ impl Session {
         for shutdown in shutdowns {
             shutdown();
         }
+    }
+
+    fn mark_output_changed(&self) {
+        let (progress, changed) = &self.output_progress;
+        let mut progress = lock(progress);
+        progress.revision = progress.revision.wrapping_add(1);
+        changed.notify_all();
+    }
+
+    fn mark_output_closed(&self) {
+        let (progress, changed) = &self.output_progress;
+        let mut progress = lock(progress);
+        progress.closed = true;
+        progress.revision = progress.revision.wrapping_add(1);
+        changed.notify_all();
     }
 
     fn capture(&self, start: Option<i32>, end: Option<i32>) -> String {
@@ -1383,6 +1408,21 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             let session = resolve_session(state, &target)?;
             Ok(Response::ok(session.capture(start, end)))
         }
+        Request::WaitExit { target, timeout_ms } => {
+            let session = resolve_session(state, &target)?;
+            Ok(Response::ok(wait_for_session_exit(&session, timeout_ms)?))
+        }
+        Request::WaitContains {
+            target,
+            needle,
+            start,
+            timeout_ms,
+        } => {
+            let session = resolve_session(state, &target)?;
+            Ok(Response::ok(wait_for_session_contains(
+                &session, &needle, start, timeout_ms,
+            )?))
+        }
         Request::Resize {
             target,
             rows,
@@ -1608,6 +1648,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
         subscribers: Mutex::new(Vec::new()),
         output_state: Mutex::new(()),
+        output_progress: (Mutex::new(OutputProgress::default()), Condvar::new()),
         #[cfg(test)]
         backpressure_hook: Mutex::new(None),
         broadcast_order: Mutex::new(()),
@@ -1648,6 +1689,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
             }
         }
         session_for_reader.close_subscribers();
+        session_for_reader.mark_output_closed();
     });
 
     let state_for_waiter = Arc::clone(state);
@@ -2217,6 +2259,143 @@ fn wait_for_cleanup_complete(session: &Session) {
                 poisoned.into_inner()
             }
         };
+    }
+}
+
+fn wait_for_session_exit(session: &Session, timeout_ms: Option<u64>) -> Result<WaitExitResult> {
+    let timed_out = if session.cleanup_complete.load(Ordering::SeqCst) {
+        false
+    } else {
+        let deadline = timeout_ms
+            .map(Duration::from_millis)
+            .map(|duration| {
+                Instant::now()
+                    .checked_add(duration)
+                    .context("wait timeout is too large")
+            })
+            .transpose()?;
+        let (complete, changed) = &session.cleanup_completion;
+        let mut complete = lock(complete);
+        while !*complete {
+            if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let wait_result = changed.wait_timeout(complete, remaining);
+                let (guard, timeout_result) = match wait_result {
+                    Ok(result) => result,
+                    Err(poisoned) => {
+                        eprintln!("recovering poisoned cleanup completion mutex");
+                        poisoned.into_inner()
+                    }
+                };
+                complete = guard;
+                if timeout_result.timed_out() && !*complete {
+                    break;
+                }
+            } else {
+                complete = match changed.wait(complete) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        eprintln!("recovering poisoned cleanup completion mutex");
+                        poisoned.into_inner()
+                    }
+                };
+            }
+        }
+        !*complete
+    };
+
+    let session = session.info();
+    Ok(WaitExitResult {
+        exited: !timed_out && !session.alive,
+        timed_out,
+        session,
+    })
+}
+
+fn wait_for_session_contains(
+    session: &Session,
+    needle: &str,
+    start: Option<i32>,
+    timeout_ms: Option<u64>,
+) -> Result<WaitContainsResult> {
+    if needle.is_empty() {
+        bail!("wait contains text cannot be empty");
+    }
+    let started = Instant::now();
+    let deadline = timeout_ms
+        .map(Duration::from_millis)
+        .map(|duration| {
+            started
+                .checked_add(duration)
+                .context("wait timeout is too large")
+        })
+        .transpose()?;
+
+    loop {
+        let before_capture = *lock(&session.output_progress.0);
+        let output = {
+            let _output_guard = lock(&session.output_state);
+            session.capture(start, None)
+        };
+        if output.contains(needle) {
+            return Ok(WaitContainsResult {
+                session: session.info(),
+                matched: true,
+                timed_out: false,
+                exited: !session.alive.load(Ordering::SeqCst),
+            });
+        }
+
+        let (progress, changed) = &session.output_progress;
+        let progress = lock(progress);
+        if progress.revision != before_capture.revision {
+            continue;
+        }
+        if progress.closed {
+            return Ok(WaitContainsResult {
+                session: session.info(),
+                matched: false,
+                timed_out: false,
+                exited: true,
+            });
+        }
+
+        if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(WaitContainsResult {
+                    session: session.info(),
+                    matched: false,
+                    timed_out: true,
+                    exited: !session.alive.load(Ordering::SeqCst),
+                });
+            }
+            let wait_for = std::cmp::min(
+                WAIT_CONTAINS_POLL_INTERVAL,
+                deadline.saturating_duration_since(now),
+            );
+            let wait_result = changed.wait_timeout(progress, wait_for);
+            let (_next_progress, timeout_result) = match wait_result {
+                Ok(result) => result,
+                Err(poisoned) => {
+                    eprintln!("recovering poisoned output progress mutex");
+                    poisoned.into_inner()
+                }
+            };
+            let _ = timeout_result;
+        } else {
+            let _guard = match changed.wait(progress) {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("recovering poisoned output progress mutex");
+                    poisoned.into_inner()
+                }
+            };
+        }
     }
 }
 
@@ -2944,11 +3123,11 @@ unsafe extern "C" {
 mod tests {
     use super::{
         ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS,
-        MAX_TERMINAL_ROWS, OutputChunk, SUBSCRIBER_QUEUE_LIMIT, Session, Subscriber,
-        TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
-        forward_attach_output, initial_pty_size, process_group_still_owns_child,
-        read_request_frame_with_limit, read_request_frame_with_timeout, request_frame_from_chunk,
-        validate_terminal_geometry,
+        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
+        Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
+        evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
+        process_group_still_owns_child, read_request_frame_with_limit,
+        read_request_frame_with_timeout, request_frame_from_chunk, validate_terminal_geometry,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
@@ -3370,6 +3549,7 @@ mod tests {
             terminal_normal_screen: Mutex::new(vt100::Parser::new(24, 80, 0).screen().clone()),
             subscribers: Mutex::new(Vec::new()),
             output_state: Mutex::new(()),
+            output_progress: (Mutex::new(OutputProgress::default()), Condvar::new()),
             backpressure_hook: Mutex::new(None),
             broadcast_order: Mutex::new(()),
             geometry_apply: Mutex::new(()),

@@ -32,8 +32,8 @@ need:
 - **cmux-friendly by design** — notifications and tmux shim calls are shaped for
   cmux/agent pane orchestration instead of generic desktop multiplexing.
 - **Built-in observability** — `doctor` / `status`, bounded `logs --start/--end`,
-  and `processes --orphans` make daemon, scrollback, and subprocess state easy
-  for humans or agents to inspect.
+  `wait` / `watch`, and `processes --orphans` make daemon, scrollback,
+  completion, and subprocess state easy for humans or agents to inspect.
 
 ## Why this exists
 
@@ -128,6 +128,8 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
+| Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
@@ -172,6 +174,8 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 `lterm doctor` (compatibility name: `lterm status`) reports client/daemon versions, protocol compatibility, runtime/data/socket/shim paths, and whether the shim directory is on `PATH`. It does not start the daemon; `daemon_reachable=no` / `false` means no compatible daemon answered on the current socket. Normal client operations warn on stderr when a reachable daemon reports a different lterm or protocol version, which usually means an old daemon survived a binary upgrade.
 
 `lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text; attached PTY streams remain raw.
+
+`lterm wait <target> --exit|--contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) draws a colored bar; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius, unless a session or environment theme is explicitly set.
 
@@ -224,10 +228,12 @@ lterm sessions --children
 lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
+lterm wait api --contains READY --timeout 30s --json
+lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
 
 **Stop a session:**
 
@@ -354,6 +360,8 @@ lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
 `lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC; subtitle/body separators such as newlines are normalized to spaces rather than concatenated.
+
+For agent workflows, prefer `lterm watch <target> --exit --notify` or `lterm watch <target> --contains DONE --notify` when the notification should be tied to a specific session condition.
 
 ## Remote access
 

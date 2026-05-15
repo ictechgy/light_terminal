@@ -11,3 +11,4 @@ Tags: wiki, log
 - 2026-05-13: Documented daemon restart expectation for wire-protocol behavior changes.
 - 2026-05-13: Documented stricter tmux-compatible value parsing for `new-session -s/-c` and `resize-pane -x/-y`.
 - 2026-05-15: Documented `doctor` / `status`, product `logs --end`, process-group/orphan visibility, and verbose/JSON `tmux-compat list-commands`.
+- 2026-05-15: Added agent observability notes for product `wait` / `watch`, including sanitized scrollback matching, exit waits, and cmux-friendly notifications.

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// base64 inside JSON. Keep the decoded cap below that frame limit with margin
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -91,6 +91,21 @@ pub struct DaemonStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitExitResult {
+    pub session: SessionInfo,
+    pub exited: bool,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitContainsResult {
+    pub session: SessionInfo,
+    pub matched: bool,
+    pub timed_out: bool,
+    pub exited: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
@@ -133,6 +148,19 @@ pub enum Request {
         start: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<i32>,
+    },
+    WaitExit {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    WaitContains {
+        target: String,
+        needle: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     Resize {
         target: String,

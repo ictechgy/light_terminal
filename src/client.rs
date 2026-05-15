@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
     DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo,
-    StatusTheme,
+    StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -37,6 +37,7 @@ const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_millis(500);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
+const WAIT_PROTOCOL_VERSION: u32 = 3;
 
 pub fn ensure_server() -> Result<()> {
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
@@ -136,11 +137,18 @@ fn rotate_log_if_large(log: &Path) -> Result<()> {
 }
 
 pub fn rpc<T: DeserializeOwned>(request: &Request) -> Result<T> {
+    rpc_with_read_timeout(request, Some(RPC_TIMEOUT))
+}
+
+fn rpc_with_read_timeout<T: DeserializeOwned>(
+    request: &Request,
+    read_timeout: Option<Duration>,
+) -> Result<T> {
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
     stream
-        .set_read_timeout(Some(RPC_TIMEOUT))
+        .set_read_timeout(read_timeout)
         .context("set rpc read timeout")?;
     stream
         .set_write_timeout(Some(RPC_TIMEOUT))
@@ -221,9 +229,52 @@ pub fn set_status_theme(target: &str, status_theme: Option<StatusTheme>) -> Resu
     })
 }
 
+pub fn wait_exit(target: &str, timeout: Option<Duration>) -> Result<WaitExitResult> {
+    ensure_server()?;
+    require_wait_protocol()?;
+    let timeout_ms = timeout.map(duration_millis_u64);
+    let read_timeout = timeout.map(|duration| duration.saturating_add(RPC_TIMEOUT));
+    rpc_with_read_timeout(
+        &Request::WaitExit {
+            target: target.to_string(),
+            timeout_ms,
+        },
+        read_timeout,
+    )
+}
+
+pub fn wait_contains(
+    target: &str,
+    needle: &str,
+    start: Option<i32>,
+    timeout: Option<Duration>,
+) -> Result<WaitContainsResult> {
+    ensure_server()?;
+    require_wait_protocol()?;
+    let timeout_ms = timeout.map(duration_millis_u64);
+    let read_timeout = timeout.map(|duration| duration.saturating_add(RPC_TIMEOUT));
+    rpc_with_read_timeout(
+        &Request::WaitContains {
+            target: target.to_string(),
+            needle: needle.to_string(),
+            start,
+            timeout_ms,
+        },
+        read_timeout,
+    )
+}
+
 fn require_status_theme_protocol() -> Result<()> {
     let status = daemon_status().context("check lterm daemon protocol for status themes")?;
     if let Some(message) = status_theme_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
+fn require_wait_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for wait/watch")?;
+    if let Some(message) = wait_protocol_error(&status) {
         bail!(message);
     }
     Ok(())
@@ -236,6 +287,19 @@ fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
             status.protocol_version, STATUS_THEME_PROTOCOL_VERSION
         )
     })
+}
+
+fn wait_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < WAIT_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support wait/watch (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version, WAIT_PROTOCOL_VERSION
+        )
+    })
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct ParentRequest {
