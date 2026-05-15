@@ -15,6 +15,26 @@
 
 > **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
 
+## Why lterm instead of plain tmux?
+
+Use tmux when you want a full terminal multiplexer with rich pane/window/layout
+management. Use `lterm` when you want the smaller surface that AI agents usually
+need:
+
+- **Agent-first persistence** — named PTY sessions keep running across detached
+  clients without requiring every workflow to manage a full tmux server.
+- **tmux-compatible where agents expect it** — `lterm tmux-compat` implements
+  the command subset used by Claude Code, Codex CLI, Gemini CLI, OMX/OMC, and
+  similar terminal-first tooling.
+- **Raw attach, safe reports** — attached PTY streams remain raw for TUIs and
+  interactive shells, while `logs`, `capture`, `list`, `doctor`, and other
+  report surfaces sanitize terminal control sequences before printing.
+- **cmux-friendly by design** — notifications and tmux shim calls are shaped for
+  cmux/agent pane orchestration instead of generic desktop multiplexing.
+- **Built-in observability** — `doctor` / `status`, bounded `logs --start/--end`,
+  and `processes --orphans` make daemon, scrollback, and subprocess state easy
+  for humans or agents to inspect.
+
 ## Why this exists
 
 The project addresses three constraints:
@@ -40,6 +60,12 @@ npm install -g @ictechgy/lterm
 ```
 
 Homebrew and npm both install the `lterm` command on your `PATH`; verify with `lterm --version`.
+
+Too lazy to install it manually? Copy the prompt in
+[`docs/agent-install.md`](docs/agent-install.md) into Claude Code, Codex CLI,
+Gemini CLI, or another terminal coding agent. It asks the agent to detect your
+platform, install `lterm`, verify it with a smoke test, and avoid modifying
+shell startup files without showing you the change.
 
 With Cargo from GitHub (use the latest tag from the Releases page):
 

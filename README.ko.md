@@ -15,6 +15,26 @@
 
 > **보안 모델:** `lterm`은 같은 OS 사용자 안에서 쓰는 편의용 데몬이며 샌드박스가 아닙니다. 다른 사용자의 Unix socket 접근은 거부하고 런타임 디렉터리는 소유자 전용 권한으로 만들지만, 같은 OS 사용자 권한으로 실행되는 프로세스는 세션을 제어할 수 있다고 보아야 합니다.
 
+## 왜 tmux 대신 lterm인가요?
+
+풍부한 pane/window/layout 관리를 원하면 tmux가 맞습니다. `lterm`은 AI
+agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
+
+- **Agent-first persistence** — named PTY session이 detached client와 무관하게
+  계속 실행되므로, 모든 workflow가 full tmux server를 직접 관리할 필요가
+  적습니다.
+- **Agent가 기대하는 tmux 호환성** — `lterm tmux-compat`는 Claude Code, Codex
+  CLI, Gemini CLI, OMX/OMC 같은 terminal-first tooling이 쓰는 tmux command
+  subset을 구현합니다.
+- **Raw attach, safe reports** — attach된 PTY stream은 TUI/interactive shell을
+  위해 raw로 유지하고, `logs`, `capture`, `list`, `doctor` 같은 report surface는
+  출력 전에 terminal control sequence를 sanitize합니다.
+- **cmux-friendly 설계** — notification과 tmux shim call이 generic desktop
+  multiplexer보다 cmux/agent pane orchestration에 맞춰져 있습니다.
+- **내장 관측성** — `doctor` / `status`, bounded `logs --start/--end`,
+  `processes --orphans`로 daemon, scrollback, subprocess 상태를 사람이나 agent가
+  쉽게 확인할 수 있습니다.
+
 ## 왜 만들었나
 
 다음 세 가지 요구를 충족하는 것이 목표입니다.
@@ -40,6 +60,11 @@ npm install -g @ictechgy/lterm
 ```
 
 Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --version`으로 확인하세요.
+
+수동 설치도 귀찮다면 [`docs/agent-install.ko.md`](docs/agent-install.ko.md)의
+프롬프트를 Claude Code, Codex CLI, Gemini CLI 같은 terminal coding agent에
+붙여 넣으세요. Agent가 platform을 감지하고, `lterm`을 설치하고, smoke test로
+검증하며, shell startup file을 바꿔야 할 때는 먼저 diff를 보여주도록 안내합니다.
 
 GitHub에서 Cargo로 설치 (Releases 페이지의 최신 태그를 사용하세요):
 
