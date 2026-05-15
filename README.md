@@ -41,10 +41,10 @@ npm install -g @ictechgy/lterm
 
 Homebrew and npm both install the `lterm` command on your `PATH`; verify with `lterm --version`.
 
-With Cargo from GitHub (replace `v0.1.0` with the latest release tag when newer versions are available):
+With Cargo from GitHub (use the latest tag from the Releases page):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
+cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.1
 ```
 
 From this checkout, use Rust 1.85 or newer:
@@ -137,7 +137,7 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small blue status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
 
-`lterm rename <target> <new-name>` changes only lterm metadata and target lookup; it does not restart the PTY or mutate the child process environment. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error.
+`lterm rename <target> <new-name>` renames a running session without restarting its process. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. `<target>` accepts a session name, session id, pane id (`%0`), or bare pane number (`0`); `<new-name>` follows the same syntax rules as `--name`.
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) shows black text on a bright-blue background; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius.
 
