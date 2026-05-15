@@ -89,6 +89,10 @@ pub fn daemon_status() -> Result<DaemonStatus> {
     rpc(&Request::Status)
 }
 
+pub fn daemon_ping() -> Result<()> {
+    rpc::<serde_json::Value>(&Request::Ping).map(|_| ())
+}
+
 fn warn_daemon_version_mismatch() {
     if VERSION_STATUS_CHECKED.swap(true, Ordering::SeqCst) {
         return;

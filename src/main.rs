@@ -490,14 +490,17 @@ fn print_doctor_report(json: bool) -> Result<()> {
     let socket_path = paths::socket_path()?;
     let shim_dir = paths::shim_dir()?;
     let tmux_shim_path = shim_dir.join("tmux");
-    let (daemon, daemon_error) = match client::daemon_status() {
-        Ok(status) => (Some(status), None),
-        Err(err) => (None, Some(err.to_string())),
+    let (daemon, daemon_reachable, daemon_error) = match client::daemon_status() {
+        Ok(status) => (Some(status), true, None),
+        Err(err) => {
+            let reachable = client::daemon_ping().is_ok();
+            (None, reachable, Some(err.to_string()))
+        }
     };
     let report = DoctorReport {
         client_version: env!("CARGO_PKG_VERSION"),
         client_protocol_version: protocol::PROTOCOL_VERSION,
-        daemon_reachable: daemon.is_some(),
+        daemon_reachable,
         daemon_version: daemon.as_ref().map(|status| status.version.clone()),
         daemon_protocol_version: daemon.as_ref().map(|status| status.protocol_version),
         version_match: daemon.as_ref().map(|status| {

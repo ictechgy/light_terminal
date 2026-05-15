@@ -129,10 +129,9 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         }
         unknown => {
             debug_unsupported_command(unknown, rest);
-            bail!(
-                "unsupported tmux command in lterm compat: {unknown} {}",
-                rest.join(" ")
-            )
+            let command = sanitize::terminal_text(unknown);
+            let args = sanitize::terminal_text(&rest.join(" "));
+            bail!("unsupported tmux command in lterm compat: {command} {args}")
         }
     }
 }
