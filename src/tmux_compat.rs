@@ -193,7 +193,7 @@ fn new_session(args: &[String]) -> Result<i32> {
         }
     }
     let command = tmux_shell_command(&command)?;
-    let info = client::new_session(name, command, cwd, HashMap::new(), true)?;
+    let info = client::new_session(name, command, cwd, HashMap::new(), None, true)?;
     remember_pane(&info, None)?;
     if detached {
         Ok(0)
@@ -492,7 +492,7 @@ fn split_window(args: &[String]) -> Result<i32> {
         }
     }
     let command = tmux_shell_command(&command)?;
-    let info = client::new_session(None, command, cwd, HashMap::new(), true)?;
+    let info = client::new_session(None, command, cwd, HashMap::new(), None, true)?;
 
     let cmux_surface = if !detached {
         open_cmux_split(direction, &info).ok().flatten()
@@ -1724,6 +1724,7 @@ mod tests {
             attached_clients: 0,
             process_id: None,
             process_group_id: None,
+            status_theme: None,
         };
         assert_eq!(
             expand_format("#{pane_id} #S #{pane_current_command}", &info),

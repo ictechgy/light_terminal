@@ -1,6 +1,7 @@
 use crate::paths;
 use crate::protocol::{
     DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo,
+    StatusTheme,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -175,6 +176,7 @@ pub fn new_session(
     command: Option<String>,
     cwd: Option<String>,
     env: std::collections::HashMap<String, String>,
+    status_theme: Option<StatusTheme>,
     tmux: bool,
 ) -> Result<SessionInfo> {
     ensure_server()?;
@@ -189,6 +191,7 @@ pub fn new_session(
         parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
         parent_token: parent.map(|parent| parent.token),
         env,
+        status_theme,
         tmux,
     })
 }
@@ -201,6 +204,15 @@ pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
         cwd: Some(resolve_client_cwd(None)?),
         parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
         parent_token: parent.map(|parent| parent.token),
+        status_theme: None,
+    })
+}
+
+pub fn set_status_theme(target: &str, status_theme: Option<StatusTheme>) -> Result<SessionInfo> {
+    ensure_server()?;
+    rpc(&Request::SetStatusTheme {
+        target: target.to_string(),
+        status_theme,
     })
 }
 
@@ -744,7 +756,8 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     });
 
     let mut stdout = std::io::stdout();
-    let status_style = status_enabled.then(resolve_status_style);
+    let status_style = status_enabled
+        .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
     if status_enabled {
         stream
@@ -980,25 +993,57 @@ fn matches_env_bool(value: &str, expected: bool) -> bool {
 /// Minimal(plain text)로 폴백해 색 매핑 충돌과 시각 노이즈를 줄인다.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusStyle {
-    Full,
+    Full(StatusTheme),
     Minimal,
 }
 
-fn resolve_status_style() -> StatusStyle {
-    if let Ok(value) = std::env::var("LTERM_STATUS_STYLE") {
-        if let Some(style) = parse_status_style(&value) {
-            return style;
+impl StatusStyle {
+    fn sgr(self) -> &'static str {
+        match self {
+            StatusStyle::Full(StatusTheme::Blue) => "\x1b[0;30;104m",
+            StatusStyle::Full(StatusTheme::Green) => "\x1b[0;30;102m",
+            StatusStyle::Full(StatusTheme::Magenta) => "\x1b[0;30;105m",
+            StatusStyle::Full(StatusTheme::Cyan) => "\x1b[0;30;106m",
+            StatusStyle::Full(StatusTheme::Amber) => "\x1b[0;30;103m",
+            StatusStyle::Full(StatusTheme::Red) => "\x1b[0;97;41m",
+            StatusStyle::Full(StatusTheme::Gray) => "\x1b[0;97;100m",
+            StatusStyle::Full(StatusTheme::Plain) | StatusStyle::Minimal => "\x1b[0m",
         }
     }
-    if is_ssh_session() {
-        return StatusStyle::Minimal;
+}
+
+fn resolve_status_style(session_theme: Option<StatusTheme>) -> StatusStyle {
+    let (theme, theme_explicit) = resolve_status_theme(session_theme);
+    if let Ok(value) = std::env::var("LTERM_STATUS_STYLE") {
+        if let Some(style) = parse_status_style(&value) {
+            return match style {
+                StatusStyle::Full(_) => StatusStyle::Full(theme),
+                StatusStyle::Minimal => StatusStyle::Minimal,
+            };
+        }
     }
-    StatusStyle::Full
+    if theme_explicit || !is_ssh_session() {
+        StatusStyle::Full(theme)
+    } else {
+        StatusStyle::Minimal
+    }
+}
+
+fn resolve_status_theme(session_theme: Option<StatusTheme>) -> (StatusTheme, bool) {
+    if let Some(theme) = session_theme {
+        return (theme, true);
+    }
+    if let Ok(value) = std::env::var("LTERM_STATUS_THEME")
+        && let Some(theme) = StatusTheme::parse(&value)
+    {
+        return (theme, true);
+    }
+    (StatusTheme::Blue, false)
 }
 
 fn parse_status_style(value: &str) -> Option<StatusStyle> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "full" => Some(StatusStyle::Full),
+        "full" => Some(StatusStyle::Full(StatusTheme::Blue)),
         "minimal" => Some(StatusStyle::Minimal),
         _ => None,
     }
@@ -1110,8 +1155,7 @@ impl StatusBar {
         // 배경을 단일 CSI(\x1b[0;30;104m)로 적용해 바이트를 줄인다.
         // (bold(1)은 두 모드 모두에서 사용하지 않는다: bold+black을 흰색으로 렌더하는 터미널이 있다.)
         let sgr = match self.style {
-            Some(StatusStyle::Full) => "\x1b[0;30;104m",
-            Some(StatusStyle::Minimal) => "\x1b[0m",
+            Some(style) => style.sgr(),
             None => return Ok(()),
         };
         // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
@@ -1780,7 +1824,7 @@ mod tests {
     use super::{
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, KeyboardProtocolRestoreState,
         ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle,
-        TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
+        StatusTheme, TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
@@ -1842,7 +1886,7 @@ mod tests {
         let mut status_bar = StatusBar {
             session_name: "omx-lterm".to_string(),
             pane_id: "%0".to_string(),
-            style: Some(StatusStyle::Full),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
         };
         let mut output = Vec::new();
@@ -1872,7 +1916,7 @@ mod tests {
         let mut status_bar = StatusBar {
             session_name: "omx-lterm".to_string(),
             pane_id: "%0".to_string(),
-            style: Some(StatusStyle::Full),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
         };
         let mut output = Vec::new();
@@ -2471,6 +2515,57 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _env_guard = EnvGuard::capture(&[
             "LTERM_STATUS_STYLE",
+            "LTERM_STATUS_THEME",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+        ]);
+
+        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+            std::env::remove_var("LTERM_STATUS_THEME");
+            std::env::remove_var("SSH_CONNECTION");
+            std::env::remove_var("SSH_CLIENT");
+            std::env::remove_var("SSH_TTY");
+
+            std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
+            std::env::set_var("LTERM_STATUS_STYLE", "full");
+        }
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Full(StatusTheme::Blue)
+        );
+
+        unsafe {
+            std::env::set_var("LTERM_STATUS_STYLE", "minimal");
+        }
+        assert_eq!(resolve_status_style(None), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+        }
+        // SSH only → Minimal
+        assert_eq!(resolve_status_style(None), StatusStyle::Minimal);
+
+        unsafe {
+            std::env::remove_var("SSH_CONNECTION");
+        }
+        // No SSH, no style → Full
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Full(StatusTheme::Blue)
+        );
+
+        // EnvGuard 가 drop 되면서 원래 환경 변수 값을 복원한다.
+    }
+
+    #[test]
+    fn resolve_status_theme_prefers_session_then_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_STATUS_STYLE",
+            "LTERM_STATUS_THEME",
             "SSH_CONNECTION",
             "SSH_CLIENT",
             "SSH_TTY",
@@ -2482,37 +2577,58 @@ mod tests {
             std::env::remove_var("SSH_CONNECTION");
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
-
-            std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
-            std::env::set_var("LTERM_STATUS_STYLE", "full");
+            std::env::set_var("LTERM_STATUS_THEME", "green");
         }
-        assert_eq!(resolve_status_style(), StatusStyle::Full);
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Full(StatusTheme::Green)
+        );
+        assert_eq!(
+            resolve_status_style(Some(StatusTheme::Red)),
+            StatusStyle::Full(StatusTheme::Red)
+        );
+
+        unsafe {
+            std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
+        }
+        assert_eq!(
+            resolve_status_style(Some(StatusTheme::Cyan)),
+            StatusStyle::Full(StatusTheme::Cyan),
+            "explicit per-session themes should remain colored over SSH"
+        );
 
         unsafe {
             std::env::set_var("LTERM_STATUS_STYLE", "minimal");
         }
-        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
+        assert_eq!(
+            resolve_status_style(Some(StatusTheme::Cyan)),
+            StatusStyle::Minimal
+        );
+    }
 
-        unsafe {
-            std::env::remove_var("LTERM_STATUS_STYLE");
-        }
-        // SSH only → Minimal
-        assert_eq!(resolve_status_style(), StatusStyle::Minimal);
-
-        unsafe {
-            std::env::remove_var("SSH_CONNECTION");
-        }
-        // No SSH, no style → Full
-        assert_eq!(resolve_status_style(), StatusStyle::Full);
-
-        // EnvGuard 가 drop 되면서 원래 환경 변수 값을 복원한다.
+    #[test]
+    fn status_theme_sgr_uses_whitelisted_sequences() {
+        assert_eq!(StatusStyle::Full(StatusTheme::Blue).sgr(), "\x1b[0;30;104m");
+        assert_eq!(
+            StatusStyle::Full(StatusTheme::Green).sgr(),
+            "\x1b[0;30;102m"
+        );
+        assert_eq!(StatusStyle::Full(StatusTheme::Plain).sgr(), "\x1b[0m");
+        assert_eq!(StatusTheme::parse("purple"), Some(StatusTheme::Magenta));
+        assert_eq!(StatusTheme::parse("\x1b[31m"), None);
     }
 
     #[test]
     fn parse_status_style_accepts_known_values() {
-        assert_eq!(parse_status_style("full"), Some(StatusStyle::Full));
+        assert_eq!(
+            parse_status_style("full"),
+            Some(StatusStyle::Full(StatusTheme::Blue))
+        );
         assert_eq!(parse_status_style("Minimal"), Some(StatusStyle::Minimal));
-        assert_eq!(parse_status_style(" full "), Some(StatusStyle::Full));
+        assert_eq!(
+            parse_status_style(" full "),
+            Some(StatusStyle::Full(StatusTheme::Blue))
+        );
         assert_eq!(parse_status_style("off"), None);
         assert_eq!(parse_status_style(""), None);
     }

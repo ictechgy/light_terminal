@@ -7,7 +7,53 @@ use std::collections::HashMap;
 /// base64 inside JSON. Keep the decoded cap below that frame limit with margin
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusTheme {
+    Blue,
+    Green,
+    Magenta,
+    Cyan,
+    Amber,
+    Red,
+    Gray,
+    Plain,
+}
+
+impl StatusTheme {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "blue" => Some(Self::Blue),
+            "green" => Some(Self::Green),
+            "magenta" | "purple" => Some(Self::Magenta),
+            "cyan" => Some(Self::Cyan),
+            "amber" | "yellow" => Some(Self::Amber),
+            "red" => Some(Self::Red),
+            "gray" | "grey" => Some(Self::Gray),
+            "plain" | "minimal" => Some(Self::Plain),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Green => "green",
+            Self::Magenta => "magenta",
+            Self::Cyan => "cyan",
+            Self::Amber => "amber",
+            Self::Red => "red",
+            Self::Gray => "gray",
+            Self::Plain => "plain",
+        }
+    }
+
+    pub fn allowed_values() -> &'static str {
+        "blue, green, magenta, cyan, amber, red, gray, plain"
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -31,6 +77,8 @@ pub struct SessionInfo {
     pub process_id: Option<u32>,
     #[serde(default)]
     pub process_group_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_theme: Option<StatusTheme>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +108,8 @@ pub enum Request {
         parent_token: Option<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_theme: Option<StatusTheme>,
         tmux: bool,
     },
     List,
@@ -136,6 +186,13 @@ pub enum Request {
         parent_pane_id: Option<String>,
         #[serde(default)]
         parent_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_theme: Option<StatusTheme>,
+    },
+    SetStatusTheme {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_theme: Option<StatusTheme>,
     },
     Shutdown,
 }
@@ -376,6 +433,7 @@ mod tests {
         assert_eq!(info.parent_pane_id, None);
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
+        assert_eq!(info.status_theme, None);
     }
 
     #[test]
