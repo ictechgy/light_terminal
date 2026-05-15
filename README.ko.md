@@ -41,10 +41,10 @@ npm install -g @ictechgy/lterm
 
 Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --version`으로 확인하세요.
 
-GitHub에서 Cargo로 설치 (새 버전이 나오면 `v0.1.0`을 최신 릴리스 태그로 바꾸세요):
+GitHub에서 Cargo로 설치 (Releases 페이지의 최신 태그를 사용하세요):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.0
+cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.1
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
@@ -138,7 +138,7 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 파란 상태 바를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 재개하려면 `lterm resume --no-status api`(호환 이름: `lterm attach --no-status api`)를 쓰거나, 상태줄 처리가 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0`을 설정하세요.
 
-`lterm rename <target> <new-name>`은 lterm metadata와 target lookup만 바꾸며, PTY를 재시작하거나 child process 환경을 바꾸지 않습니다. 현재 이름으로 다시 rename하면 no-op success이고, 다른 세션이 이미 쓰는 이름으로 rename하면 conflict error로 실패합니다.
+`lterm rename <target> <new-name>`은 실행 중인 세션의 프로세스를 재시작하지 않고 이름만 바꿉니다. 현재 이름과 동일한 이름으로 바꾸면 no-op success이고, 다른 세션이 이미 쓰는 이름으로 바꾸면 conflict error로 실패합니다. `<target>`은 세션 이름, session id, pane id(`%0`), 또는 bare pane 번호(`0`)를 받으며, `<new-name>`은 `--name`과 같은 이름 규칙을 따릅니다.
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 검정 글자 + bright-blue 배경, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄입니다.
 
