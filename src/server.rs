@@ -47,7 +47,6 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 /// `BACKPRESSURE_SEND_TIMEOUT` 하나로 묶인다.
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const WAIT_CONTAINS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
@@ -170,6 +169,23 @@ struct SessionMaps {
 struct OutputProgress {
     revision: u64,
     closed: bool,
+}
+
+struct OutputClosedGuard {
+    session: Arc<Session>,
+}
+
+impl OutputClosedGuard {
+    fn new(session: Arc<Session>) -> Self {
+        Self { session }
+    }
+}
+
+impl Drop for OutputClosedGuard {
+    fn drop(&mut self) {
+        self.session.close_subscribers();
+        self.session.mark_output_closed();
+    }
 }
 
 struct Session {
@@ -1673,6 +1689,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
 
     let session_for_reader = Arc::clone(&session);
     thread::spawn(move || {
+        let _output_closed = OutputClosedGuard::new(Arc::clone(&session_for_reader));
         let mut buf = [0_u8; 8192];
         loop {
             match reader.read(&mut buf) {
@@ -1688,8 +1705,6 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                 }
             }
         }
-        session_for_reader.close_subscribers();
-        session_for_reader.mark_output_closed();
     });
 
     let state_for_waiter = Arc::clone(state);
@@ -2374,19 +2389,15 @@ fn wait_for_session_contains(
                     exited: !session.alive.load(Ordering::SeqCst),
                 });
             }
-            let wait_for = std::cmp::min(
-                WAIT_CONTAINS_POLL_INTERVAL,
-                deadline.saturating_duration_since(now),
-            );
-            let wait_result = changed.wait_timeout(progress, wait_for);
-            let (_next_progress, timeout_result) = match wait_result {
+            let wait_result =
+                changed.wait_timeout(progress, deadline.saturating_duration_since(now));
+            let (_next_progress, _timeout_result) = match wait_result {
                 Ok(result) => result,
                 Err(poisoned) => {
                     eprintln!("recovering poisoned output progress mutex");
                     poisoned.into_inner()
                 }
             };
-            let _ = timeout_result;
         } else {
             let _guard = match changed.wait(progress) {
                 Ok(guard) => guard,

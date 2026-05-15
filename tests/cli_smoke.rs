@@ -432,7 +432,7 @@ fn wait_contains_succeeds_against_sanitized_capture_text() -> TestResult {
             "--",
             "sh",
             "-lc",
-            "printf '\\033]52;c;secret\\007'; echo AGENT_READY; sleep 2",
+            "printf '\\033]52;c;secret\\007'; echo AGENT_READY; sleep 30",
         ])
         .status()?;
     assert!(status.success());
@@ -460,6 +460,91 @@ fn wait_contains_succeeds_against_sanitized_capture_text() -> TestResult {
     assert_eq!(result["matched"], true);
     assert_eq!(result["timed_out"], false);
     assert_eq!(result["needle"], "AGENT_READY");
+
+    let stripped_output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-contains",
+            "--contains",
+            "secret",
+            "--timeout",
+            "200ms",
+            "--json",
+        ])
+        .output()?;
+    assert_eq!(
+        stripped_output.status.code(),
+        Some(124),
+        "{stripped_output:?}"
+    );
+    let stripped: serde_json::Value = serde_json::from_slice(&stripped_output.stdout)?;
+    assert_eq!(stripped["event"], "contains");
+    assert_eq!(stripped["matched"], false);
+    assert_eq!(stripped["timed_out"], true);
+    assert_eq!(stripped["needle"], "secret");
+    Ok(())
+}
+
+#[test]
+fn wait_contains_tail_limits_sanitized_scrollback_scan() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-tail",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'OLD_MARKER\\nNEW_MARKER'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-tail");
+    env.capture_until("wait-tail", "NEW_MARKER")?;
+
+    let old_output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-tail",
+            "--contains",
+            "OLD_MARKER",
+            "--tail",
+            "1",
+            "--timeout",
+            "200ms",
+            "--json",
+        ])
+        .output()?;
+    assert_eq!(old_output.status.code(), Some(124), "{old_output:?}");
+    let old_result: serde_json::Value = serde_json::from_slice(&old_output.stdout)?;
+    assert_eq!(old_result["event"], "contains");
+    assert_eq!(old_result["matched"], false);
+    assert_eq!(old_result["timed_out"], true);
+
+    let new_output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-tail",
+            "--contains",
+            "NEW_MARKER",
+            "--tail",
+            "1",
+            "--timeout",
+            "5s",
+            "--json",
+        ])
+        .output()?;
+    assert!(new_output.status.success(), "{new_output:?}");
+    let new_result: serde_json::Value = serde_json::from_slice(&new_output.stdout)?;
+    assert_eq!(new_result["event"], "contains");
+    assert_eq!(new_result["matched"], true);
+    assert_eq!(new_result["timed_out"], false);
     Ok(())
 }
 
@@ -517,7 +602,7 @@ fn wait_contains_timeout_returns_nonzero_and_json_timeout_status() -> TestResult
             "--",
             "sh",
             "-lc",
-            "sleep 2",
+            "sleep 30",
         ])
         .status()?;
     assert!(status.success());
@@ -593,6 +678,11 @@ fn watch_exit_notify_invokes_cmux_with_sanitized_message() -> TestResult {
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("SHOULD_NOT_POLLUTE_JSON_STDOUT"),
+        "{stdout}"
+    );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(result["event"], "exit");
     assert_eq!(result["matched"], true);
@@ -606,6 +696,80 @@ fn watch_exit_notify_invokes_cmux_with_sanitized_message() -> TestResult {
         cmux.contains("session watch-notify exited with status 0"),
         "{cmux:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn watch_contains_notify_invokes_cmux_with_sanitized_message() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-contains.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\necho SHOULD_NOT_POLLUTE_JSON_STDOUT\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let mut paths = vec![fake_bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths)?;
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-contains-notify",
+            "--",
+            "sh",
+            "-lc",
+            "echo 'WATCH;MATCH'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-contains-notify");
+
+    let mut watch = env.cmd();
+    watch.env("PATH", path);
+    let output = watch
+        .args([
+            "watch",
+            "watch-contains-notify",
+            "--contains",
+            "WATCH;MATCH",
+            "--timeout",
+            "5s",
+            "--notify",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("SHOULD_NOT_POLLUTE_JSON_STDOUT"),
+        "{stdout}"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "contains");
+    assert_eq!(result["matched"], true);
+    assert_eq!(result["timed_out"], false);
+    assert_eq!(result["needle"], "WATCH;MATCH");
+
+    let cmux = wait_for_file_contents(&cmux_log)?;
+    assert!(cmux.contains("notify"), "{cmux:?}");
+    assert!(cmux.contains("--title"), "{cmux:?}");
+    assert!(cmux.contains("lterm watch matched"), "{cmux:?}");
+    assert!(cmux.contains("--body"), "{cmux:?}");
+    assert!(
+        cmux.contains("session watch-contains-notify output matched WATCH MATCH"),
+        "{cmux:?}"
+    );
+    assert!(!cmux.contains("WATCH;MATCH"), "{cmux:?}");
     Ok(())
 }
 
