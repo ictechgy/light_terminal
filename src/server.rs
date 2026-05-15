@@ -1,5 +1,5 @@
 use crate::paths;
-use crate::protocol::{Request, Response, SessionInfo};
+use crate::protocol::{DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo};
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use libc::{c_int, mode_t};
@@ -1271,6 +1271,16 @@ fn sanitized_preview(value: &str) -> String {
 fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
     match request {
         Request::Ping => Ok(Response::ok(serde_json::json!({ "pong": true }))),
+        Request::Status => {
+            let session_count = lock(&state.sessions).by_pane.len();
+            Ok(Response::ok(DaemonStatus {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                session_count,
+                active_connections: state.active_connections.load(Ordering::SeqCst),
+                shutting_down: state.shutting_down.load(Ordering::SeqCst),
+            }))
+        }
         Request::New {
             name,
             command,

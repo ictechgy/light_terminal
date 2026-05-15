@@ -16,11 +16,12 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
 | List sessions | `lterm sessions` | `list`, `ls` |
-| Inspect process trees | `lterm processes api --json` | `ps` |
+| Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | none |
-| Read sanitized scrollback | `lterm logs api --start=-80` | `capture` |
+| Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session or pane | `lterm close api` | `kill` |
+| Diagnose daemon and shim state | `lterm doctor --json` | `status` |
 | Run the daemon explicitly | `lterm daemon` | none |
 | Stop the daemon and all sessions it owns | `lterm shutdown` | none |
 
@@ -54,6 +55,8 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - `run` is the generic product command for an unprofiled tmux-compatible session; it enables the shim by default, hides the legacy no-op `--tmux` flag from help, and uses `--no-tmux` as the visible opt-out.
 - Remote `lterm ssh` currently keeps its wire command on compatibility spelling where needed so newer local clients can talk to older remote installs.
 - cmux split handoff intentionally sends compatibility `lterm attach <pane>` so stale `LTERM_BIN` builds that predate `resume` still work.
+- `doctor` / `status` does not start a missing daemon; it reports the current socket, version/protocol compatibility, and shim/PATH state.
+- `processes --orphans` includes same-process-group rows that are no longer descendants of the recorded session root, and text/JSON rows expose process-group ids.
 
 ## tmux-compat boundary
 
@@ -66,6 +69,13 @@ lterm tmux-compat list-commands
 to inspect the supported shim subset at runtime.
 
 The shim covers the tmux subset used by common AI orchestration scripts, including session commands, query commands, pane operations, buffers/popups, and deliberate no-op compatibility commands such as `select-pane` and `set-option`. Product-only lifecycle commands such as `daemon` and `shutdown` do not imply tmux-compatible aliases.
+
+`lterm tmux-compat list-commands --verbose` prints tab-separated command,
+alias, support tier, and usage fields. `--json` prints machine-readable rows
+with `name`, `alias`, `aliases`, `usage`, and `support`. Support tiers are
+`full`, `partial`, and `noop` within lterm's shim boundary. Set
+`LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when an
+unsupported tmux command reaches the shim.
 
 Session rename is available through the product command `lterm rename <target> <new-name>` and the tmux shim command `lterm tmux-compat rename-session [-t target-session] <new-name>`. Rename changes lterm metadata and target lookup only; it does not restart the PTY or mutate the child process environment. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. The tmux shim accepts both `rename-session -t old new` and `rename-session new -t old`.
 
@@ -83,9 +93,10 @@ Parser strictness follows tmux more closely for value-taking options: for exampl
 values instead of silently falling back to defaults or no-op behavior.
 
 Capture has a product surface and a tmux shim surface with different defaults:
-`lterm logs` always prints sanitized scrollback, while `lterm tmux-compat
-capture-pane` writes the compatibility buffer unless `-p` is passed. Detailed
-range and parser expectations live in [[tmux-compat-capture]].
+`lterm logs` always prints sanitized scrollback and now accepts both `--start`
+/ `-S` and inclusive `--end` / `-E`, while `lterm tmux-compat capture-pane`
+writes the compatibility buffer unless `-p` is passed. Detailed range and
+parser expectations live in [[tmux-compat-capture]].
 
 ## Update policy
 

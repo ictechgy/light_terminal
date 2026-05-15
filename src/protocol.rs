@@ -7,6 +7,7 @@ use std::collections::HashMap;
 /// base64 inside JSON. Keep the decoded cap below that frame limit with margin
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -33,9 +34,19 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub version: String,
+    pub protocol_version: u32,
+    pub session_count: usize,
+    pub active_connections: usize,
+    pub shutting_down: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    Status,
     New {
         name: Option<String>,
         command: Option<String>,

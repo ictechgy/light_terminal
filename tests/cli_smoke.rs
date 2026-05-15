@@ -387,6 +387,110 @@ fn capture_alias_captures_output() -> TestResult {
 }
 
 #[test]
+fn logs_supports_inclusive_end_range() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "logs-end",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'FIRST_LINE\\nSECOND_LINE\\nTHIRD_LINE\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("logs-end", "THIRD_LINE")?;
+
+    let output = env
+        .cmd()
+        .args(["logs", "logs-end", "-S0", "--end", "0"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FIRST_LINE"), "{stdout:?}");
+    assert!(
+        !stdout.contains("SECOND_LINE"),
+        "logs --end should stop at the inclusive end line: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("THIRD_LINE"),
+        "logs --end should stop at the inclusive end line: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_daemon_version_and_paths() -> TestResult {
+    let env = TestEnv::new()?;
+    let initial = env.cmd().args(["doctor", "--json"]).output()?;
+    assert!(initial.status.success(), "{initial:?}");
+    let initial_report: serde_json::Value = serde_json::from_slice(&initial.stdout)?;
+    assert_eq!(
+        initial_report
+            .get("client_version")
+            .and_then(|v| v.as_str()),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        initial_report
+            .get("daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert!(
+        initial_report
+            .get("socket_path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|path| path.contains("lterm.sock")),
+        "{initial_report:?}"
+    );
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "doctor-session",
+            "--",
+            "sh",
+            "-lc",
+            "echo DOCTOR_READY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("doctor-session", "DOCTOR_READY")?;
+
+    let live = env.cmd().args(["status", "--json"]).output()?;
+    assert!(live.status.success(), "{live:?}");
+    let report: serde_json::Value = serde_json::from_slice(&live.stdout)?;
+    assert_eq!(
+        report.get("daemon_reachable").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        report.get("daemon_version").and_then(|v| v.as_str()),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        report.get("version_match").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(
+        report
+            .get("daemon_session_count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count >= 1),
+        "{report:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn new_attaches_by_default() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
@@ -745,6 +849,10 @@ fn help_describes_machine_readable_session_surfaces() -> TestResult {
             normalized.contains("Print process rows as a JSON array for automation"),
             "{command} help should describe --json output:\n{stdout}"
         );
+        assert!(
+            normalized.contains("Include same-process-group rows that escaped the child tree"),
+            "{command} help should describe --orphans output:\n{stdout}"
+        );
     }
 
     Ok(())
@@ -874,6 +982,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             &[
                 "Session or pane target to capture",
                 "Starting scrollback line offset, matching tmux -S semantics",
+                "Inclusive ending scrollback line offset, matching tmux -E semantics",
             ][..],
         ),
         (
@@ -881,6 +990,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             &[
                 "Session or pane target to capture",
                 "Starting scrollback line offset, matching tmux -S semantics",
+                "Inclusive ending scrollback line offset, matching tmux -E semantics",
             ][..],
         ),
         (
@@ -938,6 +1048,8 @@ fn help_describes_daemon_lifecycle_commands() -> TestResult {
 
     for (command, expected) in [
         ("daemon", "Run the background PTY session daemon"),
+        ("doctor", "Diagnose daemon, shim, and version state"),
+        ("status", "Diagnose daemon, shim, and version state"),
         ("shutdown", "Stop the daemon and all sessions"),
     ] {
         let output = env.cmd().args([command, "--help"]).output()?;
@@ -3020,6 +3132,37 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
         list_commands_row.contains("[-F format]"),
         "list-commands usage field missing: {list_commands_row:?}"
     );
+    let verbose = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "--verbose", "has"])
+        .output()?;
+    assert!(verbose.status.success(), "{verbose:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&verbose.stdout).trim(),
+        "has-session\thas\tfull\t[-t target-session]"
+    );
+    let json_output = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "--json", "show-option"])
+        .output()?;
+    assert!(json_output.status.success(), "{json_output:?}");
+    let commands: serde_json::Value = serde_json::from_slice(&json_output.stdout)?;
+    let row = commands
+        .as_array()
+        .and_then(|rows| rows.first())
+        .ok_or("missing list-commands --json row")?;
+    assert_eq!(
+        row.get("name").and_then(|value| value.as_str()),
+        Some("show-options")
+    );
+    assert_eq!(
+        row.get("alias").and_then(|value| value.as_str()),
+        Some("show")
+    );
+    assert_eq!(
+        row.get("support").and_then(|value| value.as_str()),
+        Some("partial")
+    );
     let unsupported_filter = env
         .cmd()
         .args(["tmux-compat", "list-commands", "-f", "#{command_name}"])
@@ -3049,6 +3192,20 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
         assert!(filtered.status.success(), "{filtered:?}");
         assert_eq!(String::from_utf8_lossy(&filtered.stdout).trim(), expected);
     }
+    let unsupported_command = env
+        .cmd()
+        .env("LTERM_DEBUG_TMUX", "1")
+        .args(["tmux-compat", "definitely-not-supported", "-x"])
+        .output()?;
+    assert!(
+        !unsupported_command.status.success(),
+        "{unsupported_command:?}"
+    );
+    let stderr = String::from_utf8_lossy(&unsupported_command.stderr);
+    assert!(
+        stderr.contains("lterm_tmux_compat\tunsupported_command\tdefinitely-not-supported\t-x"),
+        "{stderr:?}"
+    );
     Ok(())
 }
 
@@ -4629,7 +4786,10 @@ fn kill_reaps_session_process_group_children() -> TestResult {
     );
 
     for command in ["ps", "processes"] {
-        let ps_output = env.cmd().args([command, "pgrp", "--json"]).output()?;
+        let ps_output = env
+            .cmd()
+            .args([command, "pgrp", "--orphans", "--json"])
+            .output()?;
         assert!(
             ps_output.status.success(),
             "{command} failed: {ps_output:?}"
@@ -4637,6 +4797,25 @@ fn kill_reaps_session_process_group_children() -> TestResult {
         assert!(
             String::from_utf8_lossy(&ps_output.stdout).contains(child_pid),
             "lterm {command} should include child process tree"
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&ps_output.stdout)?;
+        let child = rows
+            .iter()
+            .find(|row| {
+                row.get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|pid| pid.to_string() == child_pid)
+                    .unwrap_or(false)
+            })
+            .ok_or("missing child process row")?;
+        assert!(
+            child.get("process_group_id").is_some(),
+            "process rows should expose process group id: {child:?}"
+        );
+        assert_eq!(
+            child.get("orphan").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "normal child tree rows should not be marked orphan: {child:?}"
         );
     }
 

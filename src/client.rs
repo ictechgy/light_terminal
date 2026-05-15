@@ -1,5 +1,7 @@
 use crate::paths;
-use crate::protocol::{MAX_SEND_DATA_BYTES, Request, Response, SessionInfo};
+use crate::protocol::{
+    DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo,
+};
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+static VERSION_MISMATCH_WARNED: AtomicBool = AtomicBool::new(false);
 /// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
 /// 리셋되어도 사용자 인지 한계(약 100~300ms) 안에 scroll region을 재확립하고 status를
 /// 재그린다. PTY가 활발히 출력 중일 때 idle heartbeat는 status_dirty가 클리어되어야 발화하므로,
@@ -35,6 +38,7 @@ const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 
 pub fn ensure_server() -> Result<()> {
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
+        warn_daemon_version_mismatch();
         return Ok(());
     }
 
@@ -68,7 +72,10 @@ pub fn ensure_server() -> Result<()> {
     let mut last_err = None;
     while Instant::now() < deadline {
         match rpc::<serde_json::Value>(&Request::Ping) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                warn_daemon_version_mismatch();
+                return Ok(());
+            }
             Err(err) => {
                 last_err = Some(err);
                 thread::sleep(Duration::from_millis(80));
@@ -76,6 +83,28 @@ pub fn ensure_server() -> Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready")))
+}
+
+pub fn daemon_status() -> Result<DaemonStatus> {
+    rpc(&Request::Status)
+}
+
+fn warn_daemon_version_mismatch() {
+    if VERSION_MISMATCH_WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Ok(status) = daemon_status() else {
+        return;
+    };
+    if status.version != env!("CARGO_PKG_VERSION") || status.protocol_version != PROTOCOL_VERSION {
+        eprintln!(
+            "warning: lterm client {} (protocol {}) is talking to daemon {} (protocol {}); run `lterm shutdown` and retry after upgrades",
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            status.version,
+            status.protocol_version
+        );
+    }
 }
 
 fn rotate_log_if_large(log: &Path) -> Result<()> {
@@ -283,6 +312,8 @@ pub struct ProcessInfo {
     pub depth: usize,
     pub pid: u32,
     pub ppid: u32,
+    pub process_group_id: Option<i32>,
+    pub orphan: bool,
     pub stat: String,
     pub cpu_percent: f32,
     pub mem_percent: f32,
@@ -291,7 +322,7 @@ pub struct ProcessInfo {
     pub command: String,
 }
 
-pub fn process_tree(target: Option<&str>) -> Result<Vec<ProcessInfo>> {
+pub fn process_tree(target: Option<&str>, include_orphans: bool) -> Result<Vec<ProcessInfo>> {
     let sessions = if let Some(target) = target {
         vec![info(target)?]
     } else {
@@ -311,10 +342,12 @@ pub fn process_tree(target: Option<&str>) -> Result<Vec<ProcessInfo>> {
 
     let mut builder = ProcessTreeBuilder::new(&by_parent, &by_pid);
     for session in sessions {
-        let Some(root) = session.process_id else {
-            continue;
-        };
-        builder.append(&session.name, &session.pane_id, root, 0);
+        if let Some(root) = session.process_id {
+            builder.append(&session.name, &session.pane_id, root, 0);
+        }
+        if include_orphans {
+            builder.append_orphans(&session, 1);
+        }
     }
     Ok(builder.into_processes())
 }
@@ -350,6 +383,8 @@ impl<'a> ProcessTreeBuilder<'a> {
                 depth,
                 pid: row.pid,
                 ppid: row.ppid,
+                process_group_id: Some(row.pgid),
+                orphan: false,
                 stat: row.stat.clone(),
                 cpu_percent: row.cpu_percent,
                 mem_percent: row.mem_percent,
@@ -365,6 +400,38 @@ impl<'a> ProcessTreeBuilder<'a> {
         }
     }
 
+    fn append_orphans(&mut self, session: &SessionInfo, depth: usize) {
+        let Some(process_group_id) = session.process_group_id else {
+            return;
+        };
+        let mut rows: Vec<_> = self
+            .by_pid
+            .values()
+            .filter(|row| row.pgid == process_group_id && !self.seen.contains(&row.pid))
+            .collect();
+        rows.sort_by_key(|row| row.pid);
+        for row in rows {
+            if !self.seen.insert(row.pid) {
+                continue;
+            }
+            self.processes.push(ProcessInfo {
+                session: session.name.clone(),
+                pane_id: session.pane_id.clone(),
+                depth,
+                pid: row.pid,
+                ppid: row.ppid,
+                process_group_id: Some(row.pgid),
+                orphan: true,
+                stat: row.stat.clone(),
+                cpu_percent: row.cpu_percent,
+                mem_percent: row.mem_percent,
+                rss_kib: row.rss_kib,
+                elapsed: row.elapsed.clone(),
+                command: row.command.clone(),
+            });
+        }
+    }
+
     fn into_processes(self) -> Vec<ProcessInfo> {
         self.processes
     }
@@ -374,6 +441,7 @@ impl<'a> ProcessTreeBuilder<'a> {
 struct ProcessRow {
     pid: u32,
     ppid: u32,
+    pgid: i32,
     stat: String,
     cpu_percent: f32,
     mem_percent: f32,
@@ -384,7 +452,10 @@ struct ProcessRow {
 
 fn read_process_table() -> Result<Vec<ProcessRow>> {
     let output = Command::new(ps_path()?)
-        .args(["-axo", "pid=,ppid=,stat=,%cpu=,%mem=,rss=,etime=,command="])
+        .args([
+            "-axo",
+            "pid=,ppid=,pgid=,stat=,%cpu=,%mem=,rss=,etime=,command=",
+        ])
         .output()
         .context("run ps")?;
     if !output.status.success() {
@@ -393,11 +464,11 @@ fn read_process_table() -> Result<Vec<ProcessRow>> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut rows = Vec::new();
     for line in text.lines() {
-        let fields: Vec<_> = line.split_whitespace().take(7).collect();
-        if fields.len() < 7 {
+        let fields: Vec<_> = line.split_whitespace().take(8).collect();
+        if fields.len() < 8 {
             continue;
         }
-        let Some(command_start) = nth_field_start(line, 7) else {
+        let Some(command_start) = nth_field_start(line, 8) else {
             continue;
         };
         let Some(pid) = parse_nonzero_u32(fields[0]) else {
@@ -406,23 +477,27 @@ fn read_process_table() -> Result<Vec<ProcessRow>> {
         let Some(ppid) = parse_u32(fields[1]) else {
             continue;
         };
-        let Some(cpu_percent) = parse_f32(fields[3]) else {
+        let Some(pgid) = parse_i32(fields[2]) else {
             continue;
         };
-        let Some(mem_percent) = parse_f32(fields[4]) else {
+        let Some(cpu_percent) = parse_f32(fields[4]) else {
             continue;
         };
-        let Some(rss_kib) = parse_u64(fields[5]) else {
+        let Some(mem_percent) = parse_f32(fields[5]) else {
+            continue;
+        };
+        let Some(rss_kib) = parse_u64(fields[6]) else {
             continue;
         };
         rows.push(ProcessRow {
             pid,
             ppid,
-            stat: fields[2].to_string(),
+            pgid,
+            stat: fields[3].to_string(),
             cpu_percent,
             mem_percent,
             rss_kib,
-            elapsed: fields[6].to_string(),
+            elapsed: fields[7].to_string(),
             command: line[command_start..].to_string(),
         });
     }
@@ -442,6 +517,10 @@ fn parse_nonzero_u32(value: &str) -> Option<u32> {
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
+    value.trim().parse().ok()
+}
+
+fn parse_i32(value: &str) -> Option<i32> {
     value.trim().parse().ok()
 }
 
