@@ -1,5 +1,7 @@
 use crate::paths;
-use crate::protocol::{DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo};
+use crate::protocol::{
+    DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
+};
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use libc::{c_int, mode_t};
@@ -178,6 +180,7 @@ struct Session {
     created_unix_ms: u128,
     process_id: Option<u32>,
     process_group_id: Option<i32>,
+    status_theme: Mutex<Option<StatusTheme>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -303,6 +306,7 @@ impl Session {
             attached_clients: lock(&self.subscribers).len(),
             process_id: self.process_id,
             process_group_id: self.process_group_id,
+            status_theme: *lock(&self.status_theme),
         }
     }
 
@@ -1290,6 +1294,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             parent_pane_id,
             parent_token,
             env,
+            status_theme,
             tmux,
         } => {
             let session = create_session(
@@ -1303,6 +1308,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     parent_pane_id,
                     parent_token,
                     env,
+                    status_theme,
                     tmux,
                 },
             )?;
@@ -1313,6 +1319,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cwd,
             parent_pane_id,
             parent_token,
+            status_theme,
         } => {
             let target = normalize_target(&target);
             if let Ok(session) = resolve_session(state, &target) {
@@ -1332,6 +1339,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     parent_pane_id,
                     parent_token,
                     env: HashMap::new(),
+                    status_theme,
                     tmux: false,
                 },
             )?;
@@ -1348,6 +1356,14 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
         }
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Rename { target, name } => Ok(Response::ok(rename_session(state, &target, name)?)),
+        Request::SetStatusTheme {
+            target,
+            status_theme,
+        } => Ok(Response::ok(set_status_theme(
+            state,
+            &target,
+            status_theme,
+        )?)),
         Request::Kill { target } => {
             let session = resolve_session(state, &target)?;
             terminate_session(state, &session);
@@ -1486,6 +1502,7 @@ struct NewSessionParams {
     parent_pane_id: Option<String>,
     parent_token: Option<String>,
     env: HashMap<String, String>,
+    status_theme: Option<StatusTheme>,
     tmux: bool,
 }
 
@@ -1580,6 +1597,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         created_unix_ms: now_unix_ms(),
         process_id: Some(process_id),
         process_group_id,
+        status_theme: Mutex::new(params.status_theme),
         child: Mutex::new(child),
         killer: Mutex::new(killer),
         master: Mutex::new(pair.master),
@@ -1969,6 +1987,17 @@ impl Drop for AttachSubscriptionGuard {
         // paths rely on this guard to prevent ghost subscribers.
         self.session.unsubscribe(self.subscriber_id);
     }
+}
+
+/// Updates status-bar metadata without touching the PTY or child process.
+fn set_status_theme(
+    state: &Arc<State>,
+    target: &str,
+    status_theme: Option<StatusTheme>,
+) -> Result<SessionInfo> {
+    let session = resolve_session(state, target)?;
+    *lock(&session.status_theme) = status_theme;
+    Ok(session.info())
 }
 
 /// Renames an existing session metadata entry without touching its PTY or child process.
@@ -3330,6 +3359,7 @@ mod tests {
             created_unix_ms: 0,
             process_id: None,
             process_group_id: None,
+            status_theme: Mutex::new(None),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             master: Mutex::new(pair.master),

@@ -637,6 +637,10 @@ fn help_shows_common_aliases() -> TestResult {
         "capture compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: theme]"),
+        "theme compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("Compatibility: lterm -a <target> is equivalent to lterm resume <target>."),
         "legacy -a shortcut was not discoverable in top-level help:\n{stdout}"
     );
@@ -915,6 +919,14 @@ fn help_describes_session_creation_arguments() -> TestResult {
             normalized.contains(tmux_description),
             "{command} help should describe the tmux compatibility flag:\n{stdout}"
         );
+        assert!(
+            normalized.contains("--status-theme <THEME>"),
+            "{command} help should show --status-theme:\n{stdout}"
+        );
+        assert!(
+            normalized.contains("Status bar theme stored on this session"),
+            "{command} help should describe --status-theme:\n{stdout}"
+        );
         if command == "run" {
             assert!(
                 !normalized.contains(" --tmux "),
@@ -940,7 +952,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             &[
                 "Session or pane target to resume",
                 "default: %0",
-                "Disable the blue lterm status bar while attached",
+                "Disable the lterm status bar while attached",
             ][..],
         ),
         (
@@ -948,7 +960,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             &[
                 "Session or pane target to resume",
                 "default: %0",
-                "Disable the blue lterm status bar while attached",
+                "Disable the lterm status bar while attached",
             ][..],
         ),
         (
@@ -972,6 +984,20 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
             &[
                 "Session or pane target whose session metadata should be renamed",
                 "New session name for future target lookup",
+            ][..],
+        ),
+        (
+            "status-theme",
+            &[
+                "Session or pane target to update",
+                "Theme name, or `default` to use the attaching client's default",
+            ][..],
+        ),
+        (
+            "theme",
+            &[
+                "Session or pane target to update",
+                "Theme name, or `default` to use the attaching client's default",
             ][..],
         ),
         (
@@ -1309,6 +1335,76 @@ fn start_and_new_short_name_list_aliases_work() -> TestResult {
         let captured = env.capture_until(name, marker)?;
         assert!(captured.contains(marker), "missing output: {captured}");
     }
+
+    Ok(())
+}
+
+#[test]
+fn status_theme_is_stored_and_mutable_per_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let create = env
+        .cmd()
+        .args([
+            "start",
+            "--detach",
+            "--name",
+            "themed",
+            "--status-color",
+            "green",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 60",
+        ])
+        .output()?;
+    assert!(create.status.success(), "{create:?}");
+
+    let sessions_json = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions_json.status.success(), "{sessions_json:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions_json.stdout)?;
+    let themed = sessions
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some("themed"))
+        })
+        .ok_or_else(|| format!("missing themed session: {sessions:?}"))?;
+    assert_eq!(
+        themed
+            .get("status_theme")
+            .and_then(serde_json::Value::as_str),
+        Some("green"),
+        "session JSON should expose the stored status theme: {sessions:?}"
+    );
+
+    let update = env.cmd().args(["status-theme", "themed", "red"]).output()?;
+    assert!(update.status.success(), "{update:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&update.stdout).trim(),
+        "themed	%0	red"
+    );
+
+    let clear = env.cmd().args(["theme", "themed", "default"]).output()?;
+    assert!(clear.status.success(), "{clear:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&clear.stdout).trim(),
+        "themed	%0	default"
+    );
+
+    let sessions_json = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions_json.status.success(), "{sessions_json:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions_json.stdout)?;
+    let themed = sessions
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some("themed"))
+        })
+        .ok_or_else(|| format!("missing themed session after clear: {sessions:?}"))?;
+    assert!(
+        themed.get("status_theme").is_none(),
+        "default theme should be omitted from JSON: {sessions:?}"
+    );
 
     Ok(())
 }

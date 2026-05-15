@@ -47,9 +47,12 @@ enum Commands {
         /// Create the session without attaching to it.
         #[arg(short = 'd', long)]
         detach: bool,
-        /// Disable the blue lterm status bar while attached.
+        /// Disable the lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
+        /// Status bar theme stored on this session (alias: --status-color).
+        #[arg(long, alias = "status-color", value_name = "THEME", value_parser = parse_status_theme_arg)]
+        status_theme: Option<protocol::StatusTheme>,
         /// Shell command to run in the session; defaults to the user's shell when omitted.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -67,9 +70,12 @@ enum Commands {
         /// Disable the lterm tmux compatibility shim for this run session (enabled by default).
         #[arg(long)]
         no_tmux: bool,
-        /// Disable the blue lterm status bar while attached.
+        /// Disable the lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
+        /// Status bar theme stored on this session (alias: --status-color).
+        #[arg(long, alias = "status-color", value_name = "THEME", value_parser = parse_status_theme_arg)]
+        status_theme: Option<protocol::StatusTheme>,
         /// Required shell command to run in the tmux-compatible session.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -80,7 +86,7 @@ enum Commands {
         /// Session or pane target to resume.
         #[arg(default_value = "%0")]
         target: String,
-        /// Disable the blue lterm status bar while attached.
+        /// Disable the lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
     },
@@ -90,7 +96,7 @@ enum Commands {
         /// Session or pane target to attach or create.
         #[arg(default_value = "main")]
         target: String,
-        /// Disable the blue lterm status bar while attached.
+        /// Disable the lterm status bar while attached.
         #[arg(long)]
         no_status: bool,
     },
@@ -138,6 +144,14 @@ enum Commands {
         target: String,
         /// New session name for future target lookup.
         name: String,
+    },
+    /// Set or clear the stored status bar theme for an existing session.
+    #[command(name = "status-theme", visible_alias = "theme")]
+    StatusTheme {
+        /// Session or pane target to update.
+        target: String,
+        /// Theme name, or `default` to use the attaching client's default.
+        theme: String,
     },
     /// Write text to a session or pane.
     #[command(name = "input", visible_alias = "send")]
@@ -280,13 +294,14 @@ fn run() -> Result<()> {
             tmux,
             detach,
             no_status,
+            status_theme,
             command,
         } => {
             if tmux {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?;
-            let info = client::new_session(name, command, cwd, HashMap::new(), tmux)?;
+            let info = client::new_session(name, command, cwd, HashMap::new(), status_theme, tmux)?;
             if detach {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())
@@ -302,6 +317,7 @@ fn run() -> Result<()> {
             tmux: _,
             no_tmux,
             no_status,
+            status_theme,
             command,
         } => {
             let tmux = !no_tmux;
@@ -309,7 +325,8 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?.context("run requires a command")?;
-            let info = client::new_session(name, Some(command), cwd, HashMap::new(), tmux)?;
+            let info =
+                client::new_session(name, Some(command), cwd, HashMap::new(), status_theme, tmux)?;
             client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
         }
         Commands::Resume { target, no_status } => {
@@ -390,6 +407,17 @@ fn run() -> Result<()> {
                 "{}\t{}",
                 sanitize::terminal_text(&info.name),
                 sanitize::terminal_text(&info.pane_id)
+            );
+            Ok(())
+        }
+        Commands::StatusTheme { target, theme } => {
+            let status_theme = parse_status_theme_setting(&theme)?;
+            let info = client::set_status_theme(&target, status_theme)?;
+            println!(
+                "{}\t{}\t{}",
+                sanitize::terminal_text(&info.name),
+                sanitize::terminal_text(&info.pane_id),
+                format_status_theme(info.status_theme)
             );
             Ok(())
         }
@@ -624,6 +652,32 @@ fn normalize_command(mut command: Vec<String>) -> Result<Option<String>> {
     }
 }
 
+fn parse_status_theme_arg(value: &str) -> std::result::Result<protocol::StatusTheme, String> {
+    protocol::StatusTheme::parse(value).ok_or_else(|| {
+        format!(
+            "invalid status theme {value:?}; expected one of: {}",
+            protocol::StatusTheme::allowed_values()
+        )
+    })
+}
+
+fn parse_status_theme_setting(value: &str) -> Result<Option<protocol::StatusTheme>> {
+    let trimmed = value.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "default" | "clear" | "none"
+    ) {
+        return Ok(None);
+    }
+    parse_status_theme_arg(trimmed)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
+}
+
+fn format_status_theme(theme: Option<protocol::StatusTheme>) -> &'static str {
+    theme.map_or("default", protocol::StatusTheme::as_str)
+}
+
 fn collapse_aliases(mut sessions: Vec<protocol::SessionInfo>) -> Vec<protocol::SessionInfo> {
     sessions.sort_by_key(|session| session.created_unix_ms);
     let mut seen = std::collections::HashSet::new();
@@ -735,6 +789,9 @@ struct AgentLaunchOptions {
     /// Disable the lterm status bar while attached.
     #[arg(long, conflicts_with = "status")]
     no_status: bool,
+    /// Status bar theme stored on this agent session (alias: --status-color).
+    #[arg(long, alias = "status-color", value_name = "THEME", value_parser = parse_status_theme_arg)]
+    status_theme: Option<protocol::StatusTheme>,
 }
 
 impl AgentLaunchOptions {
@@ -758,6 +815,10 @@ impl AgentLaunchOptions {
         } else {
             default
         }
+    }
+
+    fn status_theme(&self) -> Option<protocol::StatusTheme> {
+        self.status_theme
     }
 }
 
@@ -1050,6 +1111,7 @@ fn run_agent_profile(
             Some(command.clone()),
             launch.cwd().map(str::to_string),
             env,
+            launch.status_theme(),
             true,
         );
         match created {
@@ -1562,6 +1624,7 @@ mod tests {
             attached_clients: 0,
             process_id: None,
             process_group_id: None,
+            status_theme: None,
         });
         assert_eq!(line.matches('\t').count(), 2, "{line:?}");
         assert!(line.ends_with('\n'), "{line:?}");

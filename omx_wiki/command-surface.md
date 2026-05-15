@@ -18,6 +18,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | none |
+| Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session or pane | `lterm close api` | `kill` |
@@ -56,6 +57,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - Remote `lterm ssh` currently keeps its wire command on compatibility spelling where needed so newer local clients can talk to older remote installs.
 - cmux split handoff intentionally sends compatibility `lterm attach <pane>` so stale `LTERM_BIN` builds that predate `resume` still work.
 - `doctor` / `status` does not start a missing daemon; it reports the current socket, version/protocol compatibility, and shim/PATH state.
+- `status-theme` / `theme` updates stored status-bar metadata only; it must not restart or resize the PTY, mutate the child process environment, or sanitize attached PTY bytes.
 - `processes --orphans` includes same-process-group rows that are no longer descendants of the recorded session root, and text/JSON rows expose process-group ids.
 
 ## tmux-compat boundary
@@ -86,7 +88,7 @@ inside those values are not reinterpreted.
 
 After changing wire-protocol behavior, restart any already-running daemon before
 depending on that behavior; old daemon processes continue running old code until
-stopped.
+stopped. Status-theme metadata is wire-protocol v2 behavior.
 
 Parser strictness follows tmux more closely for value-taking options: for example,
 `new-session -s`/`-c` and `resize-pane -x`/`-y` now report missing or invalid
