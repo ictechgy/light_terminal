@@ -70,7 +70,7 @@ shell startup files without showing you the change.
 With Cargo from GitHub (use the latest tag from the Releases page):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.2
+cargo install --git https://github.com/ictechgy/light_terminal --tag v0.1.3
 ```
 
 From this checkout, use Rust 1.85 or newer:
