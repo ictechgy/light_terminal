@@ -177,6 +177,35 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` 으로 attach client의 기본 status bar 색을 바꿀 수 있습니다. 세션별 override가 환경값보다 우선합니다: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, `lterm status-theme api plain`. 이 변수를 shell startup 파일에서 export하면 SSH attach도 colored status bar로 opt-in됩니다. 모바일 SSH client에서 plain text가 필요하면 unset하거나 `LTERM_STATUS_STYLE=minimal`을 설정하세요. Theme 이름은 고정 allowlist에서만 파싱되며, lterm은 사용자 입력 escape sequence를 status row에 임의 삽입하지 않습니다.
 
+### Status bar 커스터마이징
+
+Status bar theme은 v0.1.3에서 추가되었습니다. 이 기능은 metadata만 바꿉니다. Theme을 바꿔도 PTY가 재시작되지 않고, attach된 PTY byte stream도 바꾸거나 정제하지 않으며, 사용자 입력으로 임의 terminal escape sequence를 status row에 넣지 않습니다.
+
+원하는 범위에 맞춰 가장 좁은 설정을 사용하세요:
+
+| 범위 | 예시 | 언제 쓰나요 |
+| --- | --- | --- |
+| 새 세션 1개 | `lterm start --status-theme green -n api -- npm run dev` | service나 agent 세션을 이후 attach에서도 쉽게 구분하고 싶을 때. |
+| 기존 세션 | `lterm status-theme api amber` | 실행 중인 process를 재시작하지 않고 색만 바꿀 때. |
+| Agent launcher 세션 | `lterm codex --status --status-color cyan -- exec "summarize"` | long-only launcher 옵션을 유지하면서 agent 세션에 지속 색상을 줄 때. |
+| Attach client 기본값 | `export LTERM_STATUS_THEME=magenta` | 세션 override가 없는 session의 기본 색을 바꾸고 싶을 때. |
+| Plain/minimal client | `export LTERM_STATUS_STYLE=minimal` | 모바일 SSH client나 색상 매핑이 불안한 terminal에서 text-only status를 선호할 때. |
+
+허용되는 theme은 고정 목록입니다:
+
+| Theme | 추천 용도 |
+| --- | --- |
+| `blue` | 로컬 status bar 기본값. |
+| `green` | 오래 실행되는 service 또는 정상/background 작업. |
+| `magenta` | 빠르게 구분하고 싶은 agent 또는 review 세션. |
+| `cyan` | build/test/dev-tool 세션. |
+| `amber` | 주의가 필요한 watch/diagnostic 세션. |
+| `red` | 위험하거나 destructive이거나 production에 가까운 세션. |
+| `gray` | 낮은 우선순위의 background 세션. |
+| `plain` | 색상 bar 없이 status row만 유지하고 싶을 때. |
+
+세션 override는 `lterm status-theme api default`(또는 `clear` / `none`)로 지웁니다. 이미 attach된 client는 detach 후 reattach할 때 새 색이 반영되므로, 사람이 붙어 있는 동안 scripted 변경을 적용해도 안전합니다.
+
 attach된 PTY가 alternate screen buffer로 진입하면(예: `vim`, `less`, `htop`이 `\x1b[?1049h` 사용) lterm은 status bar를 일시 중단해 alt-screen 앱의 UI와 충돌을 피합니다. 앱이 alt-screen을 종료하는 즉시 status bar가 다시 그려집니다.
 
 `lterm resume` / `lterm attach` 도중 panic이나 abort가 발생해도 process-wide hook이 최소 복구 sequence(scroll region 리셋, 커서 보이기, alt-screen 종료, SGR 리셋)를 emit해 사용자 터미널이 raw mode나 hidden cursor 상태로 남지 않습니다.

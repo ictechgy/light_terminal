@@ -177,6 +177,35 @@ Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visu
 
 Set `LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` to change the default colored status bar for the attaching client. Per-session overrides win over the environment: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, or `lterm status-theme api plain`. If you export this variable from shell startup files, it also opts SSH attaches into colored status bars; leave it unset or set `LTERM_STATUS_STYLE=minimal` on mobile SSH clients that need plain text. Theme names are parsed from a fixed allowlist; lterm never injects arbitrary user-provided terminal escape sequences into the status row.
 
+### Status bar customization
+
+Status bar themes were added in v0.1.3. They are metadata-only: changing a theme never restarts the PTY, never changes the attached PTY byte stream, and never accepts arbitrary terminal escape sequences from user input.
+
+Use the narrowest scope that matches what you want:
+
+| Scope | Example | When to use it |
+| --- | --- | --- |
+| One new session | `lterm start --status-theme green -n api -- npm run dev` | Keep a service or agent session recognizable across future attaches. |
+| Existing session | `lterm status-theme api amber` | Recolor a running session without restarting its process. |
+| Agent launcher session | `lterm codex --status --status-color cyan -- exec "summarize"` | Give an agent-owned session a persistent color while preserving long-only launcher controls. |
+| Attaching client default | `export LTERM_STATUS_THEME=magenta` | Change the default for sessions that do not have their own override. |
+| Plain/minimal clients | `export LTERM_STATUS_STYLE=minimal` | Prefer text-only status on mobile SSH clients or terminals with fragile color mapping. |
+
+Allowed themes are intentionally fixed:
+
+| Theme | Good fit |
+| --- | --- |
+| `blue` | Default local status bar. |
+| `green` | Long-running services or healthy/background tasks. |
+| `magenta` | Agent or review sessions you want to spot quickly. |
+| `cyan` | Build/test/dev-tool sessions. |
+| `amber` | Watch/diagnostic sessions that need attention. |
+| `red` | Risky, destructive, or production-adjacent sessions. |
+| `gray` | Low-priority background sessions. |
+| `plain` | No colored bar; useful when ANSI colors are distracting but the status row is still helpful. |
+
+Reset a session override with `lterm status-theme api default` (or `clear` / `none`). Already-attached clients keep their current rendered color until detach/reattach, so scripted changes are safe to apply while a human is attached.
+
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
 
 If `lterm resume` / `lterm attach` panics or aborts mid-session, a process-wide hook emits a minimal recovery sequence (scroll region reset, cursor visible, alt-screen exit, SGR reset) so the user's terminal isn't left in raw mode or with hidden cursor.
