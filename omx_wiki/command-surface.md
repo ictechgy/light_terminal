@@ -92,7 +92,8 @@ inside those values are not reinterpreted.
 After changing wire-protocol behavior, restart any already-running daemon before
 depending on that behavior; old daemon processes continue running old code until
 stopped. Status-theme metadata is wire-protocol v2 behavior. Server-side
-`wait --exit` / `watch --exit` is wire-protocol v3 behavior.
+`wait` / `watch` observation, including `--exit` and `--contains`, is
+wire-protocol v3 behavior.
 
 Parser strictness follows tmux more closely for value-taking options: for example,
 `new-session -s`/`-c` and `resize-pane -x`/`-y` now report missing or invalid
