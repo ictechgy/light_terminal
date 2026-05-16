@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_soak_release_gate:
+        description: "Run the 15-minute pre-tag soak release gate"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  rust-standard-checks:
+    name: rust-standard-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
+      - name: Format check
+        run: cargo fmt -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test -- --test-threads=1
+      - name: Release build
+        run: cargo build --release --locked
+
+  contract-manifest-validate:
+    name: contract-manifest-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate public contract manifest
+        run: python3 scripts/validate_contract_manifest.py docs/contract-manifest.json
+
+  json-schema-validate:
+    name: json-schema-validate
+    runs-on: ubuntu-latest
+    needs: contract-manifest-validate
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build lterm for schema samples
+        run: cargo build --locked
+      - name: Validate stable JSON schemas
+        run: python3 scripts/validate_json_schemas.py --manifest docs/contract-manifest.json --schema-dir docs/schemas --lterm-bin target/debug/lterm
+
+  contract-examples:
+    name: contract-examples
+    runs-on: ubuntu-latest
+    needs: json-schema-validate
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build lterm for contract examples
+        run: cargo build --locked
+      - name: Run manifest-listed contract examples
+        env:
+          LTERM_BIN: ${{ github.workspace }}/target/debug/lterm
+        run: python3 scripts/check_contract_examples.py --manifest docs/contract-manifest.json README.md docs/public-contract.md
+
+  upgrade-matrix:
+    name: upgrade-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run v0.1.4 compatibility matrix
+        run: cargo test --test upgrade_matrix -- --nocapture --test-threads=1
+
+  soak-release-gate:
+    name: soak-release-gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_soak_release_gate
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run 15-minute soak profile
+        run: LTERM_SOAK_DURATION=900 LTERM_SOAK_SESSIONS=16 cargo test --test soak -- --ignored --nocapture --test-threads=1

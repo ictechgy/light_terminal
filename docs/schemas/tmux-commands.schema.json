@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm tmux-compat list-commands --json output",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["name", "alias", "aliases", "usage", "support"],
+    "properties": {
+      "name": { "type": "string", "minLength": 1 },
+      "alias": { "type": ["string", "null"] },
+      "aliases": { "type": "array", "items": { "type": "string" } },
+      "usage": { "type": "string" },
+      "support": { "type": "string", "enum": ["full", "partial", "noop"] }
+    },
+    "additionalProperties": false
+  }
+}

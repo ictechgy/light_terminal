@@ -1,0 +1,120 @@
+# lterm 1.0 Public Contract
+
+This document defines the public command and output contract intended for the
+`lterm` 1.x release line. The machine-readable source of truth is
+[`docs/contract-manifest.json`](contract-manifest.json); this page explains the
+stability classes, raw-stream boundary, and command surface in human terms.
+
+## Stability classes
+
+The 1.0 contract separates command stability from tmux compatibility breadth.
+A command can be stable as an `lterm` product command while still implementing
+only a small tmux-compatible subset.
+
+| Class | Meaning |
+| --- | --- |
+| `stable` | Product behavior promised across 1.x unless it is deprecated first. |
+| `compatibility-stable` | Documented tmux-compatible subset or no-op compatibility behavior that is intentionally supported. |
+| `best-effort` | Useful behavior that may change as integrations evolve. |
+| `internal` | Implementation detail, not a promised user-facing API. |
+| `explicit-raw-unsafe` | Attached PTY stream behavior that is transparent and intentionally unsanitized. |
+
+Output stability is tracked separately for text and JSON. Stable JSON outputs
+must have a schema path in the manifest; schema files and schema validation are
+owned by the JSON-schema validation lane. Text output stability applies to the
+shape and documented fields, not to user-controlled PTY content.
+
+## Sanitization and raw PTY boundary
+
+Attached PTY streams are raw by design. `lterm resume`, compatibility aliases
+such as `lterm attach` / `lterm a` / `lterm -a`, `lterm open`, default attached
+`lterm start`, `lterm run`, profiled agent launchers, and `lterm ssh` forward PTY
+bytes without escape-sequence sanitization. This preserves full-screen programs,
+OSC notifications, cmux passthrough, and shell behavior, but it also means
+untrusted programs can emit terminal escape sequences to the attaching terminal.
+Do not use attached `lterm` streams as a sanitizer or sandbox.
+
+Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
+`wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
+surfaces sanitize terminal controls before printing human- or machine-readable
+reports. Sanitization belongs only to these non-attached surfaces; adding
+sanitization to attach/resume would violate the 1.0 contract.
+
+## Product command surface
+
+| Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
+| --- | --- | --- | --- | --- | --- |
+| `lterm start` | `lterm new` | `stable` | `stable` for `--detach`; attached stream is raw | none | `raw-transparent` when attached |
+| `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
+| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
+| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
+| `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
+| `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
+| `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
+| `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
+| `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
+| `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
+| `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
+| `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
+| `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
+| `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |
+| `lterm daemon` | none | `internal` | none | none | `not-applicable` |
+| `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
+
+## Utility and integration surface
+
+| Command | Aliases | Classification | Contract notes |
+| --- | --- | --- | --- |
+| `lterm install-shim` | none | `stable` | Installs/prints the tmux shim path; text is sanitized. |
+| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; quote style is not a stable visual API. |
+| `lterm notify` | none | `best-effort` | Tries `cmux notify`, then emits sanitized OSC 777 fallback output. |
+| `lterm ssh` | none | `explicit-raw-unsafe` | Uses SSH to run a remote attach-or-new command; remote PTY bytes are unsanitized. |
+| `lterm agents` | none | `stable` | Reports built-in/configured/custom agent launcher profile availability. |
+| `lterm agent` | `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | Launcher controls are public, but the attached agent PTY stream is raw and the external agent CLI behavior is outside the lterm contract. |
+
+## tmux compatibility boundary
+
+`lterm tmux-compat ...` is a compatibility shim namespace for scripts that already
+speak tmux. It is not a second spelling for every product command. The stable
+contract is the documented subset exposed by `lterm tmux-compat list-commands`
+and the focused compatibility docs. Its support tiers (`full`, `partial`, and
+`noop`) describe tmux-shim coverage only; they do not replace the 1.0 stability
+classes above.
+
+The manifest classifies `lterm tmux-compat list-commands` as
+`compatibility-stable`. Individual shim commands keep their behavior within the
+subset documented in the README and wiki, while unsupported tmux commands remain
+outside the 1.0 contract unless later added to the manifest.
+
+## Manifest-listed examples
+
+The following examples are intentionally listed in
+`docs/contract-manifest.json` and executed by the contract example gate. They are
+kept side-effect-light so CI can run them with isolated `LTERM_RUNTIME_DIR` and
+`LTERM_DATA_DIR` values.
+
+```bash
+lterm install-shim
+lterm sessions --json
+lterm doctor --json
+lterm shutdown
+lterm notify --title 'Task complete' --body 'All checks passed'
+lterm agents --json
+lterm tmux-compat list-commands --json
+```
+
+## Non-blocking P1 surfaces
+
+Shell completions and agent workflow cookbook recipes are useful follow-up work,
+but they are not 1.0 release blockers unless a future manifest change explicitly
+adds a completion or recipe surface as stable. Cookbook examples should not be
+used as release-gate contract examples unless they are manifest-promoted.
+
+## Release evidence
+
+Before tagging `v1.0.0`, attach a verification transcript to the release notes or
+release checklist. The transcript should include the standard Rust checks,
+manifest/schema/example validation, the required upgrade matrix, the release-gate
+soak profile, and dependency audit evidence. This docs lane defines the public
+contract; the validation, upgrade, soak, and security lanes own their respective
+implementation evidence.

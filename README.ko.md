@@ -14,6 +14,7 @@
 `lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, terminal-first agent 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.
 
 > **보안 모델:** `lterm`은 같은 OS 사용자 안에서 쓰는 편의용 데몬이며 샌드박스가 아닙니다. 다른 사용자의 Unix socket 접근은 거부하고 런타임 디렉터리는 소유자 전용 권한으로 만들지만, 같은 OS 사용자 권한으로 실행되는 프로세스는 세션을 제어할 수 있다고 보아야 합니다.
+> 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 
 ## 왜 tmux 대신 lterm인가요?
 
