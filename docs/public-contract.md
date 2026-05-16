@@ -24,6 +24,12 @@ must have a schema path in the manifest; schema files and schema validation are
 owned by the JSON-schema validation lane. Text output stability applies to the
 shape and documented fields, not to user-controlled PTY content.
 
+For mixed commands, the manifest's `surface_contracts` field is the
+authoritative stability boundary for each output surface. For example,
+`lterm start` has a stable detached summary row, but its default attached PTY
+stream is raw and has no sanitized text contract. `lterm env` stability covers
+the shell-evaluable exports and variable names, not the exact visual quote style.
+
 ## Sanitization and raw PTY boundary
 
 Attached PTY streams are raw by design. `lterm resume`, compatibility aliases
@@ -44,7 +50,7 @@ sanitization to attach/resume would violate the 1.0 contract.
 
 | Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
 | --- | --- | --- | --- | --- | --- |
-| `lterm start` | `lterm new` | `stable` | `stable` for `--detach`; attached stream is raw | none | `raw-transparent` when attached |
+| `lterm start` | `lterm new` | `stable` | `best-effort` at command level; `stable` for the `--detach` summary row; attached stream is raw | none | `raw-transparent` when attached |
 | `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
 | `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
 | `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
@@ -66,7 +72,7 @@ sanitization to attach/resume would violate the 1.0 contract.
 | Command | Aliases | Classification | Contract notes |
 | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | Installs/prints the tmux shim path; text is sanitized. |
-| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; quote style is not a stable visual API. |
+| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; shell-eval semantics are stable, quote style is not a stable visual API. |
 | `lterm notify` | none | `best-effort` | Tries `cmux notify`, then emits sanitized OSC 777 fallback output. |
 | `lterm ssh` | none | `explicit-raw-unsafe` | Uses SSH to run a remote attach-or-new command; remote PTY bytes are unsanitized. |
 | `lterm agents` | none | `stable` | Reports built-in/configured/custom agent launcher profile availability. |

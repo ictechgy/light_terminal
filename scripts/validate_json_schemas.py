@@ -113,8 +113,26 @@ def validate_value(value: Json, schema: Json, schema_dir: Path, store: dict[str,
         return [f"{path}: schema must be an object"]
     if "$ref" in schema:
         return validate_value(value, resolve_ref(schema["$ref"], schema_dir, store), schema_dir, store, path)
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path}: expected const {schema['const']!r}, got {value!r}")
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: {value!r} not in enum {schema['enum']!r}")
+    if "oneOf" in schema:
+        variants = schema["oneOf"]
+        if not isinstance(variants, list) or not variants:
+            errors.append(f"{path}: schema oneOf must be a non-empty array")
+        else:
+            matches = 0
+            variant_summaries: list[str] = []
+            for variant_index, variant in enumerate(variants):
+                variant_errors = validate_value(value, variant, schema_dir, store, path)
+                if variant_errors:
+                    variant_summaries.append(f"branch {variant_index}: {'; '.join(variant_errors)}")
+                else:
+                    matches += 1
+            if matches != 1:
+                detail = "; ".join(variant_summaries[:3])
+                errors.append(f"{path}: expected exactly one oneOf branch to match, matched {matches}" + (f"; {detail}" if detail else ""))
     if "type" in schema:
         expected = schema["type"]
         expected_types = expected if isinstance(expected, list) else [expected]

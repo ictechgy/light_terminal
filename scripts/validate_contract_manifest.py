@@ -151,11 +151,18 @@ def enum_check(label: str, entry: dict[str, Any], field: str, allowed: set[str])
 
 def validate_surface_contracts(label: str, surfaces: list[Any]) -> list[str]:
     errors: list[str] = []
+    seen_names: set[str] = set()
     for index, surface in enumerate(surfaces):
         surface_label = f"{label}.surface_contracts[{index}]"
         if not isinstance(surface, dict):
             errors.append(f"{surface_label}: surface contract must be an object")
             continue
+        name = str(surface.get("surface") or surface.get("name") or surface.get("id") or "")
+        if name:
+            if name in seen_names:
+                errors.append(f"{surface_label}: duplicate surface contract name {name!r}")
+            else:
+                seen_names.add(name)
         if "classification" in surface and surface["classification"] not in CLASSIFICATIONS:
             errors.append(f"{surface_label}: invalid classification {surface['classification']!r}")
         if "raw_stream_policy" in surface and surface["raw_stream_policy"] not in RAW_POLICIES:

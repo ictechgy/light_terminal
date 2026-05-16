@@ -25,7 +25,7 @@
       "aliases": [
         "lterm new"
       ],
-      "text_output_stability": "stable",
+      "text_output_stability": "best-effort",
       "json_output_stability": "none",
       "schema_path": null,
       "tests": [
@@ -52,7 +52,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "Top-level text stability is conservative for the mixed attach/detach command; the detached-summary-row surface is stable, while the attached raw-pty-stream has no stable sanitized text contract."
     },
     {
       "command": "lterm run",
@@ -106,14 +107,6 @@
           "schema_path": null
         },
         {
-          "name": "raw-pty-stream",
-          "classification": "explicit-raw-unsafe",
-          "raw_stream_policy": "raw-transparent",
-          "text_output_stability": "none",
-          "json_output_stability": "none",
-          "schema_path": null
-        },
-        {
           "name": "local-status-bar",
           "classification": "best-effort",
           "raw_stream_policy": "not-applicable",
@@ -138,14 +131,6 @@
       "classification": "explicit-raw-unsafe",
       "raw_stream_policy": "raw-transparent",
       "surface_contracts": [
-        {
-          "name": "raw-pty-stream",
-          "classification": "explicit-raw-unsafe",
-          "raw_stream_policy": "raw-transparent",
-          "text_output_stability": "none",
-          "json_output_stability": "none",
-          "schema_path": null
-        },
         {
           "name": "raw-pty-stream",
           "classification": "explicit-raw-unsafe",
@@ -382,7 +367,8 @@
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
-      "raw_stream_policy": "sanitized-output-only"
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Stable shell-eval semantics and exported variable names; exact quote style and visual formatting are not stable."
     },
     {
       "command": "lterm notify",

@@ -35,6 +35,7 @@ impl TestEnv {
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+        cmd.env_remove("LTERM_SOCKET");
         cmd.env("LTERM_RUNTIME_DIR", self.temp.path().join("run"));
         cmd.env("LTERM_DATA_DIR", self.temp.path().join("data"));
         cmd

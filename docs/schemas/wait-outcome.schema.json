@@ -3,6 +3,20 @@
   "title": "lterm wait/watch --json output",
   "type": "object",
   "required": ["target", "event", "matched", "timed_out", "elapsed_ms"],
+  "oneOf": [
+    {
+      "required": ["exited", "exit_code"],
+      "properties": {
+        "event": { "const": "exit" }
+      }
+    },
+    {
+      "required": ["needle"],
+      "properties": {
+        "event": { "const": "contains" }
+      }
+    }
+  ],
   "properties": {
     "target": { "type": "string", "minLength": 1 },
     "event": { "type": "string", "enum": ["exit", "contains"] },

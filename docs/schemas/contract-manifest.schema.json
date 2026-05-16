@@ -69,6 +69,7 @@
           "type": "array",
           "items": { "$ref": "#/definitions/surface_contract" }
         },
+        "stability_scope": { "type": "string", "minLength": 1 },
         "json_samples": {
           "type": "array",
           "items": { "$ref": "#/definitions/json_sample" }
