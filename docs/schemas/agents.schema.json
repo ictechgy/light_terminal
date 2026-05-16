@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm agents --json output",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["profile", "kind", "binary", "session_base", "status_default", "available", "path"],
+    "properties": {
+      "profile": { "type": "string", "minLength": 1 },
+      "kind": { "type": "string", "enum": ["built-in", "custom", "configured"] },
+      "binary": { "type": "string", "minLength": 1 },
+      "session_base": { "type": "string", "minLength": 1 },
+      "status_default": { "type": "boolean" },
+      "available": { "type": "boolean" },
+      "path": { "type": ["string", "null"] }
+    },
+    "additionalProperties": false
+  }
+}

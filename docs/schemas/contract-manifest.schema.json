@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ictechgy/light_terminal/docs/schemas/contract-manifest.schema.json",
+  "title": "lterm 1.0 public contract manifest",
+  "type": "object",
+  "required": ["schema_version", "release", "source_of_truth", "policy", "required_entry_fields", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "minLength": 1 },
+    "release": { "type": "string", "minLength": 1 },
+    "source_of_truth": { "const": "docs/contract-manifest.json" },
+    "policy": {
+      "type": "object",
+      "required": [
+        "stable_json_requires_schema",
+        "raw_attach_streams_are_unsanitized",
+        "report_surfaces_are_sanitized",
+        "p1_cookbook_and_completions_are_non_blocking_unless_manifest_promoted"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stable_json_requires_schema": { "type": "boolean" },
+        "raw_attach_streams_are_unsanitized": { "type": "boolean" },
+        "report_surfaces_are_sanitized": { "type": "boolean" },
+        "p1_cookbook_and_completions_are_non_blocking_unless_manifest_promoted": { "type": "boolean" }
+      }
+    },
+    "required_entry_fields": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/entry" }
+    }
+  },
+  "definitions": {
+    "stability": { "enum": ["stable", "best-effort", "none"] },
+    "classification": { "enum": ["stable", "compatibility-stable", "best-effort", "internal", "explicit-raw-unsafe"] },
+    "raw_stream_policy": { "enum": ["not-applicable", "raw-transparent", "sanitized-output-only"] },
+    "docs_owner": { "enum": ["README.md", "docs/public-contract.md", "docs/agent-install.md", "other"] },
+    "entry": {
+      "type": "object",
+      "required": [
+        "command",
+        "aliases",
+        "text_output_stability",
+        "json_output_stability",
+        "schema_path",
+        "tests",
+        "docs_owner",
+        "classification",
+        "raw_stream_policy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "aliases": { "type": "array", "items": { "type": "string" } },
+        "text_output_stability": { "$ref": "#/definitions/stability" },
+        "json_output_stability": { "$ref": "#/definitions/stability" },
+        "schema_path": { "type": ["string", "null"] },
+        "tests": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "docs_owner": { "$ref": "#/definitions/docs_owner" },
+        "classification": { "$ref": "#/definitions/classification" },
+        "raw_stream_policy": { "$ref": "#/definitions/raw_stream_policy" },
+        "surface_contracts": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/surface_contract" }
+        },
+        "stability_scope": { "type": "string", "minLength": 1 },
+        "json_samples": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/json_sample" }
+        },
+        "examples": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "example_timeout_seconds": { "type": "integer", "minimum": 1 },
+        "expected_exit_code": { "type": "integer" }
+      }
+    },
+    "surface_contract": {
+      "type": "object",
+      "required": [
+        "name",
+        "classification",
+        "raw_stream_policy",
+        "text_output_stability",
+        "json_output_stability",
+        "schema_path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "classification": { "$ref": "#/definitions/classification" },
+        "raw_stream_policy": { "$ref": "#/definitions/raw_stream_policy" },
+        "text_output_stability": { "$ref": "#/definitions/stability" },
+        "json_output_stability": { "$ref": "#/definitions/stability" },
+        "schema_path": { "type": ["string", "null"] }
+      }
+    },
+    "json_sample": {
+      "type": "object",
+      "required": ["argv"],
+      "additionalProperties": false,
+      "properties": {
+        "setup": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm processes --json output",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "session",
+      "pane_id",
+      "depth",
+      "pid",
+      "ppid",
+      "process_group_id",
+      "orphan",
+      "stat",
+      "cpu_percent",
+      "mem_percent",
+      "rss_kib",
+      "elapsed",
+      "command"
+    ],
+    "properties": {
+      "session": { "type": "string", "minLength": 1 },
+      "pane_id": { "type": "string", "pattern": "^%[0-9]+$" },
+      "depth": { "type": "integer", "minimum": 0 },
+      "pid": { "type": "integer", "minimum": 1 },
+      "ppid": { "type": "integer", "minimum": 0 },
+      "process_group_id": { "type": ["integer", "null"] },
+      "orphan": { "type": "boolean" },
+      "stat": { "type": "string" },
+      "cpu_percent": { "type": "number", "minimum": 0 },
+      "mem_percent": { "type": "number", "minimum": 0 },
+      "rss_kib": { "type": "integer", "minimum": 0 },
+      "elapsed": { "type": "string" },
+      "command": { "type": "string" }
+    },
+    "additionalProperties": false
+  }
+}

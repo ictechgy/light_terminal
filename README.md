@@ -14,6 +14,7 @@
 `lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by terminal-first agent tooling.
 
 > **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
+> See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 
 ## Why lterm instead of plain tmux?
 
@@ -66,6 +67,10 @@ Too lazy to install it manually? Copy the prompt in
 Gemini CLI, or another terminal coding agent. It asks the agent to detect your
 platform, install `lterm`, verify it with a smoke test, and avoid modifying
 shell startup files without showing you the change.
+
+For the 1.0 command/output stability boundary, see the
+[public contract](docs/public-contract.md) and its machine-readable
+[contract manifest](docs/contract-manifest.json).
 
 With Cargo from GitHub (use the latest tag from the Releases page):
 

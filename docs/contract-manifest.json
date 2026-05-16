@@ -1,0 +1,491 @@
+{
+  "schema_version": "1.0",
+  "release": "lterm-1.0.0",
+  "source_of_truth": "docs/contract-manifest.json",
+  "policy": {
+    "stable_json_requires_schema": true,
+    "raw_attach_streams_are_unsanitized": true,
+    "report_surfaces_are_sanitized": true,
+    "p1_cookbook_and_completions_are_non_blocking_unless_manifest_promoted": true
+  },
+  "required_entry_fields": [
+    "command",
+    "aliases",
+    "text_output_stability",
+    "json_output_stability",
+    "schema_path",
+    "tests",
+    "docs_owner",
+    "classification",
+    "raw_stream_policy"
+  ],
+  "entries": [
+    {
+      "command": "lterm start",
+      "aliases": [
+        "lterm new"
+      ],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke keeps_session_and_captures_output",
+        "cargo test --test cli_smoke new_attaches_by_default"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "detached-summary-row",
+          "classification": "stable",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "stable",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ],
+      "stability_scope": "Top-level text stability is conservative for the mixed attach/detach command; the detached-summary-row surface is stable, while the attached raw-pty-stream has no stable sanitized text contract."
+    },
+    {
+      "command": "lterm run",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke run_defaults_to_lterm_tmux_shim",
+        "cargo test --test cli_smoke run_no_tmux_does_not_inject_lterm_tmux_shim"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ]
+    },
+    {
+      "command": "lterm resume",
+      "aliases": [
+        "lterm attach",
+        "lterm a",
+        "lterm -a"
+      ],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke explicit_attach_detaches_on_stdin_eof",
+        "cargo test --test cli_smoke attach_short_aliases_detach_on_stdin_eof",
+        "cargo test --test cli_smoke attach_replays_screen_state_before_live_output"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "explicit-raw-unsafe",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "local-status-bar",
+          "classification": "best-effort",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ]
+    },
+    {
+      "command": "lterm open",
+      "aliases": [
+        "lterm attach-or-new"
+      ],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke open_and_attach_or_new_create_missing_session"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "explicit-raw-unsafe",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "create-if-missing-control",
+          "classification": "stable",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ]
+    },
+    {
+      "command": "lterm sessions",
+      "aliases": [
+        "lterm list",
+        "lterm ls"
+      ],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/sessions.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke start_and_new_short_name_list_aliases_work",
+        "cargo test --test cli_smoke help_describes_machine_readable_session_surfaces"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm sessions --json"
+      ]
+    },
+    {
+      "command": "lterm processes",
+      "aliases": [
+        "lterm ps"
+      ],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/processes.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke help_describes_machine_readable_session_surfaces",
+        "cargo test --test cli_smoke kill_reaps_session_process_group_children"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm rename",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke rename_existing_session_updates_targets",
+        "cargo test --test cli_smoke rename_rejects_conflicts_and_invalid_names_without_mutation"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm status-theme",
+      "aliases": [
+        "lterm theme"
+      ],
+      "text_output_stability": "stable",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke status_theme_is_stored_and_mutable_per_session"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm logs",
+      "aliases": [
+        "lterm capture"
+      ],
+      "text_output_stability": "stable",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke capture_alias_captures_output",
+        "cargo test --test cli_smoke logs_supports_inclusive_end_range",
+        "cargo test --test cli_smoke capture_strips_terminal_escape_sequences"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm wait",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/wait-outcome.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke wait_exit_json_reports_session_exit",
+        "cargo test --test cli_smoke wait_contains_succeeds_against_sanitized_capture_text",
+        "cargo test --test cli_smoke wait_contains_timeout_returns_nonzero_and_json_timeout_status"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm watch",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/wait-outcome.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke watch_exit_notify_invokes_cmux_with_sanitized_message",
+        "cargo test --test cli_smoke watch_json_notify_without_cmux_keeps_stdout_machine_readable"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only"
+    },
+    {
+      "command": "lterm input",
+      "aliases": [
+        "lterm send"
+      ],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke input_sends_text_to_pty",
+        "cargo test --test cli_smoke send_alias_sends_text_to_pty"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "not-applicable"
+    },
+    {
+      "command": "lterm close",
+      "aliases": [
+        "lterm kill"
+      ],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke close_kills_session",
+        "cargo test --test cli_smoke kill_alias_closes_session"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "not-applicable"
+    },
+    {
+      "command": "lterm doctor",
+      "aliases": [
+        "lterm status"
+      ],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/doctor.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke doctor_reports_daemon_version_and_paths"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm doctor --json"
+      ]
+    },
+    {
+      "command": "lterm daemon",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke doctor_reports_daemon_version_and_paths"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "internal",
+      "raw_stream_policy": "not-applicable"
+    },
+    {
+      "command": "lterm shutdown",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke keeps_session_and_captures_output"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "not-applicable",
+      "examples": [
+        "lterm shutdown"
+      ]
+    },
+    {
+      "command": "lterm install-shim",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm install-shim"
+      ]
+    },
+    {
+      "command": "lterm env",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke env_outputs_only_shell_exports",
+        "cargo test --test cli_smoke env_quotes_generated_paths_for_posix_shell_eval"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Stable shell-eval semantics and exported variable names; exact quote style and visual formatting are not stable."
+    },
+    {
+      "command": "lterm notify",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke watch_exit_notify_invokes_cmux_with_sanitized_message"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm notify --title 'Task complete' --body 'All checks passed'"
+      ]
+    },
+    {
+      "command": "lterm ssh",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke help_describes_target_io_and_remote_arguments"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "explicit-raw-unsafe",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "ssh-invocation",
+          "classification": "best-effort",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ]
+    },
+    {
+      "command": "lterm agents",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/agents.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke agents_lists_builtin_profiles_and_path_availability"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm agents --json"
+      ]
+    },
+    {
+      "command": "lterm agent",
+      "aliases": [
+        "lterm claude",
+        "lterm codex",
+        "lterm gemini",
+        "lterm omx",
+        "lterm omc"
+      ],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke generic_agent_profile_forwards_args_and_tmux_environment",
+        "cargo test --test cli_smoke named_agent_alias_uses_profile_environment"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "launcher-control",
+          "classification": "stable",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ]
+    },
+    {
+      "command": "lterm tmux-compat list-commands",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/tmux-commands.schema.json",
+      "tests": [
+        "cargo test --test cli_smoke tmux_compat_list_commands_includes_agent_query_surface"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "compatibility-stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "examples": [
+        "lterm tmux-compat list-commands --json"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm sessions --json output",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "id",
+      "name",
+      "pane_id",
+      "command",
+      "cwd",
+      "created_unix_ms",
+      "alive",
+      "exit_code",
+      "rows",
+      "cols",
+      "parent_pane_id",
+      "parent_session_id",
+      "attached_clients",
+      "process_id",
+      "process_group_id"
+    ],
+    "properties": {
+      "id": { "type": "string", "minLength": 1 },
+      "name": { "type": "string", "minLength": 1 },
+      "pane_id": { "type": "string", "pattern": "^%[0-9]+$" },
+      "command": { "type": "string" },
+      "cwd": { "type": "string" },
+      "created_unix_ms": { "type": "integer", "minimum": 0 },
+      "alive": { "type": "boolean" },
+      "exit_code": { "type": ["integer", "null"] },
+      "rows": { "type": "integer", "minimum": 1 },
+      "cols": { "type": "integer", "minimum": 1 },
+      "parent_pane_id": { "type": ["string", "null"] },
+      "parent_session_id": { "type": ["string", "null"] },
+      "attached_clients": { "type": "integer", "minimum": 0 },
+      "process_id": { "type": ["integer", "null"], "minimum": 1 },
+      "process_group_id": { "type": ["integer", "null"] },
+      "status_theme": { "type": "string", "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"] }
+    },
+    "additionalProperties": false
+  }
+}
