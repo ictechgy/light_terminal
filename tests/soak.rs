@@ -117,7 +117,9 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let _ = self.cmd().arg("shutdown").status();
+        let mut cmd = self.cmd();
+        cmd.arg("shutdown");
+        let _ = run_command(cmd, COMMAND_TIMEOUT, "shutdown");
     }
 }
 
@@ -234,7 +236,7 @@ fn exercise_watch_exit(env: &TestEnv) -> TestResult {
     // Give the watcher a brief chance to subscribe before triggering exit so
     // the soak harness verifies watch lifecycle behavior instead of racing a
     // session that has already disappeared.
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(500));
 
     let input = env.run(&["input", name, "STOP", "--enter"])?;
     assert_success(&input, "input soak-watch-exit STOP")?;

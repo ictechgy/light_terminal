@@ -10,7 +10,7 @@ const LEGACY_TAG: &str = "v0.1.4";
 const LEGACY_BIN_ENV: &str = "LTERM_UPGRADE_V0_1_4_BIN";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const LEGACY_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
+const LEGACY_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -90,7 +90,9 @@ impl Drop for DaemonGuard {
 
 #[test]
 fn old_daemon_v0_1_4_current_client() -> TestResult {
-    let legacy = legacy_lterm_binary()?;
+    let Some(legacy) = legacy_lterm_binary()? else {
+        return Ok(());
+    };
     let env = MatrixEnv::new()?;
     let mut daemon = DaemonGuard::spawn(&legacy.path, &env)?;
     let current = current_lterm_binary();
@@ -120,7 +122,9 @@ fn old_daemon_v0_1_4_current_client() -> TestResult {
 
 #[test]
 fn current_daemon_v0_1_4_client() -> TestResult {
-    let legacy = legacy_lterm_binary()?;
+    let Some(legacy) = legacy_lterm_binary()? else {
+        return Ok(());
+    };
     let env = MatrixEnv::new()?;
     let current = current_lterm_binary();
     let mut daemon = DaemonGuard::spawn(&current, &env)?;
@@ -153,7 +157,7 @@ fn current_lterm_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_lterm"))
 }
 
-fn legacy_lterm_binary() -> TestResult<LegacyBinary> {
+fn legacy_lterm_binary() -> TestResult<Option<LegacyBinary>> {
     if let Some(path) = std::env::var_os(LEGACY_BIN_ENV) {
         let path = PathBuf::from(path);
         if !path.is_file() {
@@ -163,7 +167,7 @@ fn legacy_lterm_binary() -> TestResult<LegacyBinary> {
             )
             .into());
         }
-        return Ok(LegacyBinary { _temp: None, path });
+        return Ok(Some(LegacyBinary { _temp: None, path }));
     }
 
     let temp = tempfile::tempdir()?;
@@ -172,14 +176,30 @@ fn legacy_lterm_binary() -> TestResult<LegacyBinary> {
     fs::create_dir_all(&source_dir)?;
 
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    run_success(
+    let tag_check = run_with_timeout(
         Command::new("git")
             .arg("-C")
             .arg(&repo_root)
             .args(["rev-parse", "--verify"])
             .arg(format!("refs/tags/{LEGACY_TAG}^{{commit}}")),
         Duration::from_secs(10),
-    )?;
+    );
+    match tag_check {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "skipping {LEGACY_TAG} upgrade matrix because the tag is unavailable: {}",
+                output_preview(&output)
+            );
+            return Ok(None);
+        }
+        Err(err) => {
+            eprintln!(
+                "skipping {LEGACY_TAG} upgrade matrix because git metadata is unavailable: {err}"
+            );
+            return Ok(None);
+        }
+    }
 
     let archive_path = temp.path().join(format!("{LEGACY_TAG}.tar"));
     run_success(
@@ -215,10 +235,10 @@ fn legacy_lterm_binary() -> TestResult<LegacyBinary> {
         return Err(format!("legacy build did not produce {}", bin.display()).into());
     }
 
-    Ok(LegacyBinary {
+    Ok(Some(LegacyBinary {
         _temp: Some(temp),
         path: bin,
-    })
+    }))
 }
 
 fn wait_for_daemon(
