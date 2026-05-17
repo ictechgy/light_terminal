@@ -1071,6 +1071,10 @@ fn help_shows_common_aliases() -> TestResult {
         "capture compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: mobile]"),
+        "mobile compose alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: theme]"),
         "theme compatibility alias was not visible in help:\n{stdout}"
     );
@@ -1467,6 +1471,26 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "Session or pane target to capture",
                 "Starting scrollback line offset, matching tmux -S semantics",
                 "Inclusive ending scrollback line offset, matching tmux -E semantics",
+            ][..],
+        ),
+        (
+            "compose",
+            &[
+                "Session or pane target to review and receive committed input",
+                "Number of sanitized scrollback lines to show",
+                "Run one capture/send cycle for automation and tests",
+                "Text to commit in --once mode",
+                "Do not append Enter",
+            ][..],
+        ),
+        (
+            "mobile",
+            &[
+                "Session or pane target to review and receive committed input",
+                "Number of sanitized scrollback lines to show",
+                "Run one capture/send cycle for automation and tests",
+                "Text to commit in --once mode",
+                "Do not append Enter",
             ][..],
         ),
         (
@@ -2868,6 +2892,179 @@ fn send_alias_sends_text_to_pty() -> TestResult {
     let captured = env.capture_until("send-alias", "SEND:hello")?;
     assert!(captured.contains("READY"), "{captured}");
     assert!(captured.contains("SEND:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn compose_once_message_appends_enter_by_default() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "compose-enter",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo COMPOSE:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("compose-enter", "READY")?;
+    let output = env
+        .cmd()
+        .args(["compose", "compose-enter", "--once", "--message", "hello"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("READY"),
+        "one-shot compose should print sanitized capture output: {stdout:?}"
+    );
+
+    let captured = env.capture_until("compose-enter", "COMPOSE:hello")?;
+    assert!(captured.contains("COMPOSE:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn mobile_once_message_appends_enter_by_default() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "mobile-enter",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo MOBILE:$line; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("mobile-enter", "READY")?;
+    let status = env
+        .cmd()
+        .args(["mobile", "mobile-enter", "--once", "--message", "hello"])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("mobile-enter", "MOBILE:hello")?;
+    assert!(captured.contains("MOBILE:hello"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn compose_once_no_enter_sends_exact_message_bytes() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "compose-no-enter",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; stty raw -echo min 0 time 5; printf 'RAW_READY\\r\\n'; bytes=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\n'); stty sane 2>/dev/null || true; printf 'HEX:%s\\n' \"$bytes\"; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("compose-no-enter", "RAW_READY")?;
+    let status = env
+        .cmd()
+        .args([
+            "compose",
+            "compose-no-enter",
+            "--once",
+            "--message",
+            "hey",
+            "--no-enter",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("compose-no-enter", "HEX:686579")?;
+    assert!(captured.contains("HEX:686579"), "{captured}");
+    assert!(
+        !captured.contains("HEX:6865790d"),
+        "--no-enter must not append carriage return: {captured}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn compose_once_does_not_change_attached_clients_or_geometry() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "compose-geometry",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo GOT:$line; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    wait_for_socket(&socket)?;
+    env.capture_until("compose-geometry", "READY")?;
+    let (_attached_stream, _subscriber_id) =
+        attach_with_geometry(&socket, "compose-geometry", 40, 152)?;
+    wait_for_size(&env, "compose-geometry", (40, 152))?;
+
+    let before = read_session_json(&env, "compose-geometry")?;
+    assert_eq!(
+        before
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "pre-compose attached client count should reflect exactly one live attach: {before}"
+    );
+
+    let output = env
+        .cmd()
+        .args([
+            "compose",
+            "compose-geometry",
+            "--once",
+            "--message",
+            "hello",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    env.capture_until("compose-geometry", "GOT:hello")?;
+
+    let after = read_session_json(&env, "compose-geometry")?;
+    assert_eq!(
+        after
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "compose must not create or drop attach subscribers: {after}"
+    );
+    assert_eq!(
+        (
+            after.get("rows").and_then(serde_json::Value::as_u64),
+            after.get("cols").and_then(serde_json::Value::as_u64)
+        ),
+        (Some(40), Some(152)),
+        "compose must not resize the raw attach PTY geometry: {after}"
+    );
     Ok(())
 }
 
@@ -5504,18 +5701,24 @@ fn attach_with_geometry(
     Ok((stream, subscriber_id))
 }
 
-/// `lterm sessions --json` 으로 단일 세션의 (rows, cols) 를 조회한다.
+/// `lterm sessions --json` 으로 단일 세션 row 를 조회한다.
 #[cfg(unix)]
-fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
+fn read_session_json(env: &TestEnv, name: &str) -> TestResult<serde_json::Value> {
     let output = env.cmd().args(["sessions", "--json"]).output()?;
     if !output.status.success() {
         return Err(format!("lterm sessions --json failed: {output:?}").into());
     }
     let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-    let session = sessions
-        .iter()
+    sessions
+        .into_iter()
         .find(|s| s.get("name").and_then(|v| v.as_str()) == Some(name))
-        .ok_or_else(|| format!("session {name} not in list"))?;
+        .ok_or_else(|| format!("session {name} not in list").into())
+}
+
+/// `lterm sessions --json` 으로 단일 세션의 (rows, cols) 를 조회한다.
+#[cfg(unix)]
+fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
+    let session = read_session_json(env, name)?;
     let rows = session
         .get("rows")
         .and_then(|v| v.as_u64())

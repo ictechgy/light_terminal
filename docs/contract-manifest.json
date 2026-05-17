@@ -261,6 +261,43 @@
       "raw_stream_policy": "sanitized-output-only"
     },
     {
+      "command": "lterm compose",
+      "aliases": [
+        "lterm mobile"
+      ],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke compose_once_message_appends_enter_by_default",
+        "cargo test --test cli_smoke mobile_once_message_appends_enter_by_default",
+        "cargo test --test cli_smoke compose_once_no_enter_sends_exact_message_bytes",
+        "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "surface_contracts": [
+        {
+          "name": "sanitized-capture-display",
+          "classification": "stable",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "committed-input-send",
+          "classification": "stable",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ],
+      "stability_scope": "compose/mobile is a non-attached local composer. Its displayed scrollback is sanitized capture output, while committed text is sent through the existing input/send path and must not subscribe to or transform raw attach streams."
+    },
+    {
       "command": "lterm input",
       "aliases": [
         "lterm send"

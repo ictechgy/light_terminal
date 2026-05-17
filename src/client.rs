@@ -5,6 +5,9 @@ use crate::protocol::{
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::ClearType;
+use crossterm::{cursor, execute, queue, terminal};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -392,6 +395,184 @@ pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Resu
         start,
         end,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposeOptions {
+    pub tail: usize,
+    pub refresh: Duration,
+    pub once: bool,
+    pub message: Option<String>,
+    pub append_enter: bool,
+}
+
+pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
+    let tail_start = compose_tail_start(options.tail)?;
+    if options.once {
+        let message = options
+            .message
+            .as_deref()
+            .context("--message is required with --once")?;
+        let output = capture_range(target, Some(tail_start), None)?;
+        print!("{output}");
+        std::io::stdout().flush().context("flush compose output")?;
+        send(target, compose_commit_bytes(message, options.append_enter))?;
+        return Ok(());
+    }
+    if options.message.is_some() {
+        bail!("--message requires --once");
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("interactive compose requires a terminal; use --once --message for automation");
+    }
+    run_interactive_compose(target, tail_start, options.refresh, options.append_enter)
+}
+
+fn run_interactive_compose(
+    target: &str,
+    tail_start: i32,
+    refresh: Duration,
+    append_enter: bool,
+) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    let _guard = ComposeTerminalGuard::enter(&mut stdout)?;
+    let mut input = String::new();
+    let mut last_refresh = Instant::now();
+    let mut dirty = true;
+
+    loop {
+        if dirty || last_refresh.elapsed() >= refresh {
+            render_compose(target, tail_start, &input, &mut stdout)?;
+            last_refresh = Instant::now();
+            dirty = false;
+        }
+        let poll_timeout = refresh
+            .checked_sub(last_refresh.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(50))
+            .min(Duration::from_millis(100));
+        if !event::poll(poll_timeout).context("poll compose input")? {
+            continue;
+        }
+        let Event::Key(key) = event::read().context("read compose input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyCode::Esc => break,
+            KeyCode::Enter => {
+                if !input.is_empty() || !append_enter {
+                    send(target, compose_commit_bytes(&input, append_enter))?;
+                    input.clear();
+                }
+                dirty = true;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                dirty = true;
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.push(ch);
+                dirty = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn render_compose(
+    target: &str,
+    tail_start: i32,
+    input: &str,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let (cols, rows) = terminal_size();
+    let width = cols.saturating_sub(1).max(1) as usize;
+    let body_rows = rows.saturating_sub(1) as usize;
+    let capture = capture_range(target, Some(tail_start), None)?;
+    let lines: Vec<&str> = capture.lines().collect();
+    let start = lines.len().saturating_sub(body_rows);
+
+    queue!(stdout, cursor::Hide, terminal::Clear(ClearType::All))
+        .context("clear compose screen")?;
+    for (row, line) in lines[start..].iter().enumerate() {
+        let row = u16::try_from(row).unwrap_or(u16::MAX);
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            terminal::Clear(ClearType::CurrentLine)
+        )
+        .context("position compose body")?;
+        write!(
+            stdout,
+            "{}",
+            compose_display_line(&sanitize::terminal_text(line), width)
+        )
+        .context("write compose body")?;
+    }
+    let prompt_row = rows.saturating_sub(1);
+    let prompt = format!("> {}", sanitize::terminal_text(input));
+    queue!(
+        stdout,
+        cursor::MoveTo(0, prompt_row),
+        terminal::Clear(ClearType::CurrentLine)
+    )
+    .context("position compose prompt")?;
+    write!(stdout, "{}", compose_display_line(&prompt, width)).context("write compose prompt")?;
+    stdout.flush().context("flush compose screen")?;
+    Ok(())
+}
+
+fn compose_tail_start(tail: usize) -> Result<i32> {
+    let tail = i32::try_from(tail).context("--tail exceeds supported scrollback range")?;
+    Ok(-tail)
+}
+
+fn compose_commit_bytes(message: &str, append_enter: bool) -> Vec<u8> {
+    let mut bytes = message.as_bytes().to_vec();
+    if append_enter {
+        bytes.push(b'\r');
+    }
+    bytes
+}
+
+fn compose_display_line(value: &str, width: usize) -> String {
+    value.chars().take(width).collect()
+}
+
+struct ComposeTerminalGuard;
+
+impl ComposeTerminalGuard {
+    fn enter(stdout: &mut impl Write) -> Result<Self> {
+        terminal::enable_raw_mode().context("enable compose raw mode")?;
+        if let Err(err) = execute!(
+            stdout,
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            terminal::Clear(ClearType::All)
+        ) {
+            let _ = terminal::disable_raw_mode();
+            return Err(err).context("enter compose screen");
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for ComposeTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = execute!(
+            stdout,
+            terminal::Clear(ClearType::All),
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 /// PTY resize 요청. `subscriber_id` 가 `Some(id)` 면 server 가 해당 attach client 의
@@ -1911,10 +2092,11 @@ mod tests {
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, DaemonStatus,
         KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
         StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
-        attach_pty_rows, cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
-        format_status_line, handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes,
-        matches_env_bool, observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
-        parse_status_style, resolve_status_style, status_theme_protocol_error,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_tail_start,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        resolve_status_style, status_theme_protocol_error,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1929,6 +2111,24 @@ mod tests {
     /// ATTACH_ACTIVE 플래그를 만지는 테스트가 공유하는 직렬화 잠금.
     /// process-global static AtomicBool 이므로 병렬 테스트 race를 막아야 한다.
     static ATTACH_FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn compose_commit_bytes_match_input_enter_semantics() {
+        assert_eq!(compose_commit_bytes("hello", true), b"hello\r");
+        assert_eq!(compose_commit_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn compose_tail_start_rejects_unsupported_offsets() {
+        assert_eq!(compose_tail_start(1).expect("tail 1"), -1);
+        assert!(compose_tail_start((i32::MAX as usize) + 1).is_err());
+    }
+
+    #[test]
+    fn compose_display_line_truncates_to_width() {
+        assert_eq!(compose_display_line("abcdef", 3), "abc");
+        assert_eq!(compose_display_line("abcdef", 0), "");
+    }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
     /// ENV_LOCK을 잡은 상태에서만 사용해야 한다.

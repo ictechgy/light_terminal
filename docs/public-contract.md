@@ -41,10 +41,11 @@ untrusted programs can emit terminal escape sequences to the attaching terminal.
 Do not use attached `lterm` streams as a sanitizer or sandbox.
 
 Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
-`wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
-surfaces sanitize terminal controls before printing human- or machine-readable
-reports. Sanitization belongs only to these non-attached surfaces; adding
-sanitization to attach/resume would violate the 1.0 contract.
+`compose` / `mobile`, `wait`, `watch`, `agents`, `notify` fallback output, and
+tmux-compat listing surfaces sanitize terminal controls before printing human-
+readable or machine-readable reports. Sanitization belongs only to these
+non-attached surfaces; adding sanitization to attach/resume would violate the
+1.0 contract.
 
 ## Product command surface
 
@@ -61,6 +62,7 @@ sanitization to attach/resume would violate the 1.0 contract.
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
+| `lterm compose` | `lterm mobile` | `stable` | `best-effort` composer UI; sanitized capture output only | none | `sanitized-output-only` |
 | `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |

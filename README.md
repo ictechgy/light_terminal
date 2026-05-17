@@ -133,6 +133,7 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Compose sanitized output and commit input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
@@ -233,12 +234,13 @@ lterm sessions --children
 lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
+lterm compose api
 lterm wait api --contains READY --timeout 30s --json
 lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, and `send`.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, `mobile`, and `send`.
 
 **Stop a session:**
 
@@ -398,7 +400,7 @@ the old code until they are stopped.
 
 **Terminal output is forwarded as-is.** `lterm resume` (compatibility name: `lterm attach`) passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
-**Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`) and `tmux capture-pane` strip common terminal control sequences before printing scrollback.
+**Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip common terminal control sequences before printing scrollback. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
 
 **Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, including process-group ids. Add `--orphans` to also include same-process-group rows that are no longer descendants of the recorded session root, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 

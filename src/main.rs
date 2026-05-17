@@ -7,7 +7,7 @@ mod tmux_compat;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use client::AttachStdinEof;
+use client::{AttachStdinEof, ComposeOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -176,6 +176,27 @@ enum Commands {
         /// Inclusive ending scrollback line offset, matching tmux -E semantics.
         #[arg(short = 'E', long, allow_hyphen_values = true)]
         end: Option<i32>,
+    },
+    /// Compose input while viewing sanitized session output.
+    #[command(name = "compose", visible_alias = "mobile")]
+    Compose {
+        /// Session or pane target to review and receive committed input.
+        target: String,
+        /// Number of sanitized scrollback lines to show.
+        #[arg(long, default_value = "80", value_parser = parse_compose_tail_arg)]
+        tail: usize,
+        /// Refresh interval for the interactive sanitized output view.
+        #[arg(long, value_name = "DURATION", default_value = "500ms", value_parser = parse_wait_duration_arg)]
+        refresh: Duration,
+        /// Run one capture/send cycle for automation and tests.
+        #[arg(long)]
+        once: bool,
+        /// Text to commit in --once mode.
+        #[arg(long, value_name = "TEXT")]
+        message: Option<String>,
+        /// Do not append Enter (carriage return) when committing input.
+        #[arg(long)]
+        no_enter: bool,
     },
     /// Wait until a session exits or sanitized output contains text.
     #[command(group(
@@ -495,6 +516,23 @@ fn run() -> Result<()> {
             print!("{output}");
             Ok(())
         }
+        Commands::Compose {
+            target,
+            tail,
+            refresh,
+            once,
+            message,
+            no_enter,
+        } => client::compose(
+            &target,
+            ComposeOptions {
+                tail,
+                refresh,
+                once,
+                message,
+                append_enter: !no_enter,
+            },
+        ),
         Commands::Wait {
             target,
             wait_for_exit,
@@ -965,6 +1003,13 @@ fn parse_wait_tail_arg(value: &str) -> std::result::Result<usize, String> {
         return Err("--tail must be greater than zero".to_string());
     }
     Ok(tail)
+}
+
+fn parse_compose_tail_arg(value: &str) -> std::result::Result<usize, String> {
+    let tail = parse_wait_tail_arg(value)?;
+    i32::try_from(tail)
+        .map(|_| tail)
+        .map_err(|_| "--tail exceeds supported scrollback range".to_string())
 }
 
 fn parse_status_theme_setting(value: &str) -> Result<Option<protocol::StatusTheme>> {
@@ -1805,6 +1850,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn compose_parses_mobile_alias_and_validates_tail() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "mobile",
+            "main",
+            "--tail",
+            "10",
+            "--refresh",
+            "250ms",
+            "--once",
+            "--message",
+            "hello",
+            "--no-enter",
+        ])
+        .expect("mobile alias should parse");
+        let Commands::Compose {
+            target,
+            tail,
+            refresh,
+            once,
+            message,
+            no_enter,
+        } = cli.command
+        else {
+            panic!("expected compose command");
+        };
+        assert_eq!(target, "main");
+        assert_eq!(tail, 10);
+        assert_eq!(refresh, Duration::from_millis(250));
+        assert!(once);
+        assert_eq!(message.as_deref(), Some("hello"));
+        assert!(no_enter);
+
+        assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "2147483648"]).is_err());
     }
 
     #[test]

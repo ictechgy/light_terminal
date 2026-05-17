@@ -5,7 +5,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 
 ## Purpose
 
-`lterm` is a general agent-terminal surface for persistent PTY sessions. Human and agent workflows should prefer product-facing commands such as `start`, `resume`, `open`, `sessions`, `processes`, `logs`, `wait`, `watch`, `input`, and `close`. Compatibility names remain available for existing scripts and muscle memory.
+`lterm` is a general agent-terminal surface for persistent PTY sessions. Human and agent workflows should prefer product-facing commands such as `start`, `resume`, `open`, `sessions`, `processes`, `logs`, `compose`, `wait`, `watch`, `input`, and `close`. Compatibility names remain available for existing scripts and muscle memory.
 
 ## Product CLI vocabulary
 
@@ -20,6 +20,7 @@ Tags: command-surface, cli, aliases, tmux-compat, agent-terminal
 | Rename a session | `lterm rename api api-renamed` | none |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Compose sanitized output and commit input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | none |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | none |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
@@ -49,6 +50,7 @@ integrations. They are not tmux aliases unless they explicitly enter the
 - `-a` is a positional legacy shortcut parsed before normal subcommand handling and must appear directly after `lterm`: `lterm -a <target>`.
 - `attach`, `a`, and `-a` are compatibility entry points for `resume`; they must preserve the same raw `client::attach` path.
 - Here, sanitization means escape-sequence/control-byte filtering for non-attached text surfaces such as `logs`, `sessions`, and `processes`; `resume` / raw attach stays a transparent PTY byte stream.
+- `compose` / `mobile` is a non-attached product surface: it displays sanitized capture output with a local input prompt, commits text via the existing input/send path, and must not use or transform the raw attach stream.
 - `notify`'s OSC 777 fallback sanitizes Unicode scalar values after argument parsing, not UTF-8 bytes; non-control text such as Korean remains intact.
 - `notify`'s OSC 777 fallback preserves human-visible separation by converting newline, carriage return, tab, and semicolon separators to spaces before emitting OSC fields.
 - `notify`'s OSC 777 fallback protects protocol framing only; it does not normalize Unicode bidi, format, or zero-width characters inside trusted title/body text.
