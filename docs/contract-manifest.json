@@ -272,7 +272,10 @@
         "cargo test --test cli_smoke compose_once_message_appends_enter_by_default",
         "cargo test --test cli_smoke mobile_once_message_appends_enter_by_default",
         "cargo test --test cli_smoke compose_once_no_enter_sends_exact_message_bytes",
-        "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry"
+        "cargo test --test cli_smoke mobile_once_no_enter_sends_exact_message_bytes",
+        "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry",
+        "cargo test --test cli_smoke mobile_once_does_not_change_attached_clients_or_geometry",
+        "cargo test compose_enter_commit_policy_allows_blank_enter"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -295,7 +298,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
+      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
     },
     {
       "command": "lterm input",

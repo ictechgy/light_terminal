@@ -2962,6 +2962,15 @@ fn mobile_once_message_appends_enter_by_default() -> TestResult {
 
 #[test]
 fn compose_once_no_enter_sends_exact_message_bytes() -> TestResult {
+    once_no_enter_sends_exact_message_bytes("compose", "compose-no-enter")
+}
+
+#[test]
+fn mobile_once_no_enter_sends_exact_message_bytes() -> TestResult {
+    once_no_enter_sends_exact_message_bytes("mobile", "mobile-no-enter")
+}
+
+fn once_no_enter_sends_exact_message_bytes(command: &str, name: &str) -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -2969,7 +2978,7 @@ fn compose_once_no_enter_sends_exact_message_bytes() -> TestResult {
             "new",
             "--detach",
             "--name",
-            "compose-no-enter",
+            name,
             "--",
             "sh",
             "-lc",
@@ -2978,21 +2987,14 @@ fn compose_once_no_enter_sends_exact_message_bytes() -> TestResult {
         .status()?;
     assert!(status.success());
 
-    env.capture_until("compose-no-enter", "RAW_READY")?;
+    env.capture_until(name, "RAW_READY")?;
     let status = env
         .cmd()
-        .args([
-            "compose",
-            "compose-no-enter",
-            "--once",
-            "--message",
-            "hey",
-            "--no-enter",
-        ])
+        .args([command, name, "--once", "--message", "hey", "--no-enter"])
         .status()?;
     assert!(status.success());
 
-    let captured = env.capture_until("compose-no-enter", "HEX:686579")?;
+    let captured = env.capture_until(name, "HEX:686579")?;
     assert!(captured.contains("HEX:686579"), "{captured}");
     assert!(
         !captured.contains("HEX:6865790d"),
@@ -3004,6 +3006,17 @@ fn compose_once_no_enter_sends_exact_message_bytes() -> TestResult {
 #[test]
 #[cfg(unix)]
 fn compose_once_does_not_change_attached_clients_or_geometry() -> TestResult {
+    once_does_not_change_attached_clients_or_geometry("compose", "compose-geometry")
+}
+
+#[test]
+#[cfg(unix)]
+fn mobile_once_does_not_change_attached_clients_or_geometry() -> TestResult {
+    once_does_not_change_attached_clients_or_geometry("mobile", "mobile-geometry")
+}
+
+#[cfg(unix)]
+fn once_does_not_change_attached_clients_or_geometry(command: &str, name: &str) -> TestResult {
     let env = TestEnv::new()?;
     let socket = socket_path_for(&env);
     let status = env
@@ -3012,7 +3025,7 @@ fn compose_once_does_not_change_attached_clients_or_geometry() -> TestResult {
             "new",
             "--detach",
             "--name",
-            "compose-geometry",
+            name,
             "--",
             "sh",
             "-lc",
@@ -3022,12 +3035,11 @@ fn compose_once_does_not_change_attached_clients_or_geometry() -> TestResult {
     assert!(status.success());
 
     wait_for_socket(&socket)?;
-    env.capture_until("compose-geometry", "READY")?;
-    let (_attached_stream, _subscriber_id) =
-        attach_with_geometry(&socket, "compose-geometry", 40, 152)?;
-    wait_for_size(&env, "compose-geometry", (40, 152))?;
+    env.capture_until(name, "READY")?;
+    let (_attached_stream, _subscriber_id) = attach_with_geometry(&socket, name, 40, 152)?;
+    wait_for_size(&env, name, (40, 152))?;
 
-    let before = read_session_json(&env, "compose-geometry")?;
+    let before = read_session_json(&env, name)?;
     assert_eq!(
         before
             .get("attached_clients")
@@ -3038,18 +3050,12 @@ fn compose_once_does_not_change_attached_clients_or_geometry() -> TestResult {
 
     let output = env
         .cmd()
-        .args([
-            "compose",
-            "compose-geometry",
-            "--once",
-            "--message",
-            "hello",
-        ])
+        .args([command, name, "--once", "--message", "hello"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    env.capture_until("compose-geometry", "GOT:hello")?;
+    env.capture_until(name, "GOT:hello")?;
 
-    let after = read_session_json(&env, "compose-geometry")?;
+    let after = read_session_json(&env, name)?;
     assert_eq!(
         after
             .get("attached_clients")

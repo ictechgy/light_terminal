@@ -54,6 +54,17 @@ attach, resize, or alter attached-client counts or PTY geometry. Sanitization
 belongs only to these non-attached surfaces; adding sanitization to attach/resume
 would violate the 1.0 contract.
 
+Interactive compose uses the same commit rule as `--once`: pressing Enter commits
+the current input buffer plus Enter (`\r`), including an empty buffer for prompts
+that ask the user to press Enter. Ctrl-C, Ctrl-D, and Esc are local composer exit
+keys and are not forwarded to the target PTY. The `lterm input --enter` option
+uses the same Enter byte (`\r`).
+
+When the manifest uses `surface_contracts`, nested `raw_stream_policy` values use
+the same policy vocabulary as top-level entries. `not-applicable` is valid for a
+sub-surface such as `committed-input-send` because that sub-surface emits no text
+or raw output stream.
+
 ## Product command surface
 
 | Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
