@@ -275,7 +275,9 @@
         "cargo test --test cli_smoke mobile_once_no_enter_sends_exact_message_bytes",
         "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry",
         "cargo test --test cli_smoke mobile_once_does_not_change_attached_clients_or_geometry",
-        "cargo test compose_enter_commit_policy_allows_blank_enter"
+        "cargo test compose_enter_commit_policy_allows_blank_enter",
+        "cargo test compose_exit_keys_are_local_controls",
+        "cargo test compose_display_line_sanitizes_controls"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -285,7 +287,7 @@
           "name": "sanitized-capture-display",
           "classification": "stable",
           "raw_stream_policy": "sanitized-output-only",
-          "text_output_stability": "best-effort",
+          "text_output_stability": "stable",
           "json_output_stability": "none",
           "schema_path": null
         },
@@ -298,7 +300,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
+      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. The composer layout is best-effort, while the displayed capture text is a stable sanitized-capture-display sub-surface. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
     },
     {
       "command": "lterm input",

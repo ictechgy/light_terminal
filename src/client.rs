@@ -5,7 +5,7 @@ use crate::protocol::{
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::ClearType;
 use crossterm::{cursor, execute, queue, terminal};
 use serde::Serialize;
@@ -468,10 +468,10 @@ fn run_interactive_compose(
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if compose_is_local_exit_key(&key) {
+            break;
+        }
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Esc => break,
             KeyCode::Enter => {
                 if compose_should_commit(&input, append_enter) {
                     send(target, compose_commit_bytes(&input, append_enter))?;
@@ -516,12 +516,8 @@ fn render_compose(
         )
         .context("position compose body")?;
         if let Some(line) = visible_lines.get(row_idx) {
-            write!(
-                stdout,
-                "{}",
-                compose_display_line(&sanitize::terminal_text(line), width)
-            )
-            .context("write compose body")?;
+            write!(stdout, "{}", compose_sanitized_display_line(line, width))
+                .context("write compose body")?;
         }
     }
     let prompt_row = rows.saturating_sub(1);
@@ -567,6 +563,18 @@ fn compose_commit_bytes(message: &str, append_enter: bool) -> Vec<u8> {
 
 fn compose_should_commit(input: &str, append_enter: bool) -> bool {
     append_enter || !input.is_empty()
+}
+
+fn compose_is_local_exit_key(key: &KeyEvent) -> bool {
+    match &key.code {
+        KeyCode::Esc => true,
+        KeyCode::Char('c' | 'C' | 'd' | 'D') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn compose_sanitized_display_line(value: &str, width: usize) -> String {
+    compose_display_line(&sanitize::terminal_text(value), width)
 }
 
 fn compose_display_line(value: &str, width: usize) -> String {
@@ -2176,12 +2184,13 @@ mod tests {
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, DaemonStatus,
         KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
         StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
-        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_prompt_line,
-        compose_refresh_interval, compose_should_commit, compose_tail_start,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
-        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
-        resolve_status_style, status_theme_protocol_error,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        compose_prompt_line, compose_refresh_interval, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, format_status_line, handle_resize_tick, heartbeat_due,
+        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
+        status_theme_protocol_error,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2229,11 +2238,38 @@ mod tests {
     }
 
     #[test]
+    fn compose_exit_keys_are_local_controls() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
     fn compose_display_line_truncates_to_display_width() {
         assert_eq!(compose_display_line("abcdef", 3), "abc");
         assert_eq!(compose_display_line("abcdef", 0), "");
         assert_eq!(compose_display_line("한글abc", 4), "한글");
         assert_eq!(compose_display_line("👨‍👩‍👧‍👦abc", 3), "👨‍👩‍👧‍👦a");
+    }
+
+    #[test]
+    fn compose_display_line_sanitizes_controls() {
+        assert_eq!(compose_sanitized_display_line("A\u{0007}B", 10), "AB");
     }
 
     #[test]
