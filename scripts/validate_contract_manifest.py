@@ -50,7 +50,7 @@ SURFACE_REQUIRED_FIELDS = {
     "json_output_stability",
     "schema_path",
 }
-ATTACH_NAMES = {"resume", "attach", "a", "open", "attach-or-new"}
+ATTACH_NAMES = {"resume", "attach", "a", "-a", "open", "attach-or-new"}
 RAW_SURFACE_NAMES = {"raw-pty-stream", "raw_pty_stream", "attached-pty", "attach-pty"}
 CARGO_TEST_FLAGS_WITH_VALUE = {
     "--package",
@@ -182,7 +182,8 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[str]:
             errors.extend(validate_surface_contracts(label, entry, surfaces))
 
         names = {command} | set(aliases or []) if isinstance(aliases, list) else {command}
-        if any(name in ATTACH_NAMES for name in names if isinstance(name, str)):
+        bare_names = {manifest_command_name(name) for name in names if isinstance(name, str)}
+        if any(name in ATTACH_NAMES for name in bare_names):
             if not has_raw_attach_surface(surfaces if isinstance(surfaces, list) else []):
                 errors.append(
                     f"{label}: attach/resume-like entry must include a raw-pty-stream surface_contract "
@@ -283,6 +284,11 @@ def has_raw_attach_surface(surfaces: list[Any]) -> bool:
         if name in RAW_SURFACE_NAMES and surface.get("classification") == "explicit-raw-unsafe" and surface.get("raw_stream_policy") == "raw-transparent":
             return True
     return False
+
+
+def manifest_command_name(value: str) -> str:
+    parts = value.strip().split()
+    return parts[-1] if parts else ""
 
 
 def entry_label(index: int, entry: Any) -> str:
@@ -476,7 +482,12 @@ def cargo_bin_exists(repo_root: Path, bin_name: str) -> bool:
         return package_name == bin_name and (repo_root / "src" / "main.rs").exists()
 
     text = cargo_toml.read_text(encoding="utf-8")
-    return bool(re.search(rf"(?ms)^\[\[bin\]\].*?^name\s*=\s*['\"]{re.escape(bin_name)}['\"]", text))
+    if re.search(rf"(?ms)^\[\[bin\]\].*?^name\s*=\s*['\"]{re.escape(bin_name)}['\"]", text):
+        return True
+    return bool(
+        (repo_root / "src" / "main.rs").exists()
+        and re.search(rf"(?ms)^\[package\].*?^name\s*=\s*['\"]{re.escape(bin_name)}['\"]", text)
+    )
 
 
 def run_self_tests() -> int:
@@ -550,6 +561,15 @@ def run_self_tests() -> int:
         helper_test = deepcopy(valid_entry)
         helper_test["tests"] = ["cargo test --test cli_smoke helper_only"]
         expect_errors("helper-only test", helper_test, ["tests name no real target"])
+
+        attach_without_raw_surface = deepcopy(valid_entry)
+        attach_without_raw_surface["command"] = "lterm resume"
+        attach_without_raw_surface["aliases"] = ["lterm attach", "lterm a", "lterm -a"]
+        attach_without_raw_surface["classification"] = "explicit-raw-unsafe"
+        attach_without_raw_surface["raw_stream_policy"] = "raw-transparent"
+        attach_without_raw_surface["surface_contracts"] = []
+        attach_without_raw_surface["stability_scope"] = "raw attach test"
+        expect_errors("attach raw surface", attach_without_raw_surface, ["attach/resume-like entry"])
 
     if failures:
         for failure in failures:

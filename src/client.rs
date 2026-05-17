@@ -468,6 +468,14 @@ fn run_interactive_compose(
                     }
                     continue;
                 }
+                Event::Paste(text) => {
+                    compose_push_paste(&mut input, &text);
+                    dirty = true;
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
                 _ => {
                     if event::poll(Duration::ZERO).context("poll queued compose input")? {
                         pending_event = Some(event::read().context("read queued compose input")?);
@@ -600,6 +608,10 @@ fn compose_pop_grapheme(input: &mut String) {
     if let Some((index, _)) = input.grapheme_indices(true).next_back() {
         input.truncate(index);
     }
+}
+
+fn compose_push_paste(input: &mut String, text: &str) {
+    input.push_str(text);
 }
 
 fn compose_sanitized_display_line(value: &str, width: usize) -> String {
@@ -2214,7 +2226,7 @@ mod tests {
         KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
         StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
         attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_pop_grapheme, compose_prompt_line, compose_refresh_interval,
+        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
         compose_sanitized_display_line, compose_should_commit, compose_tail_start,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
@@ -2310,6 +2322,13 @@ mod tests {
         let mut combining = String::from("e\u{0301}");
         compose_pop_grapheme(&mut combining);
         assert_eq!(combining, "");
+    }
+
+    #[test]
+    fn compose_paste_appends_text_to_input_buffer() {
+        let mut input = String::from("pre");
+        compose_push_paste(&mut input, "\t붙여넣기\n");
+        assert_eq!(input, "pre\t붙여넣기\n");
     }
 
     #[test]
