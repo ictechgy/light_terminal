@@ -149,7 +149,7 @@ used as release-gate contract examples unless they are manifest-promoted.
 
 ## Release evidence
 
-Before tagging `v1.0.0`, attach a verification transcript to the release notes or
+Before tagging a `1.x` release, attach a verification transcript to the release notes or
 release checklist. The transcript should include the standard Rust checks,
 manifest/schema/example validation, the required upgrade matrix, the release-gate
 soak profile, and dependency audit evidence. This docs lane defines the public
