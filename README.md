@@ -133,7 +133,7 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
-| Compose sanitized output and commit input | `lterm compose api` | `mobile` |
+| Open a sanitized composer for input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
@@ -240,7 +240,9 @@ lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. The compatibility names are visible aliases that remain available for scripts and muscle memory: `list` / `ls`, `ps`, `capture`, `mobile`, and `send`.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `mobile` is a visible alias for `compose`; the compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
+
+For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and must not change attached-client counts or PTY geometry.
 
 **Stop a session:**
 

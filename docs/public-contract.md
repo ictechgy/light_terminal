@@ -41,11 +41,18 @@ untrusted programs can emit terminal escape sequences to the attaching terminal.
 Do not use attached `lterm` streams as a sanitizer or sandbox.
 
 Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
-`compose` / `mobile`, `wait`, `watch`, `agents`, `notify` fallback output, and
-tmux-compat listing surfaces sanitize terminal controls before printing human-
-readable or machine-readable reports. Sanitization belongs only to these
-non-attached surfaces; adding sanitization to attach/resume would violate the
-1.0 contract.
+`wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
+surfaces sanitize terminal controls before printing human-readable or
+machine-readable reports.
+
+`lterm compose` / `lterm mobile` is also non-attached, but it is an interactive
+composer UI rather than a machine-readable report surface. Its displayed
+scrollback is sanitized capture output, it has no JSON output contract, and
+committed input goes through the existing `input` / `send` path. Default commits
+append Enter (`\r`), `--no-enter` sends exact message bytes, and compose must not
+attach, resize, or alter attached-client counts or PTY geometry. Sanitization
+belongs only to these non-attached surfaces; adding sanitization to attach/resume
+would violate the 1.0 contract.
 
 ## Product command surface
 
@@ -62,7 +69,7 @@ non-attached surfaces; adding sanitization to attach/resume would violate the
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
-| `lterm compose` | `lterm mobile` | `stable` | `best-effort` composer UI; sanitized capture output only | none | `sanitized-output-only` |
+| `lterm compose` | `lterm mobile` | `stable` | `best-effort` sanitized capture display | none | `sanitized-output-only` |
 | `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |

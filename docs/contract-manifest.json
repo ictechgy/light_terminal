@@ -295,7 +295,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "compose/mobile is a non-attached local composer. Its displayed scrollback is sanitized capture output, while committed text is sent through the existing input/send path and must not subscribe to or transform raw attach streams."
+      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
     },
     {
       "command": "lterm input",

@@ -128,7 +128,7 @@ lterm -a api
 | 세션 이름 변경 | `lterm rename api api-renamed` | 없음 |
 | 세션 status theme 설정 | `lterm status-theme api green` | `theme` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80 --end=-1` | `capture` |
-| 정제된 출력 보기와 입력 commit | `lterm compose api` | `mobile` |
+| 정제된 입력 화면 열기 | `lterm compose api` | `mobile` |
 | 세션 출력 또는 종료 대기 | `lterm wait api --contains READY --timeout 30s --json` | 없음 |
 | 세션을 감시하고 완료 시 알림 | `lterm watch api --exit --notify` | 없음 |
 | PTY에 입력 쓰기 | `lterm input api 'echo hello' --enter` | `send` |
@@ -236,7 +236,9 @@ lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. 호환 이름은 visible alias로 유지되어 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다: `list` / `ls`, `ps`, `capture`, `mobile`, `send`.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `mobile`은 `compose`의 visible alias입니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
+
+자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸면 안 됩니다.
 
 **세션 종료:**
 

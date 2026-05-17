@@ -1888,6 +1888,7 @@ mod tests {
 
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "0"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "2147483648"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "compose", "main", "--refresh", "0ms"]).is_err());
     }
 
     #[test]
