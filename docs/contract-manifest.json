@@ -285,6 +285,7 @@
         "cargo test --bin lterm compose_display_line_sanitizes_controls",
         "cargo test --bin lterm compose_backspace_removes_one_grapheme_cluster",
         "cargo test --bin lterm compose_paste_appends_text_to_input_buffer",
+        "cargo test --bin lterm compose_terminal_sequences_toggle_bracketed_paste",
         "cargo test --bin lterm input_enter_writes_carriage_return",
         "python3 scripts/validate_contract_manifest.py --self-test"
       ],

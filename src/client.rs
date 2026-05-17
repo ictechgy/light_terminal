@@ -5,7 +5,10 @@ use crate::protocol::{
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::terminal::ClearType;
 use crossterm::{cursor, execute, queue, terminal};
 use serde::Serialize;
@@ -679,12 +682,8 @@ impl ComposeTerminalGuard {
         ensure_panic_terminal_cleanup_hook();
         terminal::enable_raw_mode().context("enable compose raw mode")?;
         let panic_cleanup = AttachActiveGuard::enter();
-        if let Err(err) = execute!(
-            stdout,
-            terminal::EnterAlternateScreen,
-            cursor::Hide,
-            terminal::Clear(ClearType::All)
-        ) {
+        if let Err(err) = compose_terminal_enter_sequence(stdout) {
+            let _ = compose_terminal_leave_sequence(stdout);
             drop(panic_cleanup);
             let _ = terminal::disable_raw_mode();
             return Err(err).context("enter compose screen");
@@ -698,14 +697,29 @@ impl ComposeTerminalGuard {
 impl Drop for ComposeTerminalGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
-        let _ = execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::Show,
-            terminal::LeaveAlternateScreen
-        );
+        let _ = compose_terminal_leave_sequence(&mut stdout);
         let _ = terminal::disable_raw_mode();
     }
+}
+
+fn compose_terminal_enter_sequence(stdout: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste,
+        cursor::Hide,
+        terminal::Clear(ClearType::All)
+    )
+}
+
+fn compose_terminal_leave_sequence(stdout: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        stdout,
+        DisableBracketedPaste,
+        terminal::Clear(ClearType::All),
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    )
 }
 
 /// PTY resize 요청. `subscriber_id` 가 `Some(id)` 면 server 가 해당 attach client 의
@@ -2025,6 +2039,7 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// - `\x1b[?1047l`: xterm alt-screen (1047) 종료 — clear 변종
 /// - `\x1b[r`     : DECSTBM 리셋 (scroll region 전체 화면) — alt 종료 이후 메인 버퍼에 적용
 /// - `\x1b[?25h`  : DECTCEM 커서 보이기
+/// - `\x1b[?2004l`: bracketed paste 비활성 (compose panic cleanup)
 /// - `\x1b[<u` ×16: kitty keyboard protocol stack pop. 정상 경로의
 ///   [`MAX_KEYBOARD_PROTOCOL_RESTORE_POPS`] 와 동일한 상한으로 정렬 — panic context에서
 ///   user push depth를 알 수 없으므로 tracked path가 허용한 최대치까지 시도한다.
@@ -2039,7 +2054,7 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// 증상의 직접 원인이었다.
 fn panic_terminal_cleanup_bytes() -> &'static [u8] {
     // 16 kitty pops = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (정상 경로와 동일 상한).
-    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[?2004l\
       \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
       \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
       \x1b[=0u\x1b[0m\r\n"
@@ -2228,6 +2243,7 @@ mod tests {
         attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
         compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
         compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
@@ -2329,6 +2345,27 @@ mod tests {
         let mut input = String::from("pre");
         compose_push_paste(&mut input, "\t붙여넣기\n");
         assert_eq!(input, "pre\t붙여넣기\n");
+    }
+
+    #[test]
+    fn compose_terminal_sequences_toggle_bracketed_paste() {
+        let mut enter = Vec::new();
+        compose_terminal_enter_sequence(&mut enter).expect("compose enter sequence");
+        assert!(
+            enter
+                .windows(b"\x1b[?2004h".len())
+                .any(|w| w == b"\x1b[?2004h"),
+            "compose enter must enable bracketed paste: {enter:?}"
+        );
+
+        let mut leave = Vec::new();
+        compose_terminal_leave_sequence(&mut leave).expect("compose leave sequence");
+        assert!(
+            leave
+                .windows(b"\x1b[?2004l".len())
+                .any(|w| w == b"\x1b[?2004l"),
+            "compose leave must disable bracketed paste: {leave:?}"
+        );
     }
 
     #[test]
@@ -2700,10 +2737,11 @@ mod tests {
     fn panic_terminal_cleanup_bytes_emits_safe_recovery_sequence() {
         let bytes = panic_terminal_cleanup_bytes();
         // 정확한 sequence (순서 중요): alt-screen(1049/47/1047) 종료 → scroll region 리셋 →
-        // 커서 visible → kitty pop ×16 → kitty direct disable → SGR 리셋 → CR+LF.
+        // 커서 visible → bracketed paste disable → kitty pop ×16 → kitty direct disable →
+        // SGR 리셋 → CR+LF.
         // alt-screen 종료가 \x1b[r 보다 먼저 와서 reset이 메인 버퍼에 적용되어야 한다.
         // pop 16회 = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (스택 바닥 이상은 no-op).
-        let expected = b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+        let expected = b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[?2004l\
                          \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
                          \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
                          \x1b[=0u\x1b[0m\r\n";
@@ -2736,6 +2774,7 @@ mod tests {
         // kitty keyboard protocol pop과 direct disable이 포함되어야 함
         assert!(bytes.windows(4).any(|w| w == b"\x1b[<u"));
         assert!(bytes.windows(5).any(|w| w == b"\x1b[=0u"));
+        assert!(bytes.windows(8).any(|w| w == b"\x1b[?2004l"));
     }
 
     #[test]
