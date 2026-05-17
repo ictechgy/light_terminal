@@ -133,7 +133,7 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
-| Open a sanitized composer for input | `lterm compose api` | `mobile` |
+| Open a sanitized scrollback composer for input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
@@ -242,8 +242,8 @@ lterm input api 'echo hello' --enter
 
 The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `mobile` is a visible alias for `compose`; the compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
 
-For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and must not change attached-client counts or PTY geometry.
-In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Enter uses the same default commit rule, including an empty input buffer; Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
+For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
+In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
 
 **Stop a session:**
 
