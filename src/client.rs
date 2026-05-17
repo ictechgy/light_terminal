@@ -456,38 +456,59 @@ fn run_interactive_compose(
         if !event::poll(poll_timeout).context("poll compose input")? {
             continue;
         }
-        let event = event::read().context("read compose input")?;
-        let key = match event {
-            Event::Key(key) => key,
-            Event::Resize(_, _) => {
-                dirty = true;
+        let mut pending_event = Some(event::read().context("read compose input")?);
+        let mut exit = false;
+        while let Some(event) = pending_event.take() {
+            let key = match event {
+                Event::Key(key) => key,
+                Event::Resize(_, _) => {
+                    dirty = true;
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
+                _ => {
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
+            };
+            if key.kind != KeyEventKind::Press {
+                if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                    pending_event = Some(event::read().context("read queued compose input")?);
+                }
                 continue;
             }
-            _ => continue,
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if compose_is_local_exit_key(&key) {
-            break;
-        }
-        match key.code {
-            KeyCode::Enter => {
-                if compose_should_commit(&input, append_enter) {
-                    send(target, compose_commit_bytes(&input, append_enter))?;
-                    input.clear();
+            if compose_is_local_exit_key(&key) {
+                exit = true;
+                break;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    if compose_should_commit(&input, append_enter) {
+                        send(target, compose_commit_bytes(&input, append_enter))?;
+                        input.clear();
+                    }
+                    dirty = true;
                 }
-                dirty = true;
+                KeyCode::Backspace => {
+                    compose_pop_grapheme(&mut input);
+                    dirty = true;
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(ch);
+                    dirty = true;
+                }
+                _ => {}
             }
-            KeyCode::Backspace => {
-                input.pop();
-                dirty = true;
+            if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                pending_event = Some(event::read().context("read queued compose input")?);
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.push(ch);
-                dirty = true;
-            }
-            _ => {}
+        }
+        if exit {
+            break;
         }
     }
     Ok(())
@@ -570,6 +591,14 @@ fn compose_is_local_exit_key(key: &KeyEvent) -> bool {
         KeyCode::Esc => true,
         KeyCode::Char('c' | 'C' | 'd' | 'D') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
+    }
+}
+
+fn compose_pop_grapheme(input: &mut String) {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if let Some((index, _)) = input.grapheme_indices(true).next_back() {
+        input.truncate(index);
     }
 }
 
@@ -2185,12 +2214,12 @@ mod tests {
         KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
         StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
         attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_prompt_line, compose_refresh_interval, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, format_status_line, handle_resize_tick, heartbeat_due,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_style, resolve_status_style,
-        status_theme_protocol_error,
+        compose_pop_grapheme, compose_prompt_line, compose_refresh_interval,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        resolve_status_style, status_theme_protocol_error,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2270,6 +2299,17 @@ mod tests {
     #[test]
     fn compose_display_line_sanitizes_controls() {
         assert_eq!(compose_sanitized_display_line("A\u{0007}B", 10), "AB");
+    }
+
+    #[test]
+    fn compose_backspace_removes_one_grapheme_cluster() {
+        let mut input = String::from("a👨‍👩‍👧‍👦");
+        compose_pop_grapheme(&mut input);
+        assert_eq!(input, "a");
+
+        let mut combining = String::from("e\u{0301}");
+        compose_pop_grapheme(&mut combining);
+        assert_eq!(combining, "");
     }
 
     #[test]

@@ -57,6 +57,14 @@ attach, resize, or alter attached-client counts or PTY geometry. Sanitization
 belongs only to these non-attached surfaces; adding sanitization to attach/resume
 would violate the 1.0 contract.
 
+Compose target resolution uses the same session-or-pane target model as
+`lterm logs`. The display sub-surface captures the last `--tail` sanitized
+scrollback lines (default: 80) from that target; it does not expose independent
+`--start` / `--end` range flags. `--once` performs that capture exactly once
+before committing input, while interactive compose refreshes on the configured
+`--refresh` interval (default: 500ms) and after local input or terminal resize
+events.
+
 Interactive compose uses the same commit rule as `--once`: pressing Enter commits
 the current input buffer plus Enter (`\r`), including an empty buffer for prompts
 that ask the user to press Enter. Ctrl-C, Ctrl-D, and Esc are local composer exit
