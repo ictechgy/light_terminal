@@ -20,9 +20,12 @@ only a small tmux-compatible subset.
 | `explicit-raw-unsafe` | Attached PTY stream behavior that is transparent and intentionally unsanitized. |
 
 Output stability is tracked separately for text and JSON. Stable JSON outputs
-must have a schema path in the manifest; schema files and schema validation are
-owned by the JSON-schema validation lane. Text output stability applies to the
-shape and documented fields, not to user-controlled PTY content.
+must have a schema path in the manifest. The manifest schema lives at
+[`docs/schemas/contract-manifest.schema.json`](schemas/contract-manifest.schema.json),
+and `scripts/validate_contract_manifest.py` validates manifest fields including
+`surface_contracts`, `stability_scope`, and the `best-effort` stability value.
+Text output stability applies to the shape and documented fields, not to
+user-controlled PTY content.
 
 For mixed commands, the manifest's `surface_contracts` field is the
 authoritative stability boundary for each output surface. For example,
@@ -42,9 +45,36 @@ Do not use attached `lterm` streams as a sanitizer or sandbox.
 
 Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
 `wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
-surfaces sanitize terminal controls before printing human- or machine-readable
-reports. Sanitization belongs only to these non-attached surfaces; adding
-sanitization to attach/resume would violate the 1.0 contract.
+surfaces sanitize terminal controls before printing human-readable or
+machine-readable reports.
+
+`lterm compose` / `lterm mobile` is also non-attached, but it is an interactive
+composer UI rather than a machine-readable report surface. Its displayed
+scrollback is sanitized capture output, it has no JSON output contract, and
+committed input goes through the existing `input` / `send` path. Default commits
+append Enter (`\r`), `--no-enter` sends exact message bytes, and compose must not
+attach, resize, or alter attached-client counts or PTY geometry. Sanitization
+belongs only to these non-attached surfaces; adding sanitization to attach/resume
+would violate the 1.0 contract.
+
+Compose target resolution uses the same session-or-pane target model as
+`lterm logs`. The display sub-surface captures the last `--tail` sanitized
+scrollback lines (default: 80) from that target; it does not expose independent
+`--start` / `--end` range flags. `--once` performs that capture exactly once
+before committing input, while interactive compose refreshes on the configured
+`--refresh` interval (default: 500ms) and after local input or terminal resize
+events.
+
+Interactive compose uses the same commit rule as `--once`: pressing Enter commits
+the current input buffer plus Enter (`\r`), including an empty buffer for prompts
+that ask the user to press Enter. Ctrl-C, Ctrl-D, and Esc are local composer exit
+keys and are not forwarded to the target PTY. The `lterm input --enter` option
+uses the same Enter byte (`\r`).
+
+When the manifest uses `surface_contracts`, nested `raw_stream_policy` values use
+the same policy vocabulary as top-level entries. `not-applicable` is valid for a
+sub-surface such as `committed-input-send` because that sub-surface emits no text
+or raw output stream.
 
 ## Product command surface
 
@@ -61,6 +91,7 @@ sanitization to attach/resume would violate the 1.0 contract.
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
+| `lterm compose` | `lterm mobile` | `stable` | `best-effort` UI with stable sanitized capture display | none | `sanitized-output-only` |
 | `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |

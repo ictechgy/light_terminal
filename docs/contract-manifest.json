@@ -77,7 +77,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "Run is an attached command surface: the raw-pty-stream sub-surface is transparent and intentionally has no stable sanitized text or JSON contract."
     },
     {
       "command": "lterm resume",
@@ -114,7 +115,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "Resume/attach is a mixed attached client surface: raw-pty-stream is transparent, while local-status-bar is a client-side decoration and not a raw output stream."
     },
     {
       "command": "lterm open",
@@ -147,7 +149,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "Open is a mixed attach-or-create surface: raw-pty-stream is transparent, while create-if-missing-control covers local control behavior before attach and is not a raw output stream."
     },
     {
       "command": "lterm sessions",
@@ -261,6 +264,55 @@
       "raw_stream_policy": "sanitized-output-only"
     },
     {
+      "command": "lterm compose",
+      "aliases": [
+        "lterm mobile"
+      ],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke compose_once_message_appends_enter_by_default",
+        "cargo test --test cli_smoke mobile_once_message_appends_enter_by_default",
+        "cargo test --test cli_smoke compose_once_no_enter_sends_exact_message_bytes",
+        "cargo test --test cli_smoke mobile_once_no_enter_sends_exact_message_bytes",
+        "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry",
+        "cargo test --test cli_smoke mobile_once_does_not_change_attached_clients_or_geometry",
+        "cargo test --test cli_smoke compose_interactive_does_not_change_attached_clients_or_geometry",
+        "cargo test --test cli_smoke mobile_interactive_does_not_change_attached_clients_or_geometry",
+        "cargo test --bin lterm compose_enter_commit_policy_allows_blank_enter",
+        "cargo test --bin lterm compose_exit_keys_are_local_controls",
+        "cargo test --bin lterm compose_display_line_sanitizes_controls",
+        "cargo test --bin lterm compose_backspace_removes_one_grapheme_cluster",
+        "cargo test --bin lterm compose_paste_appends_text_to_input_buffer",
+        "cargo test --bin lterm compose_terminal_sequences_toggle_bracketed_paste",
+        "cargo test --bin lterm input_enter_writes_carriage_return",
+        "python3 scripts/validate_contract_manifest.py --self-test"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "surface_contracts": [
+        {
+          "name": "sanitized-capture-display",
+          "classification": "stable",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "stable",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "committed-input-send",
+          "classification": "stable",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ],
+      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. The composer layout is best-effort, while the displayed capture text is a stable sanitized-capture-display sub-surface. The display resolves targets like logs and captures the last --tail sanitized lines (default 80); --once captures once before commit, while interactive mode refreshes on --refresh (default 500ms), local input, and terminal resize. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry."
+    },
+    {
       "command": "lterm input",
       "aliases": [
         "lterm send"
@@ -270,7 +322,8 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke input_sends_text_to_pty",
-        "cargo test --test cli_smoke send_alias_sends_text_to_pty"
+        "cargo test --test cli_smoke send_alias_sends_text_to_pty",
+        "cargo test --bin lterm input_enter_writes_carriage_return"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -415,7 +468,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "SSH is a mixed remote invocation surface: raw-pty-stream remains transparent after remote attach, while ssh-invocation covers local command construction and is not a raw output stream."
     },
     {
       "command": "lterm agents",
@@ -469,7 +523,8 @@
           "json_output_stability": "none",
           "schema_path": null
         }
-      ]
+      ],
+      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once attached, while launcher-control covers local profile/session setup and is not a raw output stream."
     },
     {
       "command": "lterm tmux-compat list-commands",

@@ -5,6 +5,12 @@ use crate::protocol::{
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::terminal::ClearType;
+use crossterm::{cursor, execute, queue, terminal};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -392,6 +398,328 @@ pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Resu
         start,
         end,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposeOptions {
+    pub tail: usize,
+    pub refresh: Duration,
+    pub once: bool,
+    pub message: Option<String>,
+    pub append_enter: bool,
+}
+
+pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
+    let tail_start = compose_tail_start(options.tail)?;
+    if options.once {
+        let message = options
+            .message
+            .as_deref()
+            .context("--message is required with --once")?;
+        let output = capture_range(target, Some(tail_start), None)?;
+        print!("{output}");
+        std::io::stdout().flush().context("flush compose output")?;
+        send(target, compose_commit_bytes(message, options.append_enter))?;
+        return Ok(());
+    }
+    if options.message.is_some() {
+        bail!("--message requires --once");
+    }
+    let refresh = compose_refresh_interval(options.refresh)?;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("interactive compose requires a terminal; use --once --message for automation");
+    }
+    run_interactive_compose(target, tail_start, refresh, options.append_enter)
+}
+
+const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
+
+fn run_interactive_compose(
+    target: &str,
+    tail_start: i32,
+    refresh: Duration,
+    append_enter: bool,
+) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    let _guard = ComposeTerminalGuard::enter(&mut stdout)?;
+    let mut input = String::new();
+    let mut last_refresh = Instant::now();
+    let mut dirty = true;
+
+    loop {
+        if dirty || last_refresh.elapsed() >= refresh {
+            render_compose(target, tail_start, &input, &mut stdout)?;
+            last_refresh = Instant::now();
+            dirty = false;
+        }
+        let poll_timeout = refresh
+            .checked_sub(last_refresh.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(50))
+            .min(Duration::from_millis(100));
+        if !event::poll(poll_timeout).context("poll compose input")? {
+            continue;
+        }
+        let mut pending_event = Some(event::read().context("read compose input")?);
+        let mut exit = false;
+        while let Some(event) = pending_event.take() {
+            let key = match event {
+                Event::Key(key) => key,
+                Event::Resize(_, _) => {
+                    dirty = true;
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
+                Event::Paste(text) => {
+                    compose_push_paste(&mut input, &text);
+                    dirty = true;
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
+                _ => {
+                    if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                        pending_event = Some(event::read().context("read queued compose input")?);
+                    }
+                    continue;
+                }
+            };
+            if key.kind != KeyEventKind::Press {
+                if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                    pending_event = Some(event::read().context("read queued compose input")?);
+                }
+                continue;
+            }
+            if compose_is_local_exit_key(&key) {
+                exit = true;
+                break;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    if compose_should_commit(&input, append_enter) {
+                        send(target, compose_commit_bytes(&input, append_enter))?;
+                        input.clear();
+                    }
+                    dirty = true;
+                }
+                KeyCode::Backspace => {
+                    compose_pop_grapheme(&mut input);
+                    dirty = true;
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(ch);
+                    dirty = true;
+                }
+                _ => {}
+            }
+            if event::poll(Duration::ZERO).context("poll queued compose input")? {
+                pending_event = Some(event::read().context("read queued compose input")?);
+            }
+        }
+        if exit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn render_compose(
+    target: &str,
+    tail_start: i32,
+    input: &str,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let (cols, rows) = terminal_size();
+    let width = cols.saturating_sub(1).max(1) as usize;
+    let body_rows = rows.saturating_sub(1) as usize;
+    let capture = capture_range(target, Some(tail_start), None)?;
+    let lines: Vec<&str> = capture.lines().collect();
+    let start = lines.len().saturating_sub(body_rows);
+
+    let visible_lines = &lines[start..];
+    for row_idx in 0..body_rows {
+        let row = u16::try_from(row_idx).unwrap_or(u16::MAX);
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            terminal::Clear(ClearType::CurrentLine)
+        )
+        .context("position compose body")?;
+        if let Some(line) = visible_lines.get(row_idx) {
+            write!(stdout, "{}", compose_sanitized_display_line(line, width))
+                .context("write compose body")?;
+        }
+    }
+    let prompt_row = rows.saturating_sub(1);
+    let (prompt, cursor_col) = compose_prompt_line(input, width);
+    queue!(
+        stdout,
+        cursor::MoveTo(0, prompt_row),
+        terminal::Clear(ClearType::CurrentLine)
+    )
+    .context("position compose prompt")?;
+    write!(stdout, "{}", compose_display_line(&prompt, width)).context("write compose prompt")?;
+    queue!(stdout, cursor::MoveTo(cursor_col, prompt_row), cursor::Show)
+        .context("position compose cursor")?;
+    stdout.flush().context("flush compose screen")?;
+    Ok(())
+}
+
+fn compose_refresh_interval(refresh: Duration) -> Result<Duration> {
+    if refresh < COMPOSE_MIN_REFRESH {
+        bail!(
+            "--refresh must be at least {}ms",
+            COMPOSE_MIN_REFRESH.as_millis()
+        );
+    }
+    Ok(refresh)
+}
+
+fn compose_tail_start(tail: usize) -> Result<i32> {
+    if tail == 0 {
+        bail!("--tail must be greater than zero");
+    }
+    let tail = i32::try_from(tail).context("--tail exceeds supported scrollback range")?;
+    Ok(-tail)
+}
+
+fn compose_commit_bytes(message: &str, append_enter: bool) -> Vec<u8> {
+    let mut bytes = message.as_bytes().to_vec();
+    if append_enter {
+        bytes.push(b'\r');
+    }
+    bytes
+}
+
+fn compose_should_commit(input: &str, append_enter: bool) -> bool {
+    append_enter || !input.is_empty()
+}
+
+fn compose_is_local_exit_key(key: &KeyEvent) -> bool {
+    match &key.code {
+        KeyCode::Esc => true,
+        KeyCode::Char('c' | 'C' | 'd' | 'D') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn compose_pop_grapheme(input: &mut String) {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if let Some((index, _)) = input.grapheme_indices(true).next_back() {
+        input.truncate(index);
+    }
+}
+
+fn compose_push_paste(input: &mut String, text: &str) {
+    input.push_str(text);
+}
+
+fn compose_sanitized_display_line(value: &str, width: usize) -> String {
+    compose_display_line(&sanitize::terminal_text(value), width)
+}
+
+fn compose_display_line(value: &str, width: usize) -> String {
+    compose_truncate_start(value, width)
+}
+
+fn compose_prompt_line(input: &str, width: usize) -> (String, u16) {
+    use unicode_width::UnicodeWidthStr;
+
+    let prompt = format!("> {}", sanitize::terminal_text(input));
+    if prompt.width() <= width {
+        let cursor_col = u16::try_from(prompt.width()).unwrap_or(u16::MAX);
+        return (prompt, cursor_col);
+    }
+    let prompt = compose_truncate_end(&prompt, width);
+    let cursor_col = u16::try_from(prompt.width()).unwrap_or(u16::MAX);
+    (prompt, cursor_col)
+}
+
+fn compose_truncate_start(value: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut used = 0_usize;
+    let mut output = String::new();
+    for cluster in value.graphemes(true) {
+        let cluster_width = cluster.width();
+        if used + cluster_width > width {
+            break;
+        }
+        output.push_str(cluster);
+        used += cluster_width;
+    }
+    output
+}
+
+fn compose_truncate_end(value: &str, width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut used = 0_usize;
+    let mut clusters = Vec::new();
+    for cluster in value.graphemes(true).rev() {
+        let cluster_width = cluster.width();
+        if used + cluster_width > width {
+            break;
+        }
+        clusters.push(cluster);
+        used += cluster_width;
+    }
+    clusters.reverse();
+    clusters.concat()
+}
+
+struct ComposeTerminalGuard {
+    _panic_cleanup: AttachActiveGuard,
+}
+
+impl ComposeTerminalGuard {
+    fn enter(stdout: &mut impl Write) -> Result<Self> {
+        ensure_panic_terminal_cleanup_hook();
+        terminal::enable_raw_mode().context("enable compose raw mode")?;
+        let panic_cleanup = AttachActiveGuard::enter();
+        if let Err(err) = compose_terminal_enter_sequence(stdout) {
+            let _ = compose_terminal_leave_sequence(stdout);
+            drop(panic_cleanup);
+            let _ = terminal::disable_raw_mode();
+            return Err(err).context("enter compose screen");
+        }
+        Ok(Self {
+            _panic_cleanup: panic_cleanup,
+        })
+    }
+}
+
+impl Drop for ComposeTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = compose_terminal_leave_sequence(&mut stdout);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn compose_terminal_enter_sequence(stdout: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste,
+        cursor::Hide,
+        terminal::Clear(ClearType::All)
+    )
+}
+
+fn compose_terminal_leave_sequence(stdout: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        stdout,
+        DisableBracketedPaste,
+        terminal::Clear(ClearType::All),
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    )
 }
 
 /// PTY resize 요청. `subscriber_id` 가 `Some(id)` 면 server 가 해당 attach client 의
@@ -1711,6 +2039,7 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// - `\x1b[?1047l`: xterm alt-screen (1047) 종료 — clear 변종
 /// - `\x1b[r`     : DECSTBM 리셋 (scroll region 전체 화면) — alt 종료 이후 메인 버퍼에 적용
 /// - `\x1b[?25h`  : DECTCEM 커서 보이기
+/// - `\x1b[?2004l`: bracketed paste 비활성 (compose panic cleanup)
 /// - `\x1b[<u` ×16: kitty keyboard protocol stack pop. 정상 경로의
 ///   [`MAX_KEYBOARD_PROTOCOL_RESTORE_POPS`] 와 동일한 상한으로 정렬 — panic context에서
 ///   user push depth를 알 수 없으므로 tracked path가 허용한 최대치까지 시도한다.
@@ -1725,7 +2054,7 @@ fn keyboard_protocol_restore_bytes(state: &KeyboardProtocolRestoreState) -> Vec<
 /// 증상의 직접 원인이었다.
 fn panic_terminal_cleanup_bytes() -> &'static [u8] {
     // 16 kitty pops = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (정상 경로와 동일 상한).
-    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+    b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[?2004l\
       \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
       \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
       \x1b[=0u\x1b[0m\r\n"
@@ -1911,10 +2240,14 @@ mod tests {
         ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, DaemonStatus,
         KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
         StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
-        attach_pty_rows, cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
-        format_status_line, handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes,
-        matches_env_bool, observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
-        parse_status_style, resolve_status_style, status_theme_protocol_error,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        resolve_status_style, status_theme_protocol_error,
     };
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1929,6 +2262,118 @@ mod tests {
     /// ATTACH_ACTIVE 플래그를 만지는 테스트가 공유하는 직렬화 잠금.
     /// process-global static AtomicBool 이므로 병렬 테스트 race를 막아야 한다.
     static ATTACH_FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn compose_commit_bytes_match_input_enter_semantics() {
+        assert_eq!(compose_commit_bytes("", true), b"\r");
+        assert_eq!(compose_commit_bytes("hello", true), b"hello\r");
+        assert_eq!(compose_commit_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn compose_tail_start_rejects_unsupported_offsets() {
+        assert_eq!(compose_tail_start(1).expect("tail 1"), -1);
+        assert!(compose_tail_start(0).is_err());
+        assert!(compose_tail_start((i32::MAX as usize) + 1).is_err());
+    }
+
+    #[test]
+    fn compose_refresh_interval_rejects_tight_loops() {
+        assert!(compose_refresh_interval(Duration::from_millis(49)).is_err());
+        assert_eq!(
+            compose_refresh_interval(Duration::from_millis(50)).expect("minimum refresh"),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn compose_enter_commit_policy_allows_blank_enter() {
+        assert!(compose_should_commit("", true));
+        assert!(compose_should_commit("hello", true));
+        assert!(!compose_should_commit("", false));
+        assert!(compose_should_commit("hello", false));
+    }
+
+    #[test]
+    fn compose_exit_keys_are_local_controls() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!compose_is_local_exit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn compose_display_line_truncates_to_display_width() {
+        assert_eq!(compose_display_line("abcdef", 3), "abc");
+        assert_eq!(compose_display_line("abcdef", 0), "");
+        assert_eq!(compose_display_line("한글abc", 4), "한글");
+        assert_eq!(compose_display_line("👨‍👩‍👧‍👦abc", 3), "👨‍👩‍👧‍👦a");
+    }
+
+    #[test]
+    fn compose_display_line_sanitizes_controls() {
+        assert_eq!(compose_sanitized_display_line("A\u{0007}B", 10), "AB");
+    }
+
+    #[test]
+    fn compose_backspace_removes_one_grapheme_cluster() {
+        let mut input = String::from("a👨‍👩‍👧‍👦");
+        compose_pop_grapheme(&mut input);
+        assert_eq!(input, "a");
+
+        let mut combining = String::from("e\u{0301}");
+        compose_pop_grapheme(&mut combining);
+        assert_eq!(combining, "");
+    }
+
+    #[test]
+    fn compose_paste_appends_text_to_input_buffer() {
+        let mut input = String::from("pre");
+        compose_push_paste(&mut input, "\t붙여넣기\n");
+        assert_eq!(input, "pre\t붙여넣기\n");
+    }
+
+    #[test]
+    fn compose_terminal_sequences_toggle_bracketed_paste() {
+        let mut enter = Vec::new();
+        compose_terminal_enter_sequence(&mut enter).expect("compose enter sequence");
+        assert!(
+            enter
+                .windows(b"\x1b[?2004h".len())
+                .any(|w| w == b"\x1b[?2004h"),
+            "compose enter must enable bracketed paste: {enter:?}"
+        );
+
+        let mut leave = Vec::new();
+        compose_terminal_leave_sequence(&mut leave).expect("compose leave sequence");
+        assert!(
+            leave
+                .windows(b"\x1b[?2004l".len())
+                .any(|w| w == b"\x1b[?2004l"),
+            "compose leave must disable bracketed paste: {leave:?}"
+        );
+    }
+
+    #[test]
+    fn compose_prompt_line_keeps_input_tail_visible() {
+        let (line, cursor_col) = compose_prompt_line("abcdef", 5);
+        assert_eq!(line, "bcdef");
+        assert_eq!(cursor_col, 5);
+    }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
     /// ENV_LOCK을 잡은 상태에서만 사용해야 한다.
@@ -2292,10 +2737,11 @@ mod tests {
     fn panic_terminal_cleanup_bytes_emits_safe_recovery_sequence() {
         let bytes = panic_terminal_cleanup_bytes();
         // 정확한 sequence (순서 중요): alt-screen(1049/47/1047) 종료 → scroll region 리셋 →
-        // 커서 visible → kitty pop ×16 → kitty direct disable → SGR 리셋 → CR+LF.
+        // 커서 visible → bracketed paste disable → kitty pop ×16 → kitty direct disable →
+        // SGR 리셋 → CR+LF.
         // alt-screen 종료가 \x1b[r 보다 먼저 와서 reset이 메인 버퍼에 적용되어야 한다.
         // pop 16회 = MAX_KEYBOARD_PROTOCOL_RESTORE_POPS 와 정렬 (스택 바닥 이상은 no-op).
-        let expected = b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\
+        let expected = b"\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?25h\x1b[?2004l\
                          \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
                          \x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\x1b[<u\
                          \x1b[=0u\x1b[0m\r\n";
@@ -2328,6 +2774,7 @@ mod tests {
         // kitty keyboard protocol pop과 direct disable이 포함되어야 함
         assert!(bytes.windows(4).any(|w| w == b"\x1b[<u"));
         assert!(bytes.windows(5).any(|w| w == b"\x1b[=0u"));
+        assert!(bytes.windows(8).any(|w| w == b"\x1b[?2004l"));
     }
 
     #[test]
