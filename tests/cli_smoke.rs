@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -6,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -3015,6 +3017,24 @@ fn mobile_once_does_not_change_attached_clients_or_geometry() -> TestResult {
     once_does_not_change_attached_clients_or_geometry("mobile", "mobile-geometry")
 }
 
+#[test]
+#[cfg(unix)]
+fn compose_interactive_does_not_change_attached_clients_or_geometry() -> TestResult {
+    interactive_does_not_change_attached_clients_or_geometry(
+        "compose",
+        "compose-interactive-geometry",
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn mobile_interactive_does_not_change_attached_clients_or_geometry() -> TestResult {
+    interactive_does_not_change_attached_clients_or_geometry(
+        "mobile",
+        "mobile-interactive-geometry",
+    )
+}
+
 #[cfg(unix)]
 fn once_does_not_change_attached_clients_or_geometry(command: &str, name: &str) -> TestResult {
     let env = TestEnv::new()?;
@@ -3070,6 +3090,90 @@ fn once_does_not_change_attached_clients_or_geometry(command: &str, name: &str) 
         ),
         (Some(40), Some(152)),
         "compose must not resize the raw attach PTY geometry: {after}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn interactive_does_not_change_attached_clients_or_geometry(
+    command: &str,
+    name: &str,
+) -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            name,
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    wait_for_socket(&socket)?;
+    env.capture_until(name, "READY")?;
+    let (_attached_stream, _subscriber_id) = attach_with_geometry(&socket, name, 40, 152)?;
+    wait_for_size(&env, name, (40, 152))?;
+
+    let before = read_session_json(&env, name)?;
+    assert_eq!(
+        before
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "pre-compose attached client count should reflect exactly one live attach: {before}"
+    );
+
+    let (mut master, slave) = open_pty_pair()?;
+    let stdin = Stdio::from(slave.try_clone()?);
+    let stdout = Stdio::from(slave.try_clone()?);
+    let mut compose = ChildCleanup::new(
+        env.cmd()
+            .args([command, name, "--refresh", "50ms"])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    drop(slave);
+    thread::sleep(Duration::from_millis(200));
+    master.write_all(b"\x1b")?;
+    master.flush()?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if let Some(status) = compose.child_mut()?.try_wait()? {
+            assert!(status.success(), "interactive compose failed: {status:?}");
+            exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(exited, "interactive compose did not exit after local Esc");
+    compose.kill_and_wait()?;
+
+    let after = read_session_json(&env, name)?;
+    assert_eq!(
+        after
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "interactive compose must not create or drop attach subscribers: {after}"
+    );
+    assert_eq!(
+        (
+            after.get("rows").and_then(serde_json::Value::as_u64),
+            after.get("cols").and_then(serde_json::Value::as_u64)
+        ),
+        (Some(40), Some(152)),
+        "interactive compose must not resize the raw attach PTY geometry: {after}"
     );
     Ok(())
 }
@@ -5705,6 +5809,27 @@ fn attach_with_geometry(
         .and_then(|v| v.as_u64())
         .ok_or("attach response missing subscriber_id")?;
     Ok((stream, subscriber_id))
+}
+
+#[cfg(unix)]
+fn open_pty_pair() -> TestResult<(File, File)> {
+    let mut master = -1;
+    let mut slave = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    Ok((master, slave))
 }
 
 /// `lterm sessions --json` 으로 단일 세션 row 를 조회한다.

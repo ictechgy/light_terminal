@@ -20,9 +20,12 @@ only a small tmux-compatible subset.
 | `explicit-raw-unsafe` | Attached PTY stream behavior that is transparent and intentionally unsanitized. |
 
 Output stability is tracked separately for text and JSON. Stable JSON outputs
-must have a schema path in the manifest; schema files and schema validation are
-owned by the JSON-schema validation lane. Text output stability applies to the
-shape and documented fields, not to user-controlled PTY content.
+must have a schema path in the manifest. The manifest schema lives at
+[`docs/schemas/contract-manifest.schema.json`](schemas/contract-manifest.schema.json),
+and `scripts/validate_contract_manifest.py` validates manifest fields including
+`surface_contracts`, `stability_scope`, and the `best-effort` stability value.
+Text output stability applies to the shape and documented fields, not to
+user-controlled PTY content.
 
 For mixed commands, the manifest's `surface_contracts` field is the
 authoritative stability boundary for each output surface. For example,

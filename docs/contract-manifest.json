@@ -275,9 +275,12 @@
         "cargo test --test cli_smoke mobile_once_no_enter_sends_exact_message_bytes",
         "cargo test --test cli_smoke compose_once_does_not_change_attached_clients_or_geometry",
         "cargo test --test cli_smoke mobile_once_does_not_change_attached_clients_or_geometry",
-        "cargo test compose_enter_commit_policy_allows_blank_enter",
-        "cargo test compose_exit_keys_are_local_controls",
-        "cargo test compose_display_line_sanitizes_controls"
+        "cargo test --test cli_smoke compose_interactive_does_not_change_attached_clients_or_geometry",
+        "cargo test --test cli_smoke mobile_interactive_does_not_change_attached_clients_or_geometry",
+        "cargo test --bin lterm compose_enter_commit_policy_allows_blank_enter",
+        "cargo test --bin lterm compose_exit_keys_are_local_controls",
+        "cargo test --bin lterm compose_display_line_sanitizes_controls",
+        "cargo test --bin lterm input_enter_writes_carriage_return"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -312,7 +315,8 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke input_sends_text_to_pty",
-        "cargo test --test cli_smoke send_alias_sends_text_to_pty"
+        "cargo test --test cli_smoke send_alias_sends_text_to_pty",
+        "cargo test --bin lterm input_enter_writes_carriage_return"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",

@@ -205,12 +205,16 @@ def collect_rust_test_names(repo_root: Path) -> set[str]:
         if not base.exists():
             continue
         for path in base.rglob("*.rs"):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            names.update(re.findall(r"(?m)^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
+            names.update(collect_rust_fn_names(path))
     return names
+
+
+def collect_rust_fn_names(path: Path) -> set[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeDecodeError):
+        return set()
+    return set(re.findall(r"(?m)^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text))
 
 
 def collect_ci_target_names(repo_root: Path) -> set[str]:
@@ -276,12 +280,7 @@ def test_target_exists(target: str, repo_root: Path, rust_tests: set[str], ci_ta
         except ValueError:
             return False
         if len(tokens) >= 2 and tokens[0] == "cargo" and tokens[1] == "test":
-            if "--test" in tokens:
-                idx = tokens.index("--test")
-                if idx + 1 < len(tokens):
-                    return (repo_root / "tests" / f"{tokens[idx + 1]}.rs").exists()
-                return False
-            return True
+            return cargo_test_target_exists(tokens, repo_root, rust_tests)
 
     normalized = target.split("::")[-1]
     if normalized in rust_tests:
@@ -291,6 +290,61 @@ def test_target_exists(target: str, repo_root: Path, rust_tests: set[str], ci_ta
     if (repo_root / "src" / f"{normalized}.rs").exists():
         return True
     return False
+
+
+def cargo_test_target_exists(tokens: list[str], repo_root: Path, rust_tests: set[str]) -> bool:
+    test_path: Path | None = None
+    bin_name: str | None = None
+    lib_scope = False
+    filters: list[str] = []
+    index = 2
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token == "--test":
+            if index + 1 >= len(tokens):
+                return False
+            test_path = repo_root / "tests" / f"{tokens[index + 1]}.rs"
+            index += 2
+            continue
+        if token == "--lib":
+            lib_scope = True
+            index += 1
+            continue
+        if token == "--bin":
+            if index + 1 >= len(tokens):
+                return False
+            bin_name = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        filters.append(token)
+        index += 1
+
+    if test_path is not None:
+        if not test_path.exists():
+            return False
+        return rust_filters_exist(filters, collect_rust_fn_names(test_path))
+
+    if bin_name is not None and bin_name != "lterm" and not (repo_root / "src" / "bin" / f"{bin_name}.rs").exists():
+        return False
+
+    if lib_scope or bin_name is not None:
+        lib_names: set[str] = set()
+        for path in (repo_root / "src").rglob("*.rs"):
+            lib_names.update(collect_rust_fn_names(path))
+        return rust_filters_exist(filters, lib_names)
+
+    return rust_filters_exist(filters, rust_tests) if filters else True
+
+
+def rust_filters_exist(filters: list[str], names: set[str]) -> bool:
+    if not filters:
+        return True
+    return all(any(test_filter in name or name in test_filter for name in names) for test_filter in filters)
 
 
 if __name__ == "__main__":

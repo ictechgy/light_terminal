@@ -500,13 +500,7 @@ fn run() -> Result<()> {
             target,
             text,
             enter,
-        } => {
-            let mut bytes = text.into_bytes();
-            if enter {
-                bytes.push(b'\r');
-            }
-            client::send(&target, bytes)
-        }
+        } => client::send(&target, input_commit_bytes(text, enter)),
         Commands::Logs { target, start, end } => {
             let output = if end.is_some() {
                 client::capture_range(&target, start, end)?
@@ -1010,6 +1004,14 @@ fn parse_compose_tail_arg(value: &str) -> std::result::Result<usize, String> {
     i32::try_from(tail)
         .map(|_| tail)
         .map_err(|_| "--tail exceeds supported scrollback range".to_string())
+}
+
+fn input_commit_bytes(text: String, enter: bool) -> Vec<u8> {
+    let mut bytes = text.into_bytes();
+    if enter {
+        bytes.push(b'\r');
+    }
+    bytes
 }
 
 fn parse_status_theme_setting(value: &str) -> Result<Option<protocol::StatusTheme>> {
@@ -1889,6 +1891,12 @@ mod tests {
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "0"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "2147483648"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--refresh", "0ms"]).is_err());
+    }
+
+    #[test]
+    fn input_enter_writes_carriage_return() {
+        assert_eq!(input_commit_bytes("hello".to_string(), true), b"hello\r");
+        assert_eq!(input_commit_bytes("hello".to_string(), false), b"hello");
     }
 
     #[test]
