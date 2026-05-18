@@ -15,6 +15,7 @@
 
 > **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
+> Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
 ## Why lterm instead of plain tmux?
 

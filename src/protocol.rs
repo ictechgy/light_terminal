@@ -88,6 +88,14 @@ pub struct DaemonStatus {
     pub session_count: u64,
     pub active_connections: u64,
     pub shutting_down: bool,
+    // daemon_uid: 데몬 프로세스의 effective uid. 같은 OS 사용자 trust boundary를
+    // doctor에서 한눈에 확인하기 위한 필드. 옛 데몬 응답에는 없으므로
+    // `#[serde(default)]`로 backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_uid: Option<u32>,
+    // started_at_unix_secs: 데몬 시작 시각(UNIX epoch seconds). uptime 계산용.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

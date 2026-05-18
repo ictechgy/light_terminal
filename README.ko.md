@@ -15,6 +15,7 @@
 
 > **보안 모델:** `lterm`은 같은 OS 사용자 안에서 쓰는 편의용 데몬이며 샌드박스가 아닙니다. 다른 사용자의 Unix socket 접근은 거부하고 런타임 디렉터리는 소유자 전용 권한으로 만들지만, 같은 OS 사용자 권한으로 실행되는 프로세스는 세션을 제어할 수 있다고 보아야 합니다.
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
+> Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
 ## 왜 tmux 대신 lterm인가요?
 

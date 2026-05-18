@@ -793,7 +793,20 @@ struct DoctorReport {
     daemon_session_count: Option<u64>,
     daemon_active_connections: Option<u64>,
     daemon_shutting_down: Option<bool>,
+    // 같은 OS 사용자 trust boundary 식별자. 옛 데몬은 보고하지 않으므로 Option.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_uid: Option<u32>,
+    // 데몬 시작 시각(UNIX epoch seconds). 옛 데몬은 없음.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_started_at_unix_secs: Option<u64>,
+    // 데몬 가동 시간(초). started_at과 현재 시각 차이로 계산.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_uptime_secs: Option<u64>,
     daemon_error: Option<String>,
+    // 비정상 상태(unreachable, version mismatch, shutting down 등)에 대한
+    // 사람·에이전트 가독 한 줄 요약. 정상이면 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     runtime_dir: String,
     data_dir: String,
     socket_path: String,
@@ -816,26 +829,69 @@ fn print_doctor_report(json: bool) -> Result<()> {
             (None, reachable, Some(err.to_string()))
         }
     };
+    let version_match = daemon.as_ref().map(|status| {
+        status.version == env!("CARGO_PKG_VERSION")
+            && status.protocol_version == protocol::PROTOCOL_VERSION
+    });
+    let daemon_uid = daemon.as_ref().and_then(|status| status.daemon_uid);
+    let daemon_started_at_unix_secs = daemon
+        .as_ref()
+        .and_then(|status| status.started_at_unix_secs);
+    // uptime 계산은 옛 데몬(필드 없음)이면 None. 시스템 clock이 UNIX_EPOCH 이전이면 0.
+    let daemon_uptime_secs = daemon_started_at_unix_secs.map(|started| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(started)
+    });
+    let daemon_shutting_down = daemon.as_ref().map(|status| status.shutting_down);
+    let tmux_shim_exists = tmux_shim_path.is_file();
+    // 비정상 상태 단일 요약. 우선순위: unreachable → shutdown → version mismatch → shim missing.
+    let reason = if !daemon_reachable {
+        Some(
+            "Daemon is not reachable. It usually auto-starts on the next `lterm` command; run `lterm doctor` again or inspect daemon startup with `lterm logs`."
+                .to_string(),
+        )
+    } else if matches!(daemon_shutting_down, Some(true)) {
+        Some(
+            "Daemon is shutting down. Wait for it to exit, then rerun any pending command."
+                .to_string(),
+        )
+    } else if matches!(version_match, Some(false)) {
+        Some(
+            "Client version or protocol does not match the running daemon. Run `lterm shutdown` and retry to load the new daemon binary."
+                .to_string(),
+        )
+    } else if !tmux_shim_exists {
+        Some(
+            "Tmux shim is missing — tmux-compatible agents may fall back to system tmux. Run `lterm install-shim` (or reinstall lterm) to recreate it."
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let report = DoctorReport {
         client_version: env!("CARGO_PKG_VERSION"),
         client_protocol_version: protocol::PROTOCOL_VERSION,
         daemon_reachable,
         daemon_version: daemon.as_ref().map(|status| status.version.clone()),
         daemon_protocol_version: daemon.as_ref().map(|status| status.protocol_version),
-        version_match: daemon.as_ref().map(|status| {
-            status.version == env!("CARGO_PKG_VERSION")
-                && status.protocol_version == protocol::PROTOCOL_VERSION
-        }),
+        version_match,
         daemon_session_count: daemon.as_ref().map(|status| status.session_count),
         daemon_active_connections: daemon.as_ref().map(|status| status.active_connections),
-        daemon_shutting_down: daemon.as_ref().map(|status| status.shutting_down),
+        daemon_shutting_down,
+        daemon_uid,
+        daemon_started_at_unix_secs,
+        daemon_uptime_secs,
         daemon_error,
+        reason,
         runtime_dir: runtime_dir.display().to_string(),
         data_dir: data_dir.display().to_string(),
         socket_path: socket_path.display().to_string(),
         shim_dir: shim_dir.display().to_string(),
         tmux_shim_path: tmux_shim_path.display().to_string(),
-        tmux_shim_exists: tmux_shim_path.is_file(),
+        tmux_shim_exists,
         shim_dir_in_path: path_contains_dir(&shim_dir),
     };
 
@@ -886,8 +942,23 @@ fn print_doctor_report(json: bool) -> Result<()> {
                 .daemon_shutting_down
                 .map_or("-", |value| if value { "yes" } else { "no" })
         );
+        println!(
+            "daemon_uid\t{}",
+            report
+                .daemon_uid
+                .map_or_else(|| "-".to_string(), |uid| uid.to_string())
+        );
+        println!(
+            "daemon_uptime_secs\t{}",
+            report
+                .daemon_uptime_secs
+                .map_or_else(|| "-".to_string(), |secs| secs.to_string())
+        );
         if let Some(error) = &report.daemon_error {
             println!("daemon_error\t{}", sanitize::terminal_text(error));
+        }
+        if let Some(reason) = &report.reason {
+            println!("reason\t{}", sanitize::terminal_text(reason));
         }
         println!(
             "runtime_dir\t{}",
