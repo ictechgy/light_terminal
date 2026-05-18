@@ -30,6 +30,8 @@ AGENTS.md
 **/AGENTS.md
 HANDOFF.md
 **/HANDOFF.md
+# Local LLM wiki — per-developer notes (HANDOFF: must not be committed). Root +
+# nested patterns are intentional; mirrors the AGENTS.md/HANDOFF.md convention.
 omx_wiki/
 **/omx_wiki/
 
