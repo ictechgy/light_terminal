@@ -5501,34 +5501,64 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
     Ok(())
 }
 
-// 부모 프로세스 관점의 default fallback runtime path
-// (env::temp_dir()/light-terminal-{euid}/lterm.sock)에 대해 UnixStream::connect가
-// 즉시 성공하는지 검사한다. lterm 데몬임을 protocol 수준에서 검증하지는 않으며,
-// stale 소켓이나 다른 Unix listener가 우연히 같은 경로에 자리 잡은 경우에도 true를
-// 반환한다 — 이 best-effort 가드는 "보수적 skip"을 위한 것이고, 진짜 보호 메커니즘은
-// 테스트 본문에서 child에 sandbox TMPDIR을 주입하는 환경 격리이다.
+// 부모 프로세스 관점의 default fallback runtime socket path
+// (env::temp_dir()/light-terminal-{euid}/lterm.sock). 가드 검사와 진단 메시지가
+// 동일한 경로를 참조하도록 단일 출처로 분리한다.
 #[cfg(unix)]
-fn default_runtime_socket_accepts_connections() -> bool {
+fn default_runtime_socket_path() -> std::path::PathBuf {
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let uid = unsafe { libc::geteuid() };
-    let socket = std::env::temp_dir()
+    std::env::temp_dir()
         .join(format!("light-terminal-{uid}"))
-        .join("lterm.sock");
-    UnixStream::connect(&socket).is_ok()
+        .join("lterm.sock")
 }
+
+// 위 path에 대해 UnixStream::connect가 즉시 성공하는지 검사한다. lterm 데몬임을
+// protocol 수준에서 검증하지는 않으며, stale 소켓이나 다른 Unix listener가 우연히
+// 같은 경로에 자리 잡은 경우에도 true를 반환한다 — 이 best-effort 가드는 "보수적
+// skip"을 위한 것이고, 진짜 보호 메커니즘은 테스트 본문에서 child에 sandbox
+// TMPDIR을 주입하는 환경 격리이다.
+#[cfg(unix)]
+fn default_runtime_socket_accepts_connections() -> bool {
+    UnixStream::connect(default_runtime_socket_path()).is_ok()
+}
+
+// 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
+// 테스트가 silent skip(`Ok(())`)으로 빠진다. 미설정 시에는 panic하여 cargo test의
+// FAIL 출력으로 "이 호스트는 안전하지 않다"는 신호가 가시화된다. CI는 default
+// 경로의 socket이 비어있으므로 가드 자체가 발동하지 않아 본문이 그대로 실행된다.
+#[cfg(unix)]
+const LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV: &str = "LTERM_TEST_ALLOW_OCCUPIED_SKIP";
 
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     // 부모 호스트의 default fallback runtime path에 어떤 Unix listener가 떠 있으면
     // 이 테스트가 (LTERM_RUNTIME_DIR을 제거한 상태로) 그 path 인근의 사용자 데몬과
-    // 상호작용해 attached 세션을 끊을 risk가 있다. 보수적으로 스킵한다. cargo test는
-    // 이 early-return을 PASS로 카운트하므로 회귀 신호는 CI(데몬 없음)에서만 보장된다.
+    // 상호작용해 attached 세션을 끊을 risk가 있다. 가드 발동 시 기본은 panic하여
+    // cargo test FAIL 출력으로 회귀 신호가 가시화되도록 한다. 호스트에 의도적으로
+    // 데몬을 띄운 개발자는 LTERM_TEST_ALLOW_OCCUPIED_SKIP env로 silent skip을
+    // opt-in 할 수 있다 (이 경우 cargo test는 PASS로 카운트하므로 신호는 CI에서만
+    // 보장된다). CI 환경은 default 경로 socket이 비어있어 가드가 발동하지 않으므로
+    // 본문이 항상 실행된다.
     if default_runtime_socket_accepts_connections() {
-        eprintln!(
-            "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: default runtime socket is occupied"
+        let socket = default_runtime_socket_path();
+        if std::env::var_os(LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV).is_some() {
+            eprintln!(
+                "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: \
+                 default runtime socket {} is occupied ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set; any non-empty value)",
+                socket.display()
+            );
+            return Ok(());
+        }
+        panic!(
+            "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a daemon \
+             currently listening on {}. \
+             Either stop that daemon before running this test, or set \
+             {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 (any non-empty value) to opt-in to skipping \
+             this test on hosts with an intentionally running lterm daemon.",
+            socket.display()
         );
-        return Ok(());
     }
 
     let temp = tempfile::tempdir()?;
