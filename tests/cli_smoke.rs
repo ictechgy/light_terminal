@@ -5558,6 +5558,28 @@ fn default_runtime_daemon_reports_reachable() -> bool {
     runtime_daemon_reports_reachable_at(&default_runtime_socket_path())
 }
 
+// LTERM_RUNTIME_DIR / LTERM_SOCKET / XDG_RUNTIME_DIR 를 모두 제거한 채 lterm
+// CLI 의 fallback runtime path 동작을 검증하는 테스트 전용 Command builder.
+// TMPDIR 을 명시 sandbox tempdir 으로 override 해 자식이 보는 fallback 경로가
+// 사용자 호스트의 default 경로와 겹치지 않도록 강제한다.
+//
+// 본 helper 를 거치지 않고 env_remove("LTERM_RUNTIME_DIR") 만 직접 쓰는 테스트는
+// 호스트에 떠 있는 사용자 데몬을 침범할 위험이 있다. PR #75 의
+// default_runtime_daemon_reports_reachable 가드가 보수적 안전망이지만, 1차
+// 방어선은 본 helper 가 강제하는 sandbox TMPDIR 환경 격리이다 (PR #76 quad-review
+// 합의 — TMPDIR isolation is the real protection). 같은 패턴이 필요한 새 테스트는
+// 반드시 본 helper 를 사용한다.
+#[cfg(unix)]
+fn cmd_for_default_fallback_test(tmpdir_root: &Path, data_dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    cmd.env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", tmpdir_root)
+        .env("LTERM_DATA_DIR", data_dir);
+    cmd
+}
+
 // 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
 // 테스트가 silent skip(`Ok(())`)으로 빠진다. 미설정 시에는 panic하여 cargo test의
 // FAIL 출력으로 "이 호스트는 안전하지 않다"는 신호가 가시화된다. CI는 default
@@ -5602,13 +5624,8 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     let data = temp.path().join("data");
     std::fs::create_dir(&tmp)?;
 
-    let mut list = Command::new(env!("CARGO_BIN_EXE_lterm"));
-    list.env_remove("LTERM_RUNTIME_DIR")
-        .env_remove("LTERM_SOCKET")
-        .env_remove("XDG_RUNTIME_DIR")
-        .env("TMPDIR", &tmp)
-        .env("LTERM_DATA_DIR", &data)
-        .arg("list");
+    let mut list = cmd_for_default_fallback_test(&tmp, &data);
+    list.arg("list");
     let output = list.output()?;
     assert!(output.status.success(), "{output:?}");
 
@@ -5618,15 +5635,8 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     assert!(!meta.file_type().is_symlink());
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
-    let mut shutdown = Command::new(env!("CARGO_BIN_EXE_lterm"));
-    let _ = shutdown
-        .env_remove("LTERM_RUNTIME_DIR")
-        .env_remove("LTERM_SOCKET")
-        .env_remove("XDG_RUNTIME_DIR")
-        .env("TMPDIR", &tmp)
-        .env("LTERM_DATA_DIR", &data)
-        .arg("shutdown")
-        .status();
+    let mut shutdown = cmd_for_default_fallback_test(&tmp, &data);
+    let _ = shutdown.arg("shutdown").status();
     Ok(())
 }
 
