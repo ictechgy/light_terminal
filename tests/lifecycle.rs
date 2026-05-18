@@ -181,7 +181,11 @@ fn stale_non_socket_at_socket_path_is_refused() -> TestResult {
     // 비-소켓 일반 파일을 사전에 둔다.
     fs::write(&socket, b"not a socket")?;
 
-    // 다음 명령은 자동 spawn 시 prepare_socket_path에서 명시적으로 실패해야 한다.
+    // 다음 명령은 명시적으로 실패해야 한다. 어느 트레이스 경로든 (a) 데몬이
+    // prepare_socket_path에서 "refusing to remove non-socket path"로 거부하거나
+    // (macOS: ENOTSOCK → "non-socket"/"Socket operation"), (b) 클라이언트가
+    // UnixStream::connect에서 즉시 거부 (Linux: ECONNREFUSED → "Connection
+    // refused"). 두 경우 모두 trust boundary가 지켜진다.
     let out = env.cmd().args(["list"]).output()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -191,12 +195,15 @@ fn stale_non_socket_at_socket_path_is_refused() -> TestResult {
         stderr
     );
     assert!(
-        stderr.contains("non-socket"),
-        "expected 'non-socket' in stderr, got: {}",
+        stderr.contains("non-socket")
+            || stderr.contains("Socket operation")
+            || stderr.contains("Connection refused"),
+        "expected non-socket/Connection-refused refusal in stderr, got: {}",
         stderr
     );
 
-    // 사전에 둔 비-소켓 파일은 보호되어야 한다 (silently 삭제/덮어쓰기 금지).
+    // 사전에 둔 비-소켓 파일은 보호되어야 한다 — silently 삭제/덮어쓰기 금지.
+    // 이것이 trust boundary의 진짜 safety invariant이며 OS-portable.
     assert_eq!(
         fs::read(&socket)?,
         b"not a socket",
@@ -333,12 +340,15 @@ fn symlink_socket_path_is_refused() -> TestResult {
         stderr
     );
     // 어느 트레이스 경로든 (a) 데몬이 prepare_socket_path에서 "refusing symlink"로
-    // 거부하거나 (b) 클라이언트가 UnixStream::connect에서 ENOTSOCK("non-socket"/
-    // "Socket operation")으로 거부한다. 두 경우 모두 보안 invariant는 동일하다.
+    // 거부하거나 (b) 클라이언트가 UnixStream::connect에서 ENOTSOCK(macOS:
+    // "non-socket"/"Socket operation")이나 ECONNREFUSED(Linux: "Connection
+    // refused")로 거부한다. 세 경우 모두 보안 invariant는 동일하다 — silently
+    // symlink를 따라가지 않음.
     assert!(
         stderr.contains("symlink")
             || stderr.contains("non-socket")
-            || stderr.contains("Socket operation"),
+            || stderr.contains("Socket operation")
+            || stderr.contains("Connection refused"),
         "expected refusal of symlink/non-socket socket path, got: {}",
         stderr
     );
