@@ -5517,18 +5517,39 @@ fn default_runtime_socket_accepts_connections() -> bool {
     UnixStream::connect(&socket).is_ok()
 }
 
+// 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
+// 테스트가 silent skip(`Ok(())`)으로 빠진다. 미설정 시에는 panic하여 cargo test의
+// FAIL 출력으로 "이 호스트는 안전하지 않다"는 신호가 가시화된다. CI는 default
+// 경로의 socket이 비어있으므로 가드 자체가 발동하지 않아 본문이 그대로 실행된다.
+#[cfg(unix)]
+const LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV: &str = "LTERM_TEST_ALLOW_OCCUPIED_SKIP";
+
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     // 부모 호스트의 default fallback runtime path에 어떤 Unix listener가 떠 있으면
     // 이 테스트가 (LTERM_RUNTIME_DIR을 제거한 상태로) 그 path 인근의 사용자 데몬과
-    // 상호작용해 attached 세션을 끊을 risk가 있다. 보수적으로 스킵한다. cargo test는
-    // 이 early-return을 PASS로 카운트하므로 회귀 신호는 CI(데몬 없음)에서만 보장된다.
+    // 상호작용해 attached 세션을 끊을 risk가 있다. 가드 발동 시 기본은 panic하여
+    // cargo test FAIL 출력으로 회귀 신호가 가시화되도록 한다. 호스트에 의도적으로
+    // 데몬을 띄운 개발자는 LTERM_TEST_ALLOW_OCCUPIED_SKIP env로 silent skip을
+    // opt-in 할 수 있다 (이 경우 cargo test는 PASS로 카운트하므로 신호는 CI에서만
+    // 보장된다). CI 환경은 default 경로 socket이 비어있어 가드가 발동하지 않으므로
+    // 본문이 항상 실행된다.
     if default_runtime_socket_accepts_connections() {
-        eprintln!(
-            "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: default runtime socket is occupied"
+        if std::env::var_os(LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV).is_some() {
+            eprintln!(
+                "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: \
+                 default runtime socket is occupied ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set)"
+            );
+            return Ok(());
+        }
+        panic!(
+            "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a daemon \
+             currently listening on the default runtime path \
+             (env::temp_dir()/light-terminal-{{euid}}/lterm.sock). \
+             Set {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 to opt-in to skipping this test on hosts \
+             with an intentionally running lterm daemon."
         );
-        return Ok(());
     }
 
     let temp = tempfile::tempdir()?;
