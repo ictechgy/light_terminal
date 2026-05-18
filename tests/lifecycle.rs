@@ -274,18 +274,25 @@ fn half_open_client_does_not_block_other_clients() -> TestResult {
     // 다른 client가 정상 동작해야 한다. 동시에 RPC 라운드트립이 half-open peer 때문에
     // single-flight로 직렬화되면 사용자가 행 걸린다고 느낀다 — 합리적 상한선 안에서
     // 끝남을 명시적으로 가드한다. RPC_TIMEOUT(5초)에서 충분히 거리를 두되 디버그
-    // 빌드 process 시작 비용까지 흡수하도록 2초로 둔다.
+    // 빌드 process 시작 비용 + RPC 라운드트립까지 흡수하도록 2초로 둔다. CI에서
+    // flake가 관측되면 별도 PR에서 증액하거나 RPC-only 측정으로 분리한다.
+    const HALF_OPEN_SECOND_CLIENT_MAX: Duration = Duration::from_secs(2);
     let started = Instant::now();
-    let r = env.doctor_json()?;
+    let doctor_report = env.doctor_json()?;
     let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "second client must not be blocked by half-open peer: elapsed={elapsed:?}, doctor={r:?}"
-    );
+    // 진단 흐름: 기능 정상성(daemon_reachable)을 먼저 확인하고, 그 다음에 성능
+    // 특성(elapsed bound)을 검증한다. 그래야 RPC가 빠르게 실패한 케이스가 latency
+    // bound assertion에 가려지지 않는다.
     assert_eq!(
-        r.get("daemon_reachable").and_then(|v| v.as_bool()),
+        doctor_report
+            .get("daemon_reachable")
+            .and_then(|v| v.as_bool()),
         Some(true),
-        "second client should reach daemon while first is half-open: {r:?}"
+        "second client should reach daemon while first is half-open: {doctor_report:?}"
+    );
+    assert!(
+        elapsed < HALF_OPEN_SECOND_CLIENT_MAX,
+        "second client must not be blocked by half-open peer: elapsed={elapsed:?}, bound={HALF_OPEN_SECOND_CLIENT_MAX:?}, doctor={doctor_report:?}"
     );
 
     // half-open 끝에 도달하는 응답 유무는 contract surface가 아니므로 panic만 가드.
