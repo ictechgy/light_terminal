@@ -5501,12 +5501,14 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
     Ok(())
 }
 
-// 사용자의 실제 default runtime dir에 살아있는 lterm 데몬이 있으면 true.
-// 이 검사는 LTERM_RUNTIME_DIR/XDG_RUNTIME_DIR을 제거하고 fallback 경로를 검증하는
-// 테스트가, 호스트에 떠 있는 사용자 데몬을 침범(다른 PATH의 바이너리가 동일 소켓에
-// 자리잡거나 sessions를 끊는 사고)하지 않도록 보호하기 위함이다.
+// 부모 프로세스 관점의 default fallback runtime path
+// (env::temp_dir()/light-terminal-{euid}/lterm.sock)에 대해 UnixStream::connect가
+// 즉시 성공하는지 검사한다. lterm 데몬임을 protocol 수준에서 검증하지는 않으며,
+// stale 소켓이나 다른 Unix listener가 우연히 같은 경로에 자리 잡은 경우에도 true를
+// 반환한다 — 이 best-effort 가드는 "보수적 skip"을 위한 것이고, 진짜 보호 메커니즘은
+// 테스트 본문에서 child에 sandbox TMPDIR을 주입하는 환경 격리이다.
 #[cfg(unix)]
-fn real_default_daemon_is_reachable() -> bool {
+fn default_runtime_socket_accepts_connections() -> bool {
     let uid = unsafe { libc::geteuid() };
     let socket = std::env::temp_dir()
         .join(format!("light-terminal-{uid}"))
@@ -5517,12 +5519,13 @@ fn real_default_daemon_is_reachable() -> bool {
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
-    // 사용자의 실제 데몬이 default 경로에 떠 있으면 이 테스트는 LTERM_RUNTIME_DIR을
-    // 제거한 채 list 명령을 실행하면서 사용자의 attached 세션을 끊을 위험이 있다.
-    // 그런 환경에서는 안전을 위해 스킵한다. CI에서는 데몬이 없으므로 항상 실행된다.
-    if real_default_daemon_is_reachable() {
+    // 부모 호스트의 default fallback runtime path에 어떤 Unix listener가 떠 있으면
+    // 이 테스트가 (LTERM_RUNTIME_DIR을 제거한 상태로) 그 path 인근의 사용자 데몬과
+    // 상호작용해 attached 세션을 끊을 risk가 있다. 보수적으로 스킵한다. cargo test는
+    // 이 early-return을 PASS로 카운트하므로 회귀 신호는 CI(데몬 없음)에서만 보장된다.
+    if default_runtime_socket_accepts_connections() {
         eprintln!(
-            "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: real daemon detected at default runtime path"
+            "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: default runtime socket is occupied"
         );
         return Ok(());
     }
