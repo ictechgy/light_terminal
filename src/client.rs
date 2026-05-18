@@ -142,6 +142,15 @@ fn rotate_log_if_large(log: &Path) -> Result<()> {
     Ok(())
 }
 
+// 데몬 소켓에 connect하지 못했을 때 모든 호출 지점이 보여줘야 할 사용자 가이드.
+// 동일 문구를 RPC 경로와 attach handshake 경로 양쪽에서 일관되게 사용한다.
+fn daemon_connect_context(path: &Path) -> String {
+    format!(
+        "connect to lterm daemon at {} (is the daemon running? it usually auto-starts on the next `lterm` command; run `lterm doctor` if it keeps failing)",
+        path.display()
+    )
+}
+
 pub fn rpc<T: DeserializeOwned>(request: &Request) -> Result<T> {
     rpc_with_read_timeout(request, Some(RPC_TIMEOUT))
 }
@@ -151,13 +160,7 @@ fn rpc_with_read_timeout<T: DeserializeOwned>(
     read_timeout: Option<Duration>,
 ) -> Result<T> {
     let path = paths::socket_path()?;
-    let mut stream = UnixStream::connect(&path)
-        .with_context(|| {
-            format!(
-                "connect to lterm daemon at {} (is the daemon running? it usually auto-starts on the next `lterm` command; run `lterm doctor` if it keeps failing)",
-                path.display()
-            )
-        })?;
+    let mut stream = UnixStream::connect(&path).with_context(|| daemon_connect_context(&path))?;
     stream
         .set_read_timeout(read_timeout)
         .context("set rpc read timeout")?;
@@ -1018,13 +1021,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let pty_rows = attach_pty_rows(rows, status_enabled);
 
     let path = paths::socket_path()?;
-    let mut stream = UnixStream::connect(&path)
-        .with_context(|| {
-            format!(
-                "connect to lterm daemon at {} (is the daemon running? it usually auto-starts on the next `lterm` command; run `lterm doctor` if it keeps failing)",
-                path.display()
-            )
-        })?;
+    let mut stream = UnixStream::connect(&path).with_context(|| daemon_connect_context(&path))?;
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .context("set attach handshake read timeout")?;
