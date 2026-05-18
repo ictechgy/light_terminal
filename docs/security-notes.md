@@ -9,7 +9,8 @@ threat model 문서가 아니다** — lterm 의 비-목표 (non-goals) 는 `doc
 - **Date**: triage 날짜
 - **Tool / Source**: 발견 출처 (semgrep MCP, manual review, dependency advisory 등)
 - **Finding**: 도구가 출력한 원문 요약
-- **Location**: 코드 위치 (가능하면 함수/심볼 이름 우선, line 번호는 *as of <commit-sha>* 로 명시)
+- **Location**: 코드 위치 (line 번호보다 함수/심볼 이름 우선; commit SHA 는
+  과거 triage snapshot 확인용으로만 사용)
 - **Assessment**: 실재 위험 여부 + 근거
 - **Threat model assumptions**: 이 평가가 의존하는 trust 전제
 - **Action**: 적용한 조치 또는 후속 작업
@@ -27,10 +28,16 @@ threat model 문서가 아니다** — lterm 의 비-목표 (non-goals) 는 `doc
 
 ### Location
 
-`src/server.rs` 의 `Request::New` 처리 경로 (as of commit `2ade5f7` / PR #77 머지 직후 main):
+`src/server.rs` 의 `Request::New` 처리 경로. 위치 추적은 line 번호나 과거 SHA 가
+아니라 다음 심볼 기준으로 한다 (`2ade5f7` / PR #77 직후 main 은 최초 triage
+snapshot 일 뿐이며 현재 위치의 진실은 심볼명이다):
 
-- `params.cwd` 를 받아 `let cwd = params.cwd.or_else(...).unwrap_or_else(|| ".".to_string())` 으로 정규화 (line 번호는 향후 변동 가능)
-- `cmd.cwd(PathBuf::from(&cwd))` 로 spawn 되는 child 의 working directory 결정
+- `src/server.rs::handle_request` 의 `Request::New` arm 이 `cwd` 를
+  `create_session(...)` 으로 전달
+- `src/server.rs::create_session` 이 `params.cwd` 를 받아
+  `let cwd = params.cwd.or_else(...).unwrap_or_else(|| ".".to_string())` 으로 정규화
+- `src/server.rs::create_session` 이 `cmd.cwd(PathBuf::from(&cwd))` 로 spawn 되는
+  child 의 working directory 결정
 - tmux 모드일 때 `paths::shim_dir()` 결과를 `shlex::try_quote` 로 인용해 셸의 `PATH` 에 prepend
 - `LTERM_SOCKET`, `LTERM_BIN` env 가 `paths::socket_path()`, `std::env::current_exe()` 결과로 채워짐
 

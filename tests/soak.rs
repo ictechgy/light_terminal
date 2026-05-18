@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,16 +28,31 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> TestResult<Self> {
-        Ok(Self {
-            temp: tempfile::tempdir()?,
-        })
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("tmp"))?;
+        Ok(Self { temp })
+    }
+
+    fn runtime_dir(&self) -> PathBuf {
+        self.temp.path().join("run")
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.temp.path().join("data")
+    }
+
+    fn tmp_dir(&self) -> PathBuf {
+        self.temp.path().join("tmp")
     }
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+        // 개발자 호스트의 custom socket 을 상속하지 않는다. soak command 가 fallback
+        // path 를 밟더라도 sandbox 안에 머물도록 TMPDIR 도 defence-in-depth 로 고정한다.
         cmd.env_remove("LTERM_SOCKET");
-        cmd.env("LTERM_RUNTIME_DIR", self.temp.path().join("run"));
-        cmd.env("LTERM_DATA_DIR", self.temp.path().join("data"));
+        cmd.env("LTERM_RUNTIME_DIR", self.runtime_dir());
+        cmd.env("LTERM_DATA_DIR", self.data_dir());
+        cmd.env("TMPDIR", self.tmp_dir());
         cmd
     }
 
