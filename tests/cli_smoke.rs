@@ -5501,20 +5501,26 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
     Ok(())
 }
 
-// 부모 프로세스 관점의 default fallback runtime path
-// (env::temp_dir()/light-terminal-{euid}/lterm.sock)에 대해 UnixStream::connect가
-// 즉시 성공하는지 검사한다. lterm 데몬임을 protocol 수준에서 검증하지는 않으며,
-// stale 소켓이나 다른 Unix listener가 우연히 같은 경로에 자리 잡은 경우에도 true를
-// 반환한다 — 이 best-effort 가드는 "보수적 skip"을 위한 것이고, 진짜 보호 메커니즘은
-// 테스트 본문에서 child에 sandbox TMPDIR을 주입하는 환경 격리이다.
+// 부모 프로세스 관점의 default fallback runtime socket path
+// (env::temp_dir()/light-terminal-{euid}/lterm.sock). 가드 검사와 진단 메시지가
+// 동일한 경로를 참조하도록 단일 출처로 분리한다.
 #[cfg(unix)]
-fn default_runtime_socket_accepts_connections() -> bool {
+fn default_runtime_socket_path() -> std::path::PathBuf {
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let uid = unsafe { libc::geteuid() };
-    let socket = std::env::temp_dir()
+    std::env::temp_dir()
         .join(format!("light-terminal-{uid}"))
-        .join("lterm.sock");
-    UnixStream::connect(&socket).is_ok()
+        .join("lterm.sock")
+}
+
+// 위 path에 대해 UnixStream::connect가 즉시 성공하는지 검사한다. lterm 데몬임을
+// protocol 수준에서 검증하지는 않으며, stale 소켓이나 다른 Unix listener가 우연히
+// 같은 경로에 자리 잡은 경우에도 true를 반환한다 — 이 best-effort 가드는 "보수적
+// skip"을 위한 것이고, 진짜 보호 메커니즘은 테스트 본문에서 child에 sandbox
+// TMPDIR을 주입하는 환경 격리이다.
+#[cfg(unix)]
+fn default_runtime_socket_accepts_connections() -> bool {
+    UnixStream::connect(default_runtime_socket_path()).is_ok()
 }
 
 // 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
@@ -5536,19 +5542,22 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     // 보장된다). CI 환경은 default 경로 socket이 비어있어 가드가 발동하지 않으므로
     // 본문이 항상 실행된다.
     if default_runtime_socket_accepts_connections() {
+        let socket = default_runtime_socket_path();
         if std::env::var_os(LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV).is_some() {
             eprintln!(
                 "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: \
-                 default runtime socket is occupied ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set)"
+                 default runtime socket {} is occupied ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set; any non-empty value)",
+                socket.display()
             );
             return Ok(());
         }
         panic!(
             "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a daemon \
-             currently listening on the default runtime path \
-             (env::temp_dir()/light-terminal-{{euid}}/lterm.sock). \
-             Set {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 to opt-in to skipping this test on hosts \
-             with an intentionally running lterm daemon."
+             currently listening on {}. \
+             Either stop that daemon before running this test, or set \
+             {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 (any non-empty value) to opt-in to skipping \
+             this test on hosts with an intentionally running lterm daemon.",
+            socket.display()
         );
     }
 
