@@ -5574,12 +5574,15 @@ fn default_runtime_daemon_reports_reachable() -> bool {
 // 때문이다 — RUNTIME_DIR 만 unset 하면 LTERM_SOCKET 이 그대로 살아 fallback
 // 검증이 무효화될 수 있다.
 //
-// 본 helper 를 거치지 않고 env_remove("LTERM_RUNTIME_DIR") 만 직접 쓰는 테스트는
-// 호스트에 떠 있는 사용자 데몬을 침범할 위험이 있다. PR #75 의
+// 본 helper 를 거치지 않고 fallback runtime selector(LTERM_RUNTIME_DIR,
+// LTERM_SOCKET, XDG_RUNTIME_DIR)를 직접 unset 하는 테스트는 호스트에 떠 있는
+// 사용자 데몬을 침범할 위험이 있다. PR #75 의
 // default_runtime_daemon_reports_reachable 가드가 보수적 안전망이지만, 1차
-// 방어선은 본 helper 가 강제하는 sandbox TMPDIR 환경 격리이다 (PR #76 quad-review
-// 합의 — TMPDIR isolation is the real protection). 같은 패턴이 필요한 새 테스트는
-// 반드시 본 helper 를 사용한다.
+// 방어선은 sandbox TMPDIR 환경 격리이다 (PR #76 quad-review 합의 — TMPDIR
+// isolation is the real protection). 같은 fallback 검증 패턴이 필요한 새 테스트는
+// 반드시 본 helper 를 사용한다. fallback 검증이 아닌 테스트가 LTERM_SOCKET 만
+// 제거해야 하는 경우에도 test-private LTERM_RUNTIME_DIR 과 TMPDIR 를 함께 주입해
+// 부모 호스트의 default runtime path 로 빠지지 않게 한다.
 #[cfg(unix)]
 fn cmd_for_default_fallback_test(
     sandbox: &tempfile::TempDir,
@@ -5668,31 +5671,40 @@ fn runtime_daemon_reports_reachable_at_rejects_non_lterm_listener() -> TestResul
     let temp = tempfile::tempdir()?;
     let bait = temp.path().join("alive.sock");
     let listener = UnixListener::bind(&bait)?;
-    listener.set_nonblocking(false)?;
+    listener.set_nonblocking(true)?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_thread = std::sync::Arc::clone(&stop);
     let bait_clone = bait.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let accept_thread = std::thread::spawn(move || {
         // doctor가 시도하는 connect 를 accept 후 즉시 drop — protocol 응답을
         // 보내지 않으므로 doctor 의 RPC 가 fast-fail (EOF / unexpected close) 한다.
-        // 백그라운드 thread 는 helper 호출 종료 후 stop flag 로 정리한다.
+        // 백그라운드 thread 는 helper 호출 종료 후 stop flag 로 정리한다. accept를
+        // nonblocking으로 두어 stop 후 join 이 wake-up connect 에 의존하지 않는다.
         while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => drop(stream),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 Err(_) => break,
             }
-            // 짧게 양보해서 busy loop 을 피한다.
-            std::thread::sleep(Duration::from_millis(5));
         }
         // 시그널을 받았을 때 cleanup helper — listener 와 path 가 tempdir Drop
         // 으로 정리되지만 명시적 cleanup 도 안전망으로 둔다.
         let _ = std::fs::remove_file(&bait_clone);
+        let _ = done_tx.send(());
     });
     let alive = runtime_daemon_reports_reachable_at(&bait);
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    // accept thread를 깨우기 위해 빈 connect 한 번 — listener 가 닫혀있어도 안전.
-    let _ = UnixStream::connect(&bait);
-    let _ = accept_thread.join();
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|err| {
+            format!("bait listener accept thread did not stop within 1s after stop signal: {err}")
+        })?;
+    accept_thread
+        .join()
+        .map_err(|_| "bait listener accept thread panicked")?;
     assert!(
         !alive,
         "runtime_daemon_reports_reachable_at must return false for a plain UnixListener at {}; \

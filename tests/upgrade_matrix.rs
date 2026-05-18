@@ -20,9 +20,9 @@ struct MatrixEnv {
 
 impl MatrixEnv {
     fn new() -> TestResult<Self> {
-        Ok(Self {
-            temp: tempfile::tempdir()?,
-        })
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("tmp"))?;
+        Ok(Self { temp })
     }
 
     fn runtime_dir(&self) -> PathBuf {
@@ -33,10 +33,18 @@ impl MatrixEnv {
         self.temp.path().join("data")
     }
 
+    fn tmp_dir(&self) -> PathBuf {
+        self.temp.path().join("tmp")
+    }
+
     fn apply_to(&self, command: &mut Command) {
+        // 개발자 호스트의 live daemon socket 을 상속하지 않도록 LTERM_SOCKET 을
+        // 제거한다. TMPDIR 도 sandbox 안에 고정해, future fallback-path 변경이
+        // LTERM_RUNTIME_DIR 직접 사용을 멈추더라도 MatrixEnv 밖으로 빠지지 않게 한다.
         command.env_remove("LTERM_SOCKET");
         command.env("LTERM_RUNTIME_DIR", self.runtime_dir());
         command.env("LTERM_DATA_DIR", self.data_dir());
+        command.env("TMPDIR", self.tmp_dir());
     }
 }
 
