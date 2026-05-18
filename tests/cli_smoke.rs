@@ -5558,6 +5558,45 @@ fn default_runtime_daemon_reports_reachable() -> bool {
     runtime_daemon_reports_reachable_at(&default_runtime_socket_path())
 }
 
+// LTERM_RUNTIME_DIR / LTERM_SOCKET / XDG_RUNTIME_DIR 를 모두 제거한 채 lterm
+// CLI 의 fallback runtime path 동작을 검증하는 테스트 전용 Command builder.
+//
+// sandbox 인자로 `&tempfile::TempDir` 만 받는다. 이는 PR #83 quad-review 합의
+// (Claude HIGH + Codex LOW): 인자 타입을 RAII tempdir로 좁혀 호출자가 임의
+// `/tmp` 같은 user-default 경로를 실수로 넘기지 못하도록 sandbox 격리를 시그니처
+// 차원에서 강제한다.
+//
+// 반환: `(Command, PathBuf, PathBuf)` = (LTERM_RUNTIME_DIR/LTERM_SOCKET/
+// XDG_RUNTIME_DIR 제거 + TMPDIR/LTERM_DATA_DIR 주입된 Command, TMPDIR 로 쓰인
+// 경로, LTERM_DATA_DIR 로 쓰인 경로). 호출자는 권한/심볼릭 검증을 위해 두
+// PathBuf 를 그대로 사용할 수 있다. LTERM_SOCKET 도 별도 unset 하는 이유는
+// LTERM_SOCKET 이 LTERM_RUNTIME_DIR 과 독립적으로 소켓 경로를 override 하기
+// 때문이다 — RUNTIME_DIR 만 unset 하면 LTERM_SOCKET 이 그대로 살아 fallback
+// 검증이 무효화될 수 있다.
+//
+// 본 helper 를 거치지 않고 env_remove("LTERM_RUNTIME_DIR") 만 직접 쓰는 테스트는
+// 호스트에 떠 있는 사용자 데몬을 침범할 위험이 있다. PR #75 의
+// default_runtime_daemon_reports_reachable 가드가 보수적 안전망이지만, 1차
+// 방어선은 본 helper 가 강제하는 sandbox TMPDIR 환경 격리이다 (PR #76 quad-review
+// 합의 — TMPDIR isolation is the real protection). 같은 패턴이 필요한 새 테스트는
+// 반드시 본 helper 를 사용한다.
+#[cfg(unix)]
+fn cmd_for_default_fallback_test(
+    sandbox: &tempfile::TempDir,
+) -> std::io::Result<(Command, std::path::PathBuf, std::path::PathBuf)> {
+    let tmp = sandbox.path().join("tmp");
+    let data = sandbox.path().join("data");
+    // 멱등 — 두 번 호출되어도 OK (이미 존재하면 create_dir_all는 Ok).
+    std::fs::create_dir_all(&tmp)?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    cmd.env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &tmp)
+        .env("LTERM_DATA_DIR", &data);
+    Ok((cmd, tmp, data))
+}
+
 // 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
 // 테스트가 silent skip(`Ok(())`)으로 빠진다. 미설정 시에는 panic하여 cargo test의
 // FAIL 출력으로 "이 호스트는 안전하지 않다"는 신호가 가시화된다. CI는 default
@@ -5598,17 +5637,8 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     }
 
     let temp = tempfile::tempdir()?;
-    let tmp = temp.path().join("tmp");
-    let data = temp.path().join("data");
-    std::fs::create_dir(&tmp)?;
-
-    let mut list = Command::new(env!("CARGO_BIN_EXE_lterm"));
-    list.env_remove("LTERM_RUNTIME_DIR")
-        .env_remove("LTERM_SOCKET")
-        .env_remove("XDG_RUNTIME_DIR")
-        .env("TMPDIR", &tmp)
-        .env("LTERM_DATA_DIR", &data)
-        .arg("list");
+    let (mut list, tmp, _data) = cmd_for_default_fallback_test(&temp)?;
+    list.arg("list");
     let output = list.output()?;
     assert!(output.status.success(), "{output:?}");
 
@@ -5618,15 +5648,8 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     assert!(!meta.file_type().is_symlink());
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
-    let mut shutdown = Command::new(env!("CARGO_BIN_EXE_lterm"));
-    let _ = shutdown
-        .env_remove("LTERM_RUNTIME_DIR")
-        .env_remove("LTERM_SOCKET")
-        .env_remove("XDG_RUNTIME_DIR")
-        .env("TMPDIR", &tmp)
-        .env("LTERM_DATA_DIR", &data)
-        .arg("shutdown")
-        .status();
+    let (mut shutdown, _, _) = cmd_for_default_fallback_test(&temp)?;
+    let _ = shutdown.arg("shutdown").status();
     Ok(())
 }
 
