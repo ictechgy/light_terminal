@@ -5501,9 +5501,32 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
     Ok(())
 }
 
+// 사용자의 실제 default runtime dir에 살아있는 lterm 데몬이 있으면 true.
+// 이 검사는 LTERM_RUNTIME_DIR/XDG_RUNTIME_DIR을 제거하고 fallback 경로를 검증하는
+// 테스트가, 호스트에 떠 있는 사용자 데몬을 침범(다른 PATH의 바이너리가 동일 소켓에
+// 자리잡거나 sessions를 끊는 사고)하지 않도록 보호하기 위함이다.
+#[cfg(unix)]
+fn real_default_daemon_is_reachable() -> bool {
+    let uid = unsafe { libc::geteuid() };
+    let socket = std::env::temp_dir()
+        .join(format!("light-terminal-{uid}"))
+        .join("lterm.sock");
+    UnixStream::connect(&socket).is_ok()
+}
+
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
+    // 사용자의 실제 데몬이 default 경로에 떠 있으면 이 테스트는 LTERM_RUNTIME_DIR을
+    // 제거한 채 list 명령을 실행하면서 사용자의 attached 세션을 끊을 위험이 있다.
+    // 그런 환경에서는 안전을 위해 스킵한다. CI에서는 데몬이 없으므로 항상 실행된다.
+    if real_default_daemon_is_reachable() {
+        eprintln!(
+            "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: real daemon detected at default runtime path"
+        );
+        return Ok(());
+    }
+
     let temp = tempfile::tempdir()?;
     let tmp = temp.path().join("tmp");
     let data = temp.path().join("data");
