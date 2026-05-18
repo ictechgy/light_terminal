@@ -3067,10 +3067,14 @@ fn ping_socket(socket: &Path) -> Result<bool> {
 fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     let mut uid = 0_u32;
     let mut gid = 0_u32;
+    // SAFETY: getpeereid(3) takes a valid socket fd from a live UnixStream and
+    // two out-pointers we own; on error it sets errno and we read it via
+    // std::io::Error::last_os_error.
     let rc = unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
     if rc != 0 {
         bail!("getpeereid failed: {}", std::io::Error::last_os_error());
     }
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
     if uid != expected {
         bail!("peer uid {uid} does not match daemon uid {expected}");
@@ -3109,6 +3113,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
     if cred.uid != expected {
         bail!("peer uid {} does not match daemon uid {expected}", cred.uid);
