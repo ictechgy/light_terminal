@@ -834,20 +834,28 @@ fn print_doctor_report(json: bool) -> Result<()> {
             && status.protocol_version == protocol::PROTOCOL_VERSION
     });
     let daemon_uid = daemon.as_ref().and_then(|status| status.daemon_uid);
+    // 옛 buggy 빌드가 sentinel 0을 보낸 경우(이전 PR 회귀)를 invalid로 걸러낸다
+    // — quad-review 합의 fix. 새 빌드는 clock failure 시 None을 전송하므로 정상
+    // 케이스에서는 filter가 no-op.
     let daemon_started_at_unix_secs = daemon
         .as_ref()
-        .and_then(|status| status.started_at_unix_secs);
-    // uptime 계산은 옛 데몬(필드 없음)이면 None. 시스템 clock이 UNIX_EPOCH 이전이면 0.
-    let daemon_uptime_secs = daemon_started_at_unix_secs.map(|started| {
-        let now = std::time::SystemTime::now()
+        .and_then(|status| status.started_at_unix_secs)
+        .filter(|&secs| secs > 0);
+    // uptime은 started_at이 valid일 때만 계산. 옛 데몬(필드 없음) 또는 clock failure
+    // 케이스에서는 None을 그대로 두어 doctor JSON이 50+년 같은 misleading 값을
+    // 보고하지 않게 한다.
+    let daemon_uptime_secs = daemon_started_at_unix_secs.and_then(|started| {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        now.saturating_sub(started)
+            .ok()
+            .map(|d| d.as_secs().saturating_sub(started))
     });
     let daemon_shutting_down = daemon.as_ref().map(|status| status.shutting_down);
     let tmux_shim_exists = tmux_shim_path.is_file();
-    // 비정상 상태 단일 요약. 우선순위: unreachable → shutdown → version mismatch → shim missing.
+    // 비정상 상태 단일 요약. 우선순위: unreachable → shutdown → version mismatch
+    // → status RPC 실패(reachable이지만 daemon_error) → shim missing.
+    // daemon_error 분기는 quad-review 합의 fix: socket은 reachable이지만 Status가
+    // 실패한 경우에도 reason을 채워 doctor 계약("abnormal에는 reason")을 지킨다.
     let reason = if !daemon_reachable {
         Some(
             "Daemon is not reachable. It usually auto-starts on the next `lterm` command; run `lterm doctor` again or inspect daemon startup with `lterm logs`."
@@ -863,6 +871,11 @@ fn print_doctor_report(json: bool) -> Result<()> {
             "Client version or protocol does not match the running daemon. Run `lterm shutdown` and retry to load the new daemon binary."
                 .to_string(),
         )
+    } else if let Some(err) = daemon_error.as_deref() {
+        Some(format!(
+            "Daemon socket is reachable but a status RPC failed: {}. Run `lterm doctor` again or check `lterm logs` for daemon errors.",
+            sanitize::terminal_text(err)
+        ))
     } else if !tmux_shim_exists {
         Some(
             "Tmux shim is missing — tmux-compatible agents may fall back to system tmux. Run `lterm install-shim` (or reinstall lterm) to recreate it."

@@ -93,48 +93,65 @@ impl LifecycleEnv {
             String::from_utf8_lossy(&out.stdout)
         );
         // dummy session이 종료되도록 짧게 대기. session_count가 0이 되어야 후속
-        // 테스트가 영향받지 않는다.
+        // 테스트가 영향받지 않는다. deadline 만료 시 leaked state로 후속 테스트를
+        // 오염시키는 대신 명시적 에러로 실패한다 (quad-review 합의 fix).
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let r = self.doctor_json()?;
             if r.get("daemon_session_count").and_then(|v| v.as_u64()) == Some(0)
                 && r.get("daemon_reachable").and_then(|v| v.as_bool()) == Some(true)
             {
-                break;
+                return Ok(());
             }
             if Instant::now() >= deadline {
-                break;
+                return Err(format!(
+                    "ensure_daemon({name}): timed out waiting for clean state (daemon_session_count=0 & daemon_reachable=true); last doctor: {r}"
+                )
+                .into());
             }
             thread::sleep(Duration::from_millis(50));
         }
-        Ok(())
     }
 
     // `lterm shutdown`은 자동 spawn 후 Shutdown 요청을 보낸다. 데몬은 종료해도
     // socket 파일을 명시적으로 정리하지 않으므로(`prepare_socket_path`가 다음 spawn
-    // 시 stale socket을 ping 후 제거) 본 helper는 호출 후 잔여 socket을 강제로
-    // 정리해 다음 단계 테스트가 깨끗한 상태에서 시작하게 한다.
+    // 시 stale socket을 ping 후 제거) 본 helper는 호출 후 ping이 실패할 때까지
+    // polling한 뒤에만 socket을 안전하게 제거한다.
+    //
+    // 살아있는 socket을 force-remove하면 unlinked listener를 남긴 orphan daemon이
+    // 생기고 후속 테스트가 잘못된 이유로 통과할 수 있다 (quad-review HIGH consensus
+    // fix). deadline 도달 시 force-remove 대신 명시적 에러로 실패한다.
     fn shutdown_and_cleanup_socket(&self) -> TestResult {
-        let _ = self.cmd().arg("shutdown").output()?;
+        let out = self.cmd().arg("shutdown").output()?;
         let socket = self.runtime_dir().join("lterm.sock");
-        // 데몬이 종료될 시간을 짧게 부여.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while socket.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-            // 데몬이 동일 PID로 살아 있으면 시간이 더 걸릴 수 있다. ping을 시도해
-            // 응답이 없으면 stale로 간주하고 강제 정리한다.
-            if let Ok(stream) = UnixStream::connect(&socket) {
-                drop(stream);
-            } else {
-                let _ = fs::remove_file(&socket);
-                break;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if !socket.exists() {
+                return Ok(());
             }
+            match UnixStream::connect(&socket) {
+                Ok(stream) => {
+                    // 데몬이 여전히 응답 — Shutdown 처리 중이거나 거부됐을 수 있다.
+                    drop(stream);
+                }
+                Err(_) => {
+                    // ping 실패 = 데몬이 더 이상 listen 하지 않음 = stale socket.
+                    // 이 시점에서만 socket 파일을 안전하게 제거한다.
+                    let _ = fs::remove_file(&socket);
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "shutdown_and_cleanup_socket: daemon still answering at {} after 3s deadline; \
+                     refusing to force-remove a live socket. shutdown stderr: {}",
+                    socket.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-        // 최종적으로 잔여가 있으면 강제 제거 (tempdir 안이므로 안전).
-        if socket.exists() {
-            let _ = fs::remove_file(&socket);
-        }
-        Ok(())
     }
 }
 
