@@ -97,10 +97,7 @@ pub fn serve_forever() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs());
-    let state = Arc::new(State {
-        started_at_unix_secs,
-        ..State::default()
-    });
+    let state = Arc::new(State::new(started_at_unix_secs));
     for stream in listener.incoming() {
         if state.shutting_down.load(Ordering::SeqCst) {
             break;
@@ -137,6 +134,16 @@ struct State {
 }
 
 impl State {
+    // Production 데몬 진입 경로용 명시 생성자. session_count/connection_count 같은
+    // 카운터 계열은 Default::default()로 0에서 시작해도 항상 안전하므로 wire에
+    // 의존하는 시작 시각만 인자로 받는다. 테스트는 State::default()를 그대로 사용.
+    fn new(started_at_unix_secs: Option<u64>) -> Self {
+        Self {
+            started_at_unix_secs,
+            ..Self::default()
+        }
+    }
+
     fn try_acquire_connection(self: &Arc<Self>) -> Option<ConnectionGuard> {
         let mut current = self.active_connections.load(Ordering::SeqCst);
         loop {
