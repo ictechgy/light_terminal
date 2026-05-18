@@ -97,10 +97,7 @@ pub fn serve_forever() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs());
-    let state = Arc::new(State {
-        started_at_unix_secs,
-        ..State::default()
-    });
+    let state = Arc::new(State::new(started_at_unix_secs));
     for stream in listener.incoming() {
         if state.shutting_down.load(Ordering::SeqCst) {
             break;
@@ -137,6 +134,16 @@ struct State {
 }
 
 impl State {
+    // Production 데몬 진입 경로용 명시 생성자. session_count/connection_count 같은
+    // 카운터 계열은 Default::default()로 0에서 시작해도 항상 안전하므로 wire에
+    // 의존하는 시작 시각만 인자로 받는다. 테스트는 State::default()를 그대로 사용.
+    fn new(started_at_unix_secs: Option<u64>) -> Self {
+        Self {
+            started_at_unix_secs,
+            ..Self::default()
+        }
+    }
+
     fn try_acquire_connection(self: &Arc<Self>) -> Option<ConnectionGuard> {
         let mut current = self.active_connections.load(Ordering::SeqCst);
         loop {
@@ -3067,10 +3074,14 @@ fn ping_socket(socket: &Path) -> Result<bool> {
 fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     let mut uid = 0_u32;
     let mut gid = 0_u32;
+    // SAFETY: getpeereid(3) takes a valid socket fd from a live UnixStream and
+    // two out-pointers we own; on error it sets errno and we read it via
+    // std::io::Error::last_os_error.
     let rc = unsafe { getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
     if rc != 0 {
         bail!("getpeereid failed: {}", std::io::Error::last_os_error());
     }
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
     if uid != expected {
         bail!("peer uid {uid} does not match daemon uid {expected}");
@@ -3109,6 +3120,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
     if cred.uid != expected {
         bail!("peer uid {} does not match daemon uid {expected}", cred.uid);

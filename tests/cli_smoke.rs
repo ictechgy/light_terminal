@@ -5509,6 +5509,7 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
 // 테스트 본문에서 child에 sandbox TMPDIR을 주입하는 환경 격리이다.
 #[cfg(unix)]
 fn default_runtime_socket_accepts_connections() -> bool {
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let uid = unsafe { libc::geteuid() };
     let socket = std::env::temp_dir()
         .join(format!("light-terminal-{uid}"))

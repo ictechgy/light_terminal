@@ -1,4 +1,4 @@
-// tests/lifecycle.rs — 5 결정적 daemon lifecycle regression 케이스.
+// tests/lifecycle.rs — 7 결정적 daemon lifecycle regression 케이스.
 //
 // 목적: alpha-MVP → 안정 1.x 약속을 PR마다 빠르게 검증한다. release-gate soak
 // (tests/soak.rs)와 upgrade matrix(tests/upgrade_matrix.rs)는 무겁고 별도 트리거를
@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::symlink;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -368,5 +368,118 @@ fn symlink_socket_path_is_refused() -> TestResult {
     );
 
     let _ = fs::remove_file(&socket);
+    Ok(())
+}
+
+// US-004 case 6: socket path가 symlink이고 그 target이 살아있는 다른 Unix socket을
+// 가리킬 때도 거부되어야 한다. dangling/regular-file symlink는 case 5에서 검증되며,
+// 본 케이스는 "target이 valid Unix socket이라 connect는 성공할 수 있다"는 회피
+// 경로를 가드한다 — lterm이 silently symlink를 따라가 임의의 socket peer에 연결하면
+// trust boundary가 무너진다.
+#[test]
+fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
+    let env = LifecycleEnv::new()?;
+    let socket = env.socket_path()?;
+    env.shutdown_and_cleanup_socket()?;
+    assert!(
+        !socket.exists(),
+        "socket path must be empty before placing live-socket symlink bait: {}",
+        socket.display()
+    );
+
+    let bait_dir = env.temp.path().join("bait_dir");
+    fs::create_dir(&bait_dir)?;
+    let bait_socket = bait_dir.join("alive.sock");
+    let _listener = UnixListener::bind(&bait_socket)?;
+    symlink(&bait_socket, &socket)?;
+
+    let out = env.cmd().args(["list"]).output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "lterm list must fail when socket path is a symlink to a live unix socket. stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    // case 5와 동일 invariant: silently symlink를 따라가지 않음. 단 target이 살아있는
+    // Unix socket이면 connect가 성공해서 path-level이 아닌 RPC-level에서 거부되는
+    // 경로도 정상이다. 관측되는 트레이스는 다음 중 하나:
+    //   (a) path-level 거부: "symlink"/"non-socket"/"Socket operation"
+    //   (b) connect 단계 거부: "Connection refused"
+    //   (c) RPC handshake 거부: "Resource temporarily unavailable" / "os error 35"
+    //       (peer가 lterm 응답을 못 보내 read response가 EAGAIN으로 떨어짐) 또는
+    //       "read response", "peer", "version" 등의 protocol-level signal
+    // 세 경로 모두 보안 invariant는 동일하다 — silent success 금지.
+    assert!(
+        stderr.contains("symlink")
+            || stderr.contains("non-socket")
+            || stderr.contains("Socket operation")
+            || stderr.contains("Connection refused")
+            || stderr.contains("Resource temporarily unavailable")
+            || stderr.contains("os error 35")
+            || stderr.contains("read response")
+            || stderr.contains("peer")
+            || stderr.contains("version"),
+        "expected refusal of symlink-to-live-socket, got: {stderr}"
+    );
+
+    // bait socket 자체는 보존되어야 한다 (거부 경로가 target을 unbind하면 안 됨).
+    assert!(
+        fs::metadata(&bait_socket).is_ok(),
+        "bait live socket must not be touched"
+    );
+    // socket_path는 여전히 symlink여야 한다 — silently 교체 금지.
+    let socket_meta = fs::symlink_metadata(&socket)?;
+    assert!(
+        socket_meta.file_type().is_symlink(),
+        "socket path must remain a symlink (not silently replaced): {:?}",
+        socket_meta.file_type()
+    );
+
+    let _ = fs::remove_file(&socket);
+    Ok(())
+}
+
+// US-004 case 7: `lterm processes --orphans`은 관찰만 하는 observability 명령이므로
+// session/connection 카운터에 사이드 이펙트를 주면 안 된다. 기존 case 4가 "명령이
+// 정상 종료 + panic-free" 표면만 확인했다면 본 케이스는 호출 전후 doctor 카운터가
+// 정확히 보존됨을 확인해 관찰자 효과 회귀를 가드한다.
+#[test]
+fn processes_orphans_does_not_mutate_observable_state() -> TestResult {
+    let env = LifecycleEnv::new()?;
+    env.ensure_daemon("lifecycle-orphans-idem")?;
+
+    let before = env.doctor_json()?;
+    let before_sessions = before.get("daemon_session_count").and_then(|v| v.as_u64());
+    let before_conns = before
+        .get("daemon_active_connections")
+        .and_then(|v| v.as_u64());
+
+    let out = env.cmd().args(["processes", "--orphans"]).output()?;
+    assert!(
+        out.status.success(),
+        "processes --orphans must exit success on healthy daemon; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout.clone())
+        .map_err(|e| format!("processes --orphans stdout must be valid UTF-8: {e}"))?;
+    assert!(
+        !stdout.contains("panicked at"),
+        "processes --orphans stdout must not contain panic trace: {stdout}"
+    );
+
+    let after = env.doctor_json()?;
+    assert_eq!(
+        after.get("daemon_session_count").and_then(|v| v.as_u64()),
+        before_sessions,
+        "session count must not change across processes --orphans"
+    );
+    assert_eq!(
+        after
+            .get("daemon_active_connections")
+            .and_then(|v| v.as_u64()),
+        before_conns,
+        "active_connections must not change across processes --orphans"
+    );
     Ok(())
 }
