@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -5513,14 +5513,49 @@ fn default_runtime_socket_path() -> std::path::PathBuf {
         .join("lterm.sock")
 }
 
-// 위 path에 대해 UnixStream::connect가 즉시 성공하는지 검사한다. lterm 데몬임을
-// protocol 수준에서 검증하지는 않으며, stale 소켓이나 다른 Unix listener가 우연히
-// 같은 경로에 자리 잡은 경우에도 true를 반환한다 — 이 best-effort 가드는 "보수적
-// skip"을 위한 것이고, 진짜 보호 메커니즘은 테스트 본문에서 child에 sandbox
-// TMPDIR을 주입하는 환경 격리이다.
+// 주어진 socket path에 lterm 데몬이 protocol 수준에서 살아있는지 확인한다.
+// lterm CLI의 `doctor --json`을 LTERM_SOCKET override 하에 spawn해서 그 결과의
+// `daemon_reachable` 필드를 검사한다. doctor는 (HANDOFF: "auto-spawn next lterm
+// command other than doctor/shutdown") auto-spawn하지 않으므로 false positive를
+// 만들지 않는다.
+//
+// helper는 path 인자를 받는 분리 형태이므로 임시 bait UnixListener에 대해서도
+// 검증 테스트가 가능하다. 가드 본문은 default_runtime_daemon_reports_reachable
+// wrapper를 사용한다.
 #[cfg(unix)]
-fn default_runtime_socket_accepts_connections() -> bool {
-    UnixStream::connect(default_runtime_socket_path()).is_ok()
+fn runtime_daemon_reports_reachable_at(socket: &Path) -> bool {
+    // cheap pre-check: connect 실패면 즉시 false. 실제 daemon이면 connect는
+    // 거의 항상 즉시 성공하므로 빠른 부정 경로 제공.
+    if UnixStream::connect(socket).is_err() {
+        return false;
+    }
+    let out = match Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .env("LTERM_SOCKET", socket)
+        .args(["doctor", "--json"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let report: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    report
+        .get("daemon_reachable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+// 부모 호스트의 default fallback runtime path에 lterm 데몬이 실제로 살아있는지
+// (protocol 수준) 확인한다. stale 소켓이나 임의 Unix listener는 false 반환.
+// `default_runtime_socket_accepts_connections`보다 false-positive가 낮다.
+#[cfg(unix)]
+fn default_runtime_daemon_reports_reachable() -> bool {
+    runtime_daemon_reports_reachable_at(&default_runtime_socket_path())
 }
 
 // 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
@@ -5541,19 +5576,20 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     // opt-in 할 수 있다 (이 경우 cargo test는 PASS로 카운트하므로 신호는 CI에서만
     // 보장된다). CI 환경은 default 경로 socket이 비어있어 가드가 발동하지 않으므로
     // 본문이 항상 실행된다.
-    if default_runtime_socket_accepts_connections() {
+    if default_runtime_daemon_reports_reachable() {
         let socket = default_runtime_socket_path();
         if std::env::var_os(LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV).is_some() {
             eprintln!(
                 "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: \
-                 default runtime socket {} is occupied ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set; any non-empty value)",
+                 default runtime socket {} hosts a live lterm daemon \
+                 ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set; any non-empty value)",
                 socket.display()
             );
             return Ok(());
         }
         panic!(
-            "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a daemon \
-             currently listening on {}. \
+            "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a live lterm \
+             daemon currently reachable at {} (doctor --json daemon_reachable=true). \
              Either stop that daemon before running this test, or set \
              {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 (any non-empty value) to opt-in to skipping \
              this test on hosts with an intentionally running lterm daemon.",
@@ -5591,6 +5627,27 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
         .env("LTERM_DATA_DIR", &data)
         .arg("shutdown")
         .status();
+    Ok(())
+}
+
+// runtime_daemon_reports_reachable_at은 단순 UnixStream::connect 가능성을 넘어
+// "lterm 데몬이 protocol 수준에서 살아있는가" 까지 검증한다. 본 회귀 가드는
+// 임의 UnixListener를 bait socket으로 두고 helper를 직접 호출해 false를 반환함을
+// 확인한다 — 즉 가드가 lterm 이 아닌 listener 를 false-positive 로 데몬 취급하지
+// 않는다는 것을 보장한다.
+#[test]
+#[cfg(unix)]
+fn runtime_daemon_reports_reachable_at_rejects_non_lterm_listener() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let bait = temp.path().join("alive.sock");
+    let _listener = UnixListener::bind(&bait)?;
+    let alive = runtime_daemon_reports_reachable_at(&bait);
+    assert!(
+        !alive,
+        "runtime_daemon_reports_reachable_at must return false for a plain UnixListener at {}; \
+         got true, meaning the strict guard fell back to the cheap reachability check",
+        bait.display()
+    );
     Ok(())
 }
 
