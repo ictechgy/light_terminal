@@ -30,6 +30,8 @@ AGENTS.md
 **/AGENTS.md
 HANDOFF.md
 **/HANDOFF.md
+omx_wiki/
+**/omx_wiki/
 
 # npm platform package staging binaries
 npm/platforms/*/bin/lterm
