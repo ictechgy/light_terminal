@@ -218,6 +218,21 @@
       "raw_stream_policy": "sanitized-output-only"
     },
     {
+      "command": "lterm init",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke init_prints_setup_preview_without_modifying_files",
+        "cargo test --test cli_smoke init_rejects_unsupported_shell_values"
+      ],
+      "docs_owner": "README.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Init is a no-touch setup preview for humans. It prints recommended commands and must not modify shell startup files or daemon state."
+    },
+    {
       "command": "lterm logs",
       "aliases": [
         "lterm capture"

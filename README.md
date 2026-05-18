@@ -102,6 +102,8 @@ eval "$(lterm env)"
 
 ## Quick start
 
+![lterm quick demo](docs/assets/lterm-demo.svg)
+
 **Create a persistent session and attach immediately:**
 
 ```bash
@@ -140,6 +142,7 @@ lterm -a api
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
+| Preview local setup steps | `lterm init --shell zsh` | None |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -439,6 +442,17 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --nam
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- logs test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
+
+Release/contract preflight helpers:
+
+```bash
+scripts/release-preflight.sh --contract-only
+scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+scripts/dependency-minor-dry-run.sh
+```
+
+Use `--run-soak` on `scripts/release-preflight.sh` only for the manual
+release-gate soak profile.
 
 ## License
 

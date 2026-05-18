@@ -23,6 +23,7 @@
   },
   "files": [
     "bin/lterm.js",
+    "docs/assets/lterm-demo.svg",
     "README.md",
     "README.ko.md",
     "LICENSE",

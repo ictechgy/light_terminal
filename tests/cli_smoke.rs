@@ -1121,6 +1121,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "tmux-compat",
         "wait",
         "watch",
+        "init",
         "notify",
         "agents",
         "agent",
@@ -1138,6 +1139,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
     }
     for expected in [
         "tmux compatibility",
+        "setup preview",
         "sanitized output",
         "cmux-friendly notification",
         "remote host",
@@ -1147,6 +1149,43 @@ fn help_exposes_utility_command_surface() -> TestResult {
             "top-level help should keep utility command context {expected:?}:\n{stdout}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn init_prints_setup_preview_without_modifying_files() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["init", "--shell", "zsh"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "lterm init preview",
+        "shell\tzsh",
+        "modifies_files\tno",
+        "step\t1\tlterm doctor --json",
+        "step\t2\tlterm install-shim",
+        "step\t3\teval \"$(lterm env)\"",
+        "Copy the enable command",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "init preview missing {expected:?}:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn init_rejects_unsupported_shell_values() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["init", "--shell", "powershell"]).output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("powershell"),
+        "unsupported shell should be rejected by clap value parser:\n{stderr}"
+    );
     Ok(())
 }
 

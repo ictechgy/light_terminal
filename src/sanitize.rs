@@ -123,4 +123,42 @@ mod tests {
         let text = terminal_capture(b"ok \x1b[\x1b]52;c;secret\x07done\n");
         assert_eq!(text, "ok done\n");
     }
+
+    #[test]
+    fn terminal_capture_fuzz_lite_seed_corpus_has_no_escape_controls() {
+        let corpus: &[(&str, &[u8])] = &[
+            (
+                "osc52_clipboard",
+                include_bytes!("../tests/fixtures/sanitize_fuzz_lite/osc52_clipboard.bin"),
+            ),
+            (
+                "split_csi_osc",
+                include_bytes!("../tests/fixtures/sanitize_fuzz_lite/split_csi_osc.bin"),
+            ),
+            (
+                "raw_c1_controls",
+                include_bytes!("../tests/fixtures/sanitize_fuzz_lite/raw_c1_controls.bin"),
+            ),
+            (
+                "unterminated_string",
+                include_bytes!("../tests/fixtures/sanitize_fuzz_lite/unterminated_string.bin"),
+            ),
+            (
+                "invalid_utf8_and_controls",
+                include_bytes!(
+                    "../tests/fixtures/sanitize_fuzz_lite/invalid_utf8_and_controls.bin"
+                ),
+            ),
+        ];
+
+        for (name, seed) in corpus {
+            let sanitized = terminal_capture(seed);
+            assert!(
+                !sanitized
+                    .chars()
+                    .any(|ch| { is_c0_or_c1(ch) && !matches!(ch, '\t' | '\n' | '\r') }),
+                "{name} left terminal controls in sanitized output: {sanitized:?}"
+            );
+        }
+    }
 }
