@@ -5633,15 +5633,43 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
 // runtime_daemon_reports_reachable_at은 단순 UnixStream::connect 가능성을 넘어
 // "lterm 데몬이 protocol 수준에서 살아있는가" 까지 검증한다. 본 회귀 가드는
 // 임의 UnixListener를 bait socket으로 두고 helper를 직접 호출해 false를 반환함을
-// 확인한다 — 즉 가드가 lterm 이 아닌 listener 를 false-positive 로 데몬 취급하지
-// 않는다는 것을 보장한다.
+// 확인한다.
+//
+// listener를 단순 bind만 한 채 두면 helper가 spawn하는 doctor가 RPC read-timeout
+// (5초)까지 대기해 테스트가 느려진다 (quad-review 합의 — Codex Issue 1/3,
+// Claude Issue 3). 짧은 accept thread를 두어 stream을 즉시 drop하면 doctor RPC
+// 가 fast-fail로 끝나 daemon_reachable=false를 빠르게 반환한다.
 #[test]
 #[cfg(unix)]
 fn runtime_daemon_reports_reachable_at_rejects_non_lterm_listener() -> TestResult {
     let temp = tempfile::tempdir()?;
     let bait = temp.path().join("alive.sock");
-    let _listener = UnixListener::bind(&bait)?;
+    let listener = UnixListener::bind(&bait)?;
+    listener.set_nonblocking(false)?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = std::sync::Arc::clone(&stop);
+    let bait_clone = bait.clone();
+    let accept_thread = std::thread::spawn(move || {
+        // doctor가 시도하는 connect 를 accept 후 즉시 drop — protocol 응답을
+        // 보내지 않으므로 doctor 의 RPC 가 fast-fail (EOF / unexpected close) 한다.
+        // 백그라운드 thread 는 helper 호출 종료 후 stop flag 로 정리한다.
+        while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(_) => break,
+            }
+            // 짧게 양보해서 busy loop 을 피한다.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 시그널을 받았을 때 cleanup helper — listener 와 path 가 tempdir Drop
+        // 으로 정리되지만 명시적 cleanup 도 안전망으로 둔다.
+        let _ = std::fs::remove_file(&bait_clone);
+    });
     let alive = runtime_daemon_reports_reachable_at(&bait);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // accept thread를 깨우기 위해 빈 connect 한 번 — listener 가 닫혀있어도 안전.
+    let _ = UnixStream::connect(&bait);
+    let _ = accept_thread.join();
     assert!(
         !alive,
         "runtime_daemon_reports_reachable_at must return false for a plain UnixListener at {}; \
