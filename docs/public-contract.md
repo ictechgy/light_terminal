@@ -140,6 +140,46 @@ lterm agents --json
 lterm tmux-compat list-commands --json
 ```
 
+## Doctor JSON example
+
+`lterm doctor --json` consolidates client/daemon identity, the same-user trust
+boundary (`daemon_uid`), uptime, and a single-line `reason` for abnormal states
+into one object. Fields with `null` defaults from older daemons may be omitted
+entirely. The schema lives at
+[`docs/schemas/doctor.schema.json`](schemas/doctor.schema.json).
+
+```json
+{
+  "client_version": "1.0.1",
+  "client_protocol_version": 3,
+  "daemon_reachable": true,
+  "daemon_version": "1.0.1",
+  "daemon_protocol_version": 3,
+  "version_match": true,
+  "daemon_session_count": 0,
+  "daemon_active_connections": 1,
+  "daemon_shutting_down": false,
+  "daemon_uid": 501,
+  "daemon_started_at_unix_secs": 1779036000,
+  "daemon_uptime_secs": 745,
+  "daemon_error": null,
+  "runtime_dir": "/var/folders/.../light-terminal-501",
+  "data_dir": "/Users/<you>/.local/share/light-terminal",
+  "socket_path": "/var/folders/.../light-terminal-501/lterm.sock",
+  "shim_dir": "/Users/<you>/.local/share/light-terminal/shims",
+  "tmux_shim_path": "/Users/<you>/.local/share/light-terminal/shims/tmux",
+  "tmux_shim_exists": true,
+  "shim_dir_in_path": false
+}
+```
+
+When something is wrong, `reason` is a single sanitized sentence (e.g. `Daemon
+is not reachable. It usually auto-starts on the next \`lterm\` command; run
+\`lterm doctor\` again or inspect daemon startup with \`lterm logs\`.`). A
+healthy daemon omits `reason`. Older daemons that predate `daemon_uid` /
+`started_at_unix_secs` simply omit those fields; their absence is not an
+error.
+
 ## Non-blocking P1 surfaces
 
 Shell completions and agent workflow cookbook recipes are useful follow-up work,

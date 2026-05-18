@@ -91,7 +91,7 @@ pub fn ensure_server() -> Result<()> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready")))
+    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready. Run `lterm doctor` to inspect daemon state or `lterm shutdown && lterm list` to retry a clean start.")))
 }
 
 pub fn daemon_status() -> Result<DaemonStatus> {
@@ -152,7 +152,12 @@ fn rpc_with_read_timeout<T: DeserializeOwned>(
 ) -> Result<T> {
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "connect to lterm daemon at {} (is the daemon running? it usually auto-starts on the next `lterm` command; run `lterm doctor` if it keeps failing)",
+                path.display()
+            )
+        })?;
     stream
         .set_read_timeout(read_timeout)
         .context("set rpc read timeout")?;
@@ -1014,7 +1019,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
 
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("connect to lterm daemon at {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "connect to lterm daemon at {} (is the daemon running? it usually auto-starts on the next `lterm` command; run `lterm doctor` if it keeps failing)",
+                path.display()
+            )
+        })?;
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .context("set attach handshake read timeout")?;
@@ -3049,6 +3059,9 @@ mod tests {
             session_count: 0,
             active_connections: 0,
             shutting_down: false,
+            // 옛 데몬은 doctor 신규 필드를 보내지 않는다. backward-compat 시뮬레이션.
+            daemon_uid: None,
+            started_at_unix_secs: None,
         };
         let current = DaemonStatus {
             protocol_version: super::STATUS_THEME_PROTOCOL_VERSION,

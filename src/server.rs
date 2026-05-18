@@ -90,7 +90,17 @@ pub fn serve_forever() -> Result<()> {
         .with_context(|| format!("chmod 0600 {}", socket.display()))?;
     eprintln!("lterm daemon listening on {}", socket.display());
 
-    let state = Arc::new(State::default());
+    // 데몬 시작 시각. SystemTime이 UNIX_EPOCH 이전이면 None을 그대로 들고 가서
+    // doctor 측 uptime 계산이 sentinel 0으로 50+년을 보고하지 않게 한다 (quad-review
+    // 합의 이슈: started_at_unix_secs=0 wire 전송 회피).
+    let started_at_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    let state = Arc::new(State {
+        started_at_unix_secs,
+        ..State::default()
+    });
     for stream in listener.incoming() {
         if state.shutting_down.load(Ordering::SeqCst) {
             break;
@@ -120,6 +130,10 @@ struct State {
     sessions: Mutex<SessionMaps>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
+    // 데몬 시작 시각(UNIX epoch seconds). doctor의 uptime 계산용. None이면
+    // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
+    // 보내 client가 uptime을 omit하게 한다.
+    started_at_unix_secs: Option<u64>,
 }
 
 impl State {
@@ -1324,6 +1338,12 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 session_count: session_count as u64,
                 active_connections: state.active_connections.load(Ordering::SeqCst) as u64,
                 shutting_down: state.shutting_down.load(Ordering::SeqCst),
+                // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
+                // 같은 OS 사용자 trust boundary 식별자. doctor가 peer 신원을 보고할 수 있게 한다.
+                daemon_uid: Some(unsafe { geteuid() }),
+                // state.started_at_unix_secs는 이미 Option<u64> — clock 실패 시 None을
+                // 그대로 wire에 전송해 client uptime이 sentinel 0으로 misreport되는 것을 방지.
+                started_at_unix_secs: state.started_at_unix_secs,
             }))
         }
         Request::New {
@@ -1367,7 +1387,9 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 return Ok(Response::ok(session.info()));
             }
             if target.starts_with('%') {
-                bail!("cannot auto-create a missing pane target: {target}");
+                bail!(
+                    "cannot auto-create a missing pane target: {target}. Pane ids (e.g. %1) cannot be created by name; run `lterm list` to find an active pane or `lterm start <NAME>` to create a new session."
+                );
             }
             let session = create_session(
                 state,
@@ -2070,7 +2092,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
         let mut sessions = lock(&state.sessions);
         let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
             anyhow!(
-                "no such lterm session or pane: {}",
+                "no such lterm session or pane: {}. Run `lterm list` to see active sessions or `lterm start <NAME>` to create one.",
                 sanitized_preview(&target)
             )
         })?;
@@ -2676,7 +2698,7 @@ fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
         return Ok(session);
     }
     bail!(
-        "no such lterm session or pane: {}",
+        "no such lterm session or pane: {}. Run `lterm list` to see active sessions or `lterm start <NAME>` to create one.",
         sanitized_preview(&target)
     )
 }
