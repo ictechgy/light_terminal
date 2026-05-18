@@ -271,8 +271,17 @@ fn half_open_client_does_not_block_other_clients() -> TestResult {
     let half_open = UnixStream::connect(&socket)?;
     half_open.set_read_timeout(Some(Duration::from_millis(50)))?;
 
-    // 다른 client가 정상 동작해야 한다.
+    // 다른 client가 정상 동작해야 한다. 동시에 RPC 라운드트립이 half-open peer 때문에
+    // single-flight로 직렬화되면 사용자가 행 걸린다고 느낀다 — 합리적 상한선 안에서
+    // 끝남을 명시적으로 가드한다. RPC_TIMEOUT(5초)에서 충분히 거리를 두되 디버그
+    // 빌드 process 시작 비용까지 흡수하도록 2초로 둔다.
+    let started = Instant::now();
     let r = env.doctor_json()?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "second client must not be blocked by half-open peer: elapsed={elapsed:?}, doctor={r:?}"
+    );
     assert_eq!(
         r.get("daemon_reachable").and_then(|v| v.as_bool()),
         Some(true),
