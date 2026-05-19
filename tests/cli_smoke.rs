@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -5109,6 +5109,28 @@ fn fish_quote_for_test(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn fish_sourceability_command() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("fish");
+        if !candidate.is_file() {
+            continue;
+        }
+        let candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        let supports_no_config = Command::new(&candidate)
+            .arg("--no-config")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if supports_no_config {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[test]
 fn env_outputs_fish_exports_when_requested() -> TestResult {
     let env = TestEnv::new()?;
@@ -5166,17 +5188,12 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
         expected_lines,
         "fish env output should keep exact sourceable line shape"
     );
-    if Command::new("fish")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-    {
+    if let Some(fish) = fish_sourceability_command() {
         let script = format!(
             "{stdout}\nprintf '%s\\n' \"$LTERM_SOCKET\"\nprintf '%s\\n' \"$TMUX\"\nprintf '%s\\n' \"$TMUX_PANE\"\nstring join : $PATH\n"
         );
-        let fish_output = Command::new("fish")
+        let fish_output = Command::new(fish)
+            .arg("--no-config")
             .arg("-c")
             .arg(script)
             .env("PATH", "BASE_PATH")
