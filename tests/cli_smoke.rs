@@ -1253,6 +1253,45 @@ fn init_prints_fish_source_preview() -> TestResult {
 }
 
 #[test]
+fn init_detects_shell_from_environment_when_omitted() -> TestResult {
+    let env = TestEnv::new()?;
+    for (shell_env, expected_shell, expected_step) in [
+        (
+            Some("/usr/local/bin/fish"),
+            "shell\tfish",
+            "step\t3\tlterm env --shell fish | source",
+        ),
+        (
+            Some("/bin/zsh"),
+            "shell\tzsh",
+            "step\t3\teval \"$(lterm env)\"",
+        ),
+        (
+            Some("/opt/custom/unknown-shell"),
+            "shell\tposix",
+            "step\t3\teval \"$(lterm env)\"",
+        ),
+        (None, "shell\tposix", "step\t3\teval \"$(lterm env)\""),
+    ] {
+        let mut cmd = env.cmd();
+        if let Some(shell_env) = shell_env {
+            cmd.env("SHELL", shell_env);
+        } else {
+            cmd.env_remove("SHELL");
+        }
+        let output = cmd.arg("init").output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(expected_shell) && stdout.contains(expected_step),
+            "init preview for SHELL={shell_env:?} missing {expected_shell:?}/{expected_step:?}:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn init_rejects_unsupported_shell_values() -> TestResult {
     let env = TestEnv::new()?;
     let output = env.cmd().args(["init", "--shell", "powershell"]).output()?;
@@ -5066,6 +5105,10 @@ fn env_outputs_only_shell_exports() -> TestResult {
     Ok(())
 }
 
+fn fish_quote_for_test(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 #[test]
 fn env_outputs_fish_exports_when_requested() -> TestResult {
     let env = TestEnv::new()?;
@@ -5090,24 +5133,113 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in [
-        "set -gx LTERM_SOCKET ",
-        "set -gx TMUX ",
-        "string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE '%0'",
-        "contains -- ",
-        " or set -gx PATH ",
-        r"fish runtime with \' quote and \\ slash/lterm.sock",
-        r"fish data with \' quote and \\ slash/shims",
-    ] {
-        assert!(
-            stdout.contains(expected),
-            "fish env output missing {expected:?}:\n{stdout}"
+    let expected_socket = runtime.join("lterm.sock").display().to_string();
+    let expected_shim = data.join("shims").display().to_string();
+    let expected_lines = vec![
+        format!(
+            "set -gx LTERM_SOCKET {}",
+            fish_quote_for_test(&expected_socket)
+        ),
+        "string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE '%0'".to_string(),
+        format!(
+            "contains -- {} $PATH; or set -gx PATH {} $PATH",
+            fish_quote_for_test(&expected_shim),
+            fish_quote_for_test(&expected_shim)
+        ),
+    ];
+    let lines: Vec<_> = stdout.lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 4, "fish env output should stay four lines");
+    let quoted_socket = fish_quote_for_test(&expected_socket);
+    let tmux_prefix = format!(
+        "set -gx TMUX {},",
+        quoted_socket
+            .strip_suffix('\'')
+            .expect("test quote should end with a single quote")
+    );
+    assert!(
+        lines[1].starts_with(&tmux_prefix) && lines[1].ends_with(",0'"),
+        "fish TMUX line should be quoted socket,pid,0: {:?}",
+        lines[1]
+    );
+    assert_eq!(
+        vec![lines[0].clone(), lines[2].clone(), lines[3].clone()],
+        expected_lines,
+        "fish env output should keep exact sourceable line shape"
+    );
+    if Command::new("fish")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        let script = format!(
+            "{stdout}\nprintf '%s\\n' \"$LTERM_SOCKET\"\nprintf '%s\\n' \"$TMUX\"\nprintf '%s\\n' \"$TMUX_PANE\"\nstring join : $PATH\n"
         );
+        let fish_output = Command::new("fish")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", "BASE_PATH")
+            .env_remove("TMUX_PANE")
+            .output()?;
+        assert!(fish_output.status.success(), "{fish_output:?}");
+        let fish_stdout = String::from_utf8(fish_output.stdout)?;
+        let sourced_lines: Vec<_> = fish_stdout.lines().collect();
+        assert_eq!(sourced_lines.first(), Some(&expected_socket.as_str()));
+        assert!(
+            sourced_lines.get(1).is_some_and(|tmux| tmux
+                .starts_with(&format!("{expected_socket},"))
+                && tmux.ends_with(",0")),
+            "{fish_stdout:?}"
+        );
+        assert_eq!(sourced_lines.get(2), Some(&"%0"));
+        let expected_path = format!("{expected_shim}:BASE_PATH");
+        assert_eq!(sourced_lines.get(3), Some(&expected_path.as_str()));
     }
     assert!(
         !stdout.contains("export "),
         "fish env output should not emit POSIX exports:\n{stdout}"
     );
+    Ok(())
+}
+
+#[test]
+fn env_rejects_unsupported_shell_values() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["env", "--shell", "powershell"]).output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("powershell"),
+        "unsupported env shell should be rejected by clap value parser:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_posix_family_shells_emit_posix_exports() -> TestResult {
+    let env = TestEnv::new()?;
+    for shell in ["bash", "zsh", "posix"] {
+        let output = env.cmd().args(["env", "--shell", shell]).output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "export LTERM_SOCKET=",
+            "export TMUX=",
+            "export TMUX_PANE=",
+            "export PATH=",
+        ] {
+            assert!(
+                stdout.contains(expected),
+                "env --shell {shell} missing POSIX export {expected:?}:\n{stdout}"
+            );
+        }
+        assert!(
+            !stdout.contains("set -gx") && !stdout.contains("contains --"),
+            "env --shell {shell} should not emit fish syntax:\n{stdout}"
+        );
+    }
     Ok(())
 }
 

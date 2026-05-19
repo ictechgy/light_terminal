@@ -115,15 +115,18 @@ else
   echo "node not found; skipping npm package version cross-check" >&2
 fi
 export LTERM_CARGO_VERSION="$cargo_version"
-python3 - <<'PY'
+manifest_release=$(python3 - <<'PY'
 import json
-import os
 from pathlib import Path
 manifest = json.loads(Path('docs/contract-manifest.json').read_text())
-expected = f"lterm-{os.environ['LTERM_CARGO_VERSION']}"
-if manifest.get('release') != expected:
-    raise SystemExit(f"contract manifest release {manifest.get('release')!r} != {expected!r}")
+print(manifest.get('release'))
 PY
+)
+expected_release="lterm-$cargo_version"
+[[ "$manifest_release" == "$expected_release" ]] || {
+  echo "contract manifest release '$manifest_release' != '$expected_release'" >&2
+  exit 65
+}
 
 if [[ "$CONTRACT_ONLY" == 0 ]]; then
   run cargo fmt -- --check
