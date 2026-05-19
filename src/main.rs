@@ -6,7 +6,7 @@ mod server;
 mod tmux_compat;
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use client::{AttachStdinEof, ComposeOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -256,7 +256,17 @@ enum Commands {
     /// Install the tmux compatibility shim and print the shim directory.
     InstallShim,
     /// Print shell exports for tmux compatibility.
-    Env,
+    Env {
+        /// Shell syntax to emit; defaults to POSIX exports for existing eval usage.
+        #[arg(long, value_enum)]
+        shell: Option<ShellKind>,
+    },
+    /// Print a no-touch setup preview for enabling lterm locally.
+    Init {
+        /// Shell syntax to show in the preview; detected from SHELL when omitted.
+        #[arg(long, value_enum)]
+        shell: Option<ShellKind>,
+    },
     /// tmux-compatible command surface used by the shim.
     TmuxCompat {
         /// Arguments forwarded to the tmux compatibility parser.
@@ -350,6 +360,14 @@ enum Commands {
         #[arg(last = true)]
         ssh_args: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ShellKind {
+    Bash,
+    Zsh,
+    Fish,
+    Posix,
 }
 
 fn main() {
@@ -562,7 +580,10 @@ fn run() -> Result<()> {
         ),
         Commands::Shutdown => client::shutdown(),
         Commands::InstallShim => tmux_compat::install_shim(),
-        Commands::Env => tmux_compat::print_env_exports(),
+        Commands::Env { shell } => {
+            tmux_compat::print_env_exports(shell.unwrap_or(ShellKind::Posix).into())
+        }
+        Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
             std::process::exit(code);
@@ -608,6 +629,49 @@ fn run() -> Result<()> {
             ssh_args,
         } => ssh_attach(&host, &target, ssh_args),
     }
+}
+
+impl From<ShellKind> for tmux_compat::EnvShell {
+    fn from(value: ShellKind) -> Self {
+        match value {
+            ShellKind::Bash | ShellKind::Zsh | ShellKind::Posix => Self::Posix,
+            ShellKind::Fish => Self::Fish,
+        }
+    }
+}
+
+fn detect_init_shell() -> ShellKind {
+    let Some(shell) = std::env::var_os("SHELL") else {
+        return ShellKind::Posix;
+    };
+    let name = Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match name {
+        "bash" => ShellKind::Bash,
+        "zsh" => ShellKind::Zsh,
+        "fish" => ShellKind::Fish,
+        _ => ShellKind::Posix,
+    }
+}
+
+fn print_init_preview(shell: ShellKind) -> Result<()> {
+    let (shell_name, enable_command) = match shell {
+        ShellKind::Bash => ("bash", "eval \"$(lterm env)\""),
+        ShellKind::Zsh => ("zsh", "eval \"$(lterm env)\""),
+        ShellKind::Fish => ("fish", "lterm env --shell fish | source"),
+        ShellKind::Posix => ("posix", "eval \"$(lterm env)\""),
+    };
+    println!("lterm init preview");
+    println!("shell\t{shell_name}");
+    println!("modifies_files\tno");
+    println!("step\t1\tlterm doctor --json");
+    println!("step\t2\tlterm install-shim");
+    println!("step\t3\t{enable_command}");
+    println!("note\tCopy the enable command into a trusted shell startup file only after review.");
+    println!("note\tRun lterm doctor --json again after changing PATH to verify shim_dir_in_path.");
+    Ok(())
 }
 
 const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;

@@ -88,6 +88,7 @@ or raw output stream.
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
+| `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
@@ -103,7 +104,7 @@ or raw output stream.
 | Command | Aliases | Classification | Contract notes |
 | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | Installs/prints the tmux shim path; text is sanitized. |
-| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; shell-eval semantics are stable, quote style is not a stable visual API. |
+| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; `--shell fish` emits fish syntax for `source`. Shell-eval semantics are stable, quote style is not a stable visual API. |
 | `lterm notify` | none | `best-effort` | Tries `cmux notify`, then emits sanitized OSC 777 fallback output. |
 | `lterm ssh` | none | `explicit-raw-unsafe` | Uses SSH to run a remote attach-or-new command; remote PTY bytes are unsanitized. |
 | `lterm agents` | none | `stable` | Reports built-in/configured/custom agent launcher profile availability. |

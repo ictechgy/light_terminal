@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" role="img" aria-labelledby="title desc">
+  <title id="title">lterm quick demo</title>
+  <desc id="desc">Terminal-style demo showing a detached lterm session, sanitized logs, JSON wait, and resume.</desc>
+  <rect width="920" height="420" rx="18" fill="#0b1020"/>
+  <rect x="18" y="18" width="884" height="384" rx="14" fill="#111827" stroke="#334155"/>
+  <circle cx="46" cy="46" r="7" fill="#ef4444"/>
+  <circle cx="70" cy="46" r="7" fill="#f59e0b"/>
+  <circle cx="94" cy="46" r="7" fill="#22c55e"/>
+  <text x="124" y="52" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" fill="#94a3b8">lterm: persistent terminal sessions for agents</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16">
+    <text x="42" y="94" fill="#38bdf8">$</text>
+    <text x="66" y="94" fill="#e5e7eb">lterm start -d -n api -- sh -lc 'echo READY; sleep 60'</text>
+    <text x="66" y="124" fill="#a7f3d0">api    %0    sh -lc 'echo READY; sleep 60'</text>
+
+    <text x="42" y="172" fill="#38bdf8">$</text>
+    <text x="66" y="172" fill="#e5e7eb">lterm logs api -S=-20</text>
+    <text x="66" y="202" fill="#a7f3d0">READY</text>
+
+    <text x="42" y="250" fill="#38bdf8">$</text>
+    <text x="66" y="250" fill="#e5e7eb">lterm wait api --contains READY --json</text>
+    <text x="66" y="280" fill="#a7f3d0">{ &quot;target&quot;: &quot;api&quot;, &quot;matched&quot;: true, &quot;timed_out&quot;: false }</text>
+
+    <text x="42" y="328" fill="#38bdf8">$</text>
+    <text x="66" y="328" fill="#e5e7eb">lterm resume api</text>
+    <text x="66" y="358" fill="#fbbf24">raw PTY attach resumes the live session</text>
+  </g>
+</svg>

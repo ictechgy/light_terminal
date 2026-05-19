@@ -116,8 +116,9 @@ Release builds use the committed `Cargo.lock` and should be built with
 `cargo build --release --locked`. Before tagging a release, maintainers should
 run the standard Rust checks and `cargo audit`; any unfixed advisory must be
 recorded in release evidence with impact, affected paths, and mitigation or
-upgrade plan. npm wrapper releases should publish binaries built from the same
-reviewed source revision.
+upgrade plan. The working dependency update policy is in
+[`docs/dependency-hygiene.md`](docs/dependency-hygiene.md). npm wrapper releases
+should publish binaries built from the same reviewed source revision.
 
 ## Security non-goals
 

@@ -67,6 +67,44 @@ impl TestEnv {
     }
 }
 
+fn temp_tree_snapshot(root: &Path) -> TestResult<BTreeSet<String>> {
+    fn visit(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> TestResult {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                out.insert(format!("dir:{rel}"));
+                visit(root, &path, out)?;
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(&path)?;
+                let hex = bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                out.insert(format!("file:{rel}:{hex}"));
+            } else if file_type.is_symlink() {
+                out.insert(format!(
+                    "symlink:{rel}:{}",
+                    std::fs::read_link(&path)?.display()
+                ));
+            } else {
+                out.insert(format!("other:{rel}"));
+            }
+        }
+        Ok(())
+    }
+
+    let mut snapshot = BTreeSet::new();
+    visit(root, root, &mut snapshot)?;
+    Ok(snapshot)
+}
+
 impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = self.cmd().arg("shutdown").status();
@@ -1121,6 +1159,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "tmux-compat",
         "wait",
         "watch",
+        "init",
         "notify",
         "agents",
         "agent",
@@ -1138,6 +1177,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
     }
     for expected in [
         "tmux compatibility",
+        "setup preview",
         "sanitized output",
         "cmux-friendly notification",
         "remote host",
@@ -1147,6 +1187,81 @@ fn help_exposes_utility_command_surface() -> TestResult {
             "top-level help should keep utility command context {expected:?}:\n{stdout}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn init_prints_setup_preview_without_modifying_files() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(home.join(".zshrc"), "original startup file\n")?;
+    let before = temp_tree_snapshot(env.temp.path())?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .args(["init", "--shell", "zsh"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "lterm init preview",
+        "shell\tzsh",
+        "modifies_files\tno",
+        "step\t1\tlterm doctor --json",
+        "step\t2\tlterm install-shim",
+        "step\t3\teval \"$(lterm env)\"",
+        "Copy the enable command",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "init preview missing {expected:?}:\n{stdout}"
+        );
+    }
+    assert_eq!(
+        before,
+        temp_tree_snapshot(env.temp.path())?,
+        "lterm init must not modify shell startup files or daemon state"
+    );
+    Ok(())
+}
+
+#[test]
+fn init_prints_fish_source_preview() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["init", "--shell", "fish"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "shell\tfish",
+        "step\t2\tlterm install-shim",
+        "step\t3\tlterm env --shell fish | source",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "fish init preview missing {expected:?}:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("set -gx PATH (lterm install-shim) $PATH"),
+        "fish init preview must not recommend re-running install-shim from shell startup:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn init_rejects_unsupported_shell_values() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["init", "--shell", "powershell"]).output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("powershell"),
+        "unsupported shell should be rejected by clap value parser:\n{stderr}"
+    );
     Ok(())
 }
 
@@ -4948,6 +5063,32 @@ fn env_outputs_only_shell_exports() -> TestResult {
     );
     assert!(stdout.contains("export PATH="), "{stdout:?}");
     assert!(!stdout.contains("\n/"), "bare shim path leaked: {stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn env_outputs_fish_exports_when_requested() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env.cmd().args(["env", "--shell", "fish"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "set -gx LTERM_SOCKET ",
+        "set -gx TMUX ",
+        "set -q TMUX_PANE; or set -gx TMUX_PANE %0",
+        "contains -- ",
+        " or set -gx PATH ",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "fish env output missing {expected:?}:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("export "),
+        "fish env output should not emit POSIX exports:\n{stdout}"
+    );
     Ok(())
 }
 

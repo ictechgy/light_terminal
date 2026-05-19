@@ -65,18 +65,38 @@ pub fn install_shim() -> Result<()> {
     Ok(())
 }
 
-pub fn print_env_exports() -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvShell {
+    Posix,
+    Fish,
+}
+
+pub fn print_env_exports(shell: EnvShell) -> Result<()> {
     ensure_shim()?;
     let shim = paths::shim_dir()?;
     let socket = paths::socket_path()?;
     let tmux = server::fake_tmux_value()?;
-    println!(
-        "export LTERM_SOCKET={}",
-        quote(&socket.display().to_string())
-    );
-    println!("export TMUX={}", quote(&tmux));
-    println!("export TMUX_PANE=${{TMUX_PANE:-%0}}");
-    println!("export PATH={}:$PATH", quote(&shim.display().to_string()));
+    match shell {
+        EnvShell::Posix => {
+            println!(
+                "export LTERM_SOCKET={}",
+                quote(&socket.display().to_string())
+            );
+            println!("export TMUX={}", quote(&tmux));
+            println!("export TMUX_PANE=${{TMUX_PANE:-%0}}");
+            println!("export PATH={}:$PATH", quote(&shim.display().to_string()));
+        }
+        EnvShell::Fish => {
+            let shim = fish_quote(&shim.display().to_string());
+            println!(
+                "set -gx LTERM_SOCKET {}",
+                fish_quote(&socket.display().to_string())
+            );
+            println!("set -gx TMUX {}", fish_quote(&tmux));
+            println!("set -q TMUX_PANE; or set -gx TMUX_PANE %0");
+            println!("contains -- {shim} $PATH; or set -gx PATH {shim} $PATH");
+        }
+    }
     Ok(())
 }
 
@@ -1441,6 +1461,10 @@ pub fn quote(value: &str) -> String {
     shlex::try_quote(value)
         .expect("shell quote should be infallible for NUL-free Rust strings")
         .into_owned()
+}
+
+fn fish_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 pub fn expand_format(format: &str, info: &SessionInfo) -> String {

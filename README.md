@@ -98,9 +98,13 @@ To expose the tmux shim:
 lterm install-shim
 # Add the printed directory to PATH ahead of the real tmux, or eval the helper:
 eval "$(lterm env)"
+# fish:
+lterm env --shell fish | source
 ```
 
 ## Quick start
+
+![lterm quick demo](docs/assets/lterm-demo.svg)
 
 **Create a persistent session and attach immediately:**
 
@@ -140,6 +144,7 @@ lterm -a api
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
+| Preview local setup steps | `lterm init --shell zsh` | None |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -150,13 +155,14 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 | Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
-| Print shell exports for tmux compatibility | `eval "$(lterm env)"` | Emits trusted `export` lines that prepend the shim dir to `$PATH` |
+| Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
 | Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
 | Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
 
 Use `eval "$(lterm env)"` only when you trust the `lterm` binary on your `PATH`.
 It emits fixed `export` lines that prepend the shim directory to `$PATH`.
+For fish, use `lterm env --shell fish | source` after the same trust check.
 
 `lterm ssh` forwards remote PTY bytes to the local terminal without sanitizing
 terminal control sequences, so a compromised remote can drive terminal features
@@ -439,6 +445,17 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --nam
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- logs test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
+
+Release/contract preflight helpers:
+
+```bash
+scripts/release-preflight.sh --contract-only
+scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+scripts/dependency-minor-dry-run.sh
+```
+
+Use `--run-soak` on `scripts/release-preflight.sh` only for the manual
+release-gate soak profile.
 
 ## License
 
