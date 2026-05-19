@@ -350,23 +350,71 @@ Codex:
 - Tell subagents to brainstorm only from the provided brief/context, not modify files, and return the structured output contract.
 - Do not duplicate external tracks; use Codex for feasibility, risks, implementation shape, and synthesis gaps.
 
-Gemini: run only after a documented no-tools/read-only mode or sandbox is available. If not verified, skip as `skipped-unsafe`.
+Gemini: run only after a documented no-tools/read-only mode or sandbox is available. The safety gate must prove that the selected `--approval-mode plan` help block itself documents a read-only/no-tools boundary; a broad help-text grep for `read-only` is insufficient. If the CLI reports trust downgrade or workspace-trust failure, mark the worker unsafe and exclude its output.
 
 ```bash
 GEMINI_PROMPT="$SESSION_TMPDIR/quad-brainstorming-gemini-1-prompt.txt"
 GEMINI_OUT="$SESSION_TMPDIR/quad-brainstorming-gemini-1-stdout.txt"
 GEMINI_ERR="$SESSION_TMPDIR/quad-brainstorming-gemini-1-stderr.txt"
+GEMINI_HELP="$SESSION_TMPDIR/gemini.help.txt"
+GEMINI_ARGS=(--prompt "" --approval-mode plan)
 SAFE_GEMINI="${SAFE_GEMINI:-0}"
-if [ "$SAFE_GEMINI" != "1" ]; then
-  printf '%s\n' "skipped-unsafe: no verified Gemini sandbox/no-tools boundary" > "$GEMINI_ERR"
-elif gemini --help 2>&1 | grep -q -- '--approval-mode' && gemini --help 2>&1 | grep -q -- 'read-only'; then
-  (cd "$SESSION_TMPDIR" && run_external "$GEMINI_OUT" "$GEMINI_ERR" gemini -p "" --approval-mode plan < "$GEMINI_PROMPT")
+gemini_help_check_approval_plan() {
+  python3 - "$GEMINI_HELP" "$1" <<'PY'
+import re
+import sys
+
+help_path, mode = sys.argv[1], sys.argv[2]
+text = open(help_path, encoding="utf-8", errors="ignore").read()
+lines = text.splitlines()
+option_re = re.compile(r'^\s*(?:-[A-Za-z],\s*)?--[A-Za-z0-9][A-Za-z0-9-]*\b')
+for i, line in enumerate(lines):
+    if "--approval-mode" not in line:
+        continue
+    block = [line]
+    for nxt in lines[i + 1:i + 8]:
+        if option_re.search(nxt):
+            break
+        block.append(nxt)
+    normalized = " ".join(block).lower()
+    has_plan = re.search(r'\bplan\b', normalized)
+    has_readonly_plan = (
+        re.search(r'\bplan\b\s*\([^)]*(?:read[- ]?only|readonly|no[- ]?tools)[^)]*\)', normalized)
+        or re.search(r'\bplan\b[^.;]{0,120}(?:read[- ]?only|readonly|no[- ]?tools)', normalized)
+    )
+    if has_plan and (mode != "readonly" or has_readonly_plan):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+if ! command -v gemini >/dev/null 2>&1; then
+  printf '%s\n' "skipped-missing: gemini command not found" > "$GEMINI_ERR"
 else
-  printf '%s\n' "skipped-unsafe: gemini approval-mode unavailable" > "$GEMINI_ERR"
+  gemini --help > "$GEMINI_HELP" 2>&1 || true
+  if [ "$SAFE_GEMINI" != "1" ] && gemini_help_check_approval_plan readonly; then
+    SAFE_GEMINI=1
+  fi
+  if ! gemini_help_check_approval_plan available; then
+    printf '%s\n' "skipped-unsafe: gemini approval-mode plan unavailable" > "$GEMINI_ERR"
+  elif [ "$SAFE_GEMINI" != "1" ]; then
+    printf '%s\n' "skipped-unsafe: no verified Gemini sandbox/no-tools boundary" > "$GEMINI_ERR"
+  else
+    grep -q -- '--skip-trust' "$GEMINI_HELP" && GEMINI_ARGS+=(--skip-trust)
+    if (cd "$SESSION_TMPDIR" && run_external "$GEMINI_OUT" "$GEMINI_ERR" gemini "${GEMINI_ARGS[@]}" < "$GEMINI_PROMPT"); then
+      GEMINI_STATUS=completed
+    else
+      rc=$?
+      [ "$rc" = 124 ] && GEMINI_STATUS=failed-timeout || GEMINI_STATUS=failed
+    fi
+    if grep -Eiq 'approval mode overridden to "default"|not running in a trusted directory' "$GEMINI_ERR"; then
+      GEMINI_STATUS=failed-trust-boundary
+      printf '%s\n' "skipped-unsafe: gemini trust boundary failed" >> "$GEMINI_ERR"
+    fi
+  fi
 fi
 ```
 
-Forge: run from `$FORGE_RUN_DIR` with a verified read-only agent. Default to `sage` because the shared review helper can verify it as read/fetch/fs-search only. Skip if the selected agent, Forge flags, or helper cannot prove a prompt-only/read-only boundary.
+Forge: run from `$FORGE_RUN_DIR` only with a verified local read-only agent that has no network-capable tools. The configured agent name may default to `sage`, but the brainstorming workflow MUST skip it if `forge-agent-check` reports tools such as `fetch`; prompt-only instructions are not a sufficient no-egress boundary. Network-capable Forge brainstorming requires a future explicit execution mode with same-turn user consent and egress restrictions, not the P0 default.
 
 ```bash
 FORGE_AGENT="${FORGE_BRAINSTORM_AGENT:-sage}"
@@ -374,6 +422,22 @@ FORGE_PROMPT="$FORGE_RUN_DIR/quad-brainstorming-forge-1-prompt.txt"
 FORGE_OUT="$FORGE_RUN_DIR/quad-brainstorming-forge-1-stdout.txt"
 FORGE_ERR="$FORGE_RUN_DIR/quad-brainstorming-forge-1-stderr.txt"
 FORGE_TOOLS="$FORGE_RUN_DIR/quad-brainstorming-forge-tools.json"
+NETWORK_CAPABLE_FORGE_TOOLS=("fetch")
+forge_agent_has_no_network_tools() {
+  python3 - "$FORGE_TOOLS" "${NETWORK_CAPABLE_FORGE_TOOLS[@]}" <<'PY'
+import json
+import sys
+
+tools_path, *blocked_tools = sys.argv[1:]
+data = json.load(open(tools_path, encoding="utf-8"))
+enabled = set(data.get("enabled", []))
+blocked = sorted(enabled.intersection(blocked_tools))
+if blocked:
+    print("network-capable tools enabled: " + ",".join(blocked), file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
 if ! command -v forge >/dev/null 2>&1; then
   FORGE_STATUS=skipped-missing
   printf '%s\n' "skipped-missing: forge command not found" > "$FORGE_ERR"
@@ -386,6 +450,9 @@ elif [ ! -x "$REVIEW_CORE" ]; then
 elif ! python3 "$REVIEW_CORE" forge-agent-check --agent "$FORGE_AGENT" --json > "$FORGE_TOOLS" 2>&1; then
   FORGE_STATUS=skipped-unsafe
   printf '%s\n' "skipped-unsafe: Forge agent is not verified read-only: $FORGE_AGENT" > "$FORGE_ERR"
+elif ! forge_agent_has_no_network_tools 2>> "$FORGE_ERR"; then
+  FORGE_STATUS=skipped-unsafe
+  printf '%s\n' "skipped-unsafe: Forge agent has network-capable tools: $FORGE_AGENT" >> "$FORGE_ERR"
 elif (cd "$FORGE_RUN_DIR" && run_external "$FORGE_OUT" "$FORGE_ERR" forge --agent "$FORGE_AGENT" -C "$FORGE_RUN_DIR" < "$FORGE_PROMPT"); then
   FORGE_STATUS=completed
 else

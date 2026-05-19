@@ -71,5 +71,27 @@
         "transport": { "enum": ["none", "local-file"] }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "quorum": { "const": "full" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["high", "medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "strong" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["high", "medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "partial" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "solo-degraded" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "no-quorum-dry-result" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["n/a"] } } }
+    }
+  ]
 }

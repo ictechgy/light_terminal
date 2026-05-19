@@ -204,6 +204,46 @@ class QuadBrainstormingRepoArtifactsTests(unittest.TestCase):
                 for field in required_fields:
                     self.assertIn(field, schema["required"])
 
+    def test_schema_confidence_caps_are_enforced_by_quorum(self) -> None:
+        expected_caps = {
+            "full": ["high", "medium", "low"],
+            "strong": ["high", "medium", "low"],
+            "partial": ["medium", "low"],
+            "solo-degraded": ["low"],
+            "no-quorum-dry-result": ["n/a"],
+        }
+        for filename, confidence_field in [
+            ("quad-brainstorming-adr.schema.json", "confidence"),
+            ("quad-brainstorming-manifest.schema.json", "confidence_cap"),
+        ]:
+            with self.subTest(filename=filename):
+                schema = json.loads((SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+                rules = {
+                    rule["if"]["properties"]["quorum"]["const"]: rule["then"]["properties"][confidence_field]["enum"]
+                    for rule in schema["allOf"]
+                }
+                self.assertEqual(rules, expected_caps)
+                self.assertNotIn("high", rules["partial"])
+                self.assertNotIn("medium", rules["solo-degraded"])
+
+    def test_track_output_failure_class_excludes_non_failures(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "quad-brainstorming-track-output.schema.json").read_text(encoding="utf-8"))
+        failure_values = schema["definitions"]["failure_class"]["enum"]
+        self.assertNotIn("ready", failure_values)
+        self.assertNotIn("usable", failure_values)
+        self.assertEqual(
+            set(failure_values),
+            {
+                "missing",
+                "auth-required",
+                "unsafe-mode",
+                "timeout",
+                "empty-output",
+                "schema-invalid",
+                "off-target",
+            },
+        )
+
     def test_adoption_docs_and_samples_are_present(self) -> None:
         adoption = ADOPTION_DOC.read_text(encoding="utf-8")
         self.assertIn("No telemetry is sent by default", adoption)
@@ -349,7 +389,7 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
             "GEMINI_PROMPT=",
             "FORGE_PROMPT=",
             "claude -p",
-            "gemini -p",
+            "gemini \"${GEMINI_ARGS[@]}\"",
             "forge --agent",
         ]
         self.assertContainsAll(track_commands, [*provider_markers, "redacted context"])
@@ -394,6 +434,26 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "| 0 | No-quorum dry result | n/a | Report only doctor/preflight status or stop unless local synthesis is explicitly useful. |",
             ],
         )
+
+    def test_provider_safety_gates_are_semantic_not_substring_only(self) -> None:
+        track_commands = self.section("Track Commands")
+        self.assertContainsAll(
+            track_commands,
+            [
+                "gemini_help_check_approval_plan",
+                "has_readonly_plan",
+                "mode != \"readonly\" or has_readonly_plan",
+                "failed-trust-boundary",
+                "not running in a trusted directory",
+                "NETWORK_CAPABLE_FORGE_TOOLS",
+                "\"fetch\"",
+                "forge_agent_has_no_network_tools",
+                "skipped-unsafe: Forge agent has network-capable tools",
+                "same-turn user consent and egress restrictions",
+            ],
+        )
+        self.assertNotIn("grep -q -- 'read-only'", track_commands)
+        self.assertNotIn("read/fetch/fs-search only", track_commands)
 
     def test_compact_adr_schema_and_artifact_policy_are_explicit(self) -> None:
         compact_adr = self.section("Compact ADR Report")

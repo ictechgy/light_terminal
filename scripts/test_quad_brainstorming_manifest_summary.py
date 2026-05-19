@@ -68,6 +68,80 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
             self.assertEqual(summary["provider_status_counts"]["codex"], {"usable": 1})
             self.assertEqual(summary["skipped_provider_reasons"]["claude:auth-required"], 1)
 
+    def test_malformed_nested_values_are_unknown_without_leaking_raw_values(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
+            root = Path(tmp)
+            run = root / "run-1"
+            run.mkdir()
+            secret = "SECRET_TOKEN_SHOULD_NOT_PRINT"
+            write_manifest(
+                run / "manifest.json",
+                preset={"raw_context": secret},
+                quorum=[secret],
+                confidence_cap={"transcript": secret},
+                telemetry={"status": {"raw_provider_output": secret}, "transport": "none"},
+                provider_statuses=[
+                    {
+                        "provider": {"raw_context": secret},
+                        "configured": True,
+                        "runnable": False,
+                        "status": {"raw_provider_output": secret},
+                        "detail": "malformed",
+                    }
+                ],
+            )
+
+            proc = subprocess.run(
+                ["python3", str(SCRIPT), "--json", str(root)],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
+            self.assertNotIn(secret, proc.stdout)
+            summary = json.loads(proc.stdout)
+            self.assertEqual(summary["preset_counts"], {"unknown": 1})
+            self.assertEqual(summary["quorum_counts"], {"unknown": 1})
+            self.assertEqual(summary["confidence_counts"], {"unknown": 1})
+            self.assertEqual(summary["telemetry_counts"], {"unknown": 1})
+            self.assertEqual(summary["provider_status_counts"]["unknown"], {"unknown": 1})
+            self.assertEqual(summary["skipped_provider_reasons"], {"unknown:unknown": 1})
+
+    def test_explicit_missing_path_returns_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
+            missing = Path(tmp) / "missing"
+            proc = subprocess.run(
+                ["python3", str(SCRIPT), str(missing)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("errors\t1", proc.stdout)
+            self.assertIn("path does not exist", proc.stderr)
+
+    def test_invalid_utf8_manifest_reports_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
+            root = Path(tmp)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "manifest.json").write_bytes(b"\xff\xfe\xfa")
+
+            proc = subprocess.run(
+                ["python3", str(SCRIPT), "--json", str(root)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(proc.returncode, 1)
+            summary = json.loads(proc.stdout)
+            self.assertEqual(summary["manifest_count"], 0)
+            self.assertEqual(summary["error_count"], 1)
+            self.assertIn("manifest.json", summary["errors"][0])
+
     def test_text_output_is_stable_and_local(self) -> None:
         with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
             root = Path(tmp)

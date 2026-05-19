@@ -46,9 +46,20 @@
       "items": { "$ref": "#/definitions/decision_matrix_row" }
     },
     "final_stance": { "type": "string" },
-    "failure_class": { "$ref": "quad-brainstorming-provider-status.schema.json#/properties/status" }
+    "failure_class": { "$ref": "#/definitions/failure_class" }
   },
   "definitions": {
+    "failure_class": {
+      "enum": [
+        "missing",
+        "auth-required",
+        "unsafe-mode",
+        "timeout",
+        "empty-output",
+        "schema-invalid",
+        "off-target"
+      ]
+    },
     "idea": {
       "type": "object",
       "additionalProperties": false,

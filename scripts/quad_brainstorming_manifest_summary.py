@@ -28,10 +28,36 @@ RAW_FIELD_NAMES = {
     "provider_request_dump",
 }
 PROVIDERS = ("claude", "codex", "gemini", "forge")
+PRESETS = ("architecture-review", "risk-scan", "decision-record", "product-strategy", "custom")
+QUORUMS = ("full", "strong", "partial", "solo-degraded", "no-quorum-dry-result")
+CONFIDENCE_CAPS = ("high", "medium", "low", "n/a")
+TELEMETRY_STATUSES = ("disabled", "explicit-export-only")
+PROVIDER_STATUSES = (
+    "ready",
+    "usable",
+    "missing",
+    "auth-required",
+    "unsafe-mode",
+    "timeout",
+    "empty-output",
+    "schema-invalid",
+    "off-target",
+)
+USABLE_PROVIDER_STATUSES = {"ready", "usable"}
 
 
-def iter_manifest_paths(inputs: Iterable[Path]) -> list[Path]:
+def safe_enum(value: Any, allowed: Iterable[str], default: str = "unknown") -> str:
+    if not isinstance(value, str):
+        return default
+    allowed_values = set(allowed)
+    if value not in allowed_values:
+        return default
+    return value
+
+
+def iter_manifest_paths(inputs: Iterable[Path], *, strict: bool = False) -> tuple[list[Path], list[str]]:
     paths: list[Path] = []
+    errors: list[str] = []
     for item in inputs:
         if item.is_file():
             paths.append(item)
@@ -40,22 +66,24 @@ def iter_manifest_paths(inputs: Iterable[Path]) -> list[Path]:
             if direct.is_file():
                 paths.append(direct)
             paths.extend(sorted(item.glob("*/manifest.json")))
-    return sorted(dict.fromkeys(paths))
+        elif strict:
+            errors.append(f"{item}: path does not exist or is not a file/directory")
+    return sorted(dict.fromkeys(paths)), errors
 
 
 def safe_load_manifest(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, f"{path}: {exc}"
     if not isinstance(data, dict):
         return None, f"{path}: manifest root must be an object"
     return data, None
 
 
-def summarize(paths: list[Path]) -> dict[str, Any]:
+def summarize(paths: list[Path], input_errors: Iterable[str] = ()) -> dict[str, Any]:
     manifests = []
-    errors = []
+    errors = list(input_errors)
     raw_field_occurrences: Counter[str] = Counter()
     preset_counts: Counter[str] = Counter()
     quorum_counts: Counter[str] = Counter()
@@ -73,12 +101,12 @@ def summarize(paths: list[Path]) -> dict[str, Any]:
         assert manifest is not None
         manifests.append(path)
         raw_field_occurrences.update(key for key in manifest if key in RAW_FIELD_NAMES)
-        preset_counts.update([str(manifest.get("preset", "unknown"))])
-        quorum_counts.update([str(manifest.get("quorum", "unknown"))])
-        confidence_counts.update([str(manifest.get("confidence_cap", "unknown"))])
+        preset_counts.update([safe_enum(manifest.get("preset"), PRESETS)])
+        quorum_counts.update([safe_enum(manifest.get("quorum"), QUORUMS)])
+        confidence_counts.update([safe_enum(manifest.get("confidence_cap"), CONFIDENCE_CAPS)])
         telemetry = manifest.get("telemetry")
         if isinstance(telemetry, dict):
-            telemetry_counts.update([str(telemetry.get("status", "unknown"))])
+            telemetry_counts.update([safe_enum(telemetry.get("status"), TELEMETRY_STATUSES)])
         else:
             telemetry_counts.update(["unknown"])
 
@@ -93,11 +121,10 @@ def summarize(paths: list[Path]) -> dict[str, Any]:
             for status in statuses:
                 if not isinstance(status, dict):
                     continue
-                provider = str(status.get("provider", "unknown"))
-                state = str(status.get("status", "unknown"))
-                if provider in provider_status_counts:
-                    provider_status_counts[provider].update([state])
-                if state not in {"ready", "usable"}:
+                provider = safe_enum(status.get("provider"), PROVIDERS)
+                state = safe_enum(status.get("status"), PROVIDER_STATUSES)
+                provider_status_counts.setdefault(provider, Counter()).update([state])
+                if state not in USABLE_PROVIDER_STATUSES:
                     skipped_provider_reasons.update([f"{provider}:{state}"])
 
     return {
@@ -120,6 +147,10 @@ def summarize(paths: list[Path]) -> dict[str, Any]:
 def print_text(summary: dict[str, Any]) -> None:
     print(f"manifests\t{summary['manifest_count']}")
     print(f"errors\t{summary['error_count']}")
+    if summary["errors"]:
+        print("[errors]", file=sys.stderr)
+        for error in summary["errors"]:
+            print(error, file=sys.stderr)
     print(f"saved_adr_count\t{summary['saved_adr_count']}")
     for section in [
         "preset_counts",
@@ -155,9 +186,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    explicit_paths = bool(args.paths)
     inputs = args.paths or [DEFAULT_ARTIFACT_DIR]
-    paths = iter_manifest_paths(inputs)
-    summary = summarize(paths)
+    paths, input_errors = iter_manifest_paths(inputs, strict=explicit_paths)
+    summary = summarize(paths, input_errors)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
