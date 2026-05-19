@@ -145,6 +145,8 @@ def owner_doc_errors(manifest: Any, repo_root: Path) -> list[str]:
         owner = entry.get("docs_owner")
         owner_path = DOC_OWNER_PATHS.get(owner)
         if owner_path is None:
+            if owner is not None:
+                errors.append(f"{entry.get('command')}: unknown docs_owner {owner!r}")
             continue
         if owner not in cache:
             path = repo_root / owner_path
@@ -206,7 +208,17 @@ def public_contract_errors(manifest: Any, repo_root: Path) -> list[str]:
         return ["docs/public-contract.md: public contract doc is missing"]
     rows = public_contract_rows(path)
     entries = {entry.get("command"): entry for entry in manifest_entries(manifest)}
+    expected_entries = {
+        entry.get("command"): entry
+        for entry in manifest_entries(manifest)
+        if entry.get("docs_owner") == "docs/public-contract.md"
+        and isinstance(entry.get("command"), str)
+    }
     errors: list[str] = []
+
+    for command in sorted(expected_entries):
+        if command not in rows:
+            errors.append(f"{command}: missing public-contract table row")
 
     for command, row in rows.items():
         entry = entries.get(command)
@@ -226,7 +238,7 @@ def public_contract_errors(manifest: Any, repo_root: Path) -> list[str]:
                 f"!= manifest classification {entry.get('classification')!r}"
             )
         raw_stream_policy = row.get("raw_stream_policy")
-        if raw_stream_policy and raw_stream_policy != entry.get("raw_stream_policy"):
+        if raw_stream_policy != entry.get("raw_stream_policy"):
             errors.append(
                 f"{command}: public-contract raw_stream_policy {raw_stream_policy!r} "
                 f"!= manifest raw_stream_policy {entry.get('raw_stream_policy')!r}"
@@ -275,14 +287,13 @@ Options:
         root = Path(tmp)
         (root / "docs").mkdir()
         (root / "README.md").write_text("Use `lterm env`.\n", encoding="utf-8")
-        (root / "docs" / "public-contract.md").write_text(
-            """| Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
+        public_contract_markdown = """| Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
 | --- | --- | --- | --- | --- | --- |
 | `lterm start` | `lterm new` | `stable` | none | none | `raw-transparent` |
 | `lterm logs` | `lterm capture` | `stable` | stable | none | `sanitized-output-only` |
-""",
-            encoding="utf-8",
-        )
+"""
+        public_contract_path = root / "docs" / "public-contract.md"
+        public_contract_path.write_text(public_contract_markdown, encoding="utf-8")
         doc_manifest = {
             "entries": [
                 {
@@ -317,6 +328,23 @@ Options:
         if not owner_doc_errors(missing_doc_manifest, root):
             raise AssertionError("owner docs self-test should catch missing command mention")
 
+        unknown_owner_manifest = {
+            "entries": [dict(doc_manifest["entries"][0], docs_owner="docs/unknown.md")]
+        }
+        if not owner_doc_errors(unknown_owner_manifest, root):
+            raise AssertionError("owner docs self-test should catch unknown docs_owner")
+
+        public_contract_path.write_text(
+            public_contract_markdown.replace(
+                "| `lterm logs` | `lterm capture` | `stable` | stable | none | `sanitized-output-only` |\n",
+                "Narrative still mentions `lterm logs`.\n",
+            ),
+            encoding="utf-8",
+        )
+        if not public_contract_errors(doc_manifest, root):
+            raise AssertionError("public-contract table self-test should catch missing table row")
+        public_contract_path.write_text(public_contract_markdown, encoding="utf-8")
+
         stale_row_manifest = {
             "entries": [
                 dict(doc_manifest["entries"][0], aliases=[]),
@@ -325,6 +353,25 @@ Options:
         }
         if not public_contract_errors(stale_row_manifest, root):
             raise AssertionError("public-contract table self-test should catch alias drift")
+
+        stale_classification_manifest = {
+            "entries": [
+                dict(doc_manifest["entries"][0], classification="best-effort"),
+                doc_manifest["entries"][1],
+            ]
+        }
+        if not public_contract_errors(stale_classification_manifest, root):
+            raise AssertionError("public-contract table self-test should catch classification drift")
+
+        public_contract_path.write_text(
+            public_contract_markdown.replace(
+                "| `lterm logs` | `lterm capture` | `stable` | stable | none | `sanitized-output-only` |",
+                "| `lterm logs` | `lterm capture` | `stable` | stable | none |",
+            ),
+            encoding="utf-8",
+        )
+        if not public_contract_errors(doc_manifest, root):
+            raise AssertionError("public-contract table self-test should catch raw-stream policy drift")
 
     print("PASS contract drift self-test")
     return 0

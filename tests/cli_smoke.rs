@@ -5093,7 +5093,7 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
     for expected in [
         "set -gx LTERM_SOCKET ",
         "set -gx TMUX ",
-        "string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE %0",
+        "string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE '%0'",
         "contains -- ",
         " or set -gx PATH ",
         r"fish runtime with \' quote and \\ slash/lterm.sock",

@@ -101,14 +101,15 @@ or raw output stream.
 
 ## Utility and integration surface
 
-| Command | Aliases | Classification | Contract notes |
-| --- | --- | --- | --- |
-| `lterm install-shim` | none | `stable` | Installs/prints the tmux shim path; text is sanitized. |
-| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; `--shell fish` emits fish syntax for `source`. Shell-eval semantics are stable, quote style is not a stable visual API. |
-| `lterm notify` | none | `best-effort` | Tries `cmux notify`, then emits sanitized OSC 777 fallback output. |
-| `lterm ssh` | none | `explicit-raw-unsafe` | Uses SSH to run a remote attach-or-new command; remote PTY bytes are unsanitized. |
-| `lterm agents` | none | `stable` | Reports built-in/configured/custom agent launcher profile availability. |
-| `lterm agent` | `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | Launcher controls are public, but the attached agent PTY stream is raw and the external agent CLI behavior is outside the lterm contract. |
+| Command | Aliases | Classification | Text output | JSON output | Raw stream policy |
+| --- | --- | --- | --- | --- | --- |
+| `lterm install-shim` | none | `stable` | `stable` shim path text | none | `sanitized-output-only` |
+| `lterm env` | none | `stable` | `stable` shell exports; `--shell fish` emits fish syntax for `source`; quote style is not a stable visual API | none | `sanitized-output-only` |
+| `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
+| `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |
+| `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
+| `lterm agent` | `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; attached agent PTY stream is raw and external agent CLI behavior is outside the lterm contract | none | `raw-transparent` |
+| `lterm tmux-compat list-commands` | none | `compatibility-stable` | `stable` tmux shim command list | `stable` | `sanitized-output-only` |
 
 ## tmux compatibility boundary
 

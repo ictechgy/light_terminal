@@ -93,7 +93,7 @@ pub fn print_env_exports(shell: EnvShell) -> Result<()> {
                 fish_quote(&socket.display().to_string())
             );
             println!("set -gx TMUX {}", fish_quote(&tmux));
-            println!("string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE %0");
+            println!("string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE '%0'");
             println!("contains -- {shim} $PATH; or set -gx PATH {shim} $PATH");
         }
     }
