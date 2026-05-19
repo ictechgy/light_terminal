@@ -126,32 +126,42 @@ mod tests {
 
     #[test]
     fn terminal_capture_fuzz_lite_seed_corpus_has_no_escape_controls() {
-        let corpus: &[(&str, &[u8])] = &[
+        let corpus: &[(&str, &[u8], &str, &[&str])] = &[
             (
                 "osc52_clipboard",
                 include_bytes!("../tests/fixtures/sanitize_fuzz_lite/osc52_clipboard.bin"),
+                "ok done\n",
+                &["secret", "52;c"],
             ),
             (
                 "split_csi_osc",
                 include_bytes!("../tests/fixtures/sanitize_fuzz_lite/split_csi_osc.bin"),
+                "ok done\n",
+                &["secret", "[31"],
             ),
             (
                 "raw_c1_controls",
                 include_bytes!("../tests/fixtures/sanitize_fuzz_lite/raw_c1_controls.bin"),
+                "ok red done\n",
+                &["secret", "52;c"],
             ),
             (
                 "unterminated_string",
                 include_bytes!("../tests/fixtures/sanitize_fuzz_lite/unterminated_string.bin"),
+                "prefix ",
+                &["never-terminated", "secret"],
             ),
             (
                 "invalid_utf8_and_controls",
                 include_bytes!(
                     "../tests/fixtures/sanitize_fuzz_lite/invalid_utf8_and_controls.bin"
                 ),
+                "a��b paste\n",
+                &["2004", "?2004h", "?2004l"],
             ),
         ];
 
-        for (name, seed) in corpus {
+        for (name, seed, expected, forbidden_fragments) in corpus {
             assert!(
                 seed.iter()
                     .any(|byte| matches!(byte, 0x00..=0x1f | 0x7f..=0x9f)),
@@ -164,6 +174,16 @@ mod tests {
                     .any(|ch| { is_c0_or_c1(ch) && !matches!(ch, '\t' | '\n' | '\r') }),
                 "{name} left terminal controls in sanitized output: {sanitized:?}"
             );
+            assert_eq!(
+                sanitized, *expected,
+                "{name} sanitized output changed unexpectedly"
+            );
+            for fragment in *forbidden_fragments {
+                assert!(
+                    !sanitized.contains(fragment),
+                    "{name} leaked terminal payload fragment {fragment:?}: {sanitized:?}"
+                );
+            }
         }
     }
 }

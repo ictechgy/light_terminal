@@ -173,6 +173,13 @@ def strip_code_value(cell: str) -> str:
     return cell.strip()
 
 
+def stability_value(cell: str) -> str:
+    value = strip_code_value(cell).split(";", 1)[0].strip()
+    if not value:
+        return value
+    return value.split(None, 1)[0]
+
+
 def split_markdown_row(line: str) -> list[str]:
     stripped = line.strip()
     if not stripped.startswith("|") or not stripped.endswith("|"):
@@ -197,6 +204,8 @@ def public_contract_rows(path: Path) -> dict[str, dict[str, Any]]:
         rows[command_spans[0]] = {
             "aliases": alias_spans,
             "classification": strip_code_value(cells[2]),
+            "text_output_stability": stability_value(cells[3]) if len(cells) >= 4 else None,
+            "json_output_stability": stability_value(cells[4]) if len(cells) >= 5 else None,
             "raw_stream_policy": raw_stream_policy,
         }
     return rows
@@ -211,8 +220,7 @@ def public_contract_errors(manifest: Any, repo_root: Path) -> list[str]:
     expected_entries = {
         entry.get("command"): entry
         for entry in manifest_entries(manifest)
-        if entry.get("docs_owner") == "docs/public-contract.md"
-        and isinstance(entry.get("command"), str)
+        if isinstance(entry.get("command"), str)
     }
     errors: list[str] = []
 
@@ -236,6 +244,16 @@ def public_contract_errors(manifest: Any, repo_root: Path) -> list[str]:
             errors.append(
                 f"{command}: public-contract classification {row['classification']!r} "
                 f"!= manifest classification {entry.get('classification')!r}"
+            )
+        if row.get("text_output_stability") != entry.get("text_output_stability"):
+            errors.append(
+                f"{command}: public-contract text_output_stability {row.get('text_output_stability')!r} "
+                f"!= manifest text_output_stability {entry.get('text_output_stability')!r}"
+            )
+        if row.get("json_output_stability") != entry.get("json_output_stability"):
+            errors.append(
+                f"{command}: public-contract json_output_stability {row.get('json_output_stability')!r} "
+                f"!= manifest json_output_stability {entry.get('json_output_stability')!r}"
             )
         raw_stream_policy = row.get("raw_stream_policy")
         if raw_stream_policy != entry.get("raw_stream_policy"):
@@ -291,6 +309,7 @@ Options:
 | --- | --- | --- | --- | --- | --- |
 | `lterm start` | `lterm new` | `stable` | none | none | `raw-transparent` |
 | `lterm logs` | `lterm capture` | `stable` | stable | none | `sanitized-output-only` |
+| `lterm env` | none | `stable` | `stable` shell exports | none | `sanitized-output-only` |
 """
         public_contract_path = root / "docs" / "public-contract.md"
         public_contract_path.write_text(public_contract_markdown, encoding="utf-8")
@@ -300,6 +319,8 @@ Options:
                     "command": "lterm start",
                     "aliases": ["lterm new"],
                     "classification": "stable",
+                    "text_output_stability": "none",
+                    "json_output_stability": "none",
                     "raw_stream_policy": "raw-transparent",
                     "docs_owner": "docs/public-contract.md",
                 },
@@ -307,6 +328,8 @@ Options:
                     "command": "lterm logs",
                     "aliases": ["lterm capture"],
                     "classification": "stable",
+                    "text_output_stability": "stable",
+                    "json_output_stability": "none",
                     "raw_stream_policy": "sanitized-output-only",
                     "docs_owner": "docs/public-contract.md",
                 },
@@ -314,6 +337,8 @@ Options:
                     "command": "lterm env",
                     "aliases": [],
                     "classification": "stable",
+                    "text_output_stability": "stable",
+                    "json_output_stability": "none",
                     "raw_stream_policy": "sanitized-output-only",
                     "docs_owner": "README.md",
                 },
@@ -345,6 +370,19 @@ Options:
             raise AssertionError("public-contract table self-test should catch missing table row")
         public_contract_path.write_text(public_contract_markdown, encoding="utf-8")
 
+        public_contract_path.write_text(
+            public_contract_markdown.replace(
+                "| `lterm env` | none | `stable` | `stable` shell exports | none | `sanitized-output-only` |\n",
+                "Narrative still mentions `lterm env`.\n",
+            ),
+            encoding="utf-8",
+        )
+        if not public_contract_errors(doc_manifest, root):
+            raise AssertionError(
+                "public-contract table self-test should catch missing README-owned table row"
+            )
+        public_contract_path.write_text(public_contract_markdown, encoding="utf-8")
+
         stale_row_manifest = {
             "entries": [
                 dict(doc_manifest["entries"][0], aliases=[]),
@@ -362,6 +400,26 @@ Options:
         }
         if not public_contract_errors(stale_classification_manifest, root):
             raise AssertionError("public-contract table self-test should catch classification drift")
+
+        stale_text_manifest = {
+            "entries": [
+                doc_manifest["entries"][0],
+                dict(doc_manifest["entries"][1], text_output_stability="best-effort"),
+                doc_manifest["entries"][2],
+            ]
+        }
+        if not public_contract_errors(stale_text_manifest, root):
+            raise AssertionError("public-contract table self-test should catch text output drift")
+
+        stale_json_manifest = {
+            "entries": [
+                doc_manifest["entries"][0],
+                dict(doc_manifest["entries"][1], json_output_stability="stable"),
+                doc_manifest["entries"][2],
+            ]
+        }
+        if not public_contract_errors(stale_json_manifest, root):
+            raise AssertionError("public-contract table self-test should catch JSON output drift")
 
         public_contract_path.write_text(
             public_contract_markdown.replace(
