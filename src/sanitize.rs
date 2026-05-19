@@ -152,6 +152,11 @@ mod tests {
         ];
 
         for (name, seed) in corpus {
+            assert!(
+                seed.iter()
+                    .any(|byte| matches!(byte, 0x00..=0x1f | 0x7f..=0x9f)),
+                "{name} fixture should contain at least one raw control byte"
+            );
             let sanitized = terminal_capture(seed);
             assert!(
                 !sanitized

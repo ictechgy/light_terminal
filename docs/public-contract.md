@@ -104,7 +104,7 @@ or raw output stream.
 | Command | Aliases | Classification | Contract notes |
 | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | Installs/prints the tmux shim path; text is sanitized. |
-| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; shell-eval semantics are stable, quote style is not a stable visual API. |
+| `lterm env` | none | `stable` | Emits POSIX shell exports that prepend the lterm shim directory to `PATH`; `--shell fish` emits fish syntax for `source`. Shell-eval semantics are stable, quote style is not a stable visual API. |
 | `lterm notify` | none | `best-effort` | Tries `cmux notify`, then emits sanitized OSC 777 fallback output. |
 | `lterm ssh` | none | `explicit-raw-unsafe` | Uses SSH to run a remote attach-or-new command; remote PTY bytes are unsanitized. |
 | `lterm agents` | none | `stable` | Reports built-in/configured/custom agent launcher profile availability. |

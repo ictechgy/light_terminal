@@ -225,6 +225,7 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke init_prints_setup_preview_without_modifying_files",
+        "cargo test --test cli_smoke init_prints_fish_source_preview",
         "cargo test --test cli_smoke init_rejects_unsupported_shell_values"
       ],
       "docs_owner": "README.md",
@@ -431,12 +432,13 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke env_outputs_only_shell_exports",
+        "cargo test --test cli_smoke env_outputs_fish_exports_when_requested",
         "cargo test --test cli_smoke env_quotes_generated_paths_for_posix_shell_eval"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Stable shell-eval semantics and exported variable names; exact quote style and visual formatting are not stable."
+      "stability_scope": "Stable shell-eval semantics and exported variable names for default POSIX output and fish output requested with --shell fish; exact quote style and visual formatting are not stable."
     },
     {
       "command": "lterm notify",

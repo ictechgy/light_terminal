@@ -256,12 +256,16 @@ enum Commands {
     /// Install the tmux compatibility shim and print the shim directory.
     InstallShim,
     /// Print shell exports for tmux compatibility.
-    Env,
+    Env {
+        /// Shell syntax to emit; defaults to POSIX exports for existing eval usage.
+        #[arg(long, value_enum)]
+        shell: Option<ShellKind>,
+    },
     /// Print a no-touch setup preview for enabling lterm locally.
     Init {
         /// Shell syntax to show in the preview; detected from SHELL when omitted.
         #[arg(long, value_enum)]
-        shell: Option<InitShell>,
+        shell: Option<ShellKind>,
     },
     /// tmux-compatible command surface used by the shim.
     TmuxCompat {
@@ -359,7 +363,7 @@ enum Commands {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum InitShell {
+enum ShellKind {
     Bash,
     Zsh,
     Fish,
@@ -576,7 +580,9 @@ fn run() -> Result<()> {
         ),
         Commands::Shutdown => client::shutdown(),
         Commands::InstallShim => tmux_compat::install_shim(),
-        Commands::Env => tmux_compat::print_env_exports(),
+        Commands::Env { shell } => {
+            tmux_compat::print_env_exports(shell.unwrap_or(ShellKind::Posix).into())
+        }
         Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
@@ -625,28 +631,37 @@ fn run() -> Result<()> {
     }
 }
 
-fn detect_init_shell() -> InitShell {
+impl From<ShellKind> for tmux_compat::EnvShell {
+    fn from(value: ShellKind) -> Self {
+        match value {
+            ShellKind::Bash | ShellKind::Zsh | ShellKind::Posix => Self::Posix,
+            ShellKind::Fish => Self::Fish,
+        }
+    }
+}
+
+fn detect_init_shell() -> ShellKind {
     let Some(shell) = std::env::var_os("SHELL") else {
-        return InitShell::Posix;
+        return ShellKind::Posix;
     };
     let name = Path::new(&shell)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     match name {
-        "bash" => InitShell::Bash,
-        "zsh" => InitShell::Zsh,
-        "fish" => InitShell::Fish,
-        _ => InitShell::Posix,
+        "bash" => ShellKind::Bash,
+        "zsh" => ShellKind::Zsh,
+        "fish" => ShellKind::Fish,
+        _ => ShellKind::Posix,
     }
 }
 
-fn print_init_preview(shell: InitShell) -> Result<()> {
+fn print_init_preview(shell: ShellKind) -> Result<()> {
     let (shell_name, enable_command) = match shell {
-        InitShell::Bash => ("bash", "eval \"$(lterm env)\""),
-        InitShell::Zsh => ("zsh", "eval \"$(lterm env)\""),
-        InitShell::Fish => ("fish", "set -gx PATH (lterm install-shim) $PATH"),
-        InitShell::Posix => ("posix", "eval \"$(lterm env)\""),
+        ShellKind::Bash => ("bash", "eval \"$(lterm env)\""),
+        ShellKind::Zsh => ("zsh", "eval \"$(lterm env)\""),
+        ShellKind::Fish => ("fish", "lterm env --shell fish | source"),
+        ShellKind::Posix => ("posix", "eval \"$(lterm env)\""),
     };
     println!("lterm init preview");
     println!("shell\t{shell_name}");
