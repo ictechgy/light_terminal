@@ -5069,16 +5069,35 @@ fn env_outputs_only_shell_exports() -> TestResult {
 #[test]
 fn env_outputs_fish_exports_when_requested() -> TestResult {
     let env = TestEnv::new()?;
-    let output = env.cmd().args(["env", "--shell", "fish"]).output()?;
+    let runtime = env
+        .temp
+        .path()
+        .join("fish runtime with ' quote and \\ slash");
+    let data = env.temp.path().join("fish data with ' quote and \\ slash");
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::create_dir_all(&data)?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let output = env
+        .cmd()
+        .env("LTERM_RUNTIME_DIR", &runtime)
+        .env("LTERM_DATA_DIR", &data)
+        .args(["env", "--shell", "fish"])
+        .output()?;
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in [
         "set -gx LTERM_SOCKET ",
         "set -gx TMUX ",
-        "set -q TMUX_PANE; or set -gx TMUX_PANE %0",
+        "string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE %0",
         "contains -- ",
         " or set -gx PATH ",
+        r"fish runtime with \' quote and \\ slash/lterm.sock",
+        r"fish data with \' quote and \\ slash/shims",
     ] {
         assert!(
             stdout.contains(expected),

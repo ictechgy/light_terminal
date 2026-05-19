@@ -455,7 +455,10 @@ scripts/dependency-minor-dry-run.sh
 ```
 
 Use `--run-soak` on `scripts/release-preflight.sh` only for the manual
-release-gate soak profile.
+release-gate soak profile. Use
+[`docs/release-evidence-template.md`](docs/release-evidence-template.md) to
+capture release, audit, contract, dependency, and soak evidence before tagging or
+publishing.
 
 ## License
 

@@ -93,7 +93,7 @@ pub fn print_env_exports(shell: EnvShell) -> Result<()> {
                 fish_quote(&socket.display().to_string())
             );
             println!("set -gx TMUX {}", fish_quote(&tmux));
-            println!("set -q TMUX_PANE; or set -gx TMUX_PANE %0");
+            println!("string length -q -- \"$TMUX_PANE\"; or set -gx TMUX_PANE %0");
             println!("contains -- {shim} $PATH; or set -gx PATH {shim} $PATH");
         }
     }
@@ -1728,6 +1728,13 @@ mod tests {
         assert_eq!(keys_to_bytes(&keys, false), b"echo ok\r");
         assert_eq!(keys_to_bytes(&["a".into(), "b".into()], true), b"ab");
         assert_eq!(keys_to_bytes(&["C-j".into()], false), b"\n");
+    }
+
+    #[test]
+    fn fish_quote_escapes_single_quote_and_backslash() {
+        assert_eq!(fish_quote(r"/tmp/with\slash"), r"'/tmp/with\\slash'");
+        assert_eq!(fish_quote("/tmp/it's-here"), r"'/tmp/it\'s-here'");
+        assert_eq!(fish_quote(r"/tmp/it'\mix"), r"'/tmp/it\'\\mix'");
     }
 
     #[test]

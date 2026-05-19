@@ -37,4 +37,6 @@ before deciding whether to apply it in the real checkout.
 
 `scripts/release-preflight.sh` runs the normal build/test/contract gates and will
 run `cargo audit` automatically when `cargo-audit` is installed. Use
-`--require-audit` for release evidence when an audit result is mandatory.
+`--require-audit` for release evidence when an audit result is mandatory. Record
+the audit result, dependency dry-run diff, and any deferred advisory decision in
+`docs/release-evidence-template.md`.
