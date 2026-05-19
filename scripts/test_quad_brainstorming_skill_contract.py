@@ -12,15 +12,20 @@ the default is the current user's Codex skill install under ~/.codex/skills.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import unittest
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_PATH_ENV = "QUAD_BRAINSTORMING_SKILL"
 DEFAULT_SKILL = Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md"
 SKILL_PATH = Path(os.environ.get(SKILL_PATH_ENV, DEFAULT_SKILL)).expanduser()
+SCHEMA_DIR = REPO_ROOT / "docs" / "schemas"
+ADOPTION_DOC = REPO_ROOT / "docs" / "quad-brainstorming" / "adoption.md"
+SAMPLE_DIR = REPO_ROOT / "docs" / "quad-brainstorming" / "samples"
 CI_ENV_VARS = ("CI", "GITHUB_ACTIONS", "BUILDKITE", "CIRCLECI", "GITLAB_CI")
 FENCE_PREFIXES = ("```", "~~~")
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*$")
@@ -152,6 +157,110 @@ class ContractHelperTests(unittest.TestCase):
                 self.assertIsNotNone(first_forbidden_external_posting(sample))
 
 
+class QuadBrainstormingRepoArtifactsTests(unittest.TestCase):
+    def test_schema_files_define_required_p1_shapes(self) -> None:
+        expected = {
+            "quad-brainstorming-provider-status.schema.json": [
+                "provider",
+                "configured",
+                "runnable",
+                "status",
+                "detail",
+            ],
+            "quad-brainstorming-track-output.schema.json": [
+                "provider",
+                "lens",
+                "status",
+                "top_ideas",
+                "decision_matrix",
+                "final_stance",
+            ],
+            "quad-brainstorming-adr.schema.json": [
+                "decision",
+                "quorum",
+                "confidence",
+                "options",
+                "recommendation",
+                "track_status",
+            ],
+            "quad-brainstorming-manifest.schema.json": [
+                "schema_version",
+                "session_id",
+                "preset",
+                "context_summary",
+                "redaction",
+                "provider_statuses",
+                "quorum",
+                "confidence_cap",
+                "persistence_policy",
+                "artifact_policy",
+                "telemetry",
+            ],
+        }
+        for filename, required_fields in expected.items():
+            with self.subTest(filename=filename):
+                schema = json.loads((SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+                self.assertEqual(schema["type"], "object")
+                for field in required_fields:
+                    self.assertIn(field, schema["required"])
+
+    def test_schema_confidence_caps_are_enforced_by_quorum(self) -> None:
+        expected_caps = {
+            "full": ["high", "medium", "low"],
+            "strong": ["high", "medium", "low"],
+            "partial": ["medium", "low"],
+            "solo-degraded": ["low"],
+            "no-quorum-dry-result": ["n/a"],
+        }
+        for filename, confidence_field in [
+            ("quad-brainstorming-adr.schema.json", "confidence"),
+            ("quad-brainstorming-manifest.schema.json", "confidence_cap"),
+        ]:
+            with self.subTest(filename=filename):
+                schema = json.loads((SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+                rules = {
+                    rule["if"]["properties"]["quorum"]["const"]: rule["then"]["properties"][confidence_field]["enum"]
+                    for rule in schema["allOf"]
+                }
+                self.assertEqual(rules, expected_caps)
+                self.assertNotIn("high", rules["partial"])
+                self.assertNotIn("medium", rules["solo-degraded"])
+
+    def test_track_output_failure_class_excludes_non_failures(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "quad-brainstorming-track-output.schema.json").read_text(encoding="utf-8"))
+        failure_values = schema["definitions"]["failure_class"]["enum"]
+        self.assertNotIn("ready", failure_values)
+        self.assertNotIn("usable", failure_values)
+        self.assertEqual(
+            set(failure_values),
+            {
+                "missing",
+                "auth-required",
+                "unsafe-mode",
+                "timeout",
+                "empty-output",
+                "schema-invalid",
+                "off-target",
+            },
+        )
+
+    def test_adoption_docs_and_samples_are_present(self) -> None:
+        adoption = ADOPTION_DOC.read_text(encoding="utf-8")
+        self.assertIn("No telemetry is sent by default", adoption)
+        self.assertIn("manual-dispatch dry-run", adoption)
+        self.assertIn("no automatic comments or issue creation", adoption)
+        for sample in [
+            SAMPLE_DIR / "architecture-review-adr.md",
+            SAMPLE_DIR / "solo-degraded-adr.md",
+        ]:
+            with self.subTest(sample=sample.name):
+                text = sample.read_text(encoding="utf-8")
+                self.assertIn("## Decision", text)
+                self.assertIn("## Track status", text)
+        solo = (SAMPLE_DIR / "solo-degraded-adr.md").read_text(encoding="utf-8")
+        self.assertIn("not true multi-model consensus", solo)
+
+
 class QuadBrainstormingSkillContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -183,6 +292,8 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "## Track Availability and Doctor/Preflight",
                 "## Read-Only Trust Envelope",
                 "## Compact ADR Report",
+                "## P1 Repeatability, Presets, and Schema Validation",
+                "## P2 Broader Surfaces and Team Adoption",
                 "## Artifact Policy and Cleanup",
             ],
         )
@@ -278,7 +389,7 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
             "GEMINI_PROMPT=",
             "FORGE_PROMPT=",
             "claude -p",
-            "gemini -p",
+            "gemini \"${GEMINI_ARGS[@]}\"",
             "forge --agent",
         ]
         self.assertContainsAll(track_commands, [*provider_markers, "redacted context"])
@@ -324,6 +435,26 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
             ],
         )
 
+    def test_provider_safety_gates_are_semantic_not_substring_only(self) -> None:
+        track_commands = self.section("Track Commands")
+        self.assertContainsAll(
+            track_commands,
+            [
+                "gemini_help_check_approval_plan",
+                "has_readonly_plan",
+                "mode != \"readonly\" or has_readonly_plan",
+                "failed-trust-boundary",
+                "not running in a trusted directory",
+                "NETWORK_CAPABLE_FORGE_TOOLS",
+                "\"fetch\"",
+                "forge_agent_has_no_network_tools",
+                "skipped-unsafe: Forge agent has network-capable tools",
+                "same-turn user consent and egress restrictions",
+            ],
+        )
+        self.assertNotIn("grep -q -- 'read-only'", track_commands)
+        self.assertNotIn("read/fetch/fs-search only", track_commands)
+
     def test_compact_adr_schema_and_artifact_policy_are_explicit(self) -> None:
         compact_adr = self.section("Compact ADR Report")
         artifact_policy = self.section("Artifact Policy and Cleanup")
@@ -350,6 +481,71 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "Do not persist raw prompts, raw context, provider stdout/stderr, or transcripts by default",
                 "Raw artifact persistence is off by default",
                 "No P0 path posts externally, opens issues, comments on PRs, or contacts production systems",
+            ],
+        )
+
+    def test_p1_adapter_schema_preset_and_troubleshooting_contracts_are_explicit(self) -> None:
+        invocation = self.section("Invocation")
+        p1 = self.section("P1 Repeatability, Presets, and Schema Validation")
+        self.assertContainsAll(
+            invocation,
+            [
+                "quad-brainstorming --preset decision-record",
+                "`--preset PRESET`",
+                "Select a repeatable P1 lens/output preset",
+                "`architecture-review`, `risk-scan`, `decision-record`, or `product-strategy`",
+                "Unknown presets MUST fail before context collection, prompt construction, or provider invocation",
+            ],
+        )
+        self.assertContainsAll(
+            p1,
+            [
+                "All P1 surfaces MUST reuse the P0 Core Contract",
+                "Provider Adapter Contract",
+                "`detect`",
+                "`check_auth`",
+                "`check_safe_mode`",
+                "`prepare_prompt`",
+                "`run`",
+                "`parse`",
+                "`classify_failure`",
+                "`capabilities`",
+                "docs/schemas/quad-brainstorming-provider-status.schema.json",
+                "docs/schemas/quad-brainstorming-track-output.schema.json",
+                "docs/schemas/quad-brainstorming-adr.schema.json",
+                "docs/schemas/quad-brainstorming-manifest.schema.json",
+                "`architecture-review`",
+                "`risk-scan`",
+                "`decision-record`",
+                "`product-strategy`",
+                "Unknown presets MUST fail before provider invocation",
+                "Raw artifact saving remains a separate high-friction opt-in",
+                "Fresh-user success targets",
+            ],
+        )
+
+    def test_p2_surfaces_playbooks_and_local_metrics_keep_safety_gates(self) -> None:
+        p2 = self.section("P2 Broader Surfaces and Team Adoption")
+        self.assertContainsAll(
+            p2,
+            [
+                "Every broader surface MUST pass the same Core Contract tests",
+                "Surface Gates",
+                "Standalone CLI wrapper",
+                "MCP/plugin",
+                "GitHub Action",
+                "manual dispatch dry-run",
+                "read-only token permissions by default",
+                "no automatic PR comments, issue creation, or external posting",
+                "`architecture-review`",
+                "`release-risk-scan`",
+                "`planning-meeting`",
+                "`incident-premortem`",
+                "No telemetry is enabled by default",
+                "run count",
+                "usable-track distribution",
+                "Public Demo and Distribution",
+                "solo-degraded sample ADR",
             ],
         )
 

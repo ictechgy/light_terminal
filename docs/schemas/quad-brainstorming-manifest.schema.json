@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://ictechgy.github.io/light_terminal/schemas/quad-brainstorming-manifest.schema.json",
+  "title": "Quad Brainstorming Run Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "created_at",
+    "preset",
+    "context_summary",
+    "redaction",
+    "provider_statuses",
+    "quorum",
+    "confidence_cap",
+    "persistence_policy",
+    "artifact_policy",
+    "telemetry"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "minLength": 1 },
+    "preset": {
+      "enum": ["architecture-review", "risk-scan", "decision-record", "product-strategy", "custom"]
+    },
+    "context_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sources", "raw_bytes", "redacted_bytes", "excluded_sensitive_paths"],
+      "properties": {
+        "sources": { "type": "array", "items": { "type": "string" } },
+        "raw_bytes": { "type": "integer", "minimum": 0 },
+        "redacted_bytes": { "type": "integer", "minimum": 0 },
+        "excluded_sensitive_paths": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "redactor", "report_path"],
+      "properties": {
+        "status": { "enum": ["ok", "fallback", "failed"] },
+        "redactor": { "type": "string" },
+        "report_path": { "type": ["string", "null"] }
+      }
+    },
+    "provider_statuses": {
+      "type": "array",
+      "items": { "$ref": "quad-brainstorming-provider-status.schema.json" }
+    },
+    "quorum": { "enum": ["full", "strong", "partial", "solo-degraded", "no-quorum-dry-result"] },
+    "confidence_cap": { "enum": ["high", "medium", "low", "n/a"] },
+    "persistence_policy": { "enum": ["private-temp-only", "redacted-artifacts", "raw-artifacts-explicit-risk"] },
+    "artifact_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["saved", "raw_persistence"],
+      "properties": {
+        "saved": { "type": "array", "items": { "enum": ["adr.md", "manifest.json"] } },
+        "raw_persistence": { "enum": ["off", "explicit-risk-opt-in"] }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "transport"],
+      "properties": {
+        "status": { "enum": ["disabled", "explicit-export-only"] },
+        "transport": { "enum": ["none", "local-file"] }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "quorum": { "const": "full" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["high", "medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "strong" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["high", "medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "partial" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["medium", "low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "solo-degraded" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["low"] } } }
+    },
+    {
+      "if": { "properties": { "quorum": { "const": "no-quorum-dry-result" } }, "required": ["quorum"] },
+      "then": { "properties": { "confidence_cap": { "enum": ["n/a"] } } }
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://ictechgy.github.io/light_terminal/schemas/quad-brainstorming-track-output.schema.json",
+  "title": "Quad Brainstorming Track Output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "provider",
+    "lens",
+    "status",
+    "top_ideas",
+    "wild_cards",
+    "risks",
+    "assumptions_to_validate",
+    "recommended_next_experiments",
+    "decision_matrix",
+    "final_stance"
+  ],
+  "properties": {
+    "provider": { "enum": ["claude", "codex", "gemini", "forge"] },
+    "lens": { "type": "string", "minLength": 1 },
+    "status": { "$ref": "quad-brainstorming-provider-status.schema.json#/properties/status" },
+    "top_ideas": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/definitions/idea" }
+    },
+    "wild_cards": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/idea" }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "assumptions_to_validate": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_next_experiments": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "decision_matrix": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/decision_matrix_row" }
+    },
+    "final_stance": { "type": "string" },
+    "failure_class": { "$ref": "#/definitions/failure_class" }
+  },
+  "definitions": {
+    "failure_class": {
+      "enum": [
+        "missing",
+        "auth-required",
+        "unsafe-mode",
+        "timeout",
+        "empty-output",
+        "schema-invalid",
+        "off-target"
+      ]
+    },
+    "idea": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idea", "rationale", "expected_impact"],
+      "properties": {
+        "idea": { "type": "string" },
+        "rationale": { "type": "string" },
+        "expected_impact": { "type": "string" }
+      }
+    },
+    "decision_matrix_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option", "upside", "downside", "cost", "confidence"],
+      "properties": {
+        "option": { "type": "string" },
+        "upside": { "type": "string" },
+        "downside": { "type": "string" },
+        "cost": { "enum": ["low", "medium", "high"] },
+        "confidence": { "enum": ["low", "medium", "high"] }
+      }
+    }
+  }
+}
