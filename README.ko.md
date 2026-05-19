@@ -71,7 +71,7 @@ Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --ver
 GitHub에서 Cargo로 설치 (Releases 페이지의 최신 태그를 사용하세요):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.1
+cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.2
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
