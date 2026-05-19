@@ -19,8 +19,63 @@ from pathlib import Path
 
 
 SKILL_PATH_ENV = "QUAD_BRAINSTORMING_SKILL"
-DEFAULT_SKILL = Path.home() / ".codex/skills/quad-brainstorming/SKILL.md"
+DEFAULT_SKILL = Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md"
 SKILL_PATH = Path(os.environ.get(SKILL_PATH_ENV, DEFAULT_SKILL)).expanduser()
+CI_ENV_VARS = ("CI", "GITHUB_ACTIONS", "BUILDKITE", "CIRCLECI", "GITLAB_CI")
+FENCE_PREFIXES = ("```", "~~~")
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*$")
+FORBIDDEN_EXTERNAL_POSTING_PATTERNS = [
+    r"\bgh\s+pr\s+comment\b",
+    r"\bgh\s+pr\s+review\b",
+    r"\bgh\s+issue\s+(?:create|comment)\b",
+    r"\bgh\s+api\b[^\n]*(?:comments|issues|pulls|reviews)",
+    r"\bcurl\b[^\n]*(?:(?:-X|--request)\s*['\"]?POST\b|--data(?:-raw|-binary|-urlencode)?\b|--form(?:-string)?\b)",
+    r"\bforge\s+(?:pr|issue)\s+comment\b",
+    r"\brequests\.post\s*\(",
+    r"\bfetch\s*\((?:(?!\n\s*\n).){0,400}\bmethod\s*:\s*['\"]POST['\"]",
+    r"\burllib\.request\.Request\s*\((?:(?!\n\s*\n).){0,400}\bmethod\s*=\s*['\"]POST['\"]",
+    r"\bhttp\.request\s*\((?:(?!\n\s*\n).){0,400}\bmethod\s*:\s*['\"]POST['\"]",
+]
+
+
+def running_in_ci() -> bool:
+    return any(os.environ.get(var) for var in CI_ENV_VARS)
+
+
+def update_fence_state(line: str, current: str | None) -> str | None:
+    stripped = line.lstrip()
+    fence = next((prefix for prefix in FENCE_PREFIXES if stripped.startswith(prefix)), None)
+    if fence is None:
+        return current
+    if current is None:
+        return fence
+    if current == fence:
+        return None
+    return current
+
+
+def level_2_heading_matches(line: str, heading: str) -> bool:
+    match = HEADING_RE.match(line)
+    return bool(match and match.group(1) == "##" and match.group(2) == heading)
+
+
+def is_outer_section_boundary(line: str) -> bool:
+    match = HEADING_RE.match(line)
+    return bool(match and len(match.group(1)) <= 2)
+
+
+def normalize_shell_continuations(text: str) -> str:
+    return re.sub(r"\\\r?\n[ \t]*", " ", text)
+
+
+def first_forbidden_external_posting(text: str) -> tuple[str, str] | None:
+    normalized = normalize_shell_continuations(text)
+    for pattern in FORBIDDEN_EXTERNAL_POSTING_PATTERNS:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            excerpt = " ".join(match.group(0).split())
+            return pattern, excerpt[:160]
+    return None
 
 
 def markdown_section(text: str, heading: str) -> str:
@@ -28,23 +83,73 @@ def markdown_section(text: str, heading: str) -> str:
     lines = text.splitlines(keepends=True)
     start = None
     target = f"## {heading}"
+    in_fence: str | None = None
     for index, line in enumerate(lines):
-        if line.strip() == target:
+        if in_fence is None and level_2_heading_matches(line, heading):
             start = index + 1
             break
+        in_fence = update_fence_state(line, in_fence)
     if start is None:
         raise AssertionError(f"Missing Markdown section: {target}")
 
     end = len(lines)
-    in_fence = False
+    in_fence = None
     for index in range(start, len(lines)):
-        stripped = lines[index].lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-        if not in_fence and lines[index].startswith("## "):
+        if in_fence is None and is_outer_section_boundary(lines[index]):
             end = index
             break
+        in_fence = update_fence_state(lines[index], in_fence)
     return "".join(lines[start:end])
+
+
+class MarkdownSectionHelperTests(unittest.TestCase):
+    def test_markdown_section_ignores_backtick_and_tilde_fenced_headings(self) -> None:
+        text = (
+            "## Intro\n"
+            "```markdown\n"
+            "## Target\n"
+            "ignored backtick fence\n"
+            "```\n"
+            "~~~markdown\n"
+            "## Target\n"
+            "ignored tilde fence\n"
+            "~~~\n"
+            "## Target\n"
+            "body\n"
+            "# Next\n"
+            "not part of target\n"
+        )
+        self.assertEqual(markdown_section(text, "Target"), "body\n")
+
+
+class ContractHelperTests(unittest.TestCase):
+    def test_default_skill_path_is_portable(self) -> None:
+        self.assertEqual(
+            DEFAULT_SKILL,
+            Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md",
+        )
+        self.assertEqual(
+            DEFAULT_SKILL.parts[-4:],
+            (".codex", "skills", "quad-brainstorming", "SKILL.md"),
+        )
+
+    def test_forbidden_external_posting_patterns_cover_common_posting_paths(self) -> None:
+        forbidden_samples = [
+            "gh pr comment 89 --body reviewed",
+            "gh pr review 89 --approve",
+            "gh pr review 89 --request-changes --body fail",
+            "gh issue create --title bug",
+            "gh api repos/o/r/issues/1/comments -f body=review",
+            "curl \\\n  -X POST \\\n  --data '{\"body\":\"x\"}' https://api.github.com/repos/o/r/issues/1/comments",
+            "forge pr comment 89 --body reviewed",
+            "requests.post('https://example.invalid')",
+            "fetch('https://example.invalid', {method: 'POST', body: 'x'})",
+            "urllib.request.Request(url, data=b'x', method='POST')",
+            "http.request(url, {method: 'POST'})",
+        ]
+        for sample in forbidden_samples:
+            with self.subTest(sample=sample):
+                self.assertIsNotNone(first_forbidden_external_posting(sample))
 
 
 class QuadBrainstormingSkillContractTests(unittest.TestCase):
@@ -56,7 +161,7 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 f"quad-brainstorming skill not found at {cls.skill_path}. "
                 f"Set {SKILL_PATH_ENV}=path/to/SKILL.md to run these local contract tests."
             )
-            if SKILL_PATH_ENV in os.environ:
+            if SKILL_PATH_ENV in os.environ or running_in_ci():
                 raise AssertionError(message)
             raise unittest.SkipTest(message)
         cls.skill_text = cls.skill_path.read_text(encoding="utf-8")
@@ -67,11 +172,8 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
     def assertContainsAll(self, text: str, snippets: list[str]) -> None:
         for snippet in snippets:
             with self.subTest(snippet=snippet):
-                self.assertIn(snippet, text)
-
-    def test_default_skill_path_is_portable(self) -> None:
-        self.assertEqual(DEFAULT_SKILL, Path.home() / ".codex/skills/quad-brainstorming/SKILL.md")
-        self.assertTrue(str(DEFAULT_SKILL).endswith("/.codex/skills/quad-brainstorming/SKILL.md"))
+                if snippet not in text:
+                    self.fail(f"Missing required snippet: {snippet!r}")
 
     def test_core_contract_sections_are_present(self) -> None:
         self.assertContainsAll(
@@ -171,10 +273,22 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "If redaction fails, set expected external track count to zero, do not create prompt files",
             ],
         )
-        self.assertContainsAll(track_commands, ["CLAUDE_PROMPT=", "redacted context"])
+        provider_markers = [
+            "CLAUDE_PROMPT=",
+            "GEMINI_PROMPT=",
+            "FORGE_PROMPT=",
+            "claude -p",
+            "gemini -p",
+            "forge --agent",
+        ]
+        self.assertContainsAll(track_commands, [*provider_markers, "redacted context"])
         redaction_contract = self.skill_text.index("**Redaction before prompts**")
-        first_prompt_file = self.skill_text.index("CLAUDE_PROMPT=")
-        self.assertLess(redaction_contract, first_prompt_file)
+        redaction_failure_guard = self.skill_text.index("If redaction fails, set expected external track count to zero")
+        for marker in provider_markers:
+            with self.subTest(marker=marker):
+                marker_index = self.skill_text.index(marker)
+                self.assertLess(redaction_contract, marker_index)
+                self.assertLess(redaction_failure_guard, marker_index)
 
     def test_failure_classes_and_confidence_caps_are_normative(self) -> None:
         core_contract = self.section("P0 Core Contract")
@@ -240,18 +354,16 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
         )
 
     def test_no_external_posting_commands_are_introduced(self) -> None:
-        forbidden_patterns = [
-            r"\bgh\s+pr\s+comment\b",
-            r"\bgh\s+pr\s+review\b[^\n]*(?:--comment|-c|--body|--body-file)",
-            r"\bgh\s+issue\s+(?:create|comment)\b",
-            r"\bgh\s+api\b[^\n]*(?:comments|issues|pulls|reviews)",
-            r"\bcurl\b[^\n]*(?:(?:-X|--request)\s*['\"]?POST\b|--data(?:-raw|-binary)?\b|--form\b)",
-            r"\bforge\s+(?:pr|issue)\s+comment\b",
-            r"\b(?:python|node|ruby)\b[^\n]*(?:requests\.post|fetch\(|urllib\.request|http\.request)",
-        ]
-        for pattern in forbidden_patterns:
-            with self.subTest(pattern=pattern):
-                self.assertIsNone(re.search(pattern, self.skill_text, flags=re.IGNORECASE))
+        forbidden = first_forbidden_external_posting(self.skill_text)
+        self.assertIsNone(
+            forbidden,
+            msg=(
+                "Forbidden external posting command introduced: "
+                f"pattern={forbidden[0]!r} excerpt={forbidden[1]!r}"
+                if forbidden
+                else ""
+            ),
+        )
 
 
 if __name__ == "__main__":
