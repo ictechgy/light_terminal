@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://ictechgy.github.io/light_terminal/schemas/quad-brainstorming-adr.schema.json",
+  "title": "Quad Brainstorming ADR",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "quorum",
+    "confidence",
+    "options",
+    "recommendation",
+    "risks",
+    "assumptions",
+    "rejected_alternatives",
+    "next_experiment",
+    "track_status",
+    "evidence_and_disagreement"
+  ],
+  "properties": {
+    "decision": { "type": "string", "minLength": 1 },
+    "quorum": { "enum": ["full", "strong", "partial", "solo-degraded", "no-quorum-dry-result"] },
+    "confidence": { "enum": ["high", "medium", "low", "n/a"] },
+    "options": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/option" }
+    },
+    "recommendation": { "type": "string" },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "rejected_alternatives": { "type": "array", "items": { "type": "string" } },
+    "next_experiment": { "type": "string" },
+    "track_status": {
+      "type": "array",
+      "items": { "$ref": "quad-brainstorming-provider-status.schema.json" }
+    },
+    "evidence_and_disagreement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strong_themes", "split_points", "contrarian_ideas"],
+      "properties": {
+        "strong_themes": { "type": "array", "items": { "type": "string" } },
+        "split_points": { "type": "array", "items": { "type": "string" } },
+        "contrarian_ideas": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "definitions": {
+    "option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option", "upside", "downside", "cost", "risk", "best_next_test"],
+      "properties": {
+        "option": { "type": "string" },
+        "upside": { "type": "string" },
+        "downside": { "type": "string" },
+        "cost": { "enum": ["low", "medium", "high"] },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "best_next_test": { "type": "string" }
+      }
+    }
+  }
+}

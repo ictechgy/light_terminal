@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Summarize local quad-brainstorming manifests without telemetry.
+
+The helper reads redacted `manifest.json` files created by the planned
+quad-brainstorming artifact policy. It never contacts the network and it ignores
+raw prompt/context/provider-output fields if a malformed manifest contains them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any, Iterable
+
+DEFAULT_ARTIFACT_DIR = Path(".codex/artifacts/quad-brainstorming")
+RAW_FIELD_NAMES = {
+    "raw_prompt",
+    "raw_prompts",
+    "raw_context",
+    "raw_provider_output",
+    "raw_provider_stdout",
+    "raw_provider_stderr",
+    "transcript",
+    "transcripts",
+    "provider_request_dump",
+}
+PROVIDERS = ("claude", "codex", "gemini", "forge")
+
+
+def iter_manifest_paths(inputs: Iterable[Path]) -> list[Path]:
+    paths: list[Path] = []
+    for item in inputs:
+        if item.is_file():
+            paths.append(item)
+        elif item.is_dir():
+            direct = item / "manifest.json"
+            if direct.is_file():
+                paths.append(direct)
+            paths.extend(sorted(item.glob("*/manifest.json")))
+    return sorted(dict.fromkeys(paths))
+
+
+def safe_load_manifest(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"{path}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"{path}: manifest root must be an object"
+    return data, None
+
+
+def summarize(paths: list[Path]) -> dict[str, Any]:
+    manifests = []
+    errors = []
+    raw_field_occurrences: Counter[str] = Counter()
+    preset_counts: Counter[str] = Counter()
+    quorum_counts: Counter[str] = Counter()
+    confidence_counts: Counter[str] = Counter()
+    telemetry_counts: Counter[str] = Counter()
+    provider_status_counts: dict[str, Counter[str]] = {provider: Counter() for provider in PROVIDERS}
+    skipped_provider_reasons: Counter[str] = Counter()
+    saved_adr_count = 0
+
+    for path in paths:
+        manifest, error = safe_load_manifest(path)
+        if error:
+            errors.append(error)
+            continue
+        assert manifest is not None
+        manifests.append(path)
+        raw_field_occurrences.update(key for key in manifest if key in RAW_FIELD_NAMES)
+        preset_counts.update([str(manifest.get("preset", "unknown"))])
+        quorum_counts.update([str(manifest.get("quorum", "unknown"))])
+        confidence_counts.update([str(manifest.get("confidence_cap", "unknown"))])
+        telemetry = manifest.get("telemetry")
+        if isinstance(telemetry, dict):
+            telemetry_counts.update([str(telemetry.get("status", "unknown"))])
+        else:
+            telemetry_counts.update(["unknown"])
+
+        artifact_policy = manifest.get("artifact_policy")
+        if isinstance(artifact_policy, dict):
+            saved = artifact_policy.get("saved", [])
+            if isinstance(saved, list) and "adr.md" in saved:
+                saved_adr_count += 1
+
+        statuses = manifest.get("provider_statuses", [])
+        if isinstance(statuses, list):
+            for status in statuses:
+                if not isinstance(status, dict):
+                    continue
+                provider = str(status.get("provider", "unknown"))
+                state = str(status.get("status", "unknown"))
+                if provider in provider_status_counts:
+                    provider_status_counts[provider].update([state])
+                if state not in {"ready", "usable"}:
+                    skipped_provider_reasons.update([f"{provider}:{state}"])
+
+    return {
+        "manifest_count": len(manifests),
+        "error_count": len(errors),
+        "errors": errors,
+        "preset_counts": dict(sorted(preset_counts.items())),
+        "quorum_counts": dict(sorted(quorum_counts.items())),
+        "confidence_counts": dict(sorted(confidence_counts.items())),
+        "provider_status_counts": {
+            provider: dict(sorted(counts.items())) for provider, counts in provider_status_counts.items()
+        },
+        "skipped_provider_reasons": dict(sorted(skipped_provider_reasons.items())),
+        "saved_adr_count": saved_adr_count,
+        "telemetry_counts": dict(sorted(telemetry_counts.items())),
+        "raw_fields_ignored": dict(sorted(raw_field_occurrences.items())),
+    }
+
+
+def print_text(summary: dict[str, Any]) -> None:
+    print(f"manifests\t{summary['manifest_count']}")
+    print(f"errors\t{summary['error_count']}")
+    print(f"saved_adr_count\t{summary['saved_adr_count']}")
+    for section in [
+        "preset_counts",
+        "quorum_counts",
+        "confidence_counts",
+        "telemetry_counts",
+        "skipped_provider_reasons",
+        "raw_fields_ignored",
+    ]:
+        values = summary[section]
+        if values:
+            print(f"[{section}]")
+            for key, value in values.items():
+                print(f"{key}\t{value}")
+    print("[provider_status_counts]")
+    for provider, counts in summary["provider_status_counts"].items():
+        if counts:
+            rendered = ",".join(f"{status}:{count}" for status, count in counts.items())
+            print(f"{provider}\t{rendered}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        type=Path,
+        help="manifest files or artifact directories; defaults to .codex/artifacts/quad-brainstorming",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON summary")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    inputs = args.paths or [DEFAULT_ARTIFACT_DIR]
+    paths = iter_manifest_paths(inputs)
+    summary = summarize(paths)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print_text(summary)
+    return 1 if summary["error_count"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

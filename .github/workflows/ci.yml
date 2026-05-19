@@ -35,6 +35,11 @@ jobs:
         run: cargo fmt -- --check
       - name: Release helper script tests
         run: python3 scripts/test_release_helpers.py
+      - name: Quad brainstorming contract tests
+        run: |
+          QUAD_BRAINSTORMING_SKILL=.codex/skills/quad-brainstorming/SKILL.md \
+            python3 scripts/test_quad_brainstorming_skill_contract.py
+          python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests

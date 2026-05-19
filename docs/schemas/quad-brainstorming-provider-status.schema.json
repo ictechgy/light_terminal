@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://ictechgy.github.io/light_terminal/schemas/quad-brainstorming-provider-status.schema.json",
+  "title": "Quad Brainstorming Provider Status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provider", "configured", "runnable", "status", "detail"],
+  "properties": {
+    "provider": { "enum": ["claude", "codex", "gemini", "forge"] },
+    "configured": { "type": "boolean" },
+    "runnable": { "type": "boolean" },
+    "status": {
+      "enum": [
+        "ready",
+        "usable",
+        "missing",
+        "auth-required",
+        "unsafe-mode",
+        "timeout",
+        "empty-output",
+        "schema-invalid",
+        "off-target"
+      ]
+    },
+    "detail": { "type": "string", "minLength": 1 },
+    "safe_mode_evidence": { "type": "string" },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
