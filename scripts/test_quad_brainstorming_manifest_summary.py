@@ -140,7 +140,75 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
             summary = json.loads(proc.stdout)
             self.assertEqual(summary["manifest_count"], 0)
             self.assertEqual(summary["error_count"], 1)
+            self.assertEqual(summary["invalid_manifest_count"], 1)
             self.assertIn("manifest.json", summary["errors"][0])
+
+    def test_missing_required_fields_are_invalid_not_valid_manifests(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
+            root = Path(tmp)
+            run = root / "run-1"
+            run.mkdir()
+            (run / "manifest.json").write_text(json.dumps({"schema_version": "1"}), encoding="utf-8")
+
+            proc = subprocess.run(
+                ["python3", str(SCRIPT), "--json", str(root)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(proc.returncode, 1)
+            summary = json.loads(proc.stdout)
+            self.assertEqual(summary["manifest_count"], 0)
+            self.assertEqual(summary["invalid_manifest_count"], 1)
+            self.assertGreater(summary["error_count"], 0)
+            self.assertTrue(any("missing required field 'session_id'" in error for error in summary["errors"]))
+
+    def test_nested_raw_fields_are_counted_without_values_or_ancestor_keys(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
+            root = Path(tmp)
+            run = root / "run-1"
+            run.mkdir()
+            secret = "SECRET_TOKEN_SHOULD_NOT_PRINT"
+            malicious_key = f"ancestor-{secret}"
+            write_manifest(
+                run / "manifest.json",
+                context_summary={
+                    "sources": ["brief"],
+                    "raw_bytes": 100,
+                    "redacted_bytes": 80,
+                    "excluded_sensitive_paths": 0,
+                    "nested": {malicious_key: {"raw_provider_stdout": secret}},
+                },
+                provider_statuses=[
+                    {
+                        "provider": "codex",
+                        "configured": True,
+                        "runnable": True,
+                        "status": "usable",
+                        "detail": {malicious_key: {"transcript": secret}},
+                    }
+                ],
+            )
+
+            proc = subprocess.run(
+                ["python3", str(SCRIPT), "--json", str(root)],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
+            self.assertNotIn(secret, proc.stdout)
+            summary = json.loads(proc.stdout)
+            self.assertEqual(summary["manifest_count"], 1)
+            self.assertEqual(
+                summary["raw_fields_ignored"],
+                {
+                    "raw_provider_stdout": 1,
+                    "transcript": 1,
+                },
+            )
 
     def test_text_output_is_stable_and_local(self) -> None:
         with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:

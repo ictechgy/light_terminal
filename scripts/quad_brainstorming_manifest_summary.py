@@ -44,6 +44,20 @@ PROVIDER_STATUSES = (
     "off-target",
 )
 USABLE_PROVIDER_STATUSES = {"ready", "usable"}
+REQUIRED_MANIFEST_FIELDS = (
+    "schema_version",
+    "session_id",
+    "created_at",
+    "preset",
+    "context_summary",
+    "redaction",
+    "provider_statuses",
+    "quorum",
+    "confidence_cap",
+    "persistence_policy",
+    "artifact_policy",
+    "telemetry",
+)
 
 
 def safe_enum(value: Any, allowed: Iterable[str], default: str = "unknown") -> str:
@@ -81,9 +95,29 @@ def safe_load_manifest(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return data, None
 
 
+def iter_raw_field_names(value: Any) -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in RAW_FIELD_NAMES:
+                yield str(key)
+            yield from iter_raw_field_names(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_raw_field_names(child)
+
+
+def validate_manifest_shape(path: Path, manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field in REQUIRED_MANIFEST_FIELDS:
+        if field not in manifest:
+            errors.append(f"{path}: missing required field {field!r}")
+    return errors
+
+
 def summarize(paths: list[Path], input_errors: Iterable[str] = ()) -> dict[str, Any]:
     manifests = []
     errors = list(input_errors)
+    invalid_manifest_count = 0
     raw_field_occurrences: Counter[str] = Counter()
     preset_counts: Counter[str] = Counter()
     quorum_counts: Counter[str] = Counter()
@@ -97,10 +131,16 @@ def summarize(paths: list[Path], input_errors: Iterable[str] = ()) -> dict[str, 
         manifest, error = safe_load_manifest(path)
         if error:
             errors.append(error)
+            invalid_manifest_count += 1
             continue
         assert manifest is not None
+        raw_field_occurrences.update(iter_raw_field_names(manifest))
+        shape_errors = validate_manifest_shape(path, manifest)
+        if shape_errors:
+            errors.extend(shape_errors)
+            invalid_manifest_count += 1
+            continue
         manifests.append(path)
-        raw_field_occurrences.update(key for key in manifest if key in RAW_FIELD_NAMES)
         preset_counts.update([safe_enum(manifest.get("preset"), PRESETS)])
         quorum_counts.update([safe_enum(manifest.get("quorum"), QUORUMS)])
         confidence_counts.update([safe_enum(manifest.get("confidence_cap"), CONFIDENCE_CAPS)])
@@ -129,6 +169,7 @@ def summarize(paths: list[Path], input_errors: Iterable[str] = ()) -> dict[str, 
 
     return {
         "manifest_count": len(manifests),
+        "invalid_manifest_count": invalid_manifest_count,
         "error_count": len(errors),
         "errors": errors,
         "preset_counts": dict(sorted(preset_counts.items())),

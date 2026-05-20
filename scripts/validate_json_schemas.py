@@ -16,6 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 Json = Any
 
@@ -92,27 +93,114 @@ def type_matches(value: Json, expected: str) -> bool:
     raise SchemaError(f"unsupported schema type {expected!r}")
 
 
-def resolve_ref(ref: str, schema_dir: Path, store: dict[str, Json]) -> Json:
-    if ref in store:
-        return store[ref]
-    name = ref.rsplit("/", 1)[-1]
-    if name in store:
-        return store[name]
-    path = (schema_dir / ref).resolve()
+def split_ref(ref: str) -> tuple[str, str]:
+    if not isinstance(ref, str) or not ref:
+        raise SchemaError(f"unsupported $ref {ref!r}")
+    base, marker, fragment = ref.partition("#")
+    return base, f"#{fragment}" if marker else ""
+
+
+def pointer_token(token: str) -> str:
+    return token.replace("~1", "/").replace("~0", "~")
+
+
+def resolve_pointer(document: Json, fragment: str, ref: str) -> Json:
+    if fragment in ("", "#"):
+        return document
+    if not fragment.startswith("#/"):
+        raise SchemaError(f"unsupported $ref fragment {fragment!r} in {ref!r}")
+    target = document
+    for raw_token in fragment[2:].split("/"):
+        token = pointer_token(raw_token)
+        if isinstance(target, dict) and token in target:
+            target = target[token]
+        elif isinstance(target, list) and token.isdecimal() and int(token) < len(target):
+            target = target[int(token)]
+        else:
+            raise SchemaError(f"unresolved $ref fragment {fragment!r} in {ref!r}")
+    return target
+
+
+def is_url_ref(base: str) -> bool:
+    parsed = urlsplit(base)
+    return bool(parsed.scheme or parsed.netloc)
+
+
+def load_ref_base(base: str, schema_dir: Path, store: dict[str, Json], current_root: Json | None) -> Json:
+    if base == "":
+        if current_root is None:
+            raise SchemaError("internal $ref requires a current schema root")
+        return current_root
+
+    if is_url_ref(base):
+        if base in store:
+            return store[base]
+        raise SchemaError(f"unresolved $ref {base!r}")
+
+    raw_path = Path(base)
+    if raw_path.is_absolute():
+        raise SchemaError(f"$ref {base!r} must be relative to schema_dir")
+    schema_root = schema_dir.resolve()
+    path = (schema_root / raw_path).resolve()
+    try:
+        path.relative_to(schema_root)
+    except ValueError as exc:
+        raise SchemaError(f"$ref {base!r} escapes schema_dir") from exc
     if path.is_file():
         schema = load_json(path)
-        store[ref] = schema
+        store[base] = schema
         store[path.name] = schema
+        if isinstance(schema, dict) and isinstance(schema.get("$id"), str):
+            store[schema["$id"]] = schema
         return schema
-    raise SchemaError(f"unresolved $ref {ref!r}")
+    if not any(sep in base for sep in ("/", "\\")) and ".." not in raw_path.parts and base in store:
+        return store[base]
+    raise SchemaError(f"unresolved $ref {base!r}")
 
 
-def validate_value(value: Json, schema: Json, schema_dir: Path, store: dict[str, Json], path: str = "$") -> list[str]:
+def resolve_ref(
+    ref: str, schema_dir: Path, store: dict[str, Json], current_root: Json | None = None
+) -> tuple[Json, Json]:
+    base, fragment = split_ref(ref)
+    root = load_ref_base(base, schema_dir, store, current_root)
+    return resolve_pointer(root, fragment, ref), root
+
+
+def validate_value(
+    value: Json,
+    schema: Json,
+    schema_dir: Path,
+    store: dict[str, Json],
+    path: str = "$",
+    root_schema: Json | None = None,
+) -> list[str]:
     errors: list[str] = []
     if not isinstance(schema, dict):
         return [f"{path}: schema must be an object"]
+    if root_schema is None:
+        root_schema = schema
     if "$ref" in schema:
-        return validate_value(value, resolve_ref(schema["$ref"], schema_dir, store), schema_dir, store, path)
+        resolved_schema, resolved_root = resolve_ref(schema["$ref"], schema_dir, store, root_schema)
+        return validate_value(value, resolved_schema, schema_dir, store, path, resolved_root)
+    if "allOf" in schema:
+        branches = schema["allOf"]
+        if not isinstance(branches, list):
+            errors.append(f"{path}: schema allOf must be an array")
+        else:
+            for branch in branches:
+                errors.extend(validate_value(value, branch, schema_dir, store, path, root_schema))
+    if "if" in schema:
+        condition_errors = validate_value(value, schema["if"], schema_dir, store, path, root_schema)
+        if not condition_errors and "then" in schema:
+            errors.extend(validate_value(value, schema["then"], schema_dir, store, path, root_schema))
+    if "not" in schema:
+        disallowed = schema["not"]
+        if not isinstance(disallowed, dict):
+            errors.append(f"{path}: schema not must be an object")
+        else:
+            disallowed_errors = validate_value(value, disallowed, schema_dir, store, path, root_schema)
+            if not disallowed_errors:
+                errors.append(f"{path}: matched disallowed schema in not")
     if "const" in schema and value != schema["const"]:
         errors.append(f"{path}: expected const {schema['const']!r}, got {value!r}")
     if "enum" in schema and value not in schema["enum"]:
@@ -125,7 +213,7 @@ def validate_value(value: Json, schema: Json, schema_dir: Path, store: dict[str,
             matches = 0
             variant_summaries: list[str] = []
             for variant_index, variant in enumerate(variants):
-                variant_errors = validate_value(value, variant, schema_dir, store, path)
+                variant_errors = validate_value(value, variant, schema_dir, store, path, root_schema)
                 if variant_errors:
                     variant_summaries.append(f"branch {variant_index}: {'; '.join(variant_errors)}")
                 else:
@@ -153,16 +241,25 @@ def validate_value(value: Json, schema: Json, schema_dir: Path, store: dict[str,
             properties = {}
         for key, subvalue in value.items():
             if key in properties:
-                errors.extend(validate_value(subvalue, properties[key], schema_dir, store, f"{path}.{key}"))
-            elif schema.get("additionalProperties", True) is False:
-                errors.append(f"{path}: unexpected property {key!r}")
+                errors.extend(validate_value(subvalue, properties[key], schema_dir, store, f"{path}.{key}", root_schema))
+            else:
+                additional = schema.get("additionalProperties", True)
+                if additional is False:
+                    errors.append(f"{path}: unexpected property {key!r}")
+                elif isinstance(additional, dict):
+                    errors.extend(validate_value(subvalue, additional, schema_dir, store, f"{path}.{key}", root_schema))
+                elif additional is not True:
+                    errors.append(f"{path}: schema additionalProperties must be boolean or object")
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             errors.append(f"{path}: expected at least {schema['minItems']} items, got {len(value)}")
         items = schema.get("items")
         if items is not None:
             for idx, item in enumerate(value):
-                errors.extend(validate_value(item, items, schema_dir, store, f"{path}[{idx}]"))
+                errors.extend(validate_value(item, items, schema_dir, store, f"{path}[{idx}]", root_schema))
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errors.append(f"{path}: expected length at least {schema['minLength']}, got {len(value)}")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
             errors.append(f"{path}: {value!r} is below minimum {schema['minimum']!r}")

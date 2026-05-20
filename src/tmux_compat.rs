@@ -11,17 +11,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::raw::c_int;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const WAIT_GENERATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+const WAIT_GENERATION_MAX_CHANNELS: usize = 4_096;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct CompatStore {
     panes: HashMap<String, CompatPane>,
-    waits: HashSet<String>,
+    wait_generations: HashMap<String, u64>,
+    wait_generation_touched_secs: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +155,10 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
             debug_unsupported_command(unknown, rest);
             let command = sanitize::terminal_text(unknown);
             let args = sanitize::terminal_text(&rest.join(" "));
-            bail!("unsupported tmux command in lterm compat: {command} {args}")
+            bail!(
+                "unsupported tmux command in lterm compat: {command} {args}. \
+                 Run `lterm tmux-compat list-commands` to inspect supported commands."
+            )
         }
     }
 }
@@ -511,20 +518,40 @@ fn split_window(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let command = tmux_shell_command(&command)?;
-    let info = client::new_session(None, command, cwd, HashMap::new(), None, true)?;
+    if let Some(target) = target.as_deref() {
+        let target = sanitize::terminal_text(target);
+        bail!(
+            "tmux split-window -t {target} is not supported by lterm compat; \
+             refusing to create a session. Use -d for a detached lterm session \
+             or run `lterm tmux-compat list-commands` for supported commands."
+        );
+    }
 
-    let cmux_surface = if !detached {
-        open_cmux_split(direction, &info).ok().flatten()
-    } else {
+    let command = tmux_shell_command(&command)?;
+    let cmux_surface = if detached {
         None
+    } else {
+        open_cmux_split(direction)?
     };
+    let info = match client::new_session(None, command, cwd, HashMap::new(), None, true) {
+        Ok(info) => info,
+        Err(err) => {
+            rollback_cmux_split(cmux_surface.as_deref());
+            return Err(err);
+        }
+    };
+
+    if !detached {
+        if let Err(err) = send_cmux_attach(cmux_surface.as_deref(), &info) {
+            let _ = client::kill(&info.pane_id);
+            rollback_cmux_split(cmux_surface.as_deref());
+            return Err(err);
+        }
+    }
     remember_pane(&info, cmux_surface)?;
 
     if print {
         println!("{}", expand_format(&format, &info));
-    } else if target.is_some() {
-        // tmux is quiet by default. target is parsed for compatibility only.
     }
     Ok(0)
 }
@@ -876,20 +903,29 @@ fn wait_for(args: &[String]) -> Result<i32> {
     let channel = channel.unwrap_or_else(|| "default".to_string());
     if signal {
         update_store(|store| {
-            store.waits.insert(channel);
+            prune_wait_generations(store, None);
+            let generation = store.wait_generations.entry(channel.clone()).or_default();
+            *generation = generation.saturating_add(1);
+            touch_wait_generation(store, &channel);
             Ok(())
         })?;
         return Ok(0);
     }
 
+    let observed_generation = update_store(|store| {
+        prune_wait_generations(store, Some(&channel));
+        touch_existing_wait_generation(store, &channel);
+        Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
+    })?;
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
     let mut sleep_for = Duration::from_millis(100);
     while Instant::now() < deadline {
-        let signaled = update_store(|store| {
-            let signaled = store.waits.remove(&channel);
-            Ok(signaled)
+        let current_generation = update_store(|store| {
+            prune_wait_generations(store, Some(&channel));
+            touch_existing_wait_generation(store, &channel);
+            Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
         })?;
-        if signaled {
+        if current_generation > observed_generation {
             return Ok(0);
         }
         thread::sleep(sleep_for);
@@ -944,20 +980,48 @@ fn read_buffer_or_empty() -> Result<Vec<u8>> {
     }
 }
 
-fn open_cmux_split(direction: &str, info: &SessionInfo) -> Result<Option<String>> {
-    if !inside_cmux() || !client::command_exists("cmux") {
-        return Ok(None);
+fn open_cmux_split(direction: &str) -> Result<Option<String>> {
+    if !inside_cmux() {
+        bail!(
+            "tmux split-window without -d requires a cmux environment; \
+             refusing to create a hidden lterm session. Use -d for a detached session."
+        );
+    }
+    if !client::command_exists("cmux") {
+        bail!(
+            "tmux split-window without -d requires the cmux CLI in PATH; \
+             refusing to create a hidden lterm session. Use -d for a detached session."
+        );
     }
     let split_status = Command::new("cmux")
         .arg("new-split")
         .arg(direction)
+        .arg("--focus")
+        .arg("true")
         .status()
         .context("cmux new-split")?;
     if !split_status.success() {
-        return Ok(None);
+        bail!(
+            "cmux new-split {direction} failed with {split_status}; \
+             refusing to create a hidden lterm session"
+        );
     }
 
-    let surface = cmux_identify_surface().ok().flatten();
+    let surface_id = match cmux_identify_surface().context("cmux identify new split surface") {
+        Ok(Some(surface_id)) => surface_id,
+        Ok(None) => {
+            rollback_focused_cmux_split();
+            bail!("cmux identify did not report a new split surface id");
+        }
+        Err(err) => {
+            rollback_focused_cmux_split();
+            return Err(err);
+        }
+    };
+    Ok(Some(surface_id))
+}
+
+fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     let lterm = std::env::var("LTERM_BIN").ok().unwrap_or_else(|| {
         std::env::current_exe()
             .map(|p| p.display().to_string())
@@ -965,16 +1029,34 @@ fn open_cmux_split(direction: &str, info: &SessionInfo) -> Result<Option<String>
     });
     let attach_cmd = format!("exec {} attach {}\n", quote(&lterm), quote(&info.pane_id));
     let mut send = Command::new("cmux");
-    if let Some(surface_id) = &surface {
-        send.arg("send-surface")
+    if let Some(surface_id) = surface {
+        send.arg("send")
             .arg("--surface")
             .arg(surface_id)
             .arg(&attach_cmd);
     } else {
         send.arg("send").arg(&attach_cmd);
     }
-    let _ = send.status();
-    Ok(surface)
+    let send_status = send.status().context("cmux send attach command")?;
+    if !send_status.success() {
+        bail!("cmux send attach command failed with {send_status}");
+    }
+    Ok(())
+}
+
+fn rollback_cmux_split(surface: Option<&str>) {
+    let Some(surface_id) = surface else {
+        return;
+    };
+    let _ = Command::new("cmux")
+        .arg("close-surface")
+        .arg("--surface")
+        .arg(surface_id)
+        .status();
+}
+
+fn rollback_focused_cmux_split() {
+    let _ = Command::new("cmux").arg("close-surface").status();
 }
 
 fn inside_cmux() -> bool {
@@ -1043,6 +1125,85 @@ fn remember_pane(info: &SessionInfo, cmux_surface_id: Option<String>) -> Result<
     })
 }
 
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn touch_wait_generation(store: &mut CompatStore, channel: &str) {
+    store
+        .wait_generation_touched_secs
+        .insert(channel.to_string(), now_unix_secs());
+}
+
+fn touch_existing_wait_generation(store: &mut CompatStore, channel: &str) {
+    if store.wait_generations.contains_key(channel) {
+        touch_wait_generation(store, channel);
+    }
+}
+
+fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&str>) {
+    let now = now_unix_secs();
+    let cutoff = now.saturating_sub(WAIT_GENERATION_RETENTION_SECS);
+    for channel in store.wait_generations.keys() {
+        store
+            .wait_generation_touched_secs
+            .entry(channel.clone())
+            .or_insert(now);
+    }
+    let stale: Vec<String> = store
+        .wait_generation_touched_secs
+        .iter()
+        .filter_map(|(channel, touched)| {
+            if protected_channel == Some(channel.as_str()) {
+                return None;
+            }
+            (*touched < cutoff).then(|| channel.clone())
+        })
+        .collect();
+    for channel in stale {
+        store.wait_generation_touched_secs.remove(&channel);
+        store.wait_generations.remove(&channel);
+    }
+    let orphaned_touched: Vec<String> = store
+        .wait_generation_touched_secs
+        .keys()
+        .filter(|channel| !store.wait_generations.contains_key(*channel))
+        .cloned()
+        .collect();
+    for channel in orphaned_touched {
+        store.wait_generation_touched_secs.remove(&channel);
+    }
+    if store.wait_generations.len() <= WAIT_GENERATION_MAX_CHANNELS {
+        return;
+    }
+    let mut channels: Vec<(String, u64)> = store
+        .wait_generations
+        .keys()
+        .filter(|channel| protected_channel != Some(channel.as_str()))
+        .map(|channel| {
+            (
+                channel.clone(),
+                *store
+                    .wait_generation_touched_secs
+                    .get(channel)
+                    .unwrap_or(&now),
+            )
+        })
+        .collect();
+    channels.sort_by_key(|(_, touched)| *touched);
+    let overflow = store
+        .wait_generations
+        .len()
+        .saturating_sub(WAIT_GENERATION_MAX_CHANNELS);
+    for (channel, _) in channels.into_iter().take(overflow) {
+        store.wait_generation_touched_secs.remove(&channel);
+        store.wait_generations.remove(&channel);
+    }
+}
+
 fn load_store() -> Result<CompatStore> {
     let path = paths::store_path()?;
     if !path.exists() {
@@ -1084,7 +1245,7 @@ impl StoreLock {
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
         loop {
-            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 {
                 return Ok(Self { file });
             }
@@ -1103,7 +1264,7 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1664,7 +1825,7 @@ fn command_usage(command: &str) -> &'static str {
         "show-options" => "[-t target-pane] [option]",
         "show-window-options" => "[-t target-window] [option]",
         "split-window" => {
-            "[-dhvP] [-F format] [-c start-directory] [-t target-pane] [shell-command]"
+            "[-dhvP] [-F format] [-c start-directory] [shell-command]  # -t unsupported"
         }
         "wait-for" => "[-S] channel",
         _ => "",
@@ -1677,14 +1838,6 @@ fn current_command(command: &str) -> String {
         .next()
         .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
         .unwrap_or_else(|| "sh".to_string())
-}
-
-const LOCK_EX: c_int = 2;
-const LOCK_NB: c_int = 4;
-const LOCK_UN: c_int = 8;
-
-unsafe extern "C" {
-    fn flock(fd: c_int, operation: c_int) -> c_int;
 }
 
 pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {
@@ -2056,6 +2209,63 @@ mod tests {
         assert_eq!(flag_arg_width("-tfoo", &args(["-tfoo"]), 0), 1);
         assert_eq!(flag_arg_width("-t", &args(["-t", "foo"]), 0), 2);
         assert_eq!(flag_arg_width("-s", &args(["-s", "-F", "format"]), 0), 1);
+    }
+
+    #[test]
+    fn prune_wait_generations_removes_stale_channels_and_preserves_active() {
+        let mut store = CompatStore::default();
+        let stale = "stale-channel".to_string();
+        let active = "active-channel".to_string();
+        let now = now_unix_secs();
+        store.wait_generations.insert(stale.clone(), 7);
+        store.wait_generations.insert(active.clone(), 8);
+        store.wait_generation_touched_secs.insert(
+            stale.clone(),
+            now.saturating_sub(WAIT_GENERATION_RETENTION_SECS + 1),
+        );
+        store.wait_generation_touched_secs.insert(
+            active.clone(),
+            now.saturating_sub(WAIT_GENERATION_RETENTION_SECS + 1),
+        );
+
+        prune_wait_generations(&mut store, Some(&active));
+
+        assert!(!store.wait_generations.contains_key(&stale));
+        assert!(!store.wait_generation_touched_secs.contains_key(&stale));
+        assert_eq!(store.wait_generations.get(&active), Some(&8));
+    }
+
+    #[test]
+    fn prune_wait_generations_timestamps_legacy_entries() {
+        let mut store = CompatStore::default();
+        store
+            .wait_generations
+            .insert("legacy-channel".to_string(), 1);
+
+        prune_wait_generations(&mut store, None);
+
+        assert_eq!(store.wait_generations.get("legacy-channel"), Some(&1));
+        assert!(
+            store
+                .wait_generation_touched_secs
+                .contains_key("legacy-channel")
+        );
+    }
+
+    #[test]
+    fn prune_wait_generations_removes_touched_only_channels() {
+        let mut store = CompatStore::default();
+        store
+            .wait_generation_touched_secs
+            .insert("unsignaled-channel".to_string(), now_unix_secs());
+
+        prune_wait_generations(&mut store, Some("unsignaled-channel"));
+
+        assert!(
+            store.wait_generation_touched_secs.is_empty(),
+            "waiters on never-signaled channels must not grow touched metadata"
+        );
+        assert!(store.wait_generations.is_empty());
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {

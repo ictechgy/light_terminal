@@ -2420,13 +2420,21 @@ fn wait_for_session_contains(
             }
             let wait_result =
                 changed.wait_timeout(progress, deadline.saturating_duration_since(now));
-            let (_next_progress, _timeout_result) = match wait_result {
+            let (next_progress, timeout_result) = match wait_result {
                 Ok(result) => result,
                 Err(poisoned) => {
                     eprintln!("recovering poisoned output progress mutex");
                     poisoned.into_inner()
                 }
             };
+            if timeout_result.timed_out() && next_progress.revision == before_capture.revision {
+                return Ok(WaitContainsResult {
+                    session: session.info(),
+                    matched: false,
+                    timed_out: true,
+                    exited: !session.alive.load(Ordering::SeqCst),
+                });
+            }
         } else {
             let _guard = match changed.wait(progress) {
                 Ok(guard) => guard,
@@ -3173,6 +3181,7 @@ mod tests {
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
         process_group_still_owns_child, read_request_frame_with_limit,
         read_request_frame_with_timeout, request_frame_from_chunk, validate_terminal_geometry,
+        wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::VecDeque;
@@ -3610,6 +3619,81 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn wait_contains_zero_timeout_checks_existing_snapshot_before_deadline() {
+        let session = build_test_session("wait-zero-timeout");
+        session.append_output(b"already-ready");
+
+        let result = wait_for_session_contains(&session, "already-ready", None, Some(0))
+            .expect("wait contains");
+
+        assert!(
+            result.matched,
+            "zero-timeout wait must still inspect already captured output"
+        );
+        assert!(
+            !result.timed_out,
+            "pre-existing output match must not report timeout"
+        );
+        assert!(!result.exited, "live session should not be reported exited");
+    }
+
+    #[test]
+    fn wait_contains_zero_timeout_without_match_reports_timeout() {
+        let session = build_test_session("wait-zero-timeout-missing");
+
+        let result = wait_for_session_contains(&session, "never-ready", None, Some(0))
+            .expect("wait contains");
+
+        assert!(!result.matched, "absent needle must not match");
+        assert!(result.timed_out, "zero-timeout miss must report timeout");
+        assert!(!result.exited, "live session should not be reported exited");
+    }
+
+    #[test]
+    fn wait_contains_continuous_output_does_not_starve_timeout() {
+        let session = build_test_session("wait-continuous-output");
+        let running = Arc::new(AtomicBool::new(true));
+        let running_for_writer = Arc::clone(&running);
+        let session_for_writer = Arc::clone(&session);
+        let writer = thread::spawn(move || {
+            while running_for_writer.load(Ordering::SeqCst) {
+                session_for_writer.append_output(b"noise\n");
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let started = Instant::now();
+        let result = wait_for_session_contains(&session, "never-appears", None, Some(20))
+            .expect("wait contains");
+        running.store(false, Ordering::SeqCst);
+        writer.join().expect("writer thread");
+
+        assert!(!result.matched, "absent needle must not match");
+        assert!(
+            result.timed_out,
+            "continuous progress must not hide timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout should stay bounded even with continuous output"
+        );
+    }
+
+    #[test]
+    fn wait_contains_closed_progress_reports_exited_without_timeout() {
+        let session = build_test_session("wait-closed");
+        session.alive.store(false, Ordering::SeqCst);
+        session.mark_output_closed();
+
+        let result = wait_for_session_contains(&session, "missing", None, Some(1_000))
+            .expect("wait contains");
+
+        assert!(!result.matched);
+        assert!(!result.timed_out);
+        assert!(result.exited, "closed output should surface exited=true");
     }
 
     #[test]
