@@ -149,6 +149,19 @@ impl Drop for ChildCleanup {
     }
 }
 
+fn wait_for_child_success(child: &mut ChildCleanup, label: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(status) = child.child_mut()?.try_wait()? {
+            assert!(status.success(), "{label} failed: {status:?}");
+            child.child = None;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("timed out waiting for {label}").into())
+}
+
 fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
     stdout
         .lines()
@@ -2897,6 +2910,248 @@ fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> TestResult {
+    let env = TestEnv::new()?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-t",
+            "some-target",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "split-window -t should be explicit instead of creating a session: {output:?}"
+    );
+    assert_stderr_contains(&output, "tmux split-window -t some-target is not supported");
+    let after = session_names_json(&env)?;
+    assert_eq!(
+        after, before,
+        "split-window -t must not create a hidden session"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_without_detach_requires_cmux_before_session_creation() -> TestResult {
+    let env = TestEnv::new()?;
+    let no_cmux_bin = env.temp.path().join("no-cmux-bin");
+    std::fs::create_dir(&no_cmux_bin)?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-missing-cmux")
+        .env("PATH", &no_cmux_bin)
+        .args(["tmux-compat", "split-window", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "non-detached split-window without cmux must fail: {output:?}"
+    );
+    assert_stderr_contains(&output, "requires the cmux CLI in PATH");
+    let after = session_names_json(&env)?;
+    assert_eq!(
+        after, before,
+        "failed non-detached split-window must not create an orphan session"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\n' \"$*\" >> {}\nexit 42\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-failing-cmux")
+        .env("PATH", &fake_bin)
+        .args(["tmux-compat", "split-window", "-v", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "cmux new-split failure must fail split-window: {output:?}"
+    );
+    assert_stderr_contains(&output, "cmux new-split down failed");
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| line == "new-split down"),
+        "fake cmux should record attempted down split: {cmux_calls:?}"
+    );
+    let after = session_names_json(&env)?;
+    assert_eq!(
+        after, before,
+        "cmux split failure must happen before lterm session creation"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_requires_identified_cmux_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-identify-missing.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) exit 0 ;;\n\
+               identify) printf '%s\\n' '{{}}'; exit 0 ;;\n\
+               send|send-surface|close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-missing-surface-id")
+        .env("PATH", &fake_bin)
+        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "missing cmux surface id must fail split-window before lterm creation: {output:?}"
+    );
+    assert_stderr_contains(
+        &output,
+        "cmux identify did not report a new split surface id",
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| line == "new-split right"),
+        "fake cmux should record the split attempt: {cmux_calls:?}"
+    );
+    assert!(
+        !cmux_calls
+            .lines()
+            .any(|line| line == "send" || line.starts_with("send ")),
+        "missing surface id must not fall back to untargeted cmux send: {cmux_calls:?}"
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "missing cmux surface id must fail before lterm session creation"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-rollback.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"surface_id\":\"surface-rollback\"}}'; exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let bad_socket = env.temp.path().join("not-a-socket");
+    std::fs::write(&bad_socket, b"not a socket")?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-rollback")
+        .env("PATH", &fake_bin)
+        .env("LTERM_SOCKET", &bad_socket)
+        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "lterm session creation failure should fail split-window: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| line == "new-split right"),
+        "fake cmux should record the split attempt: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface-rollback"),
+        "failed lterm creation should roll back the new cmux surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_wait_for_signal_wakes_multiple_waiters() -> TestResult {
+    let env = TestEnv::new()?;
+    let channel = "broadcast-channel";
+    let mut first = ChildCleanup::new(
+        env.cmd()
+            .args(["tmux-compat", "wait-for", channel])
+            .spawn()?,
+    );
+    let mut second = ChildCleanup::new(
+        env.cmd()
+            .args(["tmux-compat", "wait-for", channel])
+            .spawn()?,
+    );
+    thread::sleep(Duration::from_secs(1));
+
+    let status = env
+        .cmd()
+        .args(["tmux-compat", "wait-for", "-S", channel])
+        .status()?;
+    assert!(status.success(), "wait-for -S failed: {status:?}");
+    wait_for_child_success(&mut first, "first wait-for waiter")?;
+    wait_for_child_success(&mut second, "second wait-for waiter")?;
+
+    let mut late = ChildCleanup::new(
+        env.cmd()
+            .args(["tmux-compat", "wait-for", channel])
+            .spawn()?,
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        late.child_mut()?.try_wait()?.is_none(),
+        "a waiter started after a signal must wait for the next generation"
+    );
+    let status = env
+        .cmd()
+        .args(["tmux-compat", "wait-for", "-S", channel])
+        .status()?;
+    assert!(status.success(), "second wait-for -S failed: {status:?}");
+    wait_for_child_success(&mut late, "late wait-for waiter")?;
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_display_message_stops_option_parsing_at_message() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -4247,6 +4502,10 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
     assert!(
         stderr.contains("lterm_tmux_compat\tunsupported_command\tdefinitely-not-supported\t-x"),
         "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("tmux-compat list-commands"),
+        "unsupported command error should include discovery hint: {stderr:?}"
     );
     Ok(())
 }

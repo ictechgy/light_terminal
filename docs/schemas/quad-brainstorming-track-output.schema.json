@@ -48,6 +48,44 @@
     "final_stance": { "type": "string" },
     "failure_class": { "$ref": "#/definitions/failure_class" }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "ready" } }, "required": ["status"] },
+      "then": { "properties": { "failure_class": { "enum": [] } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "usable" } }, "required": ["status"] },
+      "then": { "properties": { "failure_class": { "enum": [] } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "missing" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "missing" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "auth-required" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "auth-required" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "unsafe-mode" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "unsafe-mode" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "timeout" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "timeout" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "empty-output" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "empty-output" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "schema-invalid" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "schema-invalid" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "off-target" } }, "required": ["status"] },
+      "then": { "required": ["failure_class"], "properties": { "failure_class": { "const": "off-target" } } }
+    }
+  ],
   "definitions": {
     "failure_class": {
       "enum": [

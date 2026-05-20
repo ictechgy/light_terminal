@@ -7,7 +7,8 @@ skill has a repo-native source package. They are intentionally local/read-only:
 no provider CLIs are invoked and no external posting is done.
 
 Set QUAD_BRAINSTORMING_SKILL to test a specific SKILL.md. Without that variable,
-the default is the current user's Codex skill install under ~/.codex/skills.
+the default is the repo-local skill when present, then the current user's Codex
+skill install under ~/.codex/skills.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_PATH_ENV = "QUAD_BRAINSTORMING_SKILL"
-DEFAULT_SKILL = Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md"
+REPO_LOCAL_SKILL = REPO_ROOT / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md"
+INSTALLED_SKILL = Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md"
+DEFAULT_SKILL = REPO_LOCAL_SKILL if REPO_LOCAL_SKILL.is_file() else INSTALLED_SKILL
 SKILL_PATH = Path(os.environ.get(SKILL_PATH_ENV, DEFAULT_SKILL)).expanduser()
 SCHEMA_DIR = REPO_ROOT / "docs" / "schemas"
 ADOPTION_DOC = REPO_ROOT / "docs" / "quad-brainstorming" / "adoption.md"
@@ -129,14 +132,12 @@ class MarkdownSectionHelperTests(unittest.TestCase):
 
 class ContractHelperTests(unittest.TestCase):
     def test_default_skill_path_is_portable(self) -> None:
-        self.assertEqual(
-            DEFAULT_SKILL,
-            Path.home() / ".codex" / "skills" / "quad-brainstorming" / "SKILL.md",
-        )
-        self.assertEqual(
-            DEFAULT_SKILL.parts[-4:],
-            (".codex", "skills", "quad-brainstorming", "SKILL.md"),
-        )
+        self.assertEqual(INSTALLED_SKILL.parts[-4:], (".codex", "skills", "quad-brainstorming", "SKILL.md"))
+        if REPO_LOCAL_SKILL.is_file():
+            self.assertEqual(DEFAULT_SKILL, REPO_LOCAL_SKILL)
+            self.assertEqual(DEFAULT_SKILL.relative_to(REPO_ROOT), Path(".codex/skills/quad-brainstorming/SKILL.md"))
+        else:
+            self.assertEqual(DEFAULT_SKILL, INSTALLED_SKILL)
 
     def test_forbidden_external_posting_patterns_cover_common_posting_paths(self) -> None:
         forbidden_samples = [
@@ -445,15 +446,41 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "mode != \"readonly\" or has_readonly_plan",
                 "failed-trust-boundary",
                 "not running in a trusted directory",
-                "NETWORK_CAPABLE_FORGE_TOOLS",
-                "\"fetch\"",
+                "FORGE_NO_EGRESS_TOOL_ALLOWLIST",
+                "fetch",
                 "forge_agent_has_no_network_tools",
-                "skipped-unsafe: Forge agent has network-capable tools",
+                "network_capable",
+                "outside_allowlist",
+                "skipped-unsafe: Forge agent is outside the no-egress allowlist",
                 "same-turn user consent and egress restrictions",
             ],
         )
         self.assertNotIn("grep -q -- 'read-only'", track_commands)
         self.assertNotIn("read/fetch/fs-search only", track_commands)
+
+    def test_forge_preflight_and_runtime_share_no_egress_gate(self) -> None:
+        track_availability = self.section("Track Availability and Doctor/Preflight")
+        track_commands = self.section("Track Commands")
+        for section in (track_availability, track_commands):
+            with self.subTest(section=section[:40]):
+                self.assertContainsAll(
+                    section,
+                    [
+                        "forge-agent-check",
+                        "forge_agent_has_no_network_tools",
+                        "FORGE_NO_EGRESS_TOOL_ALLOWLIST",
+                        "outside_allowlist",
+                        "network_capable",
+                    ],
+                )
+        self.assertContainsAll(
+            track_availability,
+            [
+                "verified read-only/no-egress Forge agent",
+                "Forge read-only/no-egress verification failed",
+                "Forge preflight and Forge runtime MUST use the same",
+            ],
+        )
 
     def test_compact_adr_schema_and_artifact_policy_are_explicit(self) -> None:
         compact_adr = self.section("Compact ADR Report")

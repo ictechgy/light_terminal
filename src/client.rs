@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -29,6 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const ATTACH_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 static VERSION_STATUS_CHECKED: AtomicBool = AtomicBool::new(false);
@@ -41,6 +42,9 @@ const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 /// 않아 status_dirty가 클리어되지 않음) self-heal이 영원히 막히지 않게 강제 발화하는 상한.
 /// 사용자 보고: cmux pane swap 후 status가 회복 안 되는 증상 회복용. 500ms = 2× heartbeat.
 const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_millis(500);
+/// Attach output idle wakeup. This bounds status-bar redraw latency without the
+/// previous 30ms hot poll; heartbeat logic still owns the actual redraw cadence.
+const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
@@ -442,6 +446,28 @@ pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
 
 const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeRenderAction {
+    RemoteCapture,
+    PromptOnly,
+    None,
+}
+
+fn compose_render_action(
+    remote_dirty: bool,
+    prompt_dirty: bool,
+    elapsed: Duration,
+    refresh: Duration,
+) -> ComposeRenderAction {
+    if remote_dirty || elapsed >= refresh {
+        ComposeRenderAction::RemoteCapture
+    } else if prompt_dirty {
+        ComposeRenderAction::PromptOnly
+    } else {
+        ComposeRenderAction::None
+    }
+}
+
 fn run_interactive_compose(
     target: &str,
     tail_start: i32,
@@ -452,13 +478,23 @@ fn run_interactive_compose(
     let _guard = ComposeTerminalGuard::enter(&mut stdout)?;
     let mut input = String::new();
     let mut last_refresh = Instant::now();
-    let mut dirty = true;
+    let mut remote_dirty = true;
+    let mut prompt_dirty = true;
 
     loop {
-        if dirty || last_refresh.elapsed() >= refresh {
-            render_compose(target, tail_start, &input, &mut stdout)?;
-            last_refresh = Instant::now();
-            dirty = false;
+        match compose_render_action(remote_dirty, prompt_dirty, last_refresh.elapsed(), refresh) {
+            ComposeRenderAction::RemoteCapture => {
+                let capture = capture_range(target, Some(tail_start), None)?;
+                render_compose_snapshot(&capture, &input, &mut stdout)?;
+                last_refresh = Instant::now();
+                remote_dirty = false;
+                prompt_dirty = false;
+            }
+            ComposeRenderAction::PromptOnly => {
+                render_compose_prompt(&input, &mut stdout)?;
+                prompt_dirty = false;
+            }
+            ComposeRenderAction::None => {}
         }
         let poll_timeout = refresh
             .checked_sub(last_refresh.elapsed())
@@ -473,7 +509,8 @@ fn run_interactive_compose(
             let key = match event {
                 Event::Key(key) => key,
                 Event::Resize(_, _) => {
-                    dirty = true;
+                    remote_dirty = true;
+                    prompt_dirty = true;
                     if event::poll(Duration::ZERO).context("poll queued compose input")? {
                         pending_event = Some(event::read().context("read queued compose input")?);
                     }
@@ -481,7 +518,7 @@ fn run_interactive_compose(
                 }
                 Event::Paste(text) => {
                     compose_push_paste(&mut input, &text);
-                    dirty = true;
+                    prompt_dirty = true;
                     if event::poll(Duration::ZERO).context("poll queued compose input")? {
                         pending_event = Some(event::read().context("read queued compose input")?);
                     }
@@ -510,15 +547,15 @@ fn run_interactive_compose(
                         send(target, compose_commit_bytes(&input, append_enter))?;
                         input.clear();
                     }
-                    dirty = true;
+                    prompt_dirty = true;
                 }
                 KeyCode::Backspace => {
                     compose_pop_grapheme(&mut input);
-                    dirty = true;
+                    prompt_dirty = true;
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     input.push(ch);
-                    dirty = true;
+                    prompt_dirty = true;
                 }
                 _ => {}
             }
@@ -533,16 +570,10 @@ fn run_interactive_compose(
     Ok(())
 }
 
-fn render_compose(
-    target: &str,
-    tail_start: i32,
-    input: &str,
-    stdout: &mut impl Write,
-) -> Result<()> {
+fn render_compose_snapshot(capture: &str, input: &str, stdout: &mut impl Write) -> Result<()> {
     let (cols, rows) = terminal_size();
     let width = cols.saturating_sub(1).max(1) as usize;
     let body_rows = rows.saturating_sub(1) as usize;
-    let capture = capture_range(target, Some(tail_start), None)?;
     let lines: Vec<&str> = capture.lines().collect();
     let start = lines.len().saturating_sub(body_rows);
 
@@ -560,7 +591,25 @@ fn render_compose(
                 .context("write compose body")?;
         }
     }
-    let prompt_row = rows.saturating_sub(1);
+    render_compose_prompt_at(input, width, rows.saturating_sub(1), stdout)?;
+    stdout.flush().context("flush compose screen")?;
+    Ok(())
+}
+
+fn render_compose_prompt(input: &str, stdout: &mut impl Write) -> Result<()> {
+    let (cols, rows) = terminal_size();
+    let width = cols.saturating_sub(1).max(1) as usize;
+    render_compose_prompt_at(input, width, rows.saturating_sub(1), stdout)?;
+    stdout.flush().context("flush compose prompt")?;
+    Ok(())
+}
+
+fn render_compose_prompt_at(
+    input: &str,
+    width: usize,
+    prompt_row: u16,
+    stdout: &mut impl Write,
+) -> Result<()> {
     let (prompt, cursor_col) = compose_prompt_line(input, width);
     queue!(
         stdout,
@@ -571,7 +620,6 @@ fn render_compose(
     write!(stdout, "{}", compose_display_line(&prompt, width)).context("write compose prompt")?;
     queue!(stdout, cursor::MoveTo(cursor_col, prompt_row), cursor::Show)
         .context("position compose cursor")?;
-    stdout.flush().context("flush compose screen")?;
     Ok(())
 }
 
@@ -1004,6 +1052,27 @@ pub enum AttachStdinEof {
     KeepAttached,
 }
 
+fn read_attach_response_header(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+    let mut header = Vec::new();
+    loop {
+        let available = reader.fill_buf().context("read attach header")?;
+        if available.is_empty() {
+            bail!("daemon closed attach before header");
+        }
+        let newline_pos = available.iter().position(|byte| *byte == b'\n');
+        let take = newline_pos.map_or(available.len(), |pos| pos + 1);
+        let remaining = ATTACH_RESPONSE_HEADER_LIMIT.saturating_sub(header.len());
+        if take > remaining {
+            bail!("attach header too large");
+        }
+        header.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline_pos.is_some() {
+            return Ok(header);
+        }
+    }
+}
+
 pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
@@ -1038,21 +1107,8 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     stream.write_all(&serde_json::to_vec(&request)?)?;
     stream.write_all(b"\n")?;
 
-    let mut header = Vec::new();
-    let mut one = [0_u8; 1];
-    loop {
-        let n = stream.read(&mut one).context("read attach header")?;
-        if n == 0 {
-            bail!("daemon closed attach before header");
-        }
-        header.push(one[0]);
-        if one[0] == b'\n' {
-            break;
-        }
-        if header.len() > 64 * 1024 {
-            bail!("attach header too large");
-        }
-    }
+    let mut reader = BufReader::with_capacity(8192, stream);
+    let header = read_attach_response_header(&mut reader)?;
     let response: Response = serde_json::from_slice(&header).context("parse attach header")?;
     if !response.ok {
         bail!(
@@ -1072,10 +1128,12 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow::anyhow!("attach response missing subscriber_id"))?;
 
-    stream
+    reader
+        .get_ref()
         .set_write_timeout(None)
         .context("clear attach stream write timeout")?;
-    stream
+    reader
+        .get_ref()
         .set_read_timeout(None)
         .context("clear attach stream read timeout")?;
 
@@ -1092,7 +1150,10 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     );
     let running = Arc::new(AtomicBool::new(true));
 
-    let mut writer = stream.try_clone().context("clone attach stream writer")?;
+    let mut writer = reader
+        .get_ref()
+        .try_clone()
+        .context("clone attach stream writer")?;
     let input_running = Arc::clone(&running);
     let detach_on_stdin_eof = matches!(stdin_eof, AttachStdinEof::Detach);
     let input_thread = thread::spawn(move || -> Result<()> {
@@ -1181,8 +1242,9 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
     if status_enabled {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(30)))
+        reader
+            .get_ref()
+            .set_read_timeout(Some(ATTACH_OUTPUT_IDLE_TIMEOUT))
             .context("set attach output read timeout")?;
     }
     let mut buf = [0_u8; 8192];
@@ -1237,7 +1299,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                     &mut last_status_refresh,
                 )?;
             }
-            let n = match stream.read(&mut buf) {
+            let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
@@ -2149,12 +2211,16 @@ impl AttachActiveGuard {
 
 impl Drop for AttachActiveGuard {
     fn drop(&mut self) {
-        let prev = ATTACH_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        let prev = ATTACH_ACTIVE.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |prev| prev.checked_sub(1),
+        );
         // refcount underflow는 unique-owner 계약 위반(생성 경로 외에서 Drop이 발생).
         // wrapping으로 usize::MAX가 되면 panic hook이 영구히 cleanup을 emit해 디버깅이
-        // 어려워지므로 dev/test 단계에서 즉시 잡는다. release 빌드는 no-op.
+        // 어려워지므로 release 빌드에서도 0에 고정하고, dev/test 단계에서는 즉시 잡는다.
         debug_assert!(
-            prev > 0,
+            prev.is_ok(),
             "AttachActiveGuard underflow: refcount went below 0"
         );
     }
@@ -2244,18 +2310,21 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTACH_ACTIVE, AltScreenState, AttachActiveGuard, DaemonStatus,
-        KeyboardProtocolRestoreState, ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
-        StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker, alt_screen_param_matches,
-        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
-        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, matches_env_bool,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
+        AttachActiveGuard, ComposeRenderAction, DaemonStatus, KeyboardProtocolRestoreState,
+        MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome, STATUS_HEARTBEAT,
+        STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker,
+        alt_screen_param_matches, attach_pty_rows, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, format_status_line, handle_resize_tick, heartbeat_due,
+        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_style, read_attach_response_header,
         resolve_status_style, status_theme_protocol_error,
     };
+    use std::io::{BufReader, Cursor, Read};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
@@ -2290,6 +2359,56 @@ mod tests {
         assert_eq!(
             compose_refresh_interval(Duration::from_millis(50)).expect("minimum refresh"),
             Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn compose_render_action_keeps_local_prompt_redraws_off_capture_path() {
+        assert_eq!(
+            compose_render_action(
+                false,
+                true,
+                Duration::from_millis(10),
+                Duration::from_millis(100)
+            ),
+            ComposeRenderAction::PromptOnly,
+            "local typing/backspace/paste should redraw only the prompt"
+        );
+    }
+
+    #[test]
+    fn compose_render_action_refreshes_remote_capture_on_timer_or_resize() {
+        assert_eq!(
+            compose_render_action(
+                false,
+                false,
+                Duration::from_millis(100),
+                Duration::from_millis(100)
+            ),
+            ComposeRenderAction::RemoteCapture,
+            "timed refresh must still request remote capture"
+        );
+        assert_eq!(
+            compose_render_action(
+                true,
+                false,
+                Duration::from_millis(0),
+                Duration::from_millis(100)
+            ),
+            ComposeRenderAction::RemoteCapture,
+            "resize/full-screen dirtiness must redraw the remote body"
+        );
+    }
+
+    #[test]
+    fn attach_output_idle_timeout_bounds_polling_without_missing_heartbeat() {
+        assert!(
+            ATTACH_OUTPUT_IDLE_TIMEOUT >= Duration::from_millis(50),
+            "attach output loop should not hot-poll at the old 30ms cadence"
+        );
+        assert!(
+            ATTACH_OUTPUT_IDLE_TIMEOUT <= STATUS_HEARTBEAT,
+            "idle wakeup must still give heartbeat_due chances before the visible heartbeat window"
         );
     }
 
@@ -2417,6 +2536,48 @@ mod tests {
         assert_eq!(attach_pty_rows(24, true), 23);
         assert_eq!(attach_pty_rows(1, true), 1);
         assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    #[test]
+    fn attach_header_reader_preserves_buffered_pty_tail() {
+        let mut reader =
+            BufReader::with_capacity(8, Cursor::new(b"{\"ok\":true}\nPTY-TAIL".to_vec()));
+
+        let header = read_attach_response_header(&mut reader).expect("read attach header");
+        assert_eq!(header, b"{\"ok\":true}\n");
+
+        let mut tail = String::new();
+        reader
+            .read_to_string(&mut tail)
+            .expect("read buffered tail");
+        assert_eq!(
+            tail, "PTY-TAIL",
+            "chunked handshake must not drop PTY bytes"
+        );
+    }
+
+    #[test]
+    fn attach_header_reader_enforces_header_cap_including_newline() {
+        let mut too_large = vec![b'a'; ATTACH_RESPONSE_HEADER_LIMIT];
+        too_large.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(too_large));
+
+        let err = read_attach_response_header(&mut reader).expect_err("oversized header");
+        assert!(
+            err.to_string().contains("attach header too large"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn attach_header_reader_accepts_newline_at_cap_boundary() {
+        let mut at_limit = vec![b'a'; ATTACH_RESPONSE_HEADER_LIMIT - 1];
+        at_limit.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(at_limit));
+
+        let header = read_attach_response_header(&mut reader).expect("header at cap boundary");
+        assert_eq!(header.len(), ATTACH_RESPONSE_HEADER_LIMIT);
+        assert_eq!(header.last(), Some(&b'\n'));
     }
 
     #[test]
@@ -2756,8 +2917,8 @@ mod tests {
         // pop 시퀀스가 정확히 16번 등장하는지 검증 (회귀 시 즉시 catch)
         let pop_count = bytes.windows(4).filter(|w| *w == b"\x1b[<u").count();
         assert_eq!(
-            pop_count, 16,
-            "kitty pop은 MAX_KEYBOARD_PROTOCOL_RESTORE_POPS=16과 일치"
+            pop_count, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS as usize,
+            "kitty pop은 MAX_KEYBOARD_PROTOCOL_RESTORE_POPS와 일치"
         );
         // alt-screen 종료가 scroll region reset보다 먼저 위치하는지 명시 검증
         let pos_alt = bytes
