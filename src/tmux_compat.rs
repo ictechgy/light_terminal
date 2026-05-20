@@ -914,7 +914,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
 
     let observed_generation = update_store(|store| {
         prune_wait_generations(store, Some(&channel));
-        touch_wait_generation(store, &channel);
+        touch_existing_wait_generation(store, &channel);
         Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
     })?;
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
@@ -922,7 +922,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
     while Instant::now() < deadline {
         let current_generation = update_store(|store| {
             prune_wait_generations(store, Some(&channel));
-            touch_wait_generation(store, &channel);
+            touch_existing_wait_generation(store, &channel);
             Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
         })?;
         if current_generation > observed_generation {
@@ -996,6 +996,8 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
     let split_status = Command::new("cmux")
         .arg("new-split")
         .arg(direction)
+        .arg("--focus")
+        .arg("true")
         .status()
         .context("cmux new-split")?;
     if !split_status.success() {
@@ -1005,9 +1007,17 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         );
     }
 
-    let surface_id = cmux_identify_surface()
-        .context("cmux identify new split surface")?
-        .ok_or_else(|| anyhow!("cmux identify did not report a new split surface id"))?;
+    let surface_id = match cmux_identify_surface().context("cmux identify new split surface") {
+        Ok(Some(surface_id)) => surface_id,
+        Ok(None) => {
+            rollback_focused_cmux_split();
+            bail!("cmux identify did not report a new split surface id");
+        }
+        Err(err) => {
+            rollback_focused_cmux_split();
+            return Err(err);
+        }
+    };
     Ok(Some(surface_id))
 }
 
@@ -1020,7 +1030,7 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     let attach_cmd = format!("exec {} attach {}\n", quote(&lterm), quote(&info.pane_id));
     let mut send = Command::new("cmux");
     if let Some(surface_id) = surface {
-        send.arg("send-surface")
+        send.arg("send")
             .arg("--surface")
             .arg(surface_id)
             .arg(&attach_cmd);
@@ -1043,6 +1053,10 @@ fn rollback_cmux_split(surface: Option<&str>) {
         .arg("--surface")
         .arg(surface_id)
         .status();
+}
+
+fn rollback_focused_cmux_split() {
+    let _ = Command::new("cmux").arg("close-surface").status();
 }
 
 fn inside_cmux() -> bool {
@@ -1124,10 +1138,15 @@ fn touch_wait_generation(store: &mut CompatStore, channel: &str) {
         .insert(channel.to_string(), now_unix_secs());
 }
 
+fn touch_existing_wait_generation(store: &mut CompatStore, channel: &str) {
+    if store.wait_generations.contains_key(channel) {
+        touch_wait_generation(store, channel);
+    }
+}
+
 fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&str>) {
     let now = now_unix_secs();
     let cutoff = now.saturating_sub(WAIT_GENERATION_RETENTION_SECS);
-    let protected = protected_channel.unwrap_or_default();
     for channel in store.wait_generations.keys() {
         store
             .wait_generation_touched_secs
@@ -1138,7 +1157,7 @@ fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&st
         .wait_generation_touched_secs
         .iter()
         .filter_map(|(channel, touched)| {
-            if channel == protected {
+            if protected_channel == Some(channel.as_str()) {
                 return None;
             }
             (*touched < cutoff).then(|| channel.clone())
@@ -1148,13 +1167,22 @@ fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&st
         store.wait_generation_touched_secs.remove(&channel);
         store.wait_generations.remove(&channel);
     }
+    let orphaned_touched: Vec<String> = store
+        .wait_generation_touched_secs
+        .keys()
+        .filter(|channel| !store.wait_generations.contains_key(*channel))
+        .cloned()
+        .collect();
+    for channel in orphaned_touched {
+        store.wait_generation_touched_secs.remove(&channel);
+    }
     if store.wait_generations.len() <= WAIT_GENERATION_MAX_CHANNELS {
         return;
     }
     let mut channels: Vec<(String, u64)> = store
         .wait_generations
         .keys()
-        .filter(|channel| channel.as_str() != protected)
+        .filter(|channel| protected_channel != Some(channel.as_str()))
         .map(|channel| {
             (
                 channel.clone(),
@@ -2222,6 +2250,22 @@ mod tests {
                 .wait_generation_touched_secs
                 .contains_key("legacy-channel")
         );
+    }
+
+    #[test]
+    fn prune_wait_generations_removes_touched_only_channels() {
+        let mut store = CompatStore::default();
+        store
+            .wait_generation_touched_secs
+            .insert("unsignaled-channel".to_string(), now_unix_secs());
+
+        prune_wait_generations(&mut store, Some("unsignaled-channel"));
+
+        assert!(
+            store.wait_generation_touched_secs.is_empty(),
+            "waiters on never-signaled channels must not grow touched metadata"
+        );
+        assert!(store.wait_generations.is_empty());
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {

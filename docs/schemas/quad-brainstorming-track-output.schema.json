@@ -51,11 +51,11 @@
   "allOf": [
     {
       "if": { "properties": { "status": { "const": "ready" } }, "required": ["status"] },
-      "then": { "properties": { "failure_class": { "enum": [] } } }
+      "then": { "not": { "required": ["failure_class"] } }
     },
     {
       "if": { "properties": { "status": { "const": "usable" } }, "required": ["status"] },
-      "then": { "properties": { "failure_class": { "enum": [] } } }
+      "then": { "not": { "required": ["failure_class"] } }
     },
     {
       "if": { "properties": { "status": { "const": "missing" } }, "required": ["status"] },

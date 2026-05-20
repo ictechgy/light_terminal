@@ -2994,7 +2994,9 @@ fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> 
     assert_stderr_contains(&output, "cmux new-split down failed");
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls.lines().any(|line| line == "new-split down"),
+        cmux_calls
+            .lines()
+            .any(|line| line == "new-split down --focus true"),
         "fake cmux should record attempted down split: {cmux_calls:?}"
     );
     let after = session_names_json(&env)?;
@@ -3043,8 +3045,14 @@ fn tmux_compat_split_window_requires_identified_cmux_surface() -> TestResult {
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls.lines().any(|line| line == "new-split right"),
+        cmux_calls
+            .lines()
+            .any(|line| line == "new-split right --focus true"),
         "fake cmux should record the split attempt: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls.lines().any(|line| line == "close-surface"),
+        "missing surface id should close the focused split surface: {cmux_calls:?}"
     );
     assert!(
         !cmux_calls
@@ -3096,7 +3104,9 @@ fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() ->
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls.lines().any(|line| line == "new-split right"),
+        cmux_calls
+            .lines()
+            .any(|line| line == "new-split right --focus true"),
         "fake cmux should record the split attempt: {cmux_calls:?}"
     );
     assert!(

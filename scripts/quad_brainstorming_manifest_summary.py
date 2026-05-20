@@ -95,17 +95,15 @@ def safe_load_manifest(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return data, None
 
 
-def iter_raw_field_paths(value: Any, path: str = "") -> Iterable[str]:
+def iter_raw_field_names(value: Any) -> Iterable[str]:
     if isinstance(value, dict):
         for key, child in value.items():
-            child_path = f"{path}.{key}" if path else str(key)
             if key in RAW_FIELD_NAMES:
-                yield child_path
-            yield from iter_raw_field_paths(child, child_path)
+                yield str(key)
+            yield from iter_raw_field_names(child)
     elif isinstance(value, list):
-        for index, child in enumerate(value):
-            child_path = f"{path}[{index}]" if path else f"[{index}]"
-            yield from iter_raw_field_paths(child, child_path)
+        for child in value:
+            yield from iter_raw_field_names(child)
 
 
 def validate_manifest_shape(path: Path, manifest: dict[str, Any]) -> list[str]:
@@ -136,7 +134,7 @@ def summarize(paths: list[Path], input_errors: Iterable[str] = ()) -> dict[str, 
             invalid_manifest_count += 1
             continue
         assert manifest is not None
-        raw_field_occurrences.update(iter_raw_field_paths(manifest))
+        raw_field_occurrences.update(iter_raw_field_names(manifest))
         shape_errors = validate_manifest_shape(path, manifest)
         if shape_errors:
             errors.extend(shape_errors)

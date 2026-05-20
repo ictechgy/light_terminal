@@ -193,6 +193,14 @@ def validate_value(
         condition_errors = validate_value(value, schema["if"], schema_dir, store, path, root_schema)
         if not condition_errors and "then" in schema:
             errors.extend(validate_value(value, schema["then"], schema_dir, store, path, root_schema))
+    if "not" in schema:
+        disallowed = schema["not"]
+        if not isinstance(disallowed, dict):
+            errors.append(f"{path}: schema not must be an object")
+        else:
+            disallowed_errors = validate_value(value, disallowed, schema_dir, store, path, root_schema)
+            if not disallowed_errors:
+                errors.append(f"{path}: matched disallowed schema in not")
     if "const" in schema and value != schema["const"]:
         errors.append(f"{path}: expected const {schema['const']!r}, got {value!r}")
     if "enum" in schema and value not in schema["enum"]:

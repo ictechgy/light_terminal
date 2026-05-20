@@ -2380,16 +2380,6 @@ fn wait_for_session_contains(
         .transpose()?;
 
     loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                return Ok(WaitContainsResult {
-                    session: session.info(),
-                    matched: false,
-                    timed_out: true,
-                    exited: !session.alive.load(Ordering::SeqCst),
-                });
-            }
-        }
         let before_capture = *lock(&session.output_progress.0);
         let output = {
             let _output_guard = lock(&session.output_state);
@@ -3632,18 +3622,33 @@ mod tests {
     }
 
     #[test]
-    fn wait_contains_zero_timeout_checks_deadline_before_snapshot_match() {
+    fn wait_contains_zero_timeout_checks_existing_snapshot_before_deadline() {
         let session = build_test_session("wait-zero-timeout");
-        session.append_output(b"ready-after-deadline");
+        session.append_output(b"already-ready");
 
-        let result = wait_for_session_contains(&session, "ready-after-deadline", None, Some(0))
+        let result = wait_for_session_contains(&session, "already-ready", None, Some(0))
             .expect("wait contains");
 
         assert!(
-            !result.matched,
-            "zero-timeout wait must not match a later snapshot"
+            result.matched,
+            "zero-timeout wait must still inspect already captured output"
         );
-        assert!(result.timed_out, "zero-timeout wait must report timeout");
+        assert!(
+            !result.timed_out,
+            "pre-existing output match must not report timeout"
+        );
+        assert!(!result.exited, "live session should not be reported exited");
+    }
+
+    #[test]
+    fn wait_contains_zero_timeout_without_match_reports_timeout() {
+        let session = build_test_session("wait-zero-timeout-missing");
+
+        let result = wait_for_session_contains(&session, "never-ready", None, Some(0))
+            .expect("wait contains");
+
+        assert!(!result.matched, "absent needle must not match");
+        assert!(result.timed_out, "zero-timeout miss must report timeout");
         assert!(!result.exited, "live session should not be reported exited");
     }
 

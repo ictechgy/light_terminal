@@ -164,12 +164,13 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
             self.assertGreater(summary["error_count"], 0)
             self.assertTrue(any("missing required field 'session_id'" in error for error in summary["errors"]))
 
-    def test_nested_raw_fields_are_counted_by_path_without_values(self) -> None:
+    def test_nested_raw_fields_are_counted_without_values_or_ancestor_keys(self) -> None:
         with tempfile.TemporaryDirectory(prefix="quad-brainstorm-summary-test-") as tmp:
             root = Path(tmp)
             run = root / "run-1"
             run.mkdir()
             secret = "SECRET_TOKEN_SHOULD_NOT_PRINT"
+            malicious_key = f"ancestor-{secret}"
             write_manifest(
                 run / "manifest.json",
                 context_summary={
@@ -177,7 +178,7 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
                     "raw_bytes": 100,
                     "redacted_bytes": 80,
                     "excluded_sensitive_paths": 0,
-                    "nested": {"raw_provider_stdout": secret},
+                    "nested": {malicious_key: {"raw_provider_stdout": secret}},
                 },
                 provider_statuses=[
                     {
@@ -185,7 +186,7 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
                         "configured": True,
                         "runnable": True,
                         "status": "usable",
-                        "detail": {"transcript": secret},
+                        "detail": {malicious_key: {"transcript": secret}},
                     }
                 ],
             )
@@ -204,8 +205,8 @@ class QuadBrainstormingManifestSummaryTests(unittest.TestCase):
             self.assertEqual(
                 summary["raw_fields_ignored"],
                 {
-                    "context_summary.nested.raw_provider_stdout": 1,
-                    "provider_statuses[0].detail.transcript": 1,
+                    "raw_provider_stdout": 1,
+                    "transcript": 1,
                 },
             )
 

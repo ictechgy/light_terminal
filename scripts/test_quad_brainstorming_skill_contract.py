@@ -451,6 +451,8 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                 "forge_agent_has_no_network_tools",
                 "network_capable",
                 "outside_allowlist",
+                "require_string_list(\"enabled\")",
+                "data.get(\"safe\") is not True",
                 "skipped-unsafe: Forge agent is outside the no-egress allowlist",
                 "same-turn user consent and egress restrictions",
             ],
@@ -469,10 +471,13 @@ class QuadBrainstormingSkillContractTests(unittest.TestCase):
                         "forge-agent-check",
                         "forge_agent_has_no_network_tools",
                         "FORGE_NO_EGRESS_TOOL_ALLOWLIST",
+                        "FORGE_TOOLS_ERR",
                         "outside_allowlist",
                         "network_capable",
+                        "require_string_list(\"enabled\")",
                     ],
                 )
+                self.assertNotIn('> "$FORGE_TOOLS" 2>&1', section)
         self.assertContainsAll(
             track_availability,
             [

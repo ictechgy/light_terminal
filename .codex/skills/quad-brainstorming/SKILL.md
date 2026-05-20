@@ -242,7 +242,8 @@ Example local-only classifier shape:
 
 ```bash
 FORGE_AGENT="${FORGE_BRAINSTORM_AGENT:-sage}"
-FORGE_TOOLS="${FORGE_TOOLS:-$SESSION_TMPDIR/quad-brainstorming-forge-tools.json}"
+FORGE_TOOLS="${FORGE_TOOLS:-${SESSION_TMPDIR:-${TMPDIR:-/tmp}}/quad-brainstorming-forge-tools.json}"
+FORGE_TOOLS_ERR="${FORGE_TOOLS_ERR:-${SESSION_TMPDIR:-${TMPDIR:-/tmp}}/quad-brainstorming-forge-tools.stderr.txt}"
 FORGE_NO_EGRESS_TOOL_ALLOWLIST=("read" "fs_search" "plan")
 forge_agent_has_no_network_tools() {
   python3 - "$FORGE_TOOLS" "${FORGE_NO_EGRESS_TOOL_ALLOWLIST[@]}" <<'PY'
@@ -251,16 +252,22 @@ import sys
 
 tools_path, *allowlisted_tools = sys.argv[1:]
 data = json.load(open(tools_path, encoding="utf-8"))
-enabled = set(data.get("enabled", []))
+def require_string_list(name, default=None):
+    raw = data.get(name, default)
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        print(f"Forge agent check JSON missing valid {name} list", file=sys.stderr)
+        raise SystemExit(1)
+    return raw
+enabled = set(require_string_list("enabled"))
 allowlisted = set(allowlisted_tools)
-dangerous = sorted(data.get("dangerous_enabled", []))
-unknown = sorted(data.get("unknown_enabled", []))
+dangerous = sorted(require_string_list("dangerous_enabled", []))
+unknown = sorted(require_string_list("unknown_enabled", []))
 outside_allowlist = sorted(enabled - allowlisted)
 network_capable = data.get("network_capable")
 if network_capable is True:
     print("Forge agent reports network_capable=true", file=sys.stderr)
     raise SystemExit(1)
-if dangerous or unknown or outside_allowlist or not data.get("safe"):
+if dangerous or unknown or outside_allowlist or data.get("safe") is not True:
     print(
         "Forge tools outside no-egress allowlist: "
         + json.dumps(
@@ -268,7 +275,7 @@ if dangerous or unknown or outside_allowlist or not data.get("safe"):
                 "dangerous": dangerous,
                 "unknown": unknown,
                 "outside_allowlist": outside_allowlist,
-                "safe": bool(data.get("safe")),
+                "safe": data.get("safe") is True,
             },
             sort_keys=True,
         ),
@@ -305,7 +312,7 @@ classify_providers() {
   if ! command -v forge >/dev/null 2>&1; then
     record_provider forge no no missing "install ForgeCode CLI to enable this track"
   elif [ -x "$REVIEW_CORE" ] \
-    && python3 "$REVIEW_CORE" forge-agent-check --agent "$FORGE_AGENT" --json > "$FORGE_TOOLS" 2>&1 \
+    && python3 "$REVIEW_CORE" forge-agent-check --agent "$FORGE_AGENT" --json > "$FORGE_TOOLS" 2> "$FORGE_TOOLS_ERR" \
     && forge_agent_has_no_network_tools >/dev/null 2>&1; then
     record_provider forge yes yes ready "verified read-only/no-egress Forge agent"
   else
@@ -463,6 +470,7 @@ FORGE_PROMPT="$FORGE_RUN_DIR/quad-brainstorming-forge-1-prompt.txt"
 FORGE_OUT="$FORGE_RUN_DIR/quad-brainstorming-forge-1-stdout.txt"
 FORGE_ERR="$FORGE_RUN_DIR/quad-brainstorming-forge-1-stderr.txt"
 FORGE_TOOLS="$FORGE_RUN_DIR/quad-brainstorming-forge-tools.json"
+FORGE_TOOLS_ERR="$FORGE_RUN_DIR/quad-brainstorming-forge-tools.stderr.txt"
 FORGE_NO_EGRESS_TOOL_ALLOWLIST=("read" "fs_search" "plan")
 forge_agent_has_no_network_tools() {
   python3 - "$FORGE_TOOLS" "${FORGE_NO_EGRESS_TOOL_ALLOWLIST[@]}" <<'PY'
@@ -471,16 +479,22 @@ import sys
 
 tools_path, *allowlisted_tools = sys.argv[1:]
 data = json.load(open(tools_path, encoding="utf-8"))
-enabled = set(data.get("enabled", []))
+def require_string_list(name, default=None):
+    raw = data.get(name, default)
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        print(f"Forge agent check JSON missing valid {name} list", file=sys.stderr)
+        raise SystemExit(1)
+    return raw
+enabled = set(require_string_list("enabled"))
 allowlisted = set(allowlisted_tools)
-dangerous = sorted(data.get("dangerous_enabled", []))
-unknown = sorted(data.get("unknown_enabled", []))
+dangerous = sorted(require_string_list("dangerous_enabled", []))
+unknown = sorted(require_string_list("unknown_enabled", []))
 outside_allowlist = sorted(enabled - allowlisted)
 network_capable = data.get("network_capable")
 if network_capable is True:
     print("Forge agent reports network_capable=true", file=sys.stderr)
     raise SystemExit(1)
-if dangerous or unknown or outside_allowlist or not data.get("safe"):
+if dangerous or unknown or outside_allowlist or data.get("safe") is not True:
     print(
         "Forge tools outside no-egress allowlist: "
         + json.dumps(
@@ -488,7 +502,7 @@ if dangerous or unknown or outside_allowlist or not data.get("safe"):
                 "dangerous": dangerous,
                 "unknown": unknown,
                 "outside_allowlist": outside_allowlist,
-                "safe": bool(data.get("safe")),
+                "safe": data.get("safe") is True,
             },
             sort_keys=True,
         ),
@@ -507,7 +521,7 @@ elif ! forge --help 2>&1 | grep -q -- '--agent' || ! forge --help 2>&1 | grep -q
 elif [ ! -x "$REVIEW_CORE" ]; then
   FORGE_STATUS=skipped-unsafe
   printf '%s\n' "skipped-unsafe: review_core forge-agent-check unavailable" > "$FORGE_ERR"
-elif ! python3 "$REVIEW_CORE" forge-agent-check --agent "$FORGE_AGENT" --json > "$FORGE_TOOLS" 2>&1; then
+elif ! python3 "$REVIEW_CORE" forge-agent-check --agent "$FORGE_AGENT" --json > "$FORGE_TOOLS" 2> "$FORGE_TOOLS_ERR"; then
   FORGE_STATUS=skipped-unsafe
   printf '%s\n' "skipped-unsafe: Forge agent is not verified read-only: $FORGE_AGENT" > "$FORGE_ERR"
 elif ! forge_agent_has_no_network_tools 2>> "$FORGE_ERR"; then

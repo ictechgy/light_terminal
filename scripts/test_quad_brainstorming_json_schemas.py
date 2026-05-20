@@ -128,7 +128,7 @@ class QuadBrainstormingJsonSchemaValidatorTests(unittest.TestCase):
         usable_with_failure = dict(usable, failure_class="timeout")
         self.assertTrue(
             any(
-                "not in enum []" in error
+                "matched disallowed schema in not" in error
                 for error in VALIDATOR.validate_value(usable_with_failure, schema, SCHEMA_DIR, store)
             )
         )
