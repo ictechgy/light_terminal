@@ -7163,6 +7163,14 @@ fn read_pty_until_child_exit<R: Read + AsRawFd>(
                     }
                 }
             }
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => {
+                // Linux PTY masters report EIO once the slave side is closed.
+                // Treat it like EOF after the child is reaped; otherwise give
+                // the child-status poll below a chance to observe the exit.
+                if child_exited {
+                    return Ok(buf);
+                }
+            }
             Err(err) => {
                 return Err(format!("{label} pty read error: {err}").into());
             }
