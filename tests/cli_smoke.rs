@@ -2849,7 +2849,9 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
             "split-window",
             "-hPF",
             "#{pane_id}",
-            "echo SPLIT_NOISY_READY; sleep 2",
+            "/bin/sh",
+            "-lc",
+            "echo SPLIT_NOISY_READY; /bin/sleep 2",
         ])
         .output()?;
     assert!(
