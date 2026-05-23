@@ -2820,6 +2820,62 @@ fn tmux_compat_split_window_supports_clustered_print_format() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-noisy.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) printf '%s\\n' 'OK surface:42 workspace:1'; exit 0 ;;\n\
+               send) printf '%s\\n' 'OK noisy send output'; exit 0 ;;\n\
+               close-surface) printf '%s\\n' 'OK noisy close output'; exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-noisy-cmux")
+        .env("PATH", &fake_bin)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-hPF",
+            "#{pane_id}",
+            "echo SPLIT_NOISY_READY; sleep 2",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "split-window with noisy cmux shim should succeed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane = stdout.trim();
+    assert!(
+        pane.starts_with('%') && !pane.contains("OK noisy"),
+        "split-window -P stdout should only contain the requested format, got {stdout:?}"
+    );
+    let captured = env.capture_until(pane, "SPLIT_NOISY_READY")?;
+    assert!(captured.contains("SPLIT_NOISY_READY"), "{captured}");
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line == "send --surface surface:42 exec "
+                || line.starts_with("send --surface surface:42 exec ")),
+        "attach command should target the new-split surface from stdout: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_stops_option_parsing_at_command() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
@@ -3080,8 +3136,8 @@ fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() ->
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               new-split) exit 0 ;;\n\
-               identify) printf '%s\\n' '{{\"surface_id\":\"surface-rollback\"}}'; exit 0 ;;\n\
+               new-split) printf '%s\\n' 'OK surface:42 workspace:1'; exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface-original\"}},\"focused\":{{\"surface_ref\":\"surface-wrong\"}}}}'; exit 0 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
              esac\n",
@@ -3112,8 +3168,8 @@ fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() ->
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "close-surface --surface surface-rollback"),
-        "failed lterm creation should roll back the new cmux surface: {cmux_calls:?}"
+            .any(|line| line == "close-surface --surface surface:42"),
+        "failed lterm creation should roll back the cmux surface reported by new-split stdout: {cmux_calls:?}"
     );
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -993,18 +993,26 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
              refusing to create a hidden lterm session. Use -d for a detached session."
         );
     }
-    let split_status = Command::new("cmux")
+    let split_output = Command::new("cmux")
         .arg("new-split")
         .arg(direction)
         .arg("--focus")
         .arg("true")
-        .status()
+        .output()
         .context("cmux new-split")?;
-    if !split_status.success() {
+    if !split_output.status.success() {
+        let stderr = String::from_utf8_lossy(&split_output.stderr);
         bail!(
-            "cmux new-split {direction} failed with {split_status}; \
-             refusing to create a hidden lterm session"
+            "cmux new-split {direction} failed with {}; \
+             refusing to create a hidden lterm session{}{}",
+            split_output.status,
+            if stderr.trim().is_empty() { "" } else { ": " },
+            stderr.trim()
         );
+    }
+
+    if let Some(surface_id) = parse_cmux_new_split_surface(&split_output.stdout) {
+        return Ok(Some(surface_id));
     }
 
     let surface_id = match cmux_identify_surface().context("cmux identify new split surface") {
@@ -1019,6 +1027,18 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         }
     };
     Ok(Some(surface_id))
+}
+
+fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .find_map(|token| {
+            let token = token.trim_matches(|c: char| c == ',' || c == ';');
+            token
+                .strip_prefix("surface:")
+                .filter(|suffix| !suffix.is_empty())
+                .map(|_| token.to_string())
+        })
 }
 
 fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
@@ -1037,9 +1057,15 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     } else {
         send.arg("send").arg(&attach_cmd);
     }
-    let send_status = send.status().context("cmux send attach command")?;
-    if !send_status.success() {
-        bail!("cmux send attach command failed with {send_status}");
+    let send_output = send.output().context("cmux send attach command")?;
+    if !send_output.status.success() {
+        let stderr = String::from_utf8_lossy(&send_output.stderr);
+        bail!(
+            "cmux send attach command failed with {}{}{}",
+            send_output.status,
+            if stderr.trim().is_empty() { "" } else { ": " },
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -1052,11 +1078,17 @@ fn rollback_cmux_split(surface: Option<&str>) {
         .arg("close-surface")
         .arg("--surface")
         .arg(surface_id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
 fn rollback_focused_cmux_split() {
-    let _ = Command::new("cmux").arg("close-surface").status();
+    let _ = Command::new("cmux")
+        .arg("close-surface")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn inside_cmux() -> bool {
@@ -1085,10 +1117,22 @@ fn cmux_identify_surface() -> Result<Option<String>> {
         return Ok(None);
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(find_json_string(
-        &value,
-        &["surface_id", "surfaceId", "surface", "id"],
-    ))
+    Ok(find_cmux_surface_ref(&value))
+}
+
+fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
+    let keys = [
+        "surface_id",
+        "surfaceId",
+        "surface_ref",
+        "surfaceRef",
+        "surface",
+        "id",
+    ];
+    value
+        .get("focused")
+        .and_then(|focused| find_json_string(focused, &keys))
+        .or_else(|| find_json_string(value, &keys))
 }
 
 fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -2266,6 +2310,43 @@ mod tests {
             "waiters on never-signaled channels must not grow touched metadata"
         );
         assert!(store.wait_generations.is_empty());
+    }
+
+    #[test]
+    fn cmux_surface_ref_prefers_focused_surface_over_caller() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            },
+            "focused": {
+                "surface_ref": "surface:focused"
+            }
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("surface:focused")
+        );
+    }
+
+    #[test]
+    fn cmux_surface_ref_accepts_legacy_surface_id() {
+        let value = serde_json::json!({
+            "surface_id": "legacy-surface-id"
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("legacy-surface-id")
+        );
+    }
+
+    #[test]
+    fn cmux_new_split_output_reports_surface_ref() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK surface:42 workspace:1\n").as_deref(),
+            Some("surface:42")
+        );
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
