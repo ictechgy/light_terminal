@@ -1573,13 +1573,13 @@ impl AgentProfile {
                 name: name.to_string(),
                 binary: "omx".to_string(),
                 session_base: "omx-lterm".to_string(),
-                show_status: false,
+                show_status: true,
             },
             "omc" => Self {
                 name: name.to_string(),
                 binary: "omc".to_string(),
                 session_base: "omc-lterm".to_string(),
-                show_status: false,
+                show_status: true,
             },
             _ => unreachable!("unknown built-in agent profile: {name}"),
         }
@@ -2312,8 +2312,8 @@ mod tests {
             ("gemini", "gemini", "gemini-lterm", false),
             ("kimi", "kimi", "kimi-lterm", false),
             ("qwen", "qwen", "qwen-lterm", false),
-            ("omx", "omx", "omx-lterm", false),
-            ("omc", "omc", "omc-lterm", false),
+            ("omx", "omx", "omx-lterm", true),
+            ("omc", "omc", "omc-lterm", true),
         ] {
             let profile = AgentProfile::resolve(name).expect("built-in profile");
             assert_eq!(profile.binary, binary, "{name}");
@@ -2364,7 +2364,7 @@ mod tests {
             .expect("omc profile info");
         assert_eq!(omc.binary, "omc");
         assert_eq!(omc.session_base, "omc-lterm");
-        assert!(!omc.status_default);
+        assert!(omc.status_default);
     }
 
     #[test]

@@ -33,6 +33,8 @@ struct CompatPane {
     pane_id: String,
     session_name: String,
     cmux_surface_id: Option<String>,
+    cmux_workspace_id: Option<String>,
+    cmux_window_id: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -536,21 +538,21 @@ fn split_window(args: &[String]) -> Result<i32> {
     let info = match client::new_session(None, command, cwd, HashMap::new(), None, true) {
         Ok(info) => info,
         Err(err) => {
-            rollback_cmux_split(cmux_surface.as_deref());
+            rollback_cmux_split(cmux_surface.as_ref());
             return Err(err);
         }
     };
 
     if !detached {
-        if let Err(err) = send_cmux_attach(cmux_surface.as_deref(), &info) {
+        if let Err(err) = send_cmux_attach(cmux_surface.as_ref(), &info) {
             rollback_lterm_pane(&info.pane_id);
-            rollback_cmux_split(cmux_surface.as_deref());
+            rollback_cmux_split(cmux_surface.as_ref());
             return Err(err);
         }
     }
-    if let Err(err) = remember_pane(&info, cmux_surface.clone()) {
+    if let Err(err) = remember_pane(&info, cmux_surface.as_ref()) {
         rollback_lterm_pane(&info.pane_id);
-        rollback_cmux_split(cmux_surface.as_deref());
+        rollback_cmux_split(cmux_surface.as_ref());
         return Err(err);
     }
 
@@ -984,7 +986,7 @@ fn read_buffer_or_empty() -> Result<Vec<u8>> {
     }
 }
 
-fn open_cmux_split(direction: &str) -> Result<Option<String>> {
+fn open_cmux_split(direction: &str) -> Result<Option<CmuxSurfaceContext>> {
     if !inside_cmux() {
         bail!(
             "tmux split-window without -d requires a cmux environment; \
@@ -997,12 +999,15 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
              refusing to create a hidden lterm session. Use -d for a detached session."
         );
     }
+    // Prefer cmux's live focused surface over $CMUX_SURFACE_ID: lterm sessions can
+    // outlive the parent shell integration env, making those defaults stale.
+    let source_surface = cmux_identify_surface()
+        .context("cmux identify split source surface")?
+        .ok_or_else(|| anyhow!("cmux identify did not report a split source surface id"))?;
     let mut split = Command::new("cmux");
-    split
-        .arg("new-split")
-        .arg(direction)
-        .arg("--focus")
-        .arg("true");
+    split.arg("new-split").arg(direction);
+    add_cmux_surface_context_args(&mut split, &source_surface);
+    split.arg("--focus").arg("true");
     let split_output = run_cmux_command(&mut split).context("cmux new-split")?;
     if !split_output.status.success() {
         let detail = cmux_stderr_suffix(&split_output.stderr.bytes);
@@ -1015,7 +1020,7 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
     }
 
     if split_output.stdout.truncated {
-        rollback_focused_cmux_split();
+        rollback_focused_cmux_split(Some(&source_surface));
         bail!(
             "cmux new-split {direction} output exceeded {} bytes; \
              refusing to parse truncated surface metadata",
@@ -1023,22 +1028,28 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         );
     }
 
-    if let Some(surface_id) = parse_cmux_new_split_surface(&split_output.stdout.bytes) {
-        return Ok(Some(surface_id));
+    if let Some(mut surface) = parse_cmux_new_split_surface_context(&split_output.stdout.bytes) {
+        if surface.workspace_ref.is_none() {
+            surface.workspace_ref = source_surface.workspace_ref.clone();
+        }
+        if surface.window_ref.is_none() {
+            surface.window_ref = source_surface.window_ref.clone();
+        }
+        return Ok(Some(surface));
     }
 
-    let surface_id = match cmux_identify_surface().context("cmux identify new split surface") {
-        Ok(Some(surface_id)) => surface_id,
+    let surface = match cmux_identify_surface().context("cmux identify new split surface") {
+        Ok(Some(surface)) => surface,
         Ok(None) => {
-            rollback_focused_cmux_split();
+            rollback_focused_cmux_split(Some(&source_surface));
             bail!("cmux identify did not report a new split surface id");
         }
         Err(err) => {
-            rollback_focused_cmux_split();
+            rollback_focused_cmux_split(Some(&source_surface));
             return Err(err);
         }
     };
-    Ok(Some(surface_id))
+    Ok(Some(surface))
 }
 
 fn rollback_lterm_pane(pane_id: &str) {
@@ -1051,7 +1062,12 @@ fn rollback_lterm_pane(pane_id: &str) {
     }
 }
 
+#[cfg(test)]
 fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
+    parse_cmux_new_split_surface_context(output).map(|surface| surface.surface_ref)
+}
+
+fn parse_cmux_new_split_surface_context(output: &[u8]) -> Option<CmuxSurfaceContext> {
     // Current cmux prints `OK surface:<ref> workspace:<ref>` for a successful split.
     // Only trust an explicit OK record; otherwise fall back to `cmux identify`.
     String::from_utf8_lossy(output)
@@ -1060,13 +1076,25 @@ fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
         .find_map(parse_cmux_new_split_surface_line)
 }
 
-fn parse_cmux_new_split_surface_line(line: &str) -> Option<String> {
+fn parse_cmux_new_split_surface_line(line: &str) -> Option<CmuxSurfaceContext> {
     let mut tokens = line.split_whitespace();
     let first = trim_cmux_output_token(tokens.next()?);
     if first != "OK" {
         return None;
     }
-    tokens.find_map(|token| parse_cmux_surface_ref_token(trim_cmux_output_token(token)))
+    let mut surface_ref = None;
+    let mut workspace_ref = None;
+    let mut window_ref = None;
+    for token in tokens.map(trim_cmux_output_token) {
+        surface_ref = surface_ref.or_else(|| parse_cmux_surface_ref_token(token));
+        workspace_ref = workspace_ref.or_else(|| parse_cmux_workspace_ref_token(token));
+        window_ref = window_ref.or_else(|| parse_cmux_window_ref_token(token));
+    }
+    Some(CmuxSurfaceContext {
+        surface_ref: surface_ref?,
+        workspace_ref,
+        window_ref,
+    })
 }
 
 fn trim_cmux_output_token(token: &str) -> &str {
@@ -1074,18 +1102,37 @@ fn trim_cmux_output_token(token: &str) -> &str {
 }
 
 fn parse_cmux_surface_ref_token(token: &str) -> Option<String> {
-    let suffix = token.strip_prefix("surface:")?;
-    if suffix.is_empty()
-        || !suffix
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
+    parse_cmux_ref_token(token, "surface:")
+}
+
+fn parse_cmux_workspace_ref_token(token: &str) -> Option<String> {
+    parse_cmux_ref_token(token, "workspace:")
+}
+
+fn parse_cmux_window_ref_token(token: &str) -> Option<String> {
+    parse_cmux_ref_token(token, "window:")
+}
+
+fn parse_cmux_ref_token(token: &str, prefix: &str) -> Option<String> {
+    let suffix = token.strip_prefix(prefix)?;
+    if !is_valid_cmux_ref_segment(suffix) {
         return None;
     }
     Some(token.to_string())
 }
 
-fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
+fn is_valid_cmux_ref_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn is_valid_cmux_json_ref(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with('-') && value.split(':').all(is_valid_cmux_ref_segment)
+}
+
+fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) -> Result<()> {
     let lterm = std::env::var("LTERM_BIN").ok().unwrap_or_else(|| {
         std::env::current_exe()
             .map(|p| p.display().to_string())
@@ -1093,11 +1140,10 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     });
     let attach_cmd = format!("exec {} attach {}\n", quote(&lterm), quote(&info.pane_id));
     let mut send = Command::new("cmux");
-    if let Some(surface_id) = surface {
-        send.arg("send")
-            .arg("--surface")
-            .arg(surface_id)
-            .arg(&attach_cmd);
+    if let Some(surface) = surface {
+        send.arg("send");
+        add_cmux_surface_context_args(&mut send, surface);
+        send.arg(&attach_cmd);
     } else {
         send.arg("send").arg(&attach_cmd);
     }
@@ -1113,21 +1159,57 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     Ok(())
 }
 
-fn rollback_cmux_split(surface: Option<&str>) {
-    let Some(surface_id) = surface else {
+fn rollback_cmux_split(surface: Option<&CmuxSurfaceContext>) {
+    let Some(surface) = surface else {
         return;
     };
     let mut close = Command::new("cmux");
-    close.arg("close-surface").arg("--surface").arg(surface_id);
+    close.arg("close-surface");
+    add_cmux_surface_context_args(&mut close, surface);
     let output = run_cmux_command(&mut close);
     report_cmux_rollback_failure("cmux close-surface rollback", output);
 }
 
-fn rollback_focused_cmux_split() {
+fn rollback_focused_cmux_split(source_surface: Option<&CmuxSurfaceContext>) {
+    let focused = match cmux_identify_surface() {
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            eprintln!(
+                "warning: cmux close focused surface rollback skipped: \
+                 cmux identify did not report a focused surface id"
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: cmux close focused surface rollback skipped: {}",
+                sanitize::terminal_text(&err.to_string())
+            );
+            return;
+        }
+    };
+    if source_surface.is_some_and(|source| source.surface_ref == focused.surface_ref) {
+        eprintln!(
+            "warning: cmux close focused surface rollback skipped: \
+             focused surface still matches the split source"
+        );
+        return;
+    }
     let mut close = Command::new("cmux");
     close.arg("close-surface");
+    add_cmux_surface_context_args(&mut close, &focused);
     let output = run_cmux_command(&mut close);
     report_cmux_rollback_failure("cmux close focused surface rollback", output);
+}
+
+fn add_cmux_surface_context_args(command: &mut Command, surface: &CmuxSurfaceContext) {
+    command.arg("--surface").arg(&surface.surface_ref);
+    if let Some(workspace_ref) = surface.workspace_ref.as_deref() {
+        command.arg("--workspace").arg(workspace_ref);
+    }
+    if let Some(window_ref) = surface.window_ref.as_deref() {
+        command.arg("--window").arg(window_ref);
+    }
 }
 
 fn report_cmux_rollback_failure(context: &str, output: io::Result<CmuxCommandOutput>) {
@@ -1174,6 +1256,13 @@ struct CmuxCommandOutput {
     status: std::process::ExitStatus,
     stdout: LimitedOutput,
     stderr: LimitedOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CmuxSurfaceContext {
+    surface_ref: String,
+    workspace_ref: Option<String>,
+    window_ref: Option<String>,
 }
 
 struct LimitedOutput {
@@ -1266,7 +1355,7 @@ fn inside_cmux() -> bool {
         && meta.uid() == paths::current_euid()
 }
 
-fn cmux_identify_surface() -> Result<Option<String>> {
+fn cmux_identify_surface() -> Result<Option<CmuxSurfaceContext>> {
     let mut identify = Command::new("cmux");
     identify.arg("identify").arg("--json");
     let output = run_cmux_command(&mut identify)?;
@@ -1280,11 +1369,30 @@ fn cmux_identify_surface() -> Result<Option<String>> {
         );
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)?;
-    Ok(find_cmux_surface_ref(&value))
+    Ok(find_cmux_surface_context(&value))
 }
 
+#[cfg(test)]
 fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
-    let keys = [
+    find_cmux_surface_context(value).map(|surface| surface.surface_ref)
+}
+
+fn find_cmux_surface_context(value: &serde_json::Value) -> Option<CmuxSurfaceContext> {
+    // Modern cmux identify payloads include caller/focused surfaces. Once that
+    // schema is present, trust focused exclusively. If focused is unavailable,
+    // fail rather than reusing caller/env metadata that may point at a stale
+    // surface or be mistaken for a newly-created split.
+    if let Some(focused) = value.get("focused") {
+        return cmux_surface_context_from_json(focused);
+    }
+    if value.get("caller").is_some() {
+        return None;
+    }
+    cmux_surface_context_from_json(value)
+}
+
+fn cmux_surface_context_from_json(value: &serde_json::Value) -> Option<CmuxSurfaceContext> {
+    let surface_keys = [
         "surface_id",
         "surfaceId",
         "surface_ref",
@@ -1292,16 +1400,23 @@ fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
         "surface",
         "id",
     ];
-    // Modern cmux identify payloads include caller/focused surfaces. Once that
-    // schema is present, trust focused exclusively so a caller surface cannot be
-    // mistaken for the newly-created split.
-    if let Some(focused) = value.get("focused") {
-        return find_json_string(focused, &keys);
-    }
-    if value.get("caller").is_some() {
-        return None;
-    }
-    find_json_string(value, &keys)
+    let workspace_keys = [
+        "workspace_id",
+        "workspaceId",
+        "workspace_ref",
+        "workspaceRef",
+        "workspace",
+    ];
+    let window_keys = ["window_id", "windowId", "window_ref", "windowRef", "window"];
+    Some(CmuxSurfaceContext {
+        surface_ref: find_json_cmux_ref(value, &surface_keys)?,
+        workspace_ref: find_json_cmux_ref(value, &workspace_keys),
+        window_ref: find_json_cmux_ref(value, &window_keys),
+    })
+}
+
+fn find_json_cmux_ref(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    find_json_string(value, keys).filter(|value| is_valid_cmux_json_ref(value))
 }
 
 fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1324,14 +1439,16 @@ fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
     }
 }
 
-fn remember_pane(info: &SessionInfo, cmux_surface_id: Option<String>) -> Result<()> {
+fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) -> Result<()> {
     update_store(|store| {
         store.panes.insert(
             info.pane_id.clone(),
             CompatPane {
                 pane_id: info.pane_id.clone(),
                 session_name: info.name.clone(),
-                cmux_surface_id,
+                cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
+                cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
+                cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
             },
         );
         Ok(())
@@ -2082,6 +2199,38 @@ pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: env-touching tmux_compat tests hold ENV_LOCK and restore on drop.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn maps_common_keys() {
@@ -2550,11 +2699,68 @@ mod tests {
     }
 
     #[test]
+    fn cmux_surface_context_keeps_focused_workspace_and_window_refs() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:stale",
+                "workspace_ref": "workspace:stale",
+                "window_ref": "window:stale"
+            },
+            "focused": {
+                "surface_ref": "surface:focused",
+                "workspace_ref": "workspace:focused",
+                "window_ref": "window:focused"
+            }
+        });
+
+        let context = find_cmux_surface_context(&value).expect("focused surface context");
+        assert_eq!(context.surface_ref, "surface:focused");
+        assert_eq!(context.workspace_ref.as_deref(), Some("workspace:focused"));
+        assert_eq!(context.window_ref.as_deref(), Some("window:focused"));
+    }
+
+    #[test]
+    fn cmux_surface_context_rejects_invalid_json_refs() {
+        let invalid_surface = serde_json::json!({
+            "focused": {
+                "surface_ref": "surface:bad ref",
+                "workspace_ref": "workspace:focused"
+            }
+        });
+        assert_eq!(find_cmux_surface_context(&invalid_surface), None);
+
+        let invalid_optional_refs = serde_json::json!({
+            "focused": {
+                "surface_ref": "surface:focused",
+                "workspace_ref": "workspace:bad ref",
+                "window_ref": "-window-option"
+            }
+        });
+        let context =
+            find_cmux_surface_context(&invalid_optional_refs).expect("valid surface remains");
+        assert_eq!(context.surface_ref, "surface:focused");
+        assert_eq!(context.workspace_ref, None);
+        assert_eq!(context.window_ref, None);
+    }
+
+    #[test]
     fn cmux_new_split_output_reports_ok_surface_ref() {
         assert_eq!(
             parse_cmux_new_split_surface(b"OK surface:42 workspace:1\n").as_deref(),
             Some("surface:42")
         );
+    }
+
+    #[test]
+    fn cmux_new_split_output_reports_workspace_and_window_context() {
+        let context = parse_cmux_new_split_surface_context(
+            b"note surface:stale\nOK surface:created workspace:focused window:main\n",
+        )
+        .expect("new split surface context");
+
+        assert_eq!(context.surface_ref, "surface:created");
+        assert_eq!(context.workspace_ref.as_deref(), Some("workspace:focused"));
+        assert_eq!(context.window_ref.as_deref(), Some("window:main"));
     }
 
     #[test]
@@ -2577,6 +2783,71 @@ mod tests {
             parse_cmux_new_split_surface(b"OK (surface:42) workspace:1\n"),
             None
         );
+    }
+
+    #[test]
+    fn cmux_split_targets_identified_focused_surface_not_stale_env_surface() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["PATH", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cmux_path = temp.path().join("cmux");
+        let log_path = temp.path().join("cmux.log");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+if [ "$1" = "identify" ] && [ "$2" = "--json" ]; then
+  printf '%s\n' '{{"caller":{{"surface_ref":"surface:stale","workspace_ref":"workspace:stale","window_ref":"window:stale"}},"focused":{{"surface_ref":"surface:focused","workspace_ref":"workspace:focused","window_ref":"window:focused"}}}}'
+  exit 0
+fi
+if [ "$1" = "new-split" ]; then
+  if [ "$*" != "new-split down --surface surface:focused --workspace workspace:focused --window window:focused --focus true" ]; then
+    printf 'unexpected args: %s\n' "$*" >&2
+    exit 64
+  fi
+  printf '%s\n' 'OK surface:created workspace:focused'
+  exit 0
+fi
+printf 'unexpected command: %s\n' "$*" >&2
+exit 65
+"#,
+            log = shlex::try_quote(&log_path.display().to_string()).expect("quote log path")
+        );
+        fs::write(&cmux_path, script).expect("write fake cmux");
+        let mut permissions = fs::metadata(&cmux_path)
+            .expect("fake cmux metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cmux_path, permissions).expect("chmod fake cmux");
+
+        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    temp.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+            std::env::set_var("CMUX_SURFACE_ID", "surface:stale");
+            std::env::set_var("CMUX_WORKSPACE_ID", "workspace:stale");
+        }
+
+        let surface = open_cmux_split("down")
+            .expect("open cmux split")
+            .expect("surface context");
+        assert_eq!(surface.surface_ref, "surface:created");
+        assert_eq!(surface.workspace_ref.as_deref(), Some("workspace:focused"));
+        assert_eq!(surface.window_ref.as_deref(), Some("window:focused"));
+        let log = fs::read_to_string(&log_path).expect("read fake cmux log");
+        assert!(log.contains("identify --json"));
+        assert!(
+            log.contains(
+                "new-split down --surface surface:focused --workspace workspace:focused --window window:focused --focus true"
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("new-split down --surface surface:stale"));
     }
 
     #[test]

@@ -71,7 +71,7 @@ Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --ver
 GitHub에서 Cargo로 설치 (Releases 페이지의 최신 태그를 사용하세요):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.3
+cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.4
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
@@ -307,7 +307,7 @@ lterm codex --detach --name repo-codex -- exec "이 저장소를 요약해줘"
 lterm agy --status -- -p "lterm status를 유지해줘"
 ```
 
-Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, status bar가 표시되는 launch/profile에서는 `--no-status`로 숨길 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
+Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. OMX/OMC는 기존 lightweight status/HUD 흐름과의 연속성을 위해 lterm status bar를 기본 표시하며, 특정 OMX/OMC 실행에서 완전 raw surface가 필요하면 `--no-status`를 쓰면 됩니다. `--status`로 lterm status bar를 강제로 켜거나, status bar가 표시되는 launch/profile에서는 `--no-status`로 숨길 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
 launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`)입니다. 이 옵션들은 `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.

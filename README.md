@@ -77,7 +77,7 @@ For the 1.0 command/output stability boundary, see the
 With Cargo from GitHub (use the latest tag from the Releases page):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.3
+cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.4
 ```
 
 From this checkout, use Rust 1.85 or newer:
@@ -318,7 +318,7 @@ lterm codex --detach --name repo-codex -- exec "summarize this repo"
 lterm agy --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to suppress it for any launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. OMX/OMC keep the lterm status bar visible by default for continuity with their existing lightweight status/HUD workflow; use `--no-status` if a specific OMX/OMC run needs a fully raw surface. Use `--status` to force the lterm status bar on, or `--no-status` to suppress it for any launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
 Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.

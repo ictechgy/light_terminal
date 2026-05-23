@@ -2912,6 +2912,7 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:source\"}}}}'; exit 0 ;;\n\
                new-split) printf '%s\\n' 'OK surface:42 workspace:1'; exit 0 ;;\n\
                send) printf '%s\\n' 'OK noisy send output'; exit 0 ;;\n\
                close-surface) printf '%s\\n' 'OK noisy close output'; exit 0 ;;\n\
@@ -2955,8 +2956,89 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line.starts_with("send --surface surface:42 exec ")),
+            .any(|line| line.starts_with("send --surface surface:42 --workspace workspace:1 exec ")),
         "attach command should target the new-split surface from stdout: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-live-context.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:stale\",\"workspace_ref\":\"workspace:stale\",\"window_ref\":\"window:stale\"}},\"focused\":{{\"surface_ref\":\"surface:focused\",\"workspace_ref\":\"workspace:focused\",\"window_ref\":\"window:focused\"}}}}'; exit 0 ;;\n\
+               new-split)\n\
+                 if [ \"$*\" != 'new-split right --surface surface:focused --workspace workspace:focused --window window:focused --focus true' ]; then\n\
+                   printf 'unexpected split args: %s\\n' \"$*\" >&2\n\
+                   exit 64\n\
+                 fi\n\
+                 printf '%s\\n' 'OK surface:created workspace:focused'\n\
+                 exit 0 ;;\n\
+               send)\n\
+                 case \"$*\" in\n\
+                   'send --surface surface:created --workspace workspace:focused --window window:focused exec '*) exit 0 ;;\n\
+                   *) printf 'unexpected send args: %s\\n' \"$*\" >&2; exit 65 ;;\n\
+                 esac ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) printf 'unexpected command: %s\\n' \"$*\" >&2; exit 66 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let shell = command_path("sh")?.display().to_string();
+    let sleep = shlex::try_quote(&command_path("sleep")?.display().to_string())?.into_owned();
+    let payload = format!("echo SPLIT_LIVE_CONTEXT_READY; {sleep} 2");
+
+    let output = env
+        .cmd()
+        .env("CMUX_SURFACE_ID", "surface:stale")
+        .env("CMUX_WORKSPACE_ID", "workspace:stale")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-hPF",
+            "#{pane_id}",
+            shell.as_str(),
+            "-lc",
+            payload.as_str(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "split-window should ignore stale cmux env and use live focused context: {output:?}"
+    );
+    let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(pane.starts_with('%'), "expected pane id, got {pane:?}");
+    let captured = env.capture_until(&pane, "SPLIT_LIVE_CONTEXT_READY")?;
+    assert!(captured.contains("SPLIT_LIVE_CONTEXT_READY"), "{captured}");
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "new-split right --surface surface:focused --workspace workspace:focused --window window:focused --focus true"
+        }),
+        "split should target live focused cmux context, not stale env: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line.starts_with(
+                "send --surface surface:created --workspace workspace:focused --window window:focused exec ",
+            )
+        }),
+        "attach send should preserve created surface plus inherited workspace/window context: {cmux_calls:?}"
+    );
+    assert!(
+        !cmux_calls.contains("surface:stale"),
+        "stale cmux env refs must not be used: {cmux_calls:?}"
     );
     Ok(())
 }
@@ -3119,8 +3201,10 @@ fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> 
         &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
-             printf '\\033]52;c;secret\\007CMUX_FAIL\\nNEXT\\n' >&2\n\
-             exit 42\n",
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:failing\"}}}}'; exit 0 ;;\n\
+               *) printf '\\033]52;c;secret\\007CMUX_FAIL\\nNEXT\\n' >&2; exit 42 ;;\n\
+             esac\n",
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
@@ -3147,7 +3231,7 @@ fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> 
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "new-split down --focus true"),
+            .any(|line| line == "new-split down --surface surface:failing --focus true"),
         "fake cmux should record attempted down split: {cmux_calls:?}"
     );
     let after = session_names_json(&env)?;
@@ -3192,18 +3276,20 @@ fn tmux_compat_split_window_requires_identified_cmux_surface() -> TestResult {
     );
     assert_stderr_contains(
         &output,
-        "cmux identify did not report a new split surface id",
+        "cmux identify did not report a split source surface id",
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls
+        !cmux_calls
             .lines()
-            .any(|line| line == "new-split right --focus true"),
-        "fake cmux should record the split attempt: {cmux_calls:?}"
+            .any(|line| line.starts_with("new-split ")),
+        "missing source surface id must fail before cmux new-split: {cmux_calls:?}"
     );
     assert!(
-        cmux_calls.lines().any(|line| line == "close-surface"),
-        "missing surface id should close the focused split surface: {cmux_calls:?}"
+        !cmux_calls
+            .lines()
+            .any(|line| line.starts_with("close-surface")),
+        "missing source surface id must not close an untargeted cmux surface: {cmux_calls:?}"
     );
     assert!(
         !cmux_calls
@@ -3225,17 +3311,21 @@ fn tmux_compat_split_window_rejects_truncated_cmux_new_split_output() -> TestRes
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
     let cmux_log = env.temp.path().join("cmux-truncated-new-split.log");
+    let identify_count = env.temp.path().join("cmux-truncated-identify-count");
     write_executable(
         &fake_bin.join("cmux"),
         &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
+               identify) if [ -f {} ]; then printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:created\"}}}}'; else : > {}; printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:source\"}}}}'; fi; exit 0 ;;\n\
                new-split) i=0; while [ \"$i\" -lt 17000 ]; do printf x; i=$((i + 1)); done; exit 0 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
              esac\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
+            shlex::try_quote(&cmux_log.display().to_string())?,
+            shlex::try_quote(&identify_count.display().to_string())?,
+            shlex::try_quote(&identify_count.display().to_string())?
         ),
     )?;
     let before = session_names_json(&env)?;
@@ -3253,7 +3343,9 @@ fn tmux_compat_split_window_rejects_truncated_cmux_new_split_output() -> TestRes
     assert_stderr_contains(&output, "cmux new-split right output exceeded");
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls.lines().any(|line| line == "close-surface"),
+        cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface:created"),
         "truncated cmux new-split output should close the focused split surface: {cmux_calls:?}"
     );
     assert!(
@@ -3308,13 +3400,13 @@ fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() ->
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "new-split right --focus true"),
-        "fake cmux should record the split attempt: {cmux_calls:?}"
+            .any(|line| line == "new-split right --surface surface-wrong --focus true"),
+        "fake cmux should target the identified focused surface for the split attempt: {cmux_calls:?}"
     );
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "close-surface --surface surface:42"),
+            .any(|line| line == "close-surface --surface surface:42 --workspace workspace:1"),
         "failed lterm creation should roll back the cmux surface reported by new-split stdout: {cmux_calls:?}"
     );
     Ok(())
@@ -3382,6 +3474,7 @@ fn tmux_compat_split_window_rolls_back_when_cmux_send_fails() -> TestResult {
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:source\"}}}}'; exit 0 ;;\n\
                new-split) printf '%s\\n' 'OK {fake_surface} workspace:1'; exit 0 ;;\n\
                send) printf '%s\\n' 'CMUX_SEND_FAIL' >&2; exit 43 ;;\n\
                close-surface) exit 0 ;;\n\
@@ -5184,7 +5277,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .find(|line| line.starts_with("omx\t"))
         .ok_or("missing omx row")?;
     let fields: Vec<_> = omx.split('\t').collect();
-    assert_eq!(fields[3], "off", "{omx:?}");
+    assert_eq!(fields[3], "on", "{omx:?}");
     assert_eq!(fields[4], "missing", "{omx:?}");
     assert_eq!(fields[5], "-", "{omx:?}");
     assert_eq!(fields[6], "built-in", "{omx:?}");
@@ -5248,7 +5341,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .iter()
         .find(|row| row["profile"] == "omx")
         .ok_or("missing omx JSON row")?;
-    assert_eq!(omx["status_default"], false);
+    assert_eq!(omx["status_default"], true);
     assert_eq!(omx["available"], false);
     assert!(omx["path"].is_null());
 
@@ -5667,26 +5760,26 @@ fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
             String::from_utf8_lossy(&default_output)
         );
         assert!(
-            !contains_subsequence(&default_output, &status_indicator),
-            "{alias} should default to raw/full-terminal attach without lterm status bytes: {:?}",
+            contains_subsequence(&default_output, &status_indicator),
+            "{alias} should default to the lterm status bar after cmux surface targeting was fixed: {:?}",
             String::from_utf8_lossy(&default_output)
         );
 
-        let status_output = run_agent_alias_on_pty_until_exit(
+        let no_status_output = run_agent_alias_on_pty_until_exit(
             &env,
             &path,
-            &[alias, "--status"],
-            &format!("{alias} explicit status"),
+            &[alias, "--no-status"],
+            &format!("{alias} explicit no status"),
         )?;
         assert!(
-            contains_subsequence(&status_output, b"AGENT_READY"),
-            "{alias} fake agent marker should be forwarded when --status is enabled: {:?}",
-            String::from_utf8_lossy(&status_output)
+            contains_subsequence(&no_status_output, b"AGENT_READY"),
+            "{alias} fake agent marker should be forwarded when --no-status is enabled: {:?}",
+            String::from_utf8_lossy(&no_status_output)
         );
         assert!(
-            contains_subsequence(&status_output, &status_indicator),
-            "--status should still opt {alias} into the lterm status bar: {:?}",
-            String::from_utf8_lossy(&status_output)
+            !contains_subsequence(&no_status_output, &status_indicator),
+            "--no-status should still opt {alias} out of the lterm status bar: {:?}",
+            String::from_utf8_lossy(&no_status_output)
         );
     }
 
