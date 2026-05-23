@@ -2839,19 +2839,24 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
+    let mut paths = vec![fake_bin.clone()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths)?;
 
     let output = env
         .cmd()
         .env("CMUX_WORKSPACE_ID", "workspace-for-noisy-cmux")
-        .env("PATH", &fake_bin)
+        .env("PATH", &path)
         .args([
             "tmux-compat",
             "split-window",
             "-hPF",
             "#{pane_id}",
-            "/bin/sh",
+            "sh",
             "-lc",
-            "echo SPLIT_NOISY_READY; /bin/sleep 2",
+            "echo SPLIT_NOISY_READY; sleep 2",
         ])
         .output()?;
     assert!(
@@ -3229,6 +3234,60 @@ fn tmux_compat_split_window_rolls_back_identified_cmux_split_when_lterm_creation
             .lines()
             .any(|line| line == "close-surface --surface surface:fallback"),
         "failed lterm creation should roll back the identified cmux surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_rolls_back_when_cmux_send_fails() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-send-failure.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) printf '%s\\n' 'OK surface:42 workspace:1'; exit 0 ;;\n\
+               send) printf '%s\\n' 'CMUX_SEND_FAIL' >&2; exit 43 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let mut paths = vec![fake_bin.clone()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths)?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-send-failure")
+        .env("PATH", &path)
+        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "cmux send failure must fail split-window: {output:?}"
+    );
+    assert_stderr_contains(&output, "cmux send attach command failed");
+    assert_stderr_contains(&output, "CMUX_SEND_FAIL");
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface:42"),
+        "cmux send failure should roll back the reported cmux surface: {cmux_calls:?}"
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "cmux send failure must not leave an orphan lterm session"
     );
     Ok(())
 }

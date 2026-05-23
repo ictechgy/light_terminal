@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
@@ -548,7 +548,11 @@ fn split_window(args: &[String]) -> Result<i32> {
             return Err(err);
         }
     }
-    remember_pane(&info, cmux_surface)?;
+    if let Err(err) = remember_pane(&info, cmux_surface.clone()) {
+        let _ = client::kill(&info.pane_id);
+        rollback_cmux_split(cmux_surface.as_deref());
+        return Err(err);
+    }
 
     if print {
         println!("{}", expand_format(&format, &info));
@@ -993,13 +997,13 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
              refusing to create a hidden lterm session. Use -d for a detached session."
         );
     }
-    let split_output = Command::new("cmux")
+    let mut split = Command::new("cmux");
+    split
         .arg("new-split")
         .arg(direction)
         .arg("--focus")
-        .arg("true")
-        .output()
-        .context("cmux new-split")?;
+        .arg("true");
+    let split_output = run_cmux_command(&mut split).context("cmux new-split")?;
     if !split_output.status.success() {
         let detail = cmux_stderr_suffix(&split_output.stderr);
         bail!(
@@ -1078,7 +1082,7 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     } else {
         send.arg("send").arg(&attach_cmd);
     }
-    let send_output = send.output().context("cmux send attach command")?;
+    let send_output = run_cmux_command(&mut send).context("cmux send attach command")?;
     if !send_output.status.success() {
         let detail = cmux_stderr_suffix(&send_output.stderr);
         bail!(
@@ -1094,26 +1098,20 @@ fn rollback_cmux_split(surface: Option<&str>) {
     let Some(surface_id) = surface else {
         return;
     };
-    let output = Command::new("cmux")
-        .arg("close-surface")
-        .arg("--surface")
-        .arg(surface_id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
+    let mut close = Command::new("cmux");
+    close.arg("close-surface").arg("--surface").arg(surface_id);
+    let output = run_cmux_command(&mut close);
     report_cmux_rollback_failure("cmux close-surface rollback", output);
 }
 
 fn rollback_focused_cmux_split() {
-    let output = Command::new("cmux")
-        .arg("close-surface")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
+    let mut close = Command::new("cmux");
+    close.arg("close-surface");
+    let output = run_cmux_command(&mut close);
     report_cmux_rollback_failure("cmux close focused surface rollback", output);
 }
 
-fn report_cmux_rollback_failure(context: &str, output: std::io::Result<std::process::Output>) {
+fn report_cmux_rollback_failure(context: &str, output: io::Result<CmuxCommandOutput>) {
     match output {
         Ok(output) if output.status.success() => {}
         Ok(output) => eprintln!(
@@ -1143,11 +1141,70 @@ fn cmux_stderr_preview(stderr: &[u8]) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    let mut preview: String = normalized.chars().take(MAX_CHARS).collect();
-    if normalized.chars().count() > MAX_CHARS {
+    let mut chars = normalized.chars();
+    let mut preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
         preview.push('…');
     }
     Some(preview)
+}
+
+const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
+
+struct CmuxCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("cmux stdout pipe missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("cmux stderr pipe missing"))?;
+    let stdout_reader =
+        thread::spawn(move || read_limited_output(stdout, CMUX_OUTPUT_CAPTURE_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
+    let status = child.wait()?;
+    let stdout = join_limited_reader(stdout_reader)?;
+    let stderr = join_limited_reader(stderr_reader)?;
+
+    Ok(CmuxCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+}
+
+fn join_limited_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("cmux output reader panicked"))?
 }
 
 fn inside_cmux() -> bool {
@@ -1168,10 +1225,9 @@ fn inside_cmux() -> bool {
 }
 
 fn cmux_identify_surface() -> Result<Option<String>> {
-    let output = Command::new("cmux")
-        .arg("identify")
-        .arg("--json")
-        .output()?;
+    let mut identify = Command::new("cmux");
+    identify.arg("identify").arg("--json");
+    let output = run_cmux_command(&mut identify)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1188,10 +1244,16 @@ fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
         "surface",
         "id",
     ];
-    match value.get("focused") {
-        Some(focused) => find_json_string(focused, &keys),
-        None => find_json_string(value, &keys),
+    // Modern cmux identify payloads include caller/focused surfaces. Once that
+    // schema is present, trust focused exclusively so a caller surface cannot be
+    // mistaken for the newly-created split.
+    if let Some(focused) = value.get("focused") {
+        return find_json_string(focused, &keys);
     }
+    if value.get("caller").is_some() {
+        return None;
+    }
+    find_json_string(value, &keys)
 }
 
 fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -2412,6 +2474,31 @@ mod tests {
         });
 
         assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_surface_ref_does_not_use_caller_when_focused_is_absent() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            }
+        });
+
+        assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_surface_ref_keeps_legacy_whole_document_lookup_without_caller_schema() {
+        let value = serde_json::json!({
+            "pane": {
+                "surface_id": "legacy-surface-id"
+            }
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("legacy-surface-id")
+        );
     }
 
     #[test]
