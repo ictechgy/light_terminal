@@ -5,8 +5,8 @@
 ## TL;DR
 
 - **무엇** — tmux 같은 영속 터미널 세션 데몬을 더 작게 만든 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
-- **대상** — Claude Code, Codex CLI, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
-- **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
+- **대상** — Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
+- **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속, shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm agy` / `lterm kimi` / `lterm qwen` / `lterm gemini`. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — alpha MVP. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스, escape-sequence sanitizer, 완전한 tmux 대체품 모두 아닙니다.**
 
 ---
@@ -26,7 +26,7 @@ agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
   계속 실행되므로, 모든 workflow가 full tmux server를 직접 관리할 필요가
   적습니다.
 - **Agent가 기대하는 tmux 호환성** — `lterm tmux-compat`는 Claude Code, Codex
-  CLI, Gemini CLI, OMX/OMC 같은 terminal-first tooling이 쓰는 tmux command
+  CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, OMX/OMC 같은 terminal-first tooling이 쓰는 tmux command
   subset을 구현합니다.
 - **Raw attach, safe reports** — attach된 PTY stream은 TUI/interactive shell을
   위해 raw로 유지하고, `logs`, `capture`, `list`, `doctor` 같은 report surface는
@@ -43,7 +43,7 @@ agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
 
 1. **tmux와 비슷한 세션 지속성과 원격 접속** — 세션은 백그라운드 데몬에서 실행되며, 이름이나 pane id로 attach/detach할 수 있습니다. 원격 호스트에 `lterm`이 설치되어 있다면 `lterm ssh`로 접속할 수 있습니다.
 2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, tmux shim은 가능한 경우 worker pane을 cmux native split으로 엽니다.
-3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
+3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm agy`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
 
 cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux native pane으로 매핑하는 tmux shim 모델을 문서화하고 있습니다.
 
@@ -64,7 +64,7 @@ npm install -g @ictechgy/lterm
 Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --version`으로 확인하세요.
 
 수동 설치도 귀찮다면 [`docs/agent-install.ko.md`](docs/agent-install.ko.md)의
-프롬프트를 Claude Code, Codex CLI, Gemini CLI 같은 terminal coding agent에
+프롬프트를 Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI 같은 terminal coding agent에
 붙여 넣으세요. Agent가 platform을 감지하고, `lterm`을 설치하고, smoke test로
 검증하며, shell startup file을 바꿔야 할 때는 먼저 diff를 보여주도록 안내합니다.
 
@@ -142,7 +142,7 @@ lterm -a api
 
 | 작업 | 제품 명령 | 호환 경계 |
 | --- | --- | --- |
-| profile 기반 agent 세션 실행 | `lterm agent claude -- --help` | sibling shortcuts: `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` |
+| profile 기반 agent 세션 실행 | `lterm agent claude -- --help` | sibling shortcuts: `lterm claude`, `lterm codex`, `lterm agy`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` |
 | 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 `PATH` 사용 가능 여부 확인 |
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
 | tmux 호환 shell export 출력 | `eval "$(lterm env)"` | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
@@ -271,7 +271,10 @@ lterm shutdown
 ```bash
 lterm claude
 lterm codex
-lterm gemini -- -p "이 저장소를 요약해줘"
+lterm agy -- -p "이 저장소를 요약해줘"
+lterm kimi
+lterm qwen
+lterm gemini -- -p "이 저장소를 요약해줘"  # legacy 호환
 lterm agents
 ```
 
@@ -280,6 +283,8 @@ lterm agents
 ```bash
 lterm agent claude
 lterm agent codex
+lterm agent agy -- -p "이 저장소를 요약해줘"
+lterm agent qwen
 lterm agent gemini -- -p "이 저장소를 요약해줘"
 ```
 
@@ -288,12 +293,12 @@ agent launcher는 built-in profile과 custom `lterm agent <profile>` 실행에�
 ```bash
 lterm claude --name repo-review --cwd /path/to/repo
 lterm codex --detach --name repo-codex -- exec "이 저장소를 요약해줘"
-lterm gemini --status -- -p "lterm status를 유지해줘"
+lterm agy --status -- -p "lterm status를 유지해줘"
 ```
 
-Claude/Codex/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. 직접 generic tmux-compatible primitive를 쓰거나 아직 profile이 없는 미래 agent를 실행하려면 `lterm run -- <command>`를 사용하세요. `run`은 shim을 기본으로 켜며 `--no-tmux`로 끌 수 있습니다.
+Claude/Codex/Antigravity/Kimi/Qwen/Gemini profile은 각 도구의 자체 TUI/status/alternate-screen 렌더링과 충돌하지 않도록 기본적으로 lterm status bar를 끈 raw full-terminal attach를 사용합니다. `--status`로 lterm status bar를 강제로 켜거나, 기본값이 켜진 profile에서는 `--no-status`로 끌 수 있습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
-launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`)입니다. 이 옵션들은 `claude`, `codex`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
+launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`)입니다. 이 옵션들은 `claude`, `codex`, `agy`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
 명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
 이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, 숫자만으로 이뤄질 수 없고, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
