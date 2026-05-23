@@ -108,7 +108,7 @@ or raw output stream.
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |
 | `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
-| `lterm agent` | `lterm claude`, `lterm codex`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; attached agent PTY stream is raw and external agent CLI behavior is outside the lterm contract | none | `raw-transparent` |
+| `lterm agent` | `lterm claude`, `lterm codex`, `lterm agy`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; attached agent PTY stream is raw and external agent CLI behavior is outside the lterm contract | none | `raw-transparent` |
 | `lterm tmux-compat list-commands` | none | `compatibility-stable` | `stable` tmux shim command list | `stable` | `sanitized-output-only` |
 
 ## tmux compatibility boundary

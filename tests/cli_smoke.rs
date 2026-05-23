@@ -1197,11 +1197,14 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "notify",
         "agents",
         "agent",
+        "agy",
         "omx",
         "omc",
         "claude",
         "codex",
         "gemini",
+        "kimi",
+        "qwen",
         "ssh",
     ] {
         assert!(
@@ -1392,7 +1395,7 @@ fn help_describes_general_agent_profile_surface() -> TestResult {
     let normalized = normalize_help(&stdout);
     for expected in [
         "Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session",
-        "Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, gemini",
+        "Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, agy, kimi, qwen",
         "JSON file with additional configured custom agent profiles",
     ] {
         assert!(
@@ -1433,8 +1436,20 @@ fn help_describes_forwarded_agent_arguments() -> TestResult {
             "Arguments forwarded to codex; use `--` before args that look like lterm options",
         ),
         (
+            "agy",
+            "Arguments forwarded to agy; use `--` before args that look like lterm options",
+        ),
+        (
             "gemini",
             "Arguments forwarded to gemini; use `--` before args that look like lterm options",
+        ),
+        (
+            "kimi",
+            "Arguments forwarded to kimi; use `--` before args that look like lterm options",
+        ),
+        (
+            "qwen",
+            "Arguments forwarded to qwen; use `--` before args that look like lterm options",
         ),
         (
             "omx",
@@ -5011,6 +5026,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let config_path = env.temp.path().join("agents.json");
     std::fs::create_dir(&fake_bin)?;
     write_executable(&fake_bin.join("codex"), "#!/bin/sh\nexit 0\n")?;
+    write_executable(&fake_bin.join("agy"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("my-agent"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("helper"), "#!/bin/sh\nexit 0\n")?;
     std::fs::write(
@@ -5044,7 +5060,9 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .collect();
     assert_eq!(
         profile_names,
-        ["claude", "codex", "gemini", "omx", "omc"],
+        [
+            "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc"
+        ],
         "{stdout:?}"
     );
 
@@ -5059,6 +5077,18 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(fields[4], "available", "{codex:?}");
     assert!(fields[5].ends_with("/codex"), "{codex:?}");
     assert_eq!(fields[6], "built-in", "{codex:?}");
+
+    let agy = stdout
+        .lines()
+        .find(|line| line.starts_with("agy\t"))
+        .ok_or("missing agy row")?;
+    let fields: Vec<_> = agy.split('\t').collect();
+    assert_eq!(fields.len(), 7, "{agy:?}");
+    assert_eq!(fields[2], "agy-lterm", "{agy:?}");
+    assert_eq!(fields[3], "off", "{agy:?}");
+    assert_eq!(fields[4], "available", "{agy:?}");
+    assert!(fields[5].ends_with("/agy"), "{agy:?}");
+    assert_eq!(fields[6], "built-in", "{agy:?}");
 
     let omx = stdout
         .lines()
@@ -5080,7 +5110,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let profiles = profiles
         .as_array()
         .ok_or("agent profiles JSON should be an array")?;
-    assert_eq!(profiles.len(), 5, "{profiles:?}");
+    assert_eq!(profiles.len(), 8, "{profiles:?}");
     let codex = profiles
         .iter()
         .find(|row| row["profile"] == "codex")
@@ -5092,6 +5122,13 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
             .unwrap_or_default()
             .ends_with("/codex")
     );
+    let agy = profiles
+        .iter()
+        .find(|row| row["profile"] == "agy")
+        .ok_or("missing agy JSON row")?;
+    assert_eq!(agy["status_default"], false);
+    assert_eq!(agy["available"], true);
+    assert!(agy["path"].as_str().unwrap_or_default().ends_with("/agy"));
     let omx = profiles
         .iter()
         .find(|row| row["profile"] == "omx")
@@ -5423,6 +5460,14 @@ printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
 printf 'ARG1:%s\n' "$1"
 "#,
     )?;
+    write_executable(
+        &fake_bin.join("agy"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
+printf 'ARG1:%s\n' "$1"
+"#,
+    )?;
     let old_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{old_path}", fake_bin.display());
 
@@ -5436,6 +5481,18 @@ printf 'ARG1:%s\n' "$1"
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("LTERM_AGENT:gemini"), "{stdout:?}");
     assert!(stdout.contains("LTERM_SESSION:gemini-lterm"), "{stdout:?}");
+    assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .args(["agy", "--", "-p"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("LTERM_AGENT:agy"), "{stdout:?}");
+    assert!(stdout.contains("LTERM_SESSION:agy-lterm"), "{stdout:?}");
     assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
     Ok(())
 }

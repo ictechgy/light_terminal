@@ -314,7 +314,7 @@ enum Commands {
     },
     /// Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session.
     Agent {
-        /// Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, gemini.
+        /// Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, agy, kimi, qwen.
         profile: String,
         /// JSON file with additional configured custom agent profiles.
         #[arg(long = "agent-config")]
@@ -322,6 +322,14 @@ enum Commands {
         #[command(flatten)]
         launch: AgentLaunchOptions,
         /// Arguments forwarded to the agent CLI; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Antigravity CLI (agy) inside a tmux-compatible lterm session.
+    Agy {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to agy; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -346,6 +354,22 @@ enum Commands {
         #[command(flatten)]
         launch: AgentLaunchOptions,
         /// Arguments forwarded to gemini; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Kimi CLI inside a tmux-compatible lterm session.
+    Kimi {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to kimi; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Qwen CLI inside a tmux-compatible lterm session.
+    Qwen {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to qwen; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -614,6 +638,9 @@ fn run() -> Result<()> {
             launch,
             args,
         ),
+        Commands::Agy { launch, args } => {
+            run_agent_profile(AgentProfile::known("agy"), launch, args)
+        }
         Commands::Claude { launch, args } => {
             run_agent_profile(AgentProfile::known("claude"), launch, args)
         }
@@ -622,6 +649,12 @@ fn run() -> Result<()> {
         }
         Commands::Gemini { launch, args } => {
             run_agent_profile(AgentProfile::known("gemini"), launch, args)
+        }
+        Commands::Kimi { launch, args } => {
+            run_agent_profile(AgentProfile::known("kimi"), launch, args)
+        }
+        Commands::Qwen { launch, args } => {
+            run_agent_profile(AgentProfile::known("qwen"), launch, args)
         }
         Commands::Ssh {
             host,
@@ -1324,7 +1357,9 @@ impl AgentLaunchOptions {
     }
 }
 
-const BUILT_IN_AGENT_PROFILES: &[&str] = &["claude", "codex", "gemini", "omx", "omc"];
+const BUILT_IN_AGENT_PROFILES: &[&str] = &[
+    "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc",
+];
 
 impl AgentProfile {
     fn known(name: &str) -> Self {
@@ -1341,10 +1376,28 @@ impl AgentProfile {
                 session_base: "codex-lterm".to_string(),
                 show_status: false,
             },
+            "agy" => Self {
+                name: name.to_string(),
+                binary: "agy".to_string(),
+                session_base: "agy-lterm".to_string(),
+                show_status: false,
+            },
             "gemini" => Self {
                 name: name.to_string(),
                 binary: "gemini".to_string(),
                 session_base: "gemini-lterm".to_string(),
+                show_status: false,
+            },
+            "kimi" => Self {
+                name: name.to_string(),
+                binary: "kimi".to_string(),
+                session_base: "kimi-lterm".to_string(),
+                show_status: false,
+            },
+            "qwen" => Self {
+                name: name.to_string(),
+                binary: "qwen".to_string(),
+                session_base: "qwen-lterm".to_string(),
                 show_status: false,
             },
             "omx" => Self {
@@ -1367,7 +1420,10 @@ impl AgentProfile {
         match profile {
             "claude" => Ok(Self::known("claude")),
             "codex" => Ok(Self::known("codex")),
+            "agy" => Ok(Self::known("agy")),
             "gemini" => Ok(Self::known("gemini")),
+            "kimi" => Ok(Self::known("kimi")),
+            "qwen" => Ok(Self::known("qwen")),
             "omx" => Ok(Self::known("omx")),
             "omc" => Ok(Self::known("omc")),
             custom => {
@@ -2072,10 +2128,25 @@ mod tests {
         assert_eq!(codex.session_base, "codex-lterm");
         assert!(!codex.show_status);
 
+        let agy = AgentProfile::resolve("agy").expect("agy profile");
+        assert_eq!(agy.binary, "agy");
+        assert_eq!(agy.session_base, "agy-lterm");
+        assert!(!agy.show_status);
+
         let gemini = AgentProfile::resolve("gemini").expect("gemini profile");
         assert_eq!(gemini.binary, "gemini");
         assert_eq!(gemini.session_base, "gemini-lterm");
         assert!(!gemini.show_status);
+
+        let kimi = AgentProfile::resolve("kimi").expect("kimi profile");
+        assert_eq!(kimi.binary, "kimi");
+        assert_eq!(kimi.session_base, "kimi-lterm");
+        assert!(!kimi.show_status);
+
+        let qwen = AgentProfile::resolve("qwen").expect("qwen profile");
+        assert_eq!(qwen.binary, "qwen");
+        assert_eq!(qwen.session_base, "qwen-lterm");
+        assert!(!qwen.show_status);
 
         let omx = AgentProfile::resolve("omx").expect("omx profile");
         assert_eq!(omx.binary, "omx");
@@ -2087,7 +2158,12 @@ mod tests {
     fn built_in_agent_profile_infos_match_launcher_contract() {
         let infos = built_in_agent_profile_infos();
         let names: Vec<_> = infos.iter().map(|info| info.profile.as_str()).collect();
-        assert_eq!(names, ["claude", "codex", "gemini", "omx", "omc"]);
+        assert_eq!(
+            names,
+            [
+                "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc"
+            ]
+        );
 
         let claude = infos
             .iter()

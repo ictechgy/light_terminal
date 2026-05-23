@@ -1,6 +1,6 @@
 # Agent install prompt for `lterm`
 
-Copy this prompt into Claude Code, Codex CLI, Gemini CLI, or another terminal
+Copy this prompt into Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, or another terminal
 coding agent when you want the agent to install and verify `lterm` for you.
 
 ```text
@@ -37,10 +37,13 @@ Then print:
 - Whether the shim directory is on PATH.
 - Any shell config change I still need to approve.
 - One recommended first command for my agent workflow, for example:
-  - `lterm claude -n claude-main`
-  - `lterm codex -n codex-main`
-  - `lterm gemini -n gemini-main`
-  - `lterm omx -n omx-main`
+  - `lterm claude --name claude-main`
+  - `lterm codex --name codex-main`
+  - `lterm agy --name agy-main`
+  - `lterm kimi --name kimi-main`
+  - `lterm qwen --name qwen-main`
+  - `lterm gemini --name gemini-main`
+  - `lterm omx --name omx-main`
 ```
 
 If the agent reports a stale daemon/version mismatch, finish important sessions

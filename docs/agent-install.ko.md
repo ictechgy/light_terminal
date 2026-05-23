@@ -1,7 +1,7 @@
 # `lterm` agent 설치 프롬프트
 
 `lterm` 설치와 검증을 직접 하기 귀찮을 때, 아래 프롬프트를 Claude Code,
-Codex CLI, Gemini CLI 같은 terminal coding agent에 그대로 붙여 넣으세요.
+Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI 같은 terminal coding agent에 그대로 붙여 넣으세요.
 
 ```text
 너는 AI-agent workflow용 lightweight tmux-compatible terminal session daemon인
@@ -37,10 +37,13 @@ Source install에서 우선 사용할 현재 release tag: v1.0.2
 - Shim directory가 PATH에 있는지 여부.
 - 내가 아직 승인해야 할 shell config 변경 사항.
 - 내 agent workflow에 추천하는 첫 명령. 예:
-  - `lterm claude -n claude-main`
-  - `lterm codex -n codex-main`
-  - `lterm gemini -n gemini-main`
-  - `lterm omx -n omx-main`
+  - `lterm claude --name claude-main`
+  - `lterm codex --name codex-main`
+  - `lterm agy --name agy-main`
+  - `lterm kimi --name kimi-main`
+  - `lterm qwen --name qwen-main`
+  - `lterm gemini --name gemini-main`
+  - `lterm omx --name omx-main`
 ```
 
 Agent가 stale daemon/version mismatch를 보고하면 중요한 session을 먼저 정리한 뒤

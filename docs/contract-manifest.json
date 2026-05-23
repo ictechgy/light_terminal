@@ -509,6 +509,9 @@
       "aliases": [
         "lterm claude",
         "lterm codex",
+        "lterm agy",
+        "lterm kimi",
+        "lterm qwen",
         "lterm gemini",
         "lterm omx",
         "lterm omc"
