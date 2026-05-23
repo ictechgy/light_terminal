@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -543,12 +543,16 @@ fn split_window(args: &[String]) -> Result<i32> {
 
     if !detached {
         if let Err(err) = send_cmux_attach(cmux_surface.as_deref(), &info) {
-            let _ = client::kill(&info.pane_id);
+            rollback_lterm_pane(&info.pane_id);
             rollback_cmux_split(cmux_surface.as_deref());
             return Err(err);
         }
     }
-    remember_pane(&info, cmux_surface)?;
+    if let Err(err) = remember_pane(&info, cmux_surface.clone()) {
+        rollback_lterm_pane(&info.pane_id);
+        rollback_cmux_split(cmux_surface.as_deref());
+        return Err(err);
+    }
 
     if print {
         println!("{}", expand_format(&format, &info));
@@ -993,18 +997,34 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
              refusing to create a hidden lterm session. Use -d for a detached session."
         );
     }
-    let split_status = Command::new("cmux")
+    let mut split = Command::new("cmux");
+    split
         .arg("new-split")
         .arg(direction)
         .arg("--focus")
-        .arg("true")
-        .status()
-        .context("cmux new-split")?;
-    if !split_status.success() {
+        .arg("true");
+    let split_output = run_cmux_command(&mut split).context("cmux new-split")?;
+    if !split_output.status.success() {
+        let detail = cmux_stderr_suffix(&split_output.stderr.bytes);
         bail!(
-            "cmux new-split {direction} failed with {split_status}; \
-             refusing to create a hidden lterm session"
+            "cmux new-split {direction} failed with {}; \
+             refusing to create a hidden lterm session{}",
+            split_output.status,
+            detail
         );
+    }
+
+    if split_output.stdout.truncated {
+        rollback_focused_cmux_split();
+        bail!(
+            "cmux new-split {direction} output exceeded {} bytes; \
+             refusing to parse truncated surface metadata",
+            CMUX_OUTPUT_CAPTURE_BYTES
+        );
+    }
+
+    if let Some(surface_id) = parse_cmux_new_split_surface(&split_output.stdout.bytes) {
+        return Ok(Some(surface_id));
     }
 
     let surface_id = match cmux_identify_surface().context("cmux identify new split surface") {
@@ -1019,6 +1039,50 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         }
     };
     Ok(Some(surface_id))
+}
+
+fn rollback_lterm_pane(pane_id: &str) {
+    if let Err(err) = client::kill(pane_id) {
+        eprintln!(
+            "warning: lterm pane rollback failed for {}: {}",
+            sanitize::terminal_text(pane_id),
+            sanitize::terminal_text(&err.to_string())
+        );
+    }
+}
+
+fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
+    // Current cmux prints `OK surface:<ref> workspace:<ref>` for a successful split.
+    // Only trust an explicit OK record; otherwise fall back to `cmux identify`.
+    String::from_utf8_lossy(output)
+        .lines()
+        .rev()
+        .find_map(parse_cmux_new_split_surface_line)
+}
+
+fn parse_cmux_new_split_surface_line(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    let first = trim_cmux_output_token(tokens.next()?);
+    if first != "OK" {
+        return None;
+    }
+    tokens.find_map(|token| parse_cmux_surface_ref_token(trim_cmux_output_token(token)))
+}
+
+fn trim_cmux_output_token(token: &str) -> &str {
+    token.trim_matches(|c: char| c == ',' || c == ';')
+}
+
+fn parse_cmux_surface_ref_token(token: &str) -> Option<String> {
+    let suffix = token.strip_prefix("surface:")?;
+    if suffix.is_empty()
+        || !suffix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
@@ -1037,9 +1101,14 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     } else {
         send.arg("send").arg(&attach_cmd);
     }
-    let send_status = send.status().context("cmux send attach command")?;
-    if !send_status.success() {
-        bail!("cmux send attach command failed with {send_status}");
+    let send_output = run_cmux_command(&mut send).context("cmux send attach command")?;
+    if !send_output.status.success() {
+        let detail = cmux_stderr_suffix(&send_output.stderr.bytes);
+        bail!(
+            "cmux send attach command failed with {}{}",
+            send_output.status,
+            detail
+        );
     }
     Ok(())
 }
@@ -1048,15 +1117,136 @@ fn rollback_cmux_split(surface: Option<&str>) {
     let Some(surface_id) = surface else {
         return;
     };
-    let _ = Command::new("cmux")
-        .arg("close-surface")
-        .arg("--surface")
-        .arg(surface_id)
-        .status();
+    let mut close = Command::new("cmux");
+    close.arg("close-surface").arg("--surface").arg(surface_id);
+    let output = run_cmux_command(&mut close);
+    report_cmux_rollback_failure("cmux close-surface rollback", output);
 }
 
 fn rollback_focused_cmux_split() {
-    let _ = Command::new("cmux").arg("close-surface").status();
+    let mut close = Command::new("cmux");
+    close.arg("close-surface");
+    let output = run_cmux_command(&mut close);
+    report_cmux_rollback_failure("cmux close focused surface rollback", output);
+}
+
+fn report_cmux_rollback_failure(context: &str, output: io::Result<CmuxCommandOutput>) {
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "warning: {} failed with {}{}",
+            context,
+            output.status,
+            cmux_stderr_suffix(&output.stderr.bytes)
+        ),
+        Err(err) => eprintln!(
+            "warning: {} failed to run: {}",
+            context,
+            sanitize::terminal_text(&err.to_string())
+        ),
+    }
+}
+
+fn cmux_stderr_suffix(stderr: &[u8]) -> String {
+    cmux_stderr_preview(stderr)
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default()
+}
+
+fn cmux_stderr_preview(stderr: &[u8]) -> Option<String> {
+    const MAX_CHARS: usize = 512;
+    let sanitized = sanitize::terminal_capture(stderr);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut chars = normalized.chars();
+    let mut preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    Some(preview)
+}
+
+const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
+
+struct CmuxCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: LimitedOutput,
+    stderr: LimitedOutput,
+}
+
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("cmux stdout pipe missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("cmux stderr pipe missing"))?;
+    let stdout_reader =
+        thread::spawn(move || read_limited_output(stdout, CMUX_OUTPUT_CAPTURE_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
+    let wait_result = child.wait();
+    if wait_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = join_limited_reader(stdout_reader)?;
+    let stderr = join_limited_reader(stderr_reader)?;
+    let status = wait_result?;
+
+    Ok(CmuxCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<LimitedOutput> {
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if read == 0 {
+            return Ok(LimitedOutput {
+                bytes: output,
+                truncated,
+            });
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+}
+
+fn join_limited_reader(
+    reader: thread::JoinHandle<io::Result<LimitedOutput>>,
+) -> io::Result<LimitedOutput> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("cmux output reader panicked"))?
 }
 
 fn inside_cmux() -> bool {
@@ -1077,18 +1267,41 @@ fn inside_cmux() -> bool {
 }
 
 fn cmux_identify_surface() -> Result<Option<String>> {
-    let output = Command::new("cmux")
-        .arg("identify")
-        .arg("--json")
-        .output()?;
+    let mut identify = Command::new("cmux");
+    identify.arg("identify").arg("--json");
+    let output = run_cmux_command(&mut identify)?;
     if !output.status.success() {
         return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(find_json_string(
-        &value,
-        &["surface_id", "surfaceId", "surface", "id"],
-    ))
+    if output.stdout.truncated {
+        bail!(
+            "cmux identify --json output exceeded {} bytes; refusing to parse truncated surface metadata",
+            CMUX_OUTPUT_CAPTURE_BYTES
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)?;
+    Ok(find_cmux_surface_ref(&value))
+}
+
+fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
+    let keys = [
+        "surface_id",
+        "surfaceId",
+        "surface_ref",
+        "surfaceRef",
+        "surface",
+        "id",
+    ];
+    // Modern cmux identify payloads include caller/focused surfaces. Once that
+    // schema is present, trust focused exclusively so a caller surface cannot be
+    // mistaken for the newly-created split.
+    if let Some(focused) = value.get("focused") {
+        return find_json_string(focused, &keys);
+    }
+    if value.get("caller").is_some() {
+        return None;
+    }
+    find_json_string(value, &keys)
 }
 
 fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -2266,6 +2479,159 @@ mod tests {
             "waiters on never-signaled channels must not grow touched metadata"
         );
         assert!(store.wait_generations.is_empty());
+    }
+
+    #[test]
+    fn cmux_surface_ref_prefers_focused_surface_over_caller() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            },
+            "focused": {
+                "surface_ref": "surface:focused"
+            }
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("surface:focused")
+        );
+    }
+
+    #[test]
+    fn cmux_surface_ref_accepts_legacy_surface_id() {
+        let value = serde_json::json!({
+            "surface_id": "legacy-surface-id"
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("legacy-surface-id")
+        );
+    }
+
+    #[test]
+    fn cmux_surface_ref_does_not_fall_back_to_caller_when_focused_lacks_surface() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            },
+            "focused": {
+                "workspace_ref": "workspace:focused"
+            }
+        });
+
+        assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_surface_ref_does_not_use_caller_when_focused_is_absent() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            }
+        });
+
+        assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_surface_ref_keeps_legacy_whole_document_lookup_without_caller_schema() {
+        let value = serde_json::json!({
+            "pane": {
+                "surface_id": "legacy-surface-id"
+            }
+        });
+
+        assert_eq!(
+            find_cmux_surface_ref(&value).as_deref(),
+            Some("legacy-surface-id")
+        );
+    }
+
+    #[test]
+    fn cmux_new_split_output_reports_ok_surface_ref() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK surface:42 workspace:1\n").as_deref(),
+            Some("surface:42")
+        );
+    }
+
+    #[test]
+    fn cmux_new_split_output_ignores_non_ok_surface_mentions() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"note previous surface:9\nOK surface:42 workspace:1\n")
+                .as_deref(),
+            Some("surface:42")
+        );
+        assert_eq!(parse_cmux_new_split_surface(b"note surface:9\n"), None);
+    }
+
+    #[test]
+    fn cmux_new_split_output_rejects_empty_or_decorated_surface_refs() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK surface: workspace:1\n"),
+            None
+        );
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK (surface:42) workspace:1\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn cmux_stderr_preview_strips_terminal_controls_and_truncates() {
+        let mut stderr = b"\x1b]52;c;secret\x07CMUX_FAIL\nNEXT ".to_vec();
+        stderr.extend(std::iter::repeat_n(b'x', 600));
+        let preview = cmux_stderr_preview(&stderr).expect("stderr preview");
+
+        assert!(preview.starts_with("CMUX_FAIL NEXT "));
+        assert!(preview.ends_with('…'));
+        assert!(!preview.contains('\x1b'));
+        assert!(!preview.contains("secret"));
+        assert!(preview.chars().count() <= 513);
+    }
+
+    struct InterruptedOnceReader {
+        interrupted: bool,
+        cursor: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl InterruptedOnceReader {
+        fn new(bytes: &[u8]) -> Self {
+            Self {
+                interrupted: false,
+                cursor: std::io::Cursor::new(bytes.to_vec()),
+            }
+        }
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.cursor.read(buf)
+        }
+    }
+
+    #[test]
+    fn limited_output_reader_retries_interrupted_reads() {
+        let output =
+            read_limited_output(InterruptedOnceReader::new(b"cmux output"), 32).expect("read");
+
+        assert_eq!(output.bytes, b"cmux output");
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn limited_output_reader_reports_truncation_while_draining() {
+        let output =
+            read_limited_output(std::io::Cursor::new(b"abcdef".to_vec()), 3).expect("read");
+
+        assert_eq!(output.bytes, b"abc");
+        assert!(output.truncated);
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
