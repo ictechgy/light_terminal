@@ -5184,7 +5184,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .find(|line| line.starts_with("omx\t"))
         .ok_or("missing omx row")?;
     let fields: Vec<_> = omx.split('\t').collect();
-    assert_eq!(fields[3], "on", "{omx:?}");
+    assert_eq!(fields[3], "off", "{omx:?}");
     assert_eq!(fields[4], "missing", "{omx:?}");
     assert_eq!(fields[5], "-", "{omx:?}");
     assert_eq!(fields[6], "built-in", "{omx:?}");
@@ -5248,7 +5248,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .iter()
         .find(|row| row["profile"] == "omx")
         .ok_or("missing omx JSON row")?;
-    assert_eq!(omx["status_default"], true);
+    assert_eq!(omx["status_default"], false);
     assert_eq!(omx["available"], false);
     assert!(omx["path"].is_null());
 
@@ -5572,18 +5572,48 @@ printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
 printf 'ARG1:%s\n' "$1"
 "#;
-    for binary in ["gemini", "agy", "opencode", "kiro-cli", "cursor-agent"] {
+    for binary in [
+        "claude",
+        "codex",
+        "opencode",
+        "copilot",
+        "cursor-agent",
+        "agy",
+        "jules",
+        "kiro-cli",
+        "aider",
+        "goose",
+        "amp",
+        "crush",
+        "gemini",
+        "kimi",
+        "qwen",
+        "omx",
+        "omc",
+    ] {
         write_executable(&fake_bin.join(binary), fake_agent)?;
     }
     let old_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{old_path}", fake_bin.display());
 
     for (command, expected_agent, expected_session) in [
-        ("gemini", "gemini", "gemini-lterm"),
-        ("agy", "agy", "agy-lterm"),
+        ("claude", "claude", "claude-lterm"),
+        ("codex", "codex", "codex-lterm"),
         ("opencode", "opencode", "opencode-lterm"),
-        ("kiro", "kiro", "kiro-lterm"),
+        ("copilot", "copilot", "copilot-lterm"),
         ("cursor-agent", "cursor-agent", "cursor-agent-lterm"),
+        ("agy", "agy", "agy-lterm"),
+        ("jules", "jules", "jules-lterm"),
+        ("kiro", "kiro", "kiro-lterm"),
+        ("aider", "aider", "aider-lterm"),
+        ("goose", "goose", "goose-lterm"),
+        ("amp", "amp", "amp-lterm"),
+        ("crush", "crush", "crush-lterm"),
+        ("gemini", "gemini", "gemini-lterm"),
+        ("kimi", "kimi", "kimi-lterm"),
+        ("qwen", "qwen", "qwen-lterm"),
+        ("omx", "omx", "omx-lterm"),
+        ("omc", "omc", "omc-lterm"),
     ] {
         let output = env
             .cmd()
@@ -5603,6 +5633,63 @@ printf 'ARG1:%s\n' "$1"
         );
         assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    for binary in ["omx", "omc"] {
+        write_executable(
+            &fake_bin.join(binary),
+            "#!/bin/sh\nprintf 'AGENT_READY\\n'\n",
+        )?;
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin.as_path().to_path_buf()).chain(std::env::split_paths(&old_path)),
+    )?;
+
+    for alias in ["omx", "omc"] {
+        let status_indicator = format!("lterm  {alias}-lterm").into_bytes();
+        let default_output = run_agent_alias_on_pty_until_exit(
+            &env,
+            &path,
+            &[alias],
+            &format!("{alias} default status"),
+        )?;
+        assert!(
+            contains_subsequence(&default_output, b"AGENT_READY"),
+            "{alias} fake agent marker should be forwarded: {:?}",
+            String::from_utf8_lossy(&default_output)
+        );
+        assert!(
+            !contains_subsequence(&default_output, &status_indicator),
+            "{alias} should default to raw/full-terminal attach without lterm status bytes: {:?}",
+            String::from_utf8_lossy(&default_output)
+        );
+
+        let status_output = run_agent_alias_on_pty_until_exit(
+            &env,
+            &path,
+            &[alias, "--status"],
+            &format!("{alias} explicit status"),
+        )?;
+        assert!(
+            contains_subsequence(&status_output, b"AGENT_READY"),
+            "{alias} fake agent marker should be forwarded when --status is enabled: {:?}",
+            String::from_utf8_lossy(&status_output)
+        );
+        assert!(
+            contains_subsequence(&status_output, &status_indicator),
+            "--status should still opt {alias} into the lterm status bar: {:?}",
+            String::from_utf8_lossy(&status_output)
+        );
+    }
+
     Ok(())
 }
 
@@ -6989,6 +7076,117 @@ fn attach_with_geometry(
 }
 
 #[cfg(unix)]
+fn run_agent_alias_on_pty_until_exit(
+    env: &TestEnv,
+    path: &OsString,
+    args: &[&str],
+    label: &str,
+) -> TestResult<Vec<u8>> {
+    let (mut master, slave) = open_pty_pair()?;
+    set_pty_window_size(&slave, 24, 80)?;
+    let stdin = Stdio::from(slave.try_clone()?);
+    let stdout = Stdio::from(slave.try_clone()?);
+    let stderr = Stdio::from(slave.try_clone()?);
+    let mut child = ChildCleanup::new(
+        env.cmd()
+            .env("PATH", path)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .args(args)
+            .spawn()?,
+    );
+    drop(slave);
+
+    read_pty_until_child_exit(&mut master, &mut child, label, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn set_pty_window_size(file: &File, rows: u16, cols: u16) -> TestResult {
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_pty_until_child_exit<R: Read + AsRawFd>(
+    stdout: &mut R,
+    child: &mut ChildCleanup,
+    label: &str,
+    timeout: Duration,
+) -> TestResult<Vec<u8>> {
+    let fd = stdout.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut child_exited = false;
+    let mut drain_until: Option<Instant> = None;
+
+    while Instant::now() < deadline {
+        match stdout.read(&mut chunk) {
+            Ok(0) => {
+                if child_exited {
+                    return Ok(buf);
+                }
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if child_exited {
+                    drain_until = Some(Instant::now() + Duration::from_millis(50));
+                }
+                continue;
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if child_exited {
+                    let drain_deadline = *drain_until
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(50));
+                    if Instant::now() >= drain_deadline {
+                        return Ok(buf);
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(format!("{label} pty read error: {err}").into());
+            }
+        }
+
+        if !child_exited {
+            if let Some(status) = child.child_mut()?.try_wait()? {
+                assert!(status.success(), "{label} failed: {status:?}");
+                child.child = None;
+                child_exited = true;
+                drain_until = Some(Instant::now() + Duration::from_millis(50));
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Err(format!(
+        "timed out waiting for {label}; buffer head: {:?}",
+        String::from_utf8_lossy(&buf[..buf.len().min(256)])
+    )
+    .into())
+}
+
+#[cfg(unix)]
 fn open_pty_pair() -> TestResult<(File, File)> {
     let mut master = -1;
     let mut slave = -1;
@@ -7454,4 +7652,9 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(unix)]
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    find_subsequence(haystack, needle).is_some()
 }

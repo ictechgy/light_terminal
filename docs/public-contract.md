@@ -152,10 +152,10 @@ entirely. The schema lives at
 
 ```json
 {
-  "client_version": "1.0.2",
+  "client_version": "1.0.3",
   "client_protocol_version": 3,
   "daemon_reachable": true,
-  "daemon_version": "1.0.2",
+  "daemon_version": "1.0.3",
   "daemon_protocol_version": 3,
   "version_match": true,
   "daemon_session_count": 0,

@@ -77,7 +77,7 @@ For the 1.0 command/output stability boundary, see the
 With Cargo from GitHub (use the latest tag from the Releases page):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.2
+cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.3
 ```
 
 From this checkout, use Rust 1.85 or newer:
@@ -318,13 +318,13 @@ lterm codex --detach --name repo-codex -- exec "summarize this repo"
 lterm agy --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to suppress it for any launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
 Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
 Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not consist only of digits, must not look like a UUID, and are limited to 128 bytes.
-Use `lterm agents` (or `lterm agents --json`) to inspect profile defaults and whether their binaries are currently available in `PATH`. JSON rows use `kind` values of `built-in`, `custom`, or `configured`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom/configured set; availability is a point-in-time PATH probe.
+Use `lterm agents` (or `lterm agents --json`) to inspect profile defaults and whether their binaries are currently available in `PATH`. JSON rows use `kind` values of `built-in`, `custom`, or `configured`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom/configured set; availability is a point-in-time PATH probe. Built-ins resolve the binary names shown by `lterm agents`; most match the profile name, while `kiro` resolves `kiro-cli`. If a provider installs a different command name, use `lterm agent <command>` or a configured profile rather than relying on a guessed alias.
 For reusable custom aliases, pass an explicit JSON config file:
 
 ```bash
