@@ -543,13 +543,13 @@ fn split_window(args: &[String]) -> Result<i32> {
 
     if !detached {
         if let Err(err) = send_cmux_attach(cmux_surface.as_deref(), &info) {
-            let _ = client::kill(&info.pane_id);
+            rollback_lterm_pane(&info.pane_id);
             rollback_cmux_split(cmux_surface.as_deref());
             return Err(err);
         }
     }
     if let Err(err) = remember_pane(&info, cmux_surface.clone()) {
-        let _ = client::kill(&info.pane_id);
+        rollback_lterm_pane(&info.pane_id);
         rollback_cmux_split(cmux_surface.as_deref());
         return Err(err);
     }
@@ -1005,7 +1005,7 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         .arg("true");
     let split_output = run_cmux_command(&mut split).context("cmux new-split")?;
     if !split_output.status.success() {
-        let detail = cmux_stderr_suffix(&split_output.stderr);
+        let detail = cmux_stderr_suffix(&split_output.stderr.bytes);
         bail!(
             "cmux new-split {direction} failed with {}; \
              refusing to create a hidden lterm session{}",
@@ -1014,7 +1014,16 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         );
     }
 
-    if let Some(surface_id) = parse_cmux_new_split_surface(&split_output.stdout) {
+    if split_output.stdout.truncated {
+        rollback_focused_cmux_split();
+        bail!(
+            "cmux new-split {direction} output exceeded {} bytes; \
+             refusing to parse truncated surface metadata",
+            CMUX_OUTPUT_CAPTURE_BYTES
+        );
+    }
+
+    if let Some(surface_id) = parse_cmux_new_split_surface(&split_output.stdout.bytes) {
         return Ok(Some(surface_id));
     }
 
@@ -1030,6 +1039,16 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         }
     };
     Ok(Some(surface_id))
+}
+
+fn rollback_lterm_pane(pane_id: &str) {
+    if let Err(err) = client::kill(pane_id) {
+        eprintln!(
+            "warning: lterm pane rollback failed for {}: {}",
+            sanitize::terminal_text(pane_id),
+            sanitize::terminal_text(&err.to_string())
+        );
+    }
 }
 
 fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
@@ -1084,7 +1103,7 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     }
     let send_output = run_cmux_command(&mut send).context("cmux send attach command")?;
     if !send_output.status.success() {
-        let detail = cmux_stderr_suffix(&send_output.stderr);
+        let detail = cmux_stderr_suffix(&send_output.stderr.bytes);
         bail!(
             "cmux send attach command failed with {}{}",
             send_output.status,
@@ -1118,7 +1137,7 @@ fn report_cmux_rollback_failure(context: &str, output: io::Result<CmuxCommandOut
             "warning: {} failed with {}{}",
             context,
             output.status,
-            cmux_stderr_suffix(&output.stderr)
+            cmux_stderr_suffix(&output.stderr.bytes)
         ),
         Err(err) => eprintln!(
             "warning: {} failed to run: {}",
@@ -1153,8 +1172,13 @@ const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
 
 struct CmuxCommandOutput {
     status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: LimitedOutput,
+    stderr: LimitedOutput,
+}
+
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
@@ -1175,9 +1199,14 @@ fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
         thread::spawn(move || read_limited_output(stdout, CMUX_OUTPUT_CAPTURE_BYTES));
     let stderr_reader =
         thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
-    let status = child.wait()?;
+    let wait_result = child.wait();
+    if wait_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let stdout = join_limited_reader(stdout_reader)?;
     let stderr = join_limited_reader(stderr_reader)?;
+    let status = wait_result?;
 
     Ok(CmuxCommandOutput {
         status,
@@ -1186,22 +1215,35 @@ fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
     })
 }
 
-fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<Vec<u8>> {
+fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<LimitedOutput> {
     let mut output = Vec::new();
+    let mut truncated = false;
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
         if read == 0 {
-            return Ok(output);
+            return Ok(LimitedOutput {
+                bytes: output,
+                truncated,
+            });
         }
         let remaining = limit.saturating_sub(output.len());
         if remaining > 0 {
             output.extend_from_slice(&buffer[..read.min(remaining)]);
         }
+        if read > remaining {
+            truncated = true;
+        }
     }
 }
 
-fn join_limited_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+fn join_limited_reader(
+    reader: thread::JoinHandle<io::Result<LimitedOutput>>,
+) -> io::Result<LimitedOutput> {
     reader
         .join()
         .map_err(|_| io::Error::other("cmux output reader panicked"))?
@@ -1231,7 +1273,13 @@ fn cmux_identify_surface() -> Result<Option<String>> {
     if !output.status.success() {
         return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if output.stdout.truncated {
+        bail!(
+            "cmux identify --json output exceeded {} bytes; refusing to parse truncated surface metadata",
+            CMUX_OUTPUT_CAPTURE_BYTES
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)?;
     Ok(find_cmux_surface_ref(&value))
 }
 
@@ -2542,6 +2590,48 @@ mod tests {
         assert!(!preview.contains('\x1b'));
         assert!(!preview.contains("secret"));
         assert!(preview.chars().count() <= 513);
+    }
+
+    struct InterruptedOnceReader {
+        interrupted: bool,
+        cursor: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl InterruptedOnceReader {
+        fn new(bytes: &[u8]) -> Self {
+            Self {
+                interrupted: false,
+                cursor: std::io::Cursor::new(bytes.to_vec()),
+            }
+        }
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.cursor.read(buf)
+        }
+    }
+
+    #[test]
+    fn limited_output_reader_retries_interrupted_reads() {
+        let output =
+            read_limited_output(InterruptedOnceReader::new(b"cmux output"), 32).expect("read");
+
+        assert_eq!(output.bytes, b"cmux output");
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn limited_output_reader_reports_truncation_while_draining() {
+        let output =
+            read_limited_output(std::io::Cursor::new(b"abcdef".to_vec()), 3).expect("read");
+
+        assert_eq!(output.bytes, b"abc");
+        assert!(output.truncated);
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {

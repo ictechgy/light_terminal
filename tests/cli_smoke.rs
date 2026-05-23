@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
@@ -331,6 +332,26 @@ fn write_executable(path: &Path, contents: &str) -> TestResult {
         std::fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+fn path_with_prepended(dir: &Path) -> TestResult<OsString> {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    Ok(std::env::join_paths(paths)?)
+}
+
+fn command_path(command: &str) -> TestResult<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!("{command:?} not found in PATH").into())
 }
 
 #[cfg(unix)]
@@ -2839,11 +2860,10 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
-    let mut paths = vec![fake_bin.clone()];
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    let path = std::env::join_paths(paths)?;
+    let path = path_with_prepended(&fake_bin)?;
+    let shell = command_path("sh")?.display().to_string();
+    let sleep = shlex::try_quote(&command_path("sleep")?.display().to_string())?.into_owned();
+    let payload = format!("echo SPLIT_NOISY_READY; {sleep} 2");
 
     let output = env
         .cmd()
@@ -2854,9 +2874,9 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
             "split-window",
             "-hPF",
             "#{pane_id}",
-            "sh",
+            shell.as_str(),
             "-lc",
-            "echo SPLIT_NOISY_READY; sleep 2",
+            payload.as_str(),
         ])
         .output()?;
     assert!(
@@ -3140,6 +3160,57 @@ fn tmux_compat_split_window_requires_identified_cmux_surface() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_split_window_rejects_truncated_cmux_new_split_output() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-truncated-new-split.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) i=0; while [ \"$i\" -lt 17000 ]; do printf x; i=$((i + 1)); done; exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let before = session_names_json(&env)?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-truncated-new-split")
+        .env("PATH", &fake_bin)
+        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "truncated cmux new-split stdout must fail split-window: {output:?}"
+    );
+    assert_stderr_contains(&output, "cmux new-split right output exceeded");
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| line == "close-surface"),
+        "truncated cmux new-split output should close the focused split surface: {cmux_calls:?}"
+    );
+    assert!(
+        !cmux_calls
+            .lines()
+            .any(|line| line == "send" || line.starts_with("send ")),
+        "truncated cmux new-split output must not send attach command: {cmux_calls:?}"
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "truncated cmux new-split output must fail before lterm session creation"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-cmux-bin");
@@ -3244,13 +3315,14 @@ fn tmux_compat_split_window_rolls_back_when_cmux_send_fails() -> TestResult {
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
     let cmux_log = env.temp.path().join("cmux-send-failure.log");
+    let fake_surface = "surface:42";
     write_executable(
         &fake_bin.join("cmux"),
         &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               new-split) printf '%s\\n' 'OK surface:42 workspace:1'; exit 0 ;;\n\
+               new-split) printf '%s\\n' 'OK {fake_surface} workspace:1'; exit 0 ;;\n\
                send) printf '%s\\n' 'CMUX_SEND_FAIL' >&2; exit 43 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
@@ -3258,18 +3330,24 @@ fn tmux_compat_split_window_rolls_back_when_cmux_send_fails() -> TestResult {
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
-    let mut paths = vec![fake_bin.clone()];
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    let path = std::env::join_paths(paths)?;
+    let path = path_with_prepended(&fake_bin)?;
+    let shell = command_path("sh")?.display().to_string();
+    let sleep = shlex::try_quote(&command_path("sleep")?.display().to_string())?.into_owned();
+    let payload = format!("{sleep} 2");
     let before = session_names_json(&env)?;
 
     let output = env
         .cmd()
         .env("CMUX_WORKSPACE_ID", "workspace-for-send-failure")
         .env("PATH", &path)
-        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-h",
+            shell.as_str(),
+            "-lc",
+            payload.as_str(),
+        ])
         .output()?;
     assert!(
         !output.status.success(),
@@ -3279,9 +3357,13 @@ fn tmux_compat_split_window_rolls_back_when_cmux_send_fails() -> TestResult {
     assert_stderr_contains(&output, "CMUX_SEND_FAIL");
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls
-            .lines()
-            .any(|line| line == "close-surface --surface surface:42"),
+        cmux_calls.lines().any(|line| {
+            let args = line.split_whitespace().collect::<Vec<_>>();
+            args.first() == Some(&"close-surface")
+                && args
+                    .windows(2)
+                    .any(|window| window == ["--surface", fake_surface])
+        }),
         "cmux send failure should roll back the reported cmux surface: {cmux_calls:?}"
     );
     assert_eq!(
