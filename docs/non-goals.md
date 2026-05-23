@@ -15,7 +15,7 @@ they fundamentally change the assumptions listed under each item.
 
 - **Why rejected.** `tmux` already exists and covers rich pane/window/layout
   multiplexing. `lterm` intentionally implements only the tmux command subset
-  that AI agent tooling (Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, OMX/OMC, cmux)
+  that AI agent tooling (Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, OMX/OMC, cmux)
   exercises. Expanding to the full surface would balloon code, tests, and the
   1.0 public contract, and would compete with `tmux` on terrain `tmux` already
   owns.

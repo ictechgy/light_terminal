@@ -1,6 +1,6 @@
 # Agent install prompt for `lterm`
 
-Copy this prompt into Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, or another terminal
+Copy this prompt into Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, or another terminal
 coding agent when you want the agent to install and verify `lterm` for you.
 
 ```text
@@ -39,7 +39,16 @@ Then print:
 - One recommended first command for my agent workflow, for example:
   - `lterm claude --name claude-main`
   - `lterm codex --name codex-main`
+  - `lterm opencode --name opencode-main`
+  - `lterm copilot --name copilot-main`
+  - `lterm cursor-agent --name cursor-main`
   - `lterm agy --name agy-main`
+  - `lterm kiro --name kiro-main`
+  - `lterm jules --name jules-main`
+  - `lterm aider --name aider-main`
+  - `lterm goose --name goose-main`
+  - `lterm amp --name amp-main`
+  - `lterm crush --name crush-main`
   - `lterm kimi --name kimi-main`
   - `lterm qwen --name qwen-main`
   - `lterm gemini --name gemini-main`

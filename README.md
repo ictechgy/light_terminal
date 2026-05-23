@@ -5,8 +5,8 @@
 ## TL;DR
 
 - **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI agent tooling. Detach and reattach by name or pane id.
-- **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
-- **How** — `lterm start` to create, `lterm resume` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm agy` / `lterm kimi` / `lterm qwen` / `lterm gemini` for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
+- **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
+- **How** — `lterm start` to create, `lterm resume` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` and other built-in shortcuts for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
 - **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
@@ -26,8 +26,9 @@ need:
 - **Agent-first persistence** — named PTY sessions keep running across detached
   clients without requiring every workflow to manage a full tmux server.
 - **tmux-compatible where agents expect it** — `lterm tmux-compat` implements
-  the command subset used by Claude Code, Codex CLI, Antigravity/`agy`, Kimi,
-  Qwen, Gemini CLI, OMX/OMC, and similar terminal-first tooling.
+  the command subset used by Claude Code, Codex CLI, OpenCode, GitHub Copilot
+  CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp,
+  Crush, Kimi, Qwen, Gemini CLI, OMX/OMC, and similar terminal-first tooling.
 - **Raw attach, safe reports** — attached PTY streams remain raw for TUIs and
   interactive shells, while `logs`, `capture`, `list`, `doctor`, and other
   report surfaces sanitize terminal control sequences before printing.
@@ -43,7 +44,7 @@ The project addresses three constraints:
 
 1. **tmux-like persistence and remote access** — sessions run inside a background daemon and can be attached or detached by name or pane id. Remote access is available through `lterm ssh`, provided `lterm` is installed on the remote host.
 2. **cmux compatibility** — when running inside cmux, `lterm` preserves OSC notifications, exposes `lterm notify`, and the tmux shim opens worker panes as native cmux splits when possible.
-3. **AI tooling support** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm agy`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that agent tools expect.
+3. **AI tooling support** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that agent tools expect.
 
 cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and a tmux shim that maps tmux commands into native cmux panes.
 
@@ -65,7 +66,7 @@ Homebrew and npm both install the `lterm` command on your `PATH`; verify with `l
 
 Too lazy to install it manually? Copy the prompt in
 [`docs/agent-install.md`](docs/agent-install.md) into Claude Code, Codex CLI,
-Antigravity/`agy`, Kimi, Qwen, Gemini CLI, or another terminal coding agent. It asks the agent to detect your
+OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, or another terminal coding agent. It asks the agent to detect your
 platform, install `lterm`, verify it with a smoke test, and avoid modifying
 shell startup files without showing you the change.
 
@@ -152,7 +153,7 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 
 | Task | Product command | Compatibility boundary |
 | --- | --- | --- |
-| Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm agy`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` |
+| Launch a profiled agent session | `lterm agent claude -- --help` | Sibling shortcuts: `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` |
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
@@ -281,7 +282,16 @@ lterm shutdown
 ```bash
 lterm claude
 lterm codex
+lterm opencode
+lterm copilot
+lterm cursor-agent
 lterm agy -- -p "summarize this repo"
+lterm kiro
+lterm jules
+lterm aider
+lterm goose
+lterm amp
+lterm crush
 lterm kimi
 lterm qwen
 lterm gemini -- -p "summarize this repo"  # legacy-compatible
@@ -293,6 +303,8 @@ These are thin profile aliases for:
 ```bash
 lterm agent claude
 lterm agent codex
+lterm agent opencode
+lterm agent cursor-agent
 lterm agent agy -- -p "summarize this repo"
 lterm agent qwen
 lterm agent gemini -- -p "summarize this repo"
@@ -306,9 +318,9 @@ lterm codex --detach --name repo-codex -- exec "summarize this repo"
 lterm agy --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/Antigravity/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Use `--status` to force the lterm status bar on, or `--no-status` to force it off for profiles that default on. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
-Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to `claude`, `codex`, `agy`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
+Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
 Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not consist only of digits, must not look like a UUID, and are limited to 128 bytes.
