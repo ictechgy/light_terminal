@@ -1,7 +1,7 @@
 # `lterm` agent 설치 프롬프트
 
 `lterm` 설치와 검증을 직접 하기 귀찮을 때, 아래 프롬프트를 Claude Code,
-Codex CLI, Antigravity/`agy`, Kimi, Qwen, Gemini CLI 같은 terminal coding agent에 그대로 붙여 넣으세요.
+Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI 같은 terminal coding agent에 그대로 붙여 넣으세요.
 
 ```text
 너는 AI-agent workflow용 lightweight tmux-compatible terminal session daemon인
@@ -39,7 +39,16 @@ Source install에서 우선 사용할 현재 release tag: v1.0.2
 - 내 agent workflow에 추천하는 첫 명령. 예:
   - `lterm claude --name claude-main`
   - `lterm codex --name codex-main`
+  - `lterm opencode --name opencode-main`
+  - `lterm copilot --name copilot-main`
+  - `lterm cursor-agent --name cursor-main`
   - `lterm agy --name agy-main`
+  - `lterm kiro --name kiro-main`
+  - `lterm jules --name jules-main`
+  - `lterm aider --name aider-main`
+  - `lterm goose --name goose-main`
+  - `lterm amp --name amp-main`
+  - `lterm crush --name crush-main`
   - `lterm kimi --name kimi-main`
   - `lterm qwen --name qwen-main`
   - `lterm gemini --name gemini-main`

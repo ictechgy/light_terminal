@@ -1198,12 +1198,21 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "agents",
         "agent",
         "agy",
+        "aider",
+        "amp",
         "omx",
         "omc",
         "claude",
         "codex",
+        "copilot",
+        "crush",
+        "cursor-agent",
         "gemini",
+        "goose",
+        "jules",
+        "kiro",
         "kimi",
+        "opencode",
         "qwen",
         "ssh",
     ] {
@@ -1395,7 +1404,7 @@ fn help_describes_general_agent_profile_surface() -> TestResult {
     let normalized = normalize_help(&stdout);
     for expected in [
         "Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session",
-        "Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, agy, kimi, qwen",
+        "Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, opencode, agy",
         "JSON file with additional configured custom agent profiles",
     ] {
         assert!(
@@ -1436,8 +1445,44 @@ fn help_describes_forwarded_agent_arguments() -> TestResult {
             "Arguments forwarded to codex; use `--` before args that look like lterm options",
         ),
         (
+            "opencode",
+            "Arguments forwarded to opencode; use `--` before args that look like lterm options",
+        ),
+        (
+            "copilot",
+            "Arguments forwarded to copilot; use `--` before args that look like lterm options",
+        ),
+        (
+            "cursor-agent",
+            "Arguments forwarded to cursor-agent; use `--` before args that look like lterm options",
+        ),
+        (
             "agy",
             "Arguments forwarded to agy; use `--` before args that look like lterm options",
+        ),
+        (
+            "jules",
+            "Arguments forwarded to jules; use `--` before args that look like lterm options",
+        ),
+        (
+            "kiro",
+            "Arguments forwarded to kiro-cli; use `--` before args that look like lterm options",
+        ),
+        (
+            "aider",
+            "Arguments forwarded to aider; use `--` before args that look like lterm options",
+        ),
+        (
+            "goose",
+            "Arguments forwarded to goose; use `--` before args that look like lterm options",
+        ),
+        (
+            "amp",
+            "Arguments forwarded to amp; use `--` before args that look like lterm options",
+        ),
+        (
+            "crush",
+            "Arguments forwarded to crush; use `--` before args that look like lterm options",
         ),
         (
             "gemini",
@@ -5026,6 +5071,8 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let config_path = env.temp.path().join("agents.json");
     std::fs::create_dir(&fake_bin)?;
     write_executable(&fake_bin.join("codex"), "#!/bin/sh\nexit 0\n")?;
+    write_executable(&fake_bin.join("opencode"), "#!/bin/sh\nexit 0\n")?;
+    write_executable(&fake_bin.join("kiro-cli"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("agy"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("my-agent"), "#!/bin/sh\nexit 0\n")?;
     write_executable(&fake_bin.join("helper"), "#!/bin/sh\nexit 0\n")?;
@@ -5061,7 +5108,23 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(
         profile_names,
         [
-            "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc"
+            "claude",
+            "codex",
+            "opencode",
+            "copilot",
+            "cursor-agent",
+            "agy",
+            "jules",
+            "kiro",
+            "aider",
+            "goose",
+            "amp",
+            "crush",
+            "gemini",
+            "kimi",
+            "qwen",
+            "omx",
+            "omc",
         ],
         "{stdout:?}"
     );
@@ -5078,6 +5141,19 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert!(fields[5].ends_with("/codex"), "{codex:?}");
     assert_eq!(fields[6], "built-in", "{codex:?}");
 
+    let opencode = stdout
+        .lines()
+        .find(|line| line.starts_with("opencode\t"))
+        .ok_or("missing opencode row")?;
+    let fields: Vec<_> = opencode.split('\t').collect();
+    assert_eq!(fields.len(), 7, "{opencode:?}");
+    assert_eq!(fields[1], "opencode", "{opencode:?}");
+    assert_eq!(fields[2], "opencode-lterm", "{opencode:?}");
+    assert_eq!(fields[3], "off", "{opencode:?}");
+    assert_eq!(fields[4], "available", "{opencode:?}");
+    assert!(fields[5].ends_with("/opencode"), "{opencode:?}");
+    assert_eq!(fields[6], "built-in", "{opencode:?}");
+
     let agy = stdout
         .lines()
         .find(|line| line.starts_with("agy\t"))
@@ -5089,6 +5165,19 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(fields[4], "available", "{agy:?}");
     assert!(fields[5].ends_with("/agy"), "{agy:?}");
     assert_eq!(fields[6], "built-in", "{agy:?}");
+
+    let kiro = stdout
+        .lines()
+        .find(|line| line.starts_with("kiro\t"))
+        .ok_or("missing kiro row")?;
+    let fields: Vec<_> = kiro.split('\t').collect();
+    assert_eq!(fields.len(), 7, "{kiro:?}");
+    assert_eq!(fields[1], "kiro-cli", "{kiro:?}");
+    assert_eq!(fields[2], "kiro-lterm", "{kiro:?}");
+    assert_eq!(fields[3], "off", "{kiro:?}");
+    assert_eq!(fields[4], "available", "{kiro:?}");
+    assert!(fields[5].ends_with("/kiro-cli"), "{kiro:?}");
+    assert_eq!(fields[6], "built-in", "{kiro:?}");
 
     let omx = stdout
         .lines()
@@ -5110,7 +5199,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     let profiles = profiles
         .as_array()
         .ok_or("agent profiles JSON should be an array")?;
-    assert_eq!(profiles.len(), 8, "{profiles:?}");
+    assert_eq!(profiles.len(), 17, "{profiles:?}");
     let codex = profiles
         .iter()
         .find(|row| row["profile"] == "codex")
@@ -5122,6 +5211,18 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
             .unwrap_or_default()
             .ends_with("/codex")
     );
+    let opencode = profiles
+        .iter()
+        .find(|row| row["profile"] == "opencode")
+        .ok_or("missing opencode JSON row")?;
+    assert_eq!(opencode["status_default"], false);
+    assert_eq!(opencode["available"], true);
+    assert!(
+        opencode["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/opencode")
+    );
     let agy = profiles
         .iter()
         .find(|row| row["profile"] == "agy")
@@ -5129,6 +5230,20 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
     assert_eq!(agy["status_default"], false);
     assert_eq!(agy["available"], true);
     assert!(agy["path"].as_str().unwrap_or_default().ends_with("/agy"));
+    let kiro = profiles
+        .iter()
+        .find(|row| row["profile"] == "kiro")
+        .ok_or("missing kiro JSON row")?;
+    assert_eq!(kiro["binary"], "kiro-cli");
+    assert_eq!(kiro["session_base"], "kiro-lterm");
+    assert_eq!(kiro["status_default"], false);
+    assert_eq!(kiro["available"], true);
+    assert!(
+        kiro["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("/kiro-cli")
+    );
     let omx = profiles
         .iter()
         .find(|row| row["profile"] == "omx")
@@ -5452,48 +5567,42 @@ fn named_agent_alias_uses_profile_environment() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
     std::fs::create_dir(&fake_bin)?;
-    write_executable(
-        &fake_bin.join("gemini"),
-        r#"#!/bin/sh
+    let fake_agent = r#"#!/bin/sh
 printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
 printf 'ARG1:%s\n' "$1"
-"#,
-    )?;
-    write_executable(
-        &fake_bin.join("agy"),
-        r#"#!/bin/sh
-printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
-printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
-printf 'ARG1:%s\n' "$1"
-"#,
-    )?;
+"#;
+    for binary in ["gemini", "agy", "opencode", "kiro-cli", "cursor-agent"] {
+        write_executable(&fake_bin.join(binary), fake_agent)?;
+    }
     let old_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{old_path}", fake_bin.display());
 
-    let output = env
-        .cmd()
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .args(["gemini", "--", "-p"])
-        .output()?;
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("LTERM_AGENT:gemini"), "{stdout:?}");
-    assert!(stdout.contains("LTERM_SESSION:gemini-lterm"), "{stdout:?}");
-    assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
-
-    let output = env
-        .cmd()
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .args(["agy", "--", "-p"])
-        .output()?;
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("LTERM_AGENT:agy"), "{stdout:?}");
-    assert!(stdout.contains("LTERM_SESSION:agy-lterm"), "{stdout:?}");
-    assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
+    for (command, expected_agent, expected_session) in [
+        ("gemini", "gemini", "gemini-lterm"),
+        ("agy", "agy", "agy-lterm"),
+        ("opencode", "opencode", "opencode-lterm"),
+        ("kiro", "kiro", "kiro-lterm"),
+        ("cursor-agent", "cursor-agent", "cursor-agent-lterm"),
+    ] {
+        let output = env
+            .cmd()
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .args([command, "--", "-p"])
+            .output()?;
+        assert!(output.status.success(), "{command} failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("LTERM_AGENT:{expected_agent}")),
+            "{stdout:?}"
+        );
+        assert!(
+            stdout.contains(&format!("LTERM_SESSION:{expected_session}")),
+            "{stdout:?}"
+        );
+        assert!(stdout.contains("ARG1:-p"), "{stdout:?}");
+    }
     Ok(())
 }
 

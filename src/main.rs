@@ -314,7 +314,7 @@ enum Commands {
     },
     /// Run a built-in, configured, or PATH-resolved agent CLI profile inside a tmux-compatible lterm session.
     Agent {
-        /// Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, agy, kimi, qwen.
+        /// Built-in, configured, or PATH-resolved custom profile name, e.g. claude, codex, opencode, agy.
         profile: String,
         /// JSON file with additional configured custom agent profiles.
         #[arg(long = "agent-config")]
@@ -330,6 +330,22 @@ enum Commands {
         #[command(flatten)]
         launch: AgentLaunchOptions,
         /// Arguments forwarded to agy; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Aider inside a tmux-compatible lterm session.
+    Aider {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to aider; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Amp CLI inside a tmux-compatible lterm session.
+    Amp {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to amp; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -349,6 +365,30 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run GitHub Copilot CLI inside a tmux-compatible lterm session.
+    Copilot {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to copilot; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Crush inside a tmux-compatible lterm session.
+    Crush {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to crush; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Cursor Agent CLI inside a tmux-compatible lterm session.
+    CursorAgent {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to cursor-agent; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run Gemini CLI inside a tmux-compatible lterm session.
     Gemini {
         #[command(flatten)]
@@ -357,11 +397,43 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run Goose CLI inside a tmux-compatible lterm session.
+    Goose {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to goose; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Jules Tools CLI inside a tmux-compatible lterm session.
+    Jules {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to jules; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Kiro CLI inside a tmux-compatible lterm session.
+    Kiro {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to kiro-cli; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run Kimi CLI inside a tmux-compatible lterm session.
     Kimi {
         #[command(flatten)]
         launch: AgentLaunchOptions,
         /// Arguments forwarded to kimi; use `--` before args that look like lterm options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run OpenCode inside a tmux-compatible lterm session.
+    Opencode {
+        #[command(flatten)]
+        launch: AgentLaunchOptions,
+        /// Arguments forwarded to opencode; use `--` before args that look like lterm options.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -641,17 +713,44 @@ fn run() -> Result<()> {
         Commands::Agy { launch, args } => {
             run_agent_profile(AgentProfile::known("agy"), launch, args)
         }
+        Commands::Aider { launch, args } => {
+            run_agent_profile(AgentProfile::known("aider"), launch, args)
+        }
+        Commands::Amp { launch, args } => {
+            run_agent_profile(AgentProfile::known("amp"), launch, args)
+        }
         Commands::Claude { launch, args } => {
             run_agent_profile(AgentProfile::known("claude"), launch, args)
         }
         Commands::Codex { launch, args } => {
             run_agent_profile(AgentProfile::known("codex"), launch, args)
         }
+        Commands::Copilot { launch, args } => {
+            run_agent_profile(AgentProfile::known("copilot"), launch, args)
+        }
+        Commands::Crush { launch, args } => {
+            run_agent_profile(AgentProfile::known("crush"), launch, args)
+        }
+        Commands::CursorAgent { launch, args } => {
+            run_agent_profile(AgentProfile::known("cursor-agent"), launch, args)
+        }
         Commands::Gemini { launch, args } => {
             run_agent_profile(AgentProfile::known("gemini"), launch, args)
         }
+        Commands::Goose { launch, args } => {
+            run_agent_profile(AgentProfile::known("goose"), launch, args)
+        }
+        Commands::Jules { launch, args } => {
+            run_agent_profile(AgentProfile::known("jules"), launch, args)
+        }
+        Commands::Kiro { launch, args } => {
+            run_agent_profile(AgentProfile::known("kiro"), launch, args)
+        }
         Commands::Kimi { launch, args } => {
             run_agent_profile(AgentProfile::known("kimi"), launch, args)
+        }
+        Commands::Opencode { launch, args } => {
+            run_agent_profile(AgentProfile::known("opencode"), launch, args)
         }
         Commands::Qwen { launch, args } => {
             run_agent_profile(AgentProfile::known("qwen"), launch, args)
@@ -1358,7 +1457,23 @@ impl AgentLaunchOptions {
 }
 
 const BUILT_IN_AGENT_PROFILES: &[&str] = &[
-    "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc",
+    "claude",
+    "codex",
+    "opencode",
+    "copilot",
+    "cursor-agent",
+    "agy",
+    "jules",
+    "kiro",
+    "aider",
+    "goose",
+    "amp",
+    "crush",
+    "gemini",
+    "kimi",
+    "qwen",
+    "omx",
+    "omc",
 ];
 
 impl AgentProfile {
@@ -1376,10 +1491,64 @@ impl AgentProfile {
                 session_base: "codex-lterm".to_string(),
                 show_status: false,
             },
+            "opencode" => Self {
+                name: name.to_string(),
+                binary: "opencode".to_string(),
+                session_base: "opencode-lterm".to_string(),
+                show_status: false,
+            },
+            "copilot" => Self {
+                name: name.to_string(),
+                binary: "copilot".to_string(),
+                session_base: "copilot-lterm".to_string(),
+                show_status: false,
+            },
+            "cursor-agent" => Self {
+                name: name.to_string(),
+                binary: "cursor-agent".to_string(),
+                session_base: "cursor-agent-lterm".to_string(),
+                show_status: false,
+            },
             "agy" => Self {
                 name: name.to_string(),
                 binary: "agy".to_string(),
                 session_base: "agy-lterm".to_string(),
+                show_status: false,
+            },
+            "jules" => Self {
+                name: name.to_string(),
+                binary: "jules".to_string(),
+                session_base: "jules-lterm".to_string(),
+                show_status: false,
+            },
+            "kiro" => Self {
+                name: name.to_string(),
+                binary: "kiro-cli".to_string(),
+                session_base: "kiro-lterm".to_string(),
+                show_status: false,
+            },
+            "aider" => Self {
+                name: name.to_string(),
+                binary: "aider".to_string(),
+                session_base: "aider-lterm".to_string(),
+                show_status: false,
+            },
+            "goose" => Self {
+                name: name.to_string(),
+                binary: "goose".to_string(),
+                session_base: "goose-lterm".to_string(),
+                show_status: false,
+            },
+            "amp" => Self {
+                name: name.to_string(),
+                binary: "amp".to_string(),
+                session_base: "amp-lterm".to_string(),
+                show_status: false,
+            },
+            "crush" => Self {
+                name: name.to_string(),
+                binary: "crush".to_string(),
+                session_base: "crush-lterm".to_string(),
                 show_status: false,
             },
             "gemini" => Self {
@@ -1420,7 +1589,16 @@ impl AgentProfile {
         match profile {
             "claude" => Ok(Self::known("claude")),
             "codex" => Ok(Self::known("codex")),
+            "opencode" => Ok(Self::known("opencode")),
+            "copilot" => Ok(Self::known("copilot")),
+            "cursor-agent" => Ok(Self::known("cursor-agent")),
             "agy" => Ok(Self::known("agy")),
+            "jules" => Ok(Self::known("jules")),
+            "kiro" => Ok(Self::known("kiro")),
+            "aider" => Ok(Self::known("aider")),
+            "goose" => Ok(Self::known("goose")),
+            "amp" => Ok(Self::known("amp")),
+            "crush" => Ok(Self::known("crush")),
             "gemini" => Ok(Self::known("gemini")),
             "kimi" => Ok(Self::known("kimi")),
             "qwen" => Ok(Self::known("qwen")),
@@ -2118,40 +2296,30 @@ mod tests {
 
     #[test]
     fn known_agent_profiles_define_terminal_policy() {
-        let claude = AgentProfile::resolve("claude").expect("claude profile");
-        assert_eq!(claude.binary, "claude");
-        assert_eq!(claude.session_base, "claude-lterm");
-        assert!(!claude.show_status);
-
-        let codex = AgentProfile::resolve("codex").expect("codex profile");
-        assert_eq!(codex.binary, "codex");
-        assert_eq!(codex.session_base, "codex-lterm");
-        assert!(!codex.show_status);
-
-        let agy = AgentProfile::resolve("agy").expect("agy profile");
-        assert_eq!(agy.binary, "agy");
-        assert_eq!(agy.session_base, "agy-lterm");
-        assert!(!agy.show_status);
-
-        let gemini = AgentProfile::resolve("gemini").expect("gemini profile");
-        assert_eq!(gemini.binary, "gemini");
-        assert_eq!(gemini.session_base, "gemini-lterm");
-        assert!(!gemini.show_status);
-
-        let kimi = AgentProfile::resolve("kimi").expect("kimi profile");
-        assert_eq!(kimi.binary, "kimi");
-        assert_eq!(kimi.session_base, "kimi-lterm");
-        assert!(!kimi.show_status);
-
-        let qwen = AgentProfile::resolve("qwen").expect("qwen profile");
-        assert_eq!(qwen.binary, "qwen");
-        assert_eq!(qwen.session_base, "qwen-lterm");
-        assert!(!qwen.show_status);
-
-        let omx = AgentProfile::resolve("omx").expect("omx profile");
-        assert_eq!(omx.binary, "omx");
-        assert_eq!(omx.session_base, "omx-lterm");
-        assert!(omx.show_status);
+        for (name, binary, session_base, show_status) in [
+            ("claude", "claude", "claude-lterm", false),
+            ("codex", "codex", "codex-lterm", false),
+            ("opencode", "opencode", "opencode-lterm", false),
+            ("copilot", "copilot", "copilot-lterm", false),
+            ("cursor-agent", "cursor-agent", "cursor-agent-lterm", false),
+            ("agy", "agy", "agy-lterm", false),
+            ("jules", "jules", "jules-lterm", false),
+            ("kiro", "kiro-cli", "kiro-lterm", false),
+            ("aider", "aider", "aider-lterm", false),
+            ("goose", "goose", "goose-lterm", false),
+            ("amp", "amp", "amp-lterm", false),
+            ("crush", "crush", "crush-lterm", false),
+            ("gemini", "gemini", "gemini-lterm", false),
+            ("kimi", "kimi", "kimi-lterm", false),
+            ("qwen", "qwen", "qwen-lterm", false),
+            ("omx", "omx", "omx-lterm", true),
+            ("omc", "omc", "omc-lterm", true),
+        ] {
+            let profile = AgentProfile::resolve(name).expect("built-in profile");
+            assert_eq!(profile.binary, binary, "{name}");
+            assert_eq!(profile.session_base, session_base, "{name}");
+            assert_eq!(profile.show_status, show_status, "{name}");
+        }
     }
 
     #[test]
@@ -2161,7 +2329,23 @@ mod tests {
         assert_eq!(
             names,
             [
-                "claude", "codex", "agy", "gemini", "kimi", "qwen", "omx", "omc"
+                "claude",
+                "codex",
+                "opencode",
+                "copilot",
+                "cursor-agent",
+                "agy",
+                "jules",
+                "kiro",
+                "aider",
+                "goose",
+                "amp",
+                "crush",
+                "gemini",
+                "kimi",
+                "qwen",
+                "omx",
+                "omc",
             ]
         );
 
