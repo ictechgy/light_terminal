@@ -2870,8 +2870,7 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "send --surface surface:42 exec "
-                || line.starts_with("send --surface surface:42 exec ")),
+            .any(|line| line.starts_with("send --surface surface:42 exec ")),
         "attach command should target the new-split surface from stdout: {cmux_calls:?}"
     );
     Ok(())
@@ -3033,7 +3032,10 @@ fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> 
     write_executable(
         &fake_bin.join("cmux"),
         &format!(
-            "#!/bin/sh\nprintf '%s\n' \"$*\" >> {}\nexit 42\n",
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             printf '\\033]52;c;secret\\007CMUX_FAIL\\nNEXT\\n' >&2\n\
+             exit 42\n",
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
@@ -3050,6 +3052,12 @@ fn tmux_compat_split_window_cmux_new_split_failure_does_not_create_session() -> 
         "cmux new-split failure must fail split-window: {output:?}"
     );
     assert_stderr_contains(&output, "cmux new-split down failed");
+    assert_stderr_contains(&output, "CMUX_FAIL NEXT");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains("secret"),
+        "cmux stderr should be sanitized before surfacing: {stderr:?}"
+    );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
         cmux_calls
@@ -3172,6 +3180,55 @@ fn tmux_compat_split_window_rolls_back_cmux_split_when_lterm_creation_fails() ->
             .lines()
             .any(|line| line == "close-surface --surface surface:42"),
         "failed lterm creation should roll back the cmux surface reported by new-split stdout: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_rolls_back_identified_cmux_split_when_lterm_creation_fails()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-identified-rollback.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split) printf '%s\\n' 'OK workspace:1'; exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:caller\"}},\"focused\":{{\"surface_ref\":\"surface:fallback\"}}}}'; exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let bad_socket = env.temp.path().join("not-a-socket");
+    std::fs::write(&bad_socket, b"not a socket")?;
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace-for-identified-rollback")
+        .env("PATH", &fake_bin)
+        .env("LTERM_SOCKET", &bad_socket)
+        .args(["tmux-compat", "split-window", "-h", "sh", "-lc", "sleep 30"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "lterm session creation failure should fail split-window: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| line == "identify --json"),
+        "fallback path should identify the focused cmux surface: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface:fallback"),
+        "failed lterm creation should roll back the identified cmux surface: {cmux_calls:?}"
     );
     Ok(())
 }

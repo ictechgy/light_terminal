@@ -1001,13 +1001,12 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
         .output()
         .context("cmux new-split")?;
     if !split_output.status.success() {
-        let stderr = String::from_utf8_lossy(&split_output.stderr);
+        let detail = cmux_stderr_suffix(&split_output.stderr);
         bail!(
             "cmux new-split {direction} failed with {}; \
-             refusing to create a hidden lterm session{}{}",
+             refusing to create a hidden lterm session{}",
             split_output.status,
-            if stderr.trim().is_empty() { "" } else { ": " },
-            stderr.trim()
+            detail
         );
     }
 
@@ -1030,15 +1029,37 @@ fn open_cmux_split(direction: &str) -> Result<Option<String>> {
 }
 
 fn parse_cmux_new_split_surface(output: &[u8]) -> Option<String> {
+    // Current cmux prints `OK surface:<ref> workspace:<ref>` for a successful split.
+    // Only trust an explicit OK record; otherwise fall back to `cmux identify`.
     String::from_utf8_lossy(output)
-        .split_whitespace()
-        .find_map(|token| {
-            let token = token.trim_matches(|c: char| c == ',' || c == ';');
-            token
-                .strip_prefix("surface:")
-                .filter(|suffix| !suffix.is_empty())
-                .map(|_| token.to_string())
-        })
+        .lines()
+        .rev()
+        .find_map(parse_cmux_new_split_surface_line)
+}
+
+fn parse_cmux_new_split_surface_line(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    let first = trim_cmux_output_token(tokens.next()?);
+    if first != "OK" {
+        return None;
+    }
+    tokens.find_map(|token| parse_cmux_surface_ref_token(trim_cmux_output_token(token)))
+}
+
+fn trim_cmux_output_token(token: &str) -> &str {
+    token.trim_matches(|c: char| c == ',' || c == ';')
+}
+
+fn parse_cmux_surface_ref_token(token: &str) -> Option<String> {
+    let suffix = token.strip_prefix("surface:")?;
+    if suffix.is_empty()
+        || !suffix
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
@@ -1059,12 +1080,11 @@ fn send_cmux_attach(surface: Option<&str>, info: &SessionInfo) -> Result<()> {
     }
     let send_output = send.output().context("cmux send attach command")?;
     if !send_output.status.success() {
-        let stderr = String::from_utf8_lossy(&send_output.stderr);
+        let detail = cmux_stderr_suffix(&send_output.stderr);
         bail!(
-            "cmux send attach command failed with {}{}{}",
+            "cmux send attach command failed with {}{}",
             send_output.status,
-            if stderr.trim().is_empty() { "" } else { ": " },
-            stderr.trim()
+            detail
         );
     }
     Ok(())
@@ -1074,21 +1094,60 @@ fn rollback_cmux_split(surface: Option<&str>) {
     let Some(surface_id) = surface else {
         return;
     };
-    let _ = Command::new("cmux")
+    let output = Command::new("cmux")
         .arg("close-surface")
         .arg("--surface")
         .arg(surface_id)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::piped())
+        .output();
+    report_cmux_rollback_failure("cmux close-surface rollback", output);
 }
 
 fn rollback_focused_cmux_split() {
-    let _ = Command::new("cmux")
+    let output = Command::new("cmux")
         .arg("close-surface")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::piped())
+        .output();
+    report_cmux_rollback_failure("cmux close focused surface rollback", output);
+}
+
+fn report_cmux_rollback_failure(context: &str, output: std::io::Result<std::process::Output>) {
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "warning: {} failed with {}{}",
+            context,
+            output.status,
+            cmux_stderr_suffix(&output.stderr)
+        ),
+        Err(err) => eprintln!(
+            "warning: {} failed to run: {}",
+            context,
+            sanitize::terminal_text(&err.to_string())
+        ),
+    }
+}
+
+fn cmux_stderr_suffix(stderr: &[u8]) -> String {
+    cmux_stderr_preview(stderr)
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default()
+}
+
+fn cmux_stderr_preview(stderr: &[u8]) -> Option<String> {
+    const MAX_CHARS: usize = 512;
+    let sanitized = sanitize::terminal_capture(stderr);
+    let normalized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut preview: String = normalized.chars().take(MAX_CHARS).collect();
+    if normalized.chars().count() > MAX_CHARS {
+        preview.push('…');
+    }
+    Some(preview)
 }
 
 fn inside_cmux() -> bool {
@@ -1129,10 +1188,10 @@ fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
         "surface",
         "id",
     ];
-    value
-        .get("focused")
-        .and_then(|focused| find_json_string(focused, &keys))
-        .or_else(|| find_json_string(value, &keys))
+    match value.get("focused") {
+        Some(focused) => find_json_string(focused, &keys),
+        None => find_json_string(value, &keys),
+    }
 }
 
 fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -2342,11 +2401,60 @@ mod tests {
     }
 
     #[test]
-    fn cmux_new_split_output_reports_surface_ref() {
+    fn cmux_surface_ref_does_not_fall_back_to_caller_when_focused_lacks_surface() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller"
+            },
+            "focused": {
+                "workspace_ref": "workspace:focused"
+            }
+        });
+
+        assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_new_split_output_reports_ok_surface_ref() {
         assert_eq!(
             parse_cmux_new_split_surface(b"OK surface:42 workspace:1\n").as_deref(),
             Some("surface:42")
         );
+    }
+
+    #[test]
+    fn cmux_new_split_output_ignores_non_ok_surface_mentions() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"note previous surface:9\nOK surface:42 workspace:1\n")
+                .as_deref(),
+            Some("surface:42")
+        );
+        assert_eq!(parse_cmux_new_split_surface(b"note surface:9\n"), None);
+    }
+
+    #[test]
+    fn cmux_new_split_output_rejects_empty_or_decorated_surface_refs() {
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK surface: workspace:1\n"),
+            None
+        );
+        assert_eq!(
+            parse_cmux_new_split_surface(b"OK (surface:42) workspace:1\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn cmux_stderr_preview_strips_terminal_controls_and_truncates() {
+        let mut stderr = b"\x1b]52;c;secret\x07CMUX_FAIL\nNEXT ".to_vec();
+        stderr.extend(std::iter::repeat_n(b'x', 600));
+        let preview = cmux_stderr_preview(&stderr).expect("stderr preview");
+
+        assert!(preview.starts_with("CMUX_FAIL NEXT "));
+        assert!(preview.ends_with('…'));
+        assert!(!preview.contains('\x1b'));
+        assert!(!preview.contains("secret"));
+        assert!(preview.chars().count() <= 513);
     }
 
     fn args(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
