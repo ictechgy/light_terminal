@@ -4319,6 +4319,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_prefix_tracker_resynchronizes_escape_inside_csi() {
+        let mut tracker = TerminalPrefixTracker::default();
+        tracker.process(b"\x1b[?1049\x1b]");
+
+        assert_eq!(
+            tracker.pending_bytes(),
+            b"\x1b]".to_vec(),
+            "ESC inside CSI must start a fresh escape sequence instead of being swallowed into CSI"
+        );
+
+        tracker.process(b"0;title\x07SAFE");
+        assert!(tracker.pending_bytes().is_empty());
+    }
+
+    #[test]
     fn terminal_prefix_tracker_clears_cancelled_control_sequences() {
         for bytes in [
             &b"\x1b]52;c;secret\x18"[..],
