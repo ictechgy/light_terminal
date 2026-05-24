@@ -126,22 +126,47 @@ impl ChildCleanup {
     }
 
     fn kill_and_wait(&mut self) -> TestResult {
-        let Some(child) = self.child.as_mut() else {
+        let Some(mut child) = self.child.take() else {
             return Ok(());
         };
-        if child.try_wait()?.is_none() {
-            match child.kill() {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(err) => {
-                    return Err(format!("failed to kill child {}: {err}", child.id()).into());
-                }
+        let child_id = child.id();
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let mut kill_error = None;
+        match child.kill() {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(err) => {
+                kill_error = Some(format!("failed to kill child {child_id}: {err}"));
             }
         }
-        let mut child = self.child.take().ok_or("child already reaped")?;
-        child.wait()?;
-        Ok(())
+        let wait_result = wait_child_exit(&mut child, Duration::from_secs(3));
+        match (kill_error, wait_result) {
+            (Some(kill_error), Err(wait_error)) => Err(format!(
+                "{kill_error}; additionally failed to reap child {child_id}: {wait_error}"
+            )
+            .into()),
+            (Some(kill_error), Ok(())) => Err(kill_error.into()),
+            (None, Err(wait_error)) => Err(wait_error),
+            (None, Ok(())) => Ok(()),
+        }
     }
+}
+
+fn wait_child_exit(child: &mut Child, timeout: Duration) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("process {} did not exit within {timeout:?}", child.id()).into())
 }
 
 impl Drop for ChildCleanup {

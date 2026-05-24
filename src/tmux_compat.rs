@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const WAIT_GENERATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const WAIT_GENERATION_MAX_CHANNELS: usize = 4_096;
+const WAIT_GENERATION_TOUCH_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,7 +55,14 @@ pub fn ensure_shim() -> Result<PathBuf> {
         .context("lterm executable path must be valid UTF-8")?;
     let quoted_lterm = shlex::try_quote(lterm).context("quote lterm executable path")?;
     let script = format!("#!/bin/sh\nexec {quoted_lterm} tmux-compat \"$@\"\n");
-    fs::write(&tmux_path, script).with_context(|| format!("write {}", tmux_path.display()))?;
+    let existing = match fs::read(&tmux_path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("read {}", tmux_path.display())),
+    };
+    if existing.as_deref() != Some(script.as_bytes()) {
+        fs::write(&tmux_path, script).with_context(|| format!("write {}", tmux_path.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -242,8 +250,27 @@ fn has_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
     match client::info(&target) {
         Ok(_) => Ok(0),
-        Err(_) => Ok(1),
+        Err(info_err) => match client::list_sessions() {
+            Ok(sessions)
+                if !sessions
+                    .iter()
+                    .any(|info| target_matches_info(&target, info)) =>
+            {
+                Ok(1)
+            }
+            Ok(_) => Err(info_err).with_context(|| {
+                format!("lterm info failed even though target {target:?} is present in list output")
+            }),
+            Err(_) => Err(info_err),
+        },
     }
+}
+
+fn target_matches_info(target: &str, info: &SessionInfo) -> bool {
+    target == info.name
+        || target == info.pane_id
+        || target == info.id
+        || (!target.starts_with('%') && !target.is_empty() && format!("%{target}") == info.pane_id)
 }
 
 fn list_sessions(args: &[String]) -> Result<i32> {
@@ -854,27 +881,34 @@ fn parse_resize_dimension(flag: char, value: Option<String>) -> Result<u16> {
 }
 
 fn show_option(args: &[String]) -> Result<i32> {
-    if args.iter().any(|a| a == "-g" || a == "-v") {
+    if show_option_prints_value(args) {
         // Return a conservative default for scripts that query options.
         println!("off");
     }
     Ok(0)
 }
 
+fn show_option_prints_value(args: &[String]) -> bool {
+    has_flag(args, "-g") || has_flag(args, "-v")
+}
+
 fn display_popup(args: &[String]) -> Result<i32> {
+    const VALUE_FLAGS: &[char] = &['b', 'c', 'd', 'e', 'h', 's', 'S', 't', 'T', 'w', 'x', 'y'];
     let mut command = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-E" => {
-                command = tmux_shell_command(&args[i + 1..])?;
-                break;
-            }
             "--" => {
                 command = tmux_shell_command(&args[i + 1..])?;
                 break;
             }
-            _ => i += 1,
+            flag if flag.starts_with('-') && flag != "-" => {
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
+            _ => {
+                command = tmux_shell_command(&args[i..])?;
+                break;
+            }
         }
     }
     if let Some(command) = command {
@@ -896,7 +930,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
         match args[i].as_str() {
             "-S" => {
                 signal = true;
-                channel = args.get(i + 1).cloned();
+                channel = Some(value_for_option(args.get(i + 1).cloned(), "-S")?);
                 i += 2;
             }
             "-L" | "-U" => bail!("tmux wait-for {} is not supported by lterm", args[i]),
@@ -906,7 +940,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let channel = channel.unwrap_or_else(|| "default".to_string());
+    let channel = channel.context("tmux wait-for requires a channel")?;
     if signal {
         update_store(|store| {
             prune_wait_generations(store, None);
@@ -924,14 +958,22 @@ fn wait_for(args: &[String]) -> Result<i32> {
         Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
     })?;
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
+    let touch_interval = Duration::from_secs(WAIT_GENERATION_TOUCH_INTERVAL_SECS);
+    let mut next_touch = Instant::now() + touch_interval;
     let mut sleep_for = Duration::from_millis(100);
     while Instant::now() < deadline {
-        let current_generation = update_store(|store| {
-            prune_wait_generations(store, Some(&channel));
-            touch_existing_wait_generation(store, &channel);
-            Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
-        })?;
-        if current_generation > observed_generation {
+        let now = Instant::now();
+        let current_generation = if now >= next_touch {
+            next_touch = now + touch_interval;
+            update_store(|store| {
+                prune_wait_generations(store, Some(&channel));
+                touch_existing_wait_generation(store, &channel);
+                Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
+            })?
+        } else {
+            read_store(|store| Ok(*store.wait_generations.get(&channel).unwrap_or(&0)))?
+        };
+        if wait_generation_has_advanced(observed_generation, current_generation) {
             return Ok(0);
         }
         thread::sleep(sleep_for);
@@ -1474,6 +1516,13 @@ fn touch_existing_wait_generation(store: &mut CompatStore, channel: &str) {
     }
 }
 
+fn wait_generation_has_advanced(observed_generation: u64, current_generation: u64) -> bool {
+    current_generation > observed_generation
+        || (observed_generation > 0
+            && current_generation > 0
+            && current_generation < observed_generation)
+}
+
 fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&str>) {
     let now = now_unix_secs();
     let cutoff = now.saturating_sub(WAIT_GENERATION_RETENTION_SECS);
@@ -1558,6 +1607,12 @@ fn update_store<T>(f: impl FnOnce(&mut CompatStore) -> Result<T>) -> Result<T> {
     let result = f(&mut store)?;
     save_store(&store)?;
     Ok(result)
+}
+
+fn read_store<T>(f: impl FnOnce(&CompatStore) -> Result<T>) -> Result<T> {
+    let _lock = StoreLock::acquire()?;
+    let store = load_store()?;
+    f(&store)
 }
 
 struct StoreLock {
@@ -2190,10 +2245,36 @@ pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {
             "Down" | "down" => out.extend_from_slice(b"\x1b[B"),
             "Right" | "right" => out.extend_from_slice(b"\x1b[C"),
             "Left" | "left" => out.extend_from_slice(b"\x1b[D"),
-            text => out.extend_from_slice(text.as_bytes()),
+            text => {
+                if let Some(byte) = control_key_byte(text) {
+                    out.push(byte);
+                } else {
+                    out.extend_from_slice(text.as_bytes());
+                }
+            }
         }
     }
     out
+}
+
+fn control_key_byte(key: &str) -> Option<u8> {
+    let suffix = key.strip_prefix("C-")?;
+    let mut chars = suffix.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    match ch {
+        '@' | ' ' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        ch if ch.is_ascii_alphabetic() => Some((ch.to_ascii_uppercase() as u8) & 0x1f),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2243,6 +2324,162 @@ mod tests {
         assert_eq!(keys_to_bytes(&keys, false), b"echo ok\r");
         assert_eq!(keys_to_bytes(&["a".into(), "b".into()], true), b"ab");
         assert_eq!(keys_to_bytes(&["C-j".into()], false), b"\n");
+    }
+
+    #[test]
+    fn maps_generic_control_keys() {
+        assert_eq!(
+            keys_to_bytes(
+                &[
+                    "C-a".into(),
+                    "C-L".into(),
+                    "C-]".into(),
+                    "C-_".into(),
+                    "C-?".into()
+                ],
+                false
+            ),
+            [0x01, 0x0c, 0x1d, 0x1f, 0x7f]
+        );
+        assert_eq!(keys_to_bytes(&["C-xy".into()], false), b"C-xy");
+    }
+
+    #[test]
+    fn target_matching_covers_tmux_forms_without_error_string_coupling() {
+        let info = SessionInfo {
+            id: "session-uuid".to_string(),
+            name: "main".to_string(),
+            pane_id: "%7".to_string(),
+            parent_pane_id: None,
+            parent_session_id: None,
+            command: "sh".to_string(),
+            cwd: "/tmp".to_string(),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            attached_clients: 0,
+            process_id: None,
+            process_group_id: None,
+            status_theme: None,
+        };
+
+        assert!(target_matches_info("main", &info));
+        assert!(target_matches_info("%7", &info));
+        assert!(target_matches_info("7", &info));
+        assert!(target_matches_info("session-uuid", &info));
+        assert!(!target_matches_info("missing", &info));
+    }
+
+    #[test]
+    fn show_option_accepts_clustered_value_flags() {
+        assert!(show_option_prints_value(&args(["-gv", "status"])));
+        assert!(show_option_prints_value(&args(["-qg", "status"])));
+        assert!(!show_option_prints_value(&args(["status"])));
+    }
+
+    #[test]
+    fn display_popup_accepts_command_without_e_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("popup.out");
+        let output_path = output.display().to_string();
+        let quoted = shlex::try_quote(&output_path).expect("quote output");
+        let status = display_popup(&[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf popup > {quoted}"),
+        ])
+        .expect("display-popup command");
+
+        assert_eq!(status, 0);
+        assert_eq!(fs::read_to_string(output).expect("popup output"), "popup");
+    }
+
+    #[test]
+    fn display_popup_skips_options_before_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("popup-e.out");
+        let output_path = output.display().to_string();
+        let quoted = shlex::try_quote(&output_path).expect("quote output");
+        let status = display_popup(&[
+            "-E".to_string(),
+            "-w".to_string(),
+            "80".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf popup-e > {quoted}"),
+        ])
+        .expect("display-popup command");
+
+        assert_eq!(status, 0);
+        assert_eq!(fs::read_to_string(output).expect("popup output"), "popup-e");
+    }
+
+    #[test]
+    fn display_popup_accepts_clustered_options_and_explicit_separator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let clustered = temp.path().join("popup-clustered.out");
+        let clustered_path = clustered.display().to_string();
+        let quoted_clustered = shlex::try_quote(&clustered_path).expect("quote clustered output");
+        let status = display_popup(&[
+            "-Ew80".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf clustered > {quoted_clustered}"),
+        ])
+        .expect("clustered display-popup command");
+        assert_eq!(status, 0);
+        assert_eq!(
+            fs::read_to_string(clustered).expect("clustered popup output"),
+            "clustered"
+        );
+
+        let separated = temp.path().join("popup-separator.out");
+        let separated_path = separated.display().to_string();
+        let quoted_separated = shlex::try_quote(&separated_path).expect("quote separator output");
+        let status = display_popup(&[
+            "-E".to_string(),
+            "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf separator > {quoted_separated}"),
+        ])
+        .expect("separator display-popup command");
+        assert_eq!(status, 0);
+        assert_eq!(
+            fs::read_to_string(separated).expect("separator popup output"),
+            "separator"
+        );
+    }
+
+    #[test]
+    fn wait_for_requires_channel() {
+        assert!(
+            wait_for(&Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a channel")
+        );
+        assert!(
+            wait_for(&args(["-S"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux option -S requires a value")
+        );
+    }
+
+    #[test]
+    fn wait_generation_detects_recreated_pruned_channel() {
+        assert!(!wait_generation_has_advanced(0, 0));
+        assert!(wait_generation_has_advanced(0, 1));
+        assert!(wait_generation_has_advanced(7, 8));
+        assert!(!wait_generation_has_advanced(7, 7));
+        assert!(!wait_generation_has_advanced(7, 0));
+        assert!(
+            wait_generation_has_advanced(7, 1),
+            "a signal that recreates a pruned channel must wake waiters even if the generation resets"
+        );
     }
 
     #[test]

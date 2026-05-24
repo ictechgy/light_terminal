@@ -73,20 +73,35 @@ impl DaemonGuard {
     }
 
     fn kill_and_wait(&mut self) -> TestResult {
-        let Some(child) = self.child.as_mut() else {
+        let Some(mut child) = self.child.take() else {
             return Ok(());
         };
-        if child.try_wait()?.is_none() {
-            match child.kill() {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(err) => {
-                    return Err(format!("failed to kill daemon {}: {err}", child.id()).into());
-                }
+        let child_id = child.id();
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let mut kill_error = None;
+        match child.kill() {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(err) => {
+                kill_error = Some(format!("failed to kill daemon {child_id}: {err}"));
             }
         }
-        let mut child = self.child.take().ok_or("daemon child already reaped")?;
-        wait_child_exit(&mut child, Duration::from_secs(3))
+        let wait_result = wait_child_exit(&mut child, Duration::from_secs(3));
+        match (kill_error, wait_result) {
+            (Some(kill_error), Err(wait_error)) => Err(format!(
+                "{kill_error}; additionally failed to reap daemon {child_id}: {wait_error}"
+            )
+            .into()),
+            (Some(kill_error), Ok(())) => Err(kill_error.into()),
+            (None, Err(wait_error)) => Err(wait_error),
+            (None, Ok(())) => Ok(()),
+        }
     }
 }
 

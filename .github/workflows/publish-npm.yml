@@ -12,10 +12,6 @@ on:
         required: true
         type: boolean
         default: true
-      source_ref:
-        description: "Git ref to build and publish from"
-        required: true
-        default: "main"
       publish_platforms:
         description: "Build and publish platform packages before the wrapper"
         required: true
@@ -31,25 +27,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-inputs:
+    name: Validate dispatch inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release tag input
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "input tag must match vMAJOR.MINOR.PATCH: $TAG" >&2
+            exit 62
+          fi
+
   metadata:
     name: Check npm metadata
+    needs: validate-inputs
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
       - name: Validate package versions
         id: meta
         shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "input tag must match vMAJOR.MINOR.PATCH: $TAG" >&2
+            exit 62
+          fi
+          actual_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "refs/tags/$TAG")"
+          if [[ "$actual_commit" != "$tag_commit" ]]; then
+            echo "checked-out commit $actual_commit does not match tag $TAG ($tag_commit)" >&2
+            exit 63
+          fi
+
           version=$(node -p 'require("./package.json").version')
           expected_tag="v${version}"
-          if [[ "${{ inputs.tag }}" != "$expected_tag" ]]; then
-            echo "input tag ${{ inputs.tag }} does not match package version $version" >&2
+          if [[ "$TAG" != "$expected_tag" ]]; then
+            echo "input tag $TAG does not match package version $version" >&2
             exit 64
           fi
 
@@ -62,6 +89,7 @@ jobs:
           done
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$actual_commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.package }}
@@ -87,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.metadata.outputs.commit_sha }}
 
       - uses: actions/setup-node@v6
         with:
@@ -134,7 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.metadata.outputs.commit_sha }}
 
       - uses: actions/setup-node@v6
         with:
@@ -168,10 +196,12 @@ jobs:
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
           publish_flags=(--access public)
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+          if [[ "$DRY_RUN" == "true" ]]; then
             publish_flags+=(--dry-run)
           else
             publish_flags+=(--provenance)
@@ -184,7 +214,11 @@ jobs:
             (
               cd "npm/platforms/${package}"
               version=$(node -p 'require("./package.json").version')
-              if [[ "${{ inputs.dry_run }}" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
+              if [[ "$version" != "$VALIDATED_VERSION" ]]; then
+                echo "${package} version ${version} does not match validated metadata version ${VALIDATED_VERSION}" >&2
+                exit 65
+              fi
+              if [[ "$DRY_RUN" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
                 echo "${package}@${version} already exists; skipping publish"
                 exit 0
               fi
@@ -196,17 +230,32 @@ jobs:
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PUBLISH_PLATFORMS: ${{ inputs.publish_platforms }}
+          VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
           publish_flags=(--access public)
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+          if [[ "$DRY_RUN" == "true" ]]; then
             publish_flags+=(--dry-run)
           else
             publish_flags+=(--provenance)
           fi
           package=$(node -p 'require("./package.json").name')
           version=$(node -p 'require("./package.json").version')
-          if [[ "${{ inputs.dry_run }}" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
+          if [[ "$version" != "$VALIDATED_VERSION" ]]; then
+            echo "${package} version ${version} does not match validated metadata version ${VALIDATED_VERSION}" >&2
+            exit 65
+          fi
+          if [[ "$DRY_RUN" != "true" && "$PUBLISH_PLATFORMS" != "true" ]]; then
+            for platform_package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
+              if ! npm view "${platform_package}@${version}" version >/dev/null 2>&1; then
+                echo "missing required platform package ${platform_package}@${version}; refusing to publish wrapper without platform build" >&2
+                exit 66
+              fi
+            done
+          fi
+          if [[ "$DRY_RUN" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
             echo "${package}@${version} already exists; skipping publish"
             exit 0
           fi

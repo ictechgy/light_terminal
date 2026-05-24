@@ -24,6 +24,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_PYTHON = sys.executable
 
 
+def cargo_package_version(cargo_toml: str) -> str:
+    in_package = False
+    for raw_line in cargo_toml.splitlines():
+        line = raw_line.strip()
+        if line == "[package]":
+            in_package = True
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_package = False
+            continue
+        if in_package and line.startswith("version"):
+            key, _, value = line.partition("=")
+            if key.strip() == "version":
+                return value.strip().strip('"')
+    raise AssertionError("Cargo.toml package.version is missing")
+
+
 def write_executable(path: Path, text: str) -> None:
     path.write_text(textwrap.dedent(text).lstrip(), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -295,6 +312,15 @@ PY
         for rel_path in files:
             path = REPO_ROOT / rel_path
             self.assertTrue(path.exists(), f"package files entry is missing: {rel_path}")
+
+    def test_homebrew_formula_version_matches_package_manifests(self) -> None:
+        version = cargo_package_version((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["version"], version)
+
+        formula = (REPO_ROOT / "packaging" / "homebrew" / "lterm.rb").read_text(encoding="utf-8")
+        self.assertIn(f"/refs/tags/v{version}.tar.gz", formula)
+        self.assertIn(f'assert_match "lterm {version}"', formula)
 
 
 if __name__ == "__main__":
