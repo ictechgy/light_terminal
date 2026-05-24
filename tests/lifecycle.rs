@@ -472,6 +472,9 @@ fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
         Duration::from_secs(3),
         "list with symlink-to-live-socket bait",
     );
+    // Give the nonblocking accept loop a brief post-command drain window so a
+    // forbidden connect queued just before process exit cannot be missed.
+    thread::sleep(Duration::from_millis(150));
     stop_accept.store(true, Ordering::Release);
     accept_thread
         .join()

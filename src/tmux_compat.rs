@@ -1,7 +1,7 @@
 use crate::client;
 use crate::client::AttachStdinEof;
 use crate::paths;
-use crate::protocol::SessionInfo;
+use crate::protocol::{MAX_SEND_DATA_BYTES, SessionInfo};
 use crate::sanitize;
 use crate::server;
 use anyhow::{Context, Result, anyhow, bail};
@@ -805,10 +805,24 @@ fn send_keys(args: &[String]) -> Result<i32> {
     }
     let target = target.unwrap_or_else(default_target);
     let bytes = keys_to_bytes(&keys, literal);
-    for _ in 0..repeat {
-        client::send(&target, bytes.clone())?;
-    }
+    let bytes = repeated_send_payload(&bytes, repeat)?;
+    client::send(&target, bytes)?;
     Ok(0)
+}
+
+fn repeated_send_payload(bytes: &[u8], repeat: usize) -> Result<Vec<u8>> {
+    let total = bytes
+        .len()
+        .checked_mul(repeat)
+        .context("send-keys -N repeat count is too large")?;
+    if total > MAX_SEND_DATA_BYTES {
+        bail!("send data exceeds {} bytes", MAX_SEND_DATA_BYTES);
+    }
+    let mut repeated = Vec::with_capacity(total);
+    for _ in 0..repeat {
+        repeated.extend_from_slice(bytes);
+    }
+    Ok(repeated)
 }
 
 fn parse_send_keys_repeat(value: Option<String>) -> Result<usize> {

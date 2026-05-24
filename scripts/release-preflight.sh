@@ -149,7 +149,7 @@ run python3 scripts/check_contract_drift.py --self-test
 run python3 scripts/check_contract_drift.py --manifest docs/contract-manifest.json --lterm-bin "$LTERM_BIN"
 
 if [[ "$CONTRACT_ONLY" == 0 ]]; then
-  run cargo test --locked --test upgrade_matrix -- --ignored --nocapture --test-threads=1
+  run cargo test --locked --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
 fi
 
 case "$AUDIT_MODE" in

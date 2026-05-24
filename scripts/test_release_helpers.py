@@ -195,7 +195,7 @@ PY
                 "cargo\tclippy\t--locked\t--all-targets\t--\t-D\twarnings",
                 "cargo\ttest\t--locked\t--\t--test-threads=1",
                 "cargo\tbuild\t--release\t--locked",
-                "cargo\ttest\t--locked\t--test\tupgrade_matrix\t--\t--ignored\t--nocapture\t--test-threads=1",
+                "cargo\ttest\t--locked\t--test\tupgrade_matrix\t--\t--include-ignored\t--nocapture\t--test-threads=1",
                 "cargo\taudit",
             ]:
                 self.assertIn(expected, log)
