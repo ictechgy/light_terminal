@@ -1834,6 +1834,48 @@ fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
     );
     assert_stderr_contains(&delay_cap, "exceeds safety cap");
 
+    let legacy_path = env.temp.path().join("legacy-v1-trace.jsonl");
+    std::fs::write(
+        &legacy_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","target":"legacy","created_at_unix_ms":1,"duration_ms":1000,"max_bytes":1024,"rows":24,"cols":80,"raw_stream_policy":"raw-transparent"}"#,
+            "\n",
+            r#"{"type":"output","elapsed_ms":1,"direction":"stdout","len":6,"bytes_hex":"4c4547414359"}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":2,"reason":"duration"}"#,
+            "\n"
+        ),
+    )?;
+    let legacy = env.cmd().arg("trace-replay").arg(&legacy_path).output()?;
+    assert!(
+        legacy.status.success(),
+        "trace-replay should accept v1.0.6 trace files without newer metadata: {legacy:?}"
+    );
+    assert_eq!(legacy.stdout, b"LEGACY");
+
+    let slightly_over_duration_path = env.temp.path().join("slightly-over-duration.jsonl");
+    std::fs::write(
+        &slightly_over_duration_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":1000}"#,
+            "\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":1001,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":1001,"reason":"duration","bytes_recorded":1,"chunks_recorded":1}"#,
+            "\n"
+        ),
+    )?;
+    let slightly_over_duration = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&slightly_over_duration_path)
+        .output()?;
+    assert!(
+        slightly_over_duration.status.success(),
+        "trace-replay should tolerate scheduler drift past duration_ms: {slightly_over_duration:?}"
+    );
+    assert_eq!(slightly_over_duration.stdout, b"A");
+
     let info_path = env.temp.path().join("info-unknown.jsonl");
     std::fs::write(
         &info_path,

@@ -640,7 +640,6 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
     let mut previous_elapsed_ms = 0_u64;
     let mut expected_chunk_index = 0_u64;
     let mut replayed_bytes = 0_u64;
-    let mut duration_ms = None;
     let mut line_number = 0_usize;
 
     while let Some(line) = read_trace_jsonl_line(&mut reader, &mut line_number, input_path)? {
@@ -670,8 +669,7 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                     );
                 }
                 validate_trace_start_event(&event, input_path, line_number)?;
-                duration_ms =
-                    required_trace_u64(&event, "duration_ms", input_path, line_number).map(Some)?;
+                required_trace_u64(&event, "duration_ms", input_path, line_number)?;
                 start_seen = true;
             }
             "output" => {
@@ -698,15 +696,21 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                         direction
                     );
                 }
-                let chunk_index =
-                    required_trace_u64(&event, "chunk_index", input_path, line_number)?;
-                if chunk_index != expected_chunk_index {
+                if let Some(chunk_index) = optional_trace_u64(&event, "chunk_index") {
+                    if chunk_index != expected_chunk_index {
+                        bail!(
+                            "trace line {} from {} has chunk_index {} but expected {}",
+                            line_number,
+                            input_path.display(),
+                            chunk_index,
+                            expected_chunk_index
+                        );
+                    }
+                } else if event.get("chunk_index").is_some() {
                     bail!(
-                        "trace line {} from {} has chunk_index {} but expected {}",
+                        "trace line {} from {} has non-u64 field chunk_index",
                         line_number,
-                        input_path.display(),
-                        chunk_index,
-                        expected_chunk_index
+                        input_path.display()
                     );
                 }
                 let elapsed_ms = required_trace_u64(&event, "elapsed_ms", input_path, line_number)?;
@@ -718,17 +722,6 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                         elapsed_ms,
                         previous_elapsed_ms
                     );
-                }
-                if let Some(duration_ms) = duration_ms {
-                    if elapsed_ms > duration_ms {
-                        bail!(
-                            "trace line {} from {} has elapsed_ms {} beyond trace duration_ms {}",
-                            line_number,
-                            input_path.display(),
-                            elapsed_ms,
-                            duration_ms
-                        );
-                    }
                 }
                 let bytes_hex = required_trace_str(&event, "bytes_hex", input_path, line_number)?;
                 let encoded_len = hex_encoded_len(bytes_hex).with_context(|| {
@@ -803,26 +796,38 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                         input_path.display()
                     );
                 }
-                let chunks_recorded =
-                    required_trace_u64(&event, "chunks_recorded", input_path, line_number)?;
-                if chunks_recorded != expected_chunk_index {
+                if let Some(chunks_recorded) = optional_trace_u64(&event, "chunks_recorded") {
+                    if chunks_recorded != expected_chunk_index {
+                        bail!(
+                            "trace line {} from {} records {} chunks but replay saw {}",
+                            line_number,
+                            input_path.display(),
+                            chunks_recorded,
+                            expected_chunk_index
+                        );
+                    }
+                } else if event.get("chunks_recorded").is_some() {
                     bail!(
-                        "trace line {} from {} records {} chunks but replay saw {}",
+                        "trace line {} from {} has non-u64 field chunks_recorded",
                         line_number,
-                        input_path.display(),
-                        chunks_recorded,
-                        expected_chunk_index
+                        input_path.display()
                     );
                 }
-                let bytes_recorded =
-                    required_trace_u64(&event, "bytes_recorded", input_path, line_number)?;
-                if bytes_recorded != replayed_bytes {
+                if let Some(bytes_recorded) = optional_trace_u64(&event, "bytes_recorded") {
+                    if bytes_recorded != replayed_bytes {
+                        bail!(
+                            "trace line {} from {} records {} bytes but replay saw {}",
+                            line_number,
+                            input_path.display(),
+                            bytes_recorded,
+                            replayed_bytes
+                        );
+                    }
+                } else if event.get("bytes_recorded").is_some() {
                     bail!(
-                        "trace line {} from {} records {} bytes but replay saw {}",
+                        "trace line {} from {} has non-u64 field bytes_recorded",
                         line_number,
-                        input_path.display(),
-                        bytes_recorded,
-                        replayed_bytes
+                        input_path.display()
                     );
                 }
                 end_seen = true;
@@ -1014,15 +1019,6 @@ fn validate_trace_start_event(
     input_path: &Path,
     line_number: usize,
 ) -> Result<()> {
-    let format = required_trace_str(event, "format", input_path, line_number)?;
-    if format != TRACE_FORMAT {
-        bail!(
-            "trace line {} from {} has unsupported trace format {:?}",
-            line_number,
-            input_path.display(),
-            format
-        );
-    }
     let schema_version = required_trace_str(event, "schema_version", input_path, line_number)?;
     if schema_version != TRACE_SCHEMA_VERSION {
         bail!(
@@ -1030,6 +1026,22 @@ fn validate_trace_start_event(
             line_number,
             input_path.display(),
             schema_version
+        );
+    }
+    if let Some(format) = optional_trace_string(event, "format") {
+        if format != TRACE_FORMAT {
+            bail!(
+                "trace line {} from {} has unsupported trace format {:?}",
+                line_number,
+                input_path.display(),
+                format
+            );
+        }
+    } else if event.get("format").is_some() {
+        bail!(
+            "trace line {} from {} has non-string field format",
+            line_number,
+            input_path.display()
         );
     }
     Ok(())
