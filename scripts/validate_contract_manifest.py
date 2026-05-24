@@ -157,6 +157,8 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[str]:
         schema_path = entry.get("schema_path")
         if schema_path is not None and not isinstance(schema_path, str):
             errors.append(f"{label}: schema_path must be a string or null")
+        elif isinstance(schema_path, str):
+            errors.extend(validate_schema_path(label, schema_path, repo_root))
         if entry.get("json_output_stability") == "stable" and not schema_path:
             errors.append(f"{label}: stable JSON output requires a non-null schema_path")
 
@@ -179,7 +181,7 @@ def validate_manifest(manifest: Any, repo_root: Path) -> list[str]:
         if isinstance(surfaces, list):
             if surfaces and not (isinstance(stability_scope, str) and stability_scope.strip()):
                 errors.append(f"{label}: surface_contracts requires a non-empty stability_scope")
-            errors.extend(validate_surface_contracts(label, entry, surfaces))
+            errors.extend(validate_surface_contracts(label, entry, surfaces, repo_root))
 
         names = {command} | set(aliases or []) if isinstance(aliases, list) else {command}
         bare_names = {manifest_command_name(name) for name in names if isinstance(name, str)}
@@ -218,7 +220,20 @@ def enum_check(label: str, entry: dict[str, Any], field: str, allowed: set[str])
     return []
 
 
-def validate_surface_contracts(label: str, entry: dict[str, Any], surfaces: list[Any]) -> list[str]:
+def validate_schema_path(label: str, schema_path: str, repo_root: Path) -> list[str]:
+    resolved = (repo_root / schema_path).resolve()
+    try:
+        resolved.relative_to(repo_root.resolve())
+    except ValueError:
+        return [f"{label}: schema_path escapes repository: {schema_path!r}"]
+    if not resolved.is_file():
+        return [f"{label}: schema_path does not exist: {schema_path!r}"]
+    return []
+
+
+def validate_surface_contracts(
+    label: str, entry: dict[str, Any], surfaces: list[Any], repo_root: Path
+) -> list[str]:
     errors: list[str] = []
     seen_names: set[str] = set()
     parent_raw_policy = entry.get("raw_stream_policy")
@@ -253,6 +268,8 @@ def validate_surface_contracts(label: str, entry: dict[str, Any], surfaces: list
         schema_path = surface.get("schema_path")
         if schema_path is not None and not isinstance(schema_path, str):
             errors.append(f"{surface_label}: schema_path must be a string or null")
+        elif isinstance(schema_path, str):
+            errors.extend(validate_schema_path(surface_label, schema_path, repo_root))
         if surface.get("json_output_stability") == "stable" and not schema_path:
             errors.append(f"{surface_label}: stable JSON output requires a non-null schema_path")
         if surface.get("raw_stream_policy") == "raw-transparent":
@@ -390,7 +407,12 @@ def test_target_exists(target: str, repo_root: Path, rust_tests: set[str], ci_ta
                 script_path.relative_to(repo_root.resolve())
             except ValueError:
                 return False
-            return script_path.exists()
+            if not script_path.exists():
+                return False
+            # Keep manifest evidence honest: do not accept arbitrary flags merely
+            # because the script exists. Current manifest Python targets are
+            # self-test contracts, so require that exact executable surface.
+            return tokens[2:] == ["--self-test"]
 
     normalized = target.split("::")[-1]
     if normalized in rust_tests:
@@ -496,6 +518,7 @@ def run_self_tests() -> int:
         root = Path(tmp)
         (root / "src").mkdir()
         (root / "tests").mkdir()
+        (root / "scripts").mkdir()
         (root / "Cargo.toml").write_text(
             '[package]\nname = "light-terminal"\nversion = "0.0.0"\nedition = "2024"\n\n[[bin]]\nname = "lterm"\npath = "src/main.rs"\n',
             encoding="utf-8",
@@ -506,6 +529,10 @@ def run_self_tests() -> int:
         )
         (root / "tests" / "cli_smoke.rs").write_text(
             '#[test]\nfn integration_contract_test() {}\nfn helper_only() {}\n',
+            encoding="utf-8",
+        )
+        (root / "scripts" / "validate_contract_manifest.py").write_text(
+            "print('self-test placeholder')\n",
             encoding="utf-8",
         )
 
@@ -557,6 +584,25 @@ def run_self_tests() -> int:
         missing_test = deepcopy(valid_entry)
         missing_test["tests"] = ["cargo test --bin lterm exact_contract_test_missing"]
         expect_errors("missing exact test", missing_test, ["tests name no real target"])
+
+        valid_python_self_test = deepcopy(valid_entry)
+        valid_python_self_test["tests"] = ["python3 scripts/validate_contract_manifest.py --self-test"]
+        errors = validate_manifest({"entries": [valid_python_self_test]}, root)
+        if errors:
+            failures.append(f"valid python self-test target unexpectedly failed: {errors!r}")
+
+        bogus_python_flag = deepcopy(valid_entry)
+        bogus_python_flag["tests"] = ["python3 scripts/validate_contract_manifest.py --does-not-exist"]
+        expect_errors("bogus python flag", bogus_python_flag, ["tests name no real target"])
+
+        no_arg_python_target = deepcopy(valid_entry)
+        no_arg_python_target["tests"] = ["python3 scripts/validate_contract_manifest.py"]
+        expect_errors("no-arg python target", no_arg_python_target, ["tests name no real target"])
+
+        missing_schema = deepcopy(valid_entry)
+        missing_schema["json_output_stability"] = "stable"
+        missing_schema["schema_path"] = "docs/schemas/missing.schema.json"
+        expect_errors("missing schema path", missing_schema, ["schema_path does not exist"])
 
         helper_test = deepcopy(valid_entry)
         helper_test["tests"] = ["cargo test --test cli_smoke helper_only"]

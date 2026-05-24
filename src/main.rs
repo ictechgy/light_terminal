@@ -5,6 +5,12 @@ mod sanitize;
 mod server;
 mod tmux_compat;
 
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+static TEST_ATTACH_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use client::{AttachStdinEof, ComposeOptions};

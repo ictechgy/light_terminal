@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const LEGACY_TAG: &str = "v0.1.4";
 const LEGACY_BIN_ENV: &str = "LTERM_UPGRADE_V0_1_4_BIN";
+const ALLOW_UPGRADE_MATRIX_SKIP_ENV: &str = "LTERM_ALLOW_UPGRADE_MATRIX_SKIP";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -41,10 +42,13 @@ impl MatrixEnv {
         // 개발자 호스트의 live daemon socket 을 상속하지 않도록 LTERM_SOCKET 을
         // 제거한다. TMPDIR 도 sandbox 안에 고정해, future fallback-path 변경이
         // LTERM_RUNTIME_DIR 직접 사용을 멈추더라도 MatrixEnv 밖으로 빠지지 않게 한다.
-        command.env_remove("LTERM_SOCKET");
-        command.env("LTERM_RUNTIME_DIR", self.runtime_dir());
-        command.env("LTERM_DATA_DIR", self.data_dir());
-        command.env("TMPDIR", self.tmp_dir());
+        command
+            .env_remove("LTERM_SOCKET")
+            .env_remove("LTERM_PANE")
+            .env_remove("LTERM_PARENT_TOKEN")
+            .env("LTERM_RUNTIME_DIR", self.runtime_dir())
+            .env("LTERM_DATA_DIR", self.data_dir())
+            .env("TMPDIR", self.tmp_dir());
     }
 }
 
@@ -112,6 +116,7 @@ impl Drop for DaemonGuard {
 }
 
 #[test]
+#[ignore = "requires building the legacy v0.1.4 tag; release-preflight and CI run ignored tests explicitly"]
 fn old_daemon_v0_1_4_current_client() -> TestResult {
     let Some(legacy) = legacy_lterm_binary()? else {
         return Ok(());
@@ -144,6 +149,7 @@ fn old_daemon_v0_1_4_current_client() -> TestResult {
 }
 
 #[test]
+#[ignore = "requires building the legacy v0.1.4 tag; release-preflight and CI run ignored tests explicitly"]
 fn current_daemon_v0_1_4_client() -> TestResult {
     let Some(legacy) = legacy_lterm_binary()? else {
         return Ok(());
@@ -210,17 +216,15 @@ fn legacy_lterm_binary() -> TestResult<Option<LegacyBinary>> {
     match tag_check {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            eprintln!(
-                "skipping {LEGACY_TAG} upgrade matrix because the tag is unavailable: {}",
+            return legacy_skip_or_error(format!(
+                "{LEGACY_TAG} upgrade matrix tag is unavailable: {}",
                 output_preview(&output)
-            );
-            return Ok(None);
+            ));
         }
         Err(err) => {
-            eprintln!(
-                "skipping {LEGACY_TAG} upgrade matrix because git metadata is unavailable: {err}"
-            );
-            return Ok(None);
+            return legacy_skip_or_error(format!(
+                "{LEGACY_TAG} upgrade matrix git metadata is unavailable: {err}"
+            ));
         }
     }
 
@@ -262,6 +266,17 @@ fn legacy_lterm_binary() -> TestResult<Option<LegacyBinary>> {
         _temp: Some(temp),
         path: bin,
     }))
+}
+
+fn legacy_skip_or_error(reason: String) -> TestResult<Option<LegacyBinary>> {
+    if std::env::var_os(ALLOW_UPGRADE_MATRIX_SKIP_ENV).is_some() {
+        eprintln!("skipping {LEGACY_TAG} upgrade matrix: {reason}");
+        return Ok(None);
+    }
+    Err(format!(
+        "{reason}. Set {ALLOW_UPGRADE_MATRIX_SKIP_ENV}=1 only for non-release local runs that intentionally skip the compatibility matrix."
+    )
+    .into())
 }
 
 fn wait_for_daemon(

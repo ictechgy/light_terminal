@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -260,6 +261,18 @@ def validate_value(
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
             errors.append(f"{path}: expected length at least {schema['minLength']}, got {len(value)}")
+        if "pattern" in schema:
+            pattern = schema["pattern"]
+            if not isinstance(pattern, str):
+                errors.append(f"{path}: schema pattern must be a string")
+            else:
+                try:
+                    matches = re.search(pattern, value) is not None
+                except re.error as exc:
+                    errors.append(f"{path}: invalid schema pattern {pattern!r}: {exc}")
+                else:
+                    if not matches:
+                        errors.append(f"{path}: {value!r} does not match pattern {pattern!r}")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
             errors.append(f"{path}: {value!r} is below minimum {schema['minimum']!r}")

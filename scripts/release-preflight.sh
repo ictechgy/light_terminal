@@ -90,30 +90,33 @@ PY
 }
 
 version_from_package_json() {
-  node -e 'const fs = require("fs"); const path = process.argv[1]; console.log(JSON.parse(fs.readFileSync(path, "utf8")).version)' "$1"
+  python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+print(json.loads(path.read_text(encoding="utf-8"))["version"])
+PY
 }
 
 step "Validate release metadata versions"
 cargo_version=$(cargo_package_version)
-if command -v node >/dev/null 2>&1; then
-  npm_version=$(version_from_package_json package.json)
-  [[ "$cargo_version" == "$npm_version" ]] || {
-    echo "Cargo.toml version $cargo_version != package.json version $npm_version" >&2
+npm_version=$(version_from_package_json package.json)
+[[ "$cargo_version" == "$npm_version" ]] || {
+  echo "Cargo.toml version $cargo_version != package.json version $npm_version" >&2
+  exit 65
+}
+shopt -s nullglob
+platform_package_jsons=(npm/platforms/*/package.json)
+shopt -u nullglob
+for package_json in "${platform_package_jsons[@]}"; do
+  platform_version=$(version_from_package_json "$package_json")
+  [[ "$platform_version" == "$cargo_version" ]] || {
+    echo "$package_json version $platform_version != $cargo_version" >&2
     exit 65
   }
-  shopt -s nullglob
-  platform_package_jsons=(npm/platforms/*/package.json)
-  shopt -u nullglob
-  for package_json in "${platform_package_jsons[@]}"; do
-    platform_version=$(version_from_package_json "$package_json")
-    [[ "$platform_version" == "$cargo_version" ]] || {
-      echo "$package_json version $platform_version != $cargo_version" >&2
-      exit 65
-    }
-  done
-else
-  echo "node not found; skipping npm package version cross-check" >&2
-fi
+done
 export LTERM_CARGO_VERSION="$cargo_version"
 manifest_release=$(python3 - <<'PY'
 import json
@@ -146,7 +149,7 @@ run python3 scripts/check_contract_drift.py --self-test
 run python3 scripts/check_contract_drift.py --manifest docs/contract-manifest.json --lterm-bin "$LTERM_BIN"
 
 if [[ "$CONTRACT_ONLY" == 0 ]]; then
-  run cargo test --locked --test upgrade_matrix -- --nocapture --test-threads=1
+  run cargo test --locked --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
 fi
 
 case "$AUDIT_MODE" in

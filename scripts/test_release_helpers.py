@@ -195,7 +195,7 @@ PY
                 "cargo\tclippy\t--locked\t--all-targets\t--\t-D\twarnings",
                 "cargo\ttest\t--locked\t--\t--test-threads=1",
                 "cargo\tbuild\t--release\t--locked",
-                "cargo\ttest\t--locked\t--test\tupgrade_matrix\t--\t--nocapture\t--test-threads=1",
+                "cargo\ttest\t--locked\t--test\tupgrade_matrix\t--\t--include-ignored\t--nocapture\t--test-threads=1",
                 "cargo\taudit",
             ]:
                 self.assertIn(expected, log)
@@ -237,6 +237,16 @@ PY
                 proc, log = self.run_release_preflight(fixture, ["--contract-only"])
                 self.assertEqual(proc.returncode, 65, proc.stderr + proc.stdout)
                 self.assertNotIn("cargo\tbuild", log)
+
+        with self.subTest(label="package.json without node"), tempfile.TemporaryDirectory(
+            prefix="lterm-release-preflight-test-"
+        ) as tmp:
+            fixture = self.make_release_fixture(Path(tmp))
+            (fixture / "package.json").write_text(json.dumps({"version": "9.9.9"}), encoding="utf-8")
+            proc, log = self.run_release_preflight(fixture, ["--contract-only"], include_node=False)
+            self.assertEqual(proc.returncode, 65, proc.stderr + proc.stdout)
+            self.assertIn("Cargo.toml version", proc.stderr)
+            self.assertNotIn("cargo\tbuild", log)
 
     def make_dependency_fixture(self, root: Path) -> Path:
         fixture = root / "repo"

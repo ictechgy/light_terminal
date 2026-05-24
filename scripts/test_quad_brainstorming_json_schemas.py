@@ -118,6 +118,16 @@ class QuadBrainstormingJsonSchemaValidatorTests(unittest.TestCase):
             with self.assertRaisesRegex(VALIDATOR.SchemaError, "unresolved"):
                 VALIDATOR.resolve_ref("missing/outside.schema.json", schema_dir, store)
 
+    def test_string_pattern_is_enforced(self) -> None:
+        schema = {"type": "string", "pattern": "^%[0-9]+$"}
+        self.assertEqual(VALIDATOR.validate_value("%12", schema, SCHEMA_DIR, {}), [])
+        self.assertTrue(
+            any(
+                "does not match pattern" in error
+                for error in VALIDATOR.validate_value("not-a-pane", schema, SCHEMA_DIR, {})
+            )
+        )
+
     def test_track_output_status_failure_class_consistency(self) -> None:
         store = VALIDATOR.build_schema_store(SCHEMA_DIR)
         schema = json.loads((SCHEMA_DIR / "quad-brainstorming-track-output.schema.json").read_text(encoding="utf-8"))
