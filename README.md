@@ -77,7 +77,7 @@ For the 1.0 command/output stability boundary, see the
 With Cargo from GitHub (use the latest tag from the Releases page):
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.4
+cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.5
 ```
 
 From this checkout, use Rust 1.85 or newer:
