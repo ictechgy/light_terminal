@@ -30,15 +30,19 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> TestResult<Self> {
-        Ok(Self {
-            temp: tempfile::tempdir()?,
-        })
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("tmp"))?;
+        Ok(Self { temp })
     }
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
-        cmd.env("LTERM_RUNTIME_DIR", self.temp.path().join("run"));
-        cmd.env("LTERM_DATA_DIR", self.temp.path().join("data"));
+        cmd.env_remove("LTERM_SOCKET")
+            .env_remove("LTERM_PANE")
+            .env_remove("LTERM_PARENT_TOKEN")
+            .env("LTERM_RUNTIME_DIR", self.temp.path().join("run"))
+            .env("LTERM_DATA_DIR", self.temp.path().join("data"))
+            .env("TMPDIR", self.temp.path().join("tmp"));
         cmd
     }
 
@@ -188,11 +192,55 @@ fn wait_for_child_success(child: &mut ChildCleanup, label: &str) -> TestResult {
     Err(format!("timed out waiting for {label}").into())
 }
 
+fn wait_for_child_output(
+    mut child: ChildCleanup,
+    timeout: Duration,
+    label: &str,
+) -> TestResult<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.child_mut()?.try_wait()?.is_some() {
+            let process = child.child.take().ok_or("child already reaped")?;
+            return process
+                .wait_with_output()
+                .map_err(|err| format!("failed to collect output for {label}: {err}").into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let Some(mut process) = child.child.take() else {
+        return Err(format!("{label} already reaped before timeout collection").into());
+    };
+    let _ = process.kill();
+    let output = process.wait_with_output()?;
+    Err(format!(
+        "timed out waiting for {label} after {timeout:?}; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .into())
+}
+
 fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
     stdout
         .lines()
         .find(|line| line.starts_with(&format!("{name}\t")))
         .map(|line| line.split('\t').collect())
+}
+
+fn assert_exact_line_set(stdout: &str, expected: &[&str]) {
+    let actual: Vec<&str> = stdout.lines().collect();
+    let actual_set: BTreeSet<&str> = actual.iter().copied().collect();
+    let expected_set: BTreeSet<&str> = expected.iter().copied().collect();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "expected exactly {expected_set:?}, got lines {actual:?}"
+    );
+    assert_eq!(
+        actual_set, expected_set,
+        "expected exactly {expected_set:?}, got lines {actual:?}"
+    );
 }
 
 fn session_names_json(env: &TestEnv) -> TestResult<BTreeSet<String>> {
@@ -1117,11 +1165,18 @@ fn attach_short_aliases_detach_on_stdin_eof() -> TestResult {
 
     for alias in ["a", "-a", "resume"] {
         let started = Instant::now();
-        let output = env
-            .cmd()
-            .args([alias, "alias-attach", "--no-status"])
-            .stdin(Stdio::null())
-            .output()?;
+        let output = wait_for_child_output(
+            ChildCleanup::new(
+                env.cmd()
+                    .args([alias, "alias-attach", "--no-status"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ),
+            Duration::from_secs(2),
+            &format!("{alias} attach EOF detach"),
+        )?;
         assert!(output.status.success(), "{alias}: {output:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1872,11 +1927,18 @@ fn open_and_attach_or_new_create_missing_session() -> TestResult {
         ("attach-or-new", "attach-or-new-missing"),
     ] {
         let started = Instant::now();
-        let output = env
-            .cmd()
-            .args([command, target, "--no-status"])
-            .stdin(Stdio::null())
-            .output()?;
+        let output = wait_for_child_output(
+            ChildCleanup::new(
+                env.cmd()
+                    .args([command, target, "--no-status"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ),
+            Duration::from_secs(2),
+            &format!("{command} missing-session EOF detach"),
+        )?;
         assert!(output.status.success(), "{command}: {output:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1917,11 +1979,18 @@ fn open_and_attach_or_new_create_missing_session() -> TestResult {
         assert!(captured.contains("READY"), "missing output: {captured}");
 
         let started = Instant::now();
-        let output = env
-            .cmd()
-            .args([command, target, "--no-status"])
-            .stdin(Stdio::null())
-            .output()?;
+        let output = wait_for_child_output(
+            ChildCleanup::new(
+                env.cmd()
+                    .args([command, target, "--no-status"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?,
+            ),
+            Duration::from_secs(2),
+            &format!("{command} existing-session EOF detach"),
+        )?;
         assert!(output.status.success(), "{command}: {output:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1957,20 +2026,27 @@ fn attached_client_exits_when_session_kills_itself() -> TestResult {
     assert!(status.success());
 
     let started = Instant::now();
-    let output = env
-        .cmd()
-        .stdin(Stdio::null())
-        .args([
-            "new",
-            "--no-status",
-            "-n",
-            "self-kill",
-            "--",
-            "sh",
-            "-lc",
-            "trap '' HUP TERM; echo READY; \"$LTERM_BIN\" kill self-kill; echo AFTER; sleep 30",
-        ])
-        .output()?;
+    let output = wait_for_child_output(
+        ChildCleanup::new(
+            env.cmd()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args([
+                    "new",
+                    "--no-status",
+                    "-n",
+                    "self-kill",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "trap '' HUP TERM; echo READY; \"$LTERM_BIN\" kill self-kill; echo AFTER; sleep 30",
+                ])
+                .spawn()?,
+        ),
+        Duration::from_secs(2),
+        "self-kill attach",
+    )?;
     assert!(output.status.success(), "{output:?}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -2040,18 +2116,22 @@ fn concurrent_new_sessions_get_unique_default_panes() -> TestResult {
     let env = TestEnv::new()?;
     let mut children = Vec::new();
     for _ in 0..24 {
-        children.push(
+        children.push(ChildCleanup::new(
             env.cmd()
                 .args(["new", "--detach", "--", "sh", "-lc", "sleep 2"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?,
-        );
+        ));
     }
 
     let mut panes = std::collections::HashSet::new();
-    for child in children {
-        let output = child.wait_with_output()?;
+    for (index, child) in children.into_iter().enumerate() {
+        let output = wait_for_child_output(
+            child,
+            Duration::from_secs(5),
+            &format!("concurrent new client {index}"),
+        )?;
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let pane = stdout
@@ -2713,7 +2793,11 @@ fn attached_new_forwards_utf8_input_bytes() -> TestResult {
         let mut stdin = child.stdin.take().ok_or("missing child stdin")?;
         stdin.write_all("한글 입력\n".as_bytes())?;
     }
-    let output = child.wait_with_output()?;
+    let output = wait_for_child_output(
+        ChildCleanup::new(child),
+        Duration::from_secs(3),
+        "utf8 input child",
+    )?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("GOT:한글 입력"), "{stdout:?}");
@@ -2898,6 +2982,45 @@ fn tmux_compat_send_keys_skips_repeat_count_before_target() -> TestResult {
 
     let captured = env.capture_until("keys-repeat", "GOT_REPEAT:repeat")?;
     assert!(captured.contains("GOT_REPEAT:repeat"), "{captured}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_send_keys_repeats_with_repeat_count() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "keys-repeat-count",
+            "echo READY_REPEAT_COUNT; for idx in 1 2 3; do read line; echo GOT_REPEAT_${idx}:$line; done; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    env.capture_until("keys-repeat-count", "READY_REPEAT_COUNT")?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "send-keys",
+            "-N",
+            "3",
+            "-t",
+            "keys-repeat-count",
+            "repeat",
+            "C-m",
+        ])
+        .status()?;
+    assert!(status.success());
+
+    let captured = env.capture_until("keys-repeat-count", "GOT_REPEAT_3:repeat")?;
+    assert!(captured.contains("GOT_REPEAT_1:repeat"), "{captured}");
+    assert!(captured.contains("GOT_REPEAT_2:repeat"), "{captured}");
+    assert!(captured.contains("GOT_REPEAT_3:repeat"), "{captured}");
     Ok(())
 }
 
@@ -3444,18 +3567,27 @@ fn tmux_compat_split_window_rolls_back_identified_cmux_split_when_lterm_creation
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
     let cmux_log = env.temp.path().join("cmux-identified-rollback.log");
+    let split_state = env.temp.path().join("cmux-identified-rollback-created");
     write_executable(
         &fake_bin.join("cmux"),
         &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               new-split) printf '%s\\n' 'OK workspace:1'; exit 0 ;;\n\
-               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:caller\"}},\"focused\":{{\"surface_ref\":\"surface:fallback\"}}}}'; exit 0 ;;\n\
+               new-split) : > {}; printf '%s\\n' 'OK workspace:1'; exit 0 ;;\n\
+               identify)\n\
+                 if [ -e {} ]; then\n\
+                   printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:caller\"}},\"focused\":{{\"surface_ref\":\"surface:new\"}}}}'\n\
+                 else\n\
+                   printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:caller\"}},\"focused\":{{\"surface_ref\":\"surface:source\"}}}}'\n\
+                 fi\n\
+                 exit 0 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
              esac\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
+            shlex::try_quote(&cmux_log.display().to_string())?,
+            shlex::try_quote(&split_state.display().to_string())?,
+            shlex::try_quote(&split_state.display().to_string())?
         ),
     )?;
     let bad_socket = env.temp.path().join("not-a-socket");
@@ -3480,8 +3612,20 @@ fn tmux_compat_split_window_rolls_back_identified_cmux_split_when_lterm_creation
     assert!(
         cmux_calls
             .lines()
-            .any(|line| line == "close-surface --surface surface:fallback"),
-        "failed lterm creation should roll back the identified cmux surface: {cmux_calls:?}"
+            .any(|line| line == "new-split right --surface surface:source --focus true"),
+        "split should target the original focused source before fallback identify: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface:new"),
+        "failed lterm creation should roll back only the post-split identified cmux surface: {cmux_calls:?}"
+    );
+    assert!(
+        !cmux_calls
+            .lines()
+            .any(|line| line == "close-surface --surface surface:source"),
+        "rollback must not close the original source cmux surface: {cmux_calls:?}"
     );
     Ok(())
 }
@@ -4359,18 +4503,7 @@ fn tmux_compat_list_windows_defaults_to_current_target_unless_all() -> TestResul
         .output()?;
     assert!(all.status.success(), "{all:?}");
     let stdout = String::from_utf8_lossy(&all.stdout);
-    assert!(
-        stdout.lines().any(|line| line == "window-one"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "window-two"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "foo-target"),
-        "{stdout:?}"
-    );
+    assert_exact_line_set(&stdout, &["window-one", "window-two", "foo-target"]);
 
     let clustered = env
         .cmd()
@@ -4379,18 +4512,7 @@ fn tmux_compat_list_windows_defaults_to_current_target_unless_all() -> TestResul
         .output()?;
     assert!(clustered.status.success(), "{clustered:?}");
     let stdout = String::from_utf8_lossy(&clustered.stdout);
-    assert!(
-        stdout.lines().any(|line| line == "window-one"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "window-two"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "foo-target"),
-        "{stdout:?}"
-    );
+    assert_exact_line_set(&stdout, &["window-one", "window-two", "foo-target"]);
 
     let clustered_inline = env
         .cmd()
@@ -4399,18 +4521,7 @@ fn tmux_compat_list_windows_defaults_to_current_target_unless_all() -> TestResul
         .output()?;
     assert!(clustered_inline.status.success(), "{clustered_inline:?}");
     let stdout = String::from_utf8_lossy(&clustered_inline.stdout);
-    assert!(
-        stdout.lines().any(|line| line == "window-one"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "window-two"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "foo-target"),
-        "{stdout:?}"
-    );
+    assert_exact_line_set(&stdout, &["window-one", "window-two", "foo-target"]);
 
     let clustered_equals_inline = env
         .cmd()
@@ -4422,18 +4533,7 @@ fn tmux_compat_list_windows_defaults_to_current_target_unless_all() -> TestResul
         "{clustered_equals_inline:?}"
     );
     let stdout = String::from_utf8_lossy(&clustered_equals_inline.stdout);
-    assert!(
-        stdout.lines().any(|line| line == "window-one"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "window-two"),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.lines().any(|line| line == "foo-target"),
-        "{stdout:?}"
-    );
+    assert_exact_line_set(&stdout, &["window-one", "window-two", "foo-target"]);
 
     let literal_format = env
         .cmd()
@@ -6706,18 +6806,6 @@ fn capture_strips_terminal_escape_sequences() -> TestResult {
     Ok(())
 }
 
-// 부모 프로세스 관점의 default fallback runtime socket path
-// (env::temp_dir()/light-terminal-{euid}/lterm.sock). 가드 검사와 진단 메시지가
-// 동일한 경로를 참조하도록 단일 출처로 분리한다.
-#[cfg(unix)]
-fn default_runtime_socket_path() -> std::path::PathBuf {
-    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
-    let uid = unsafe { libc::geteuid() };
-    std::env::temp_dir()
-        .join(format!("light-terminal-{uid}"))
-        .join("lterm.sock")
-}
-
 // 주어진 socket path에 lterm 데몬이 protocol 수준에서 살아있는지 확인한다.
 // lterm CLI의 `doctor --json`을 LTERM_SOCKET override 하에 spawn해서 그 결과의
 // `daemon_reachable` 필드를 검사한다. doctor는 (HANDOFF: "auto-spawn next lterm
@@ -6725,8 +6813,7 @@ fn default_runtime_socket_path() -> std::path::PathBuf {
 // 만들지 않는다.
 //
 // helper는 path 인자를 받는 분리 형태이므로 임시 bait UnixListener에 대해서도
-// 검증 테스트가 가능하다. 가드 본문은 default_runtime_daemon_reports_reachable
-// wrapper를 사용한다.
+// 검증 테스트가 가능하다.
 #[cfg(unix)]
 fn runtime_daemon_reports_reachable_at(socket: &Path) -> bool {
     // cheap pre-check: connect 실패면 즉시 false. 실제 daemon이면 connect는
@@ -6755,14 +6842,6 @@ fn runtime_daemon_reports_reachable_at(socket: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// 부모 호스트의 default fallback runtime path에 lterm 데몬이 실제로 살아있는지
-// (protocol 수준) 확인한다. stale 소켓이나 임의 Unix listener는 false 반환.
-// `default_runtime_socket_accepts_connections`보다 false-positive가 낮다.
-#[cfg(unix)]
-fn default_runtime_daemon_reports_reachable() -> bool {
-    runtime_daemon_reports_reachable_at(&default_runtime_socket_path())
-}
-
 // LTERM_RUNTIME_DIR / LTERM_SOCKET / XDG_RUNTIME_DIR 를 모두 제거한 채 lterm
 // CLI 의 fallback runtime path 동작을 검증하는 테스트 전용 Command builder.
 //
@@ -6781,10 +6860,8 @@ fn default_runtime_daemon_reports_reachable() -> bool {
 //
 // 본 helper 를 거치지 않고 fallback runtime selector(LTERM_RUNTIME_DIR,
 // LTERM_SOCKET, XDG_RUNTIME_DIR)를 직접 unset 하는 테스트는 호스트에 떠 있는
-// 사용자 데몬을 침범할 위험이 있다. PR #75 의
-// default_runtime_daemon_reports_reachable 가드가 보수적 안전망이지만, 1차
-// 방어선은 sandbox TMPDIR 환경 격리이다 (PR #76 quad-review 합의 — TMPDIR
-// isolation is the real protection). 같은 fallback 검증 패턴이 필요한 새 테스트는
+// 사용자 데몬을 침범할 위험이 있다. 1차 방어선은 sandbox TMPDIR 환경 격리이다
+// (PR #76 quad-review 합의 — TMPDIR isolation is the real protection). 같은 fallback 검증 패턴이 필요한 새 테스트는
 // 반드시 본 helper 를 사용한다. fallback 검증이 아닌 테스트가 LTERM_SOCKET 만
 // 제거해야 하는 경우에도 test-private LTERM_RUNTIME_DIR 과 TMPDIR 를 함께 주입해
 // 부모 호스트의 default runtime path 로 빠지지 않게 한다.
@@ -6805,45 +6882,9 @@ fn cmd_for_default_fallback_test(
     Ok((cmd, tmp, data))
 }
 
-// 위 헬퍼가 true일 때 사용하는 opt-in skip env. 이 env가 설정되어 있어야만
-// 테스트가 silent skip(`Ok(())`)으로 빠진다. 미설정 시에는 panic하여 cargo test의
-// FAIL 출력으로 "이 호스트는 안전하지 않다"는 신호가 가시화된다. CI는 default
-// 경로의 socket이 비어있으므로 가드 자체가 발동하지 않아 본문이 그대로 실행된다.
-#[cfg(unix)]
-const LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV: &str = "LTERM_TEST_ALLOW_OCCUPIED_SKIP";
-
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
-    // 부모 호스트의 default fallback runtime path에 어떤 Unix listener가 떠 있으면
-    // 이 테스트가 (LTERM_RUNTIME_DIR을 제거한 상태로) 그 path 인근의 사용자 데몬과
-    // 상호작용해 attached 세션을 끊을 risk가 있다. 가드 발동 시 기본은 panic하여
-    // cargo test FAIL 출력으로 회귀 신호가 가시화되도록 한다. 호스트에 의도적으로
-    // 데몬을 띄운 개발자는 LTERM_TEST_ALLOW_OCCUPIED_SKIP env로 silent skip을
-    // opt-in 할 수 있다 (이 경우 cargo test는 PASS로 카운트하므로 신호는 CI에서만
-    // 보장된다). CI 환경은 default 경로 socket이 비어있어 가드가 발동하지 않으므로
-    // 본문이 항상 실행된다.
-    if default_runtime_daemon_reports_reachable() {
-        let socket = default_runtime_socket_path();
-        if std::env::var_os(LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV).is_some() {
-            eprintln!(
-                "skip default_tmp_runtime_dir_is_private_and_not_a_symlink: \
-                 default runtime socket {} hosts a live lterm daemon \
-                 ({LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV} set; any non-empty value)",
-                socket.display()
-            );
-            return Ok(());
-        }
-        panic!(
-            "default_tmp_runtime_dir_is_private_and_not_a_symlink would race with a live lterm \
-             daemon currently reachable at {} (doctor --json daemon_reachable=true). \
-             Either stop that daemon before running this test, or set \
-             {LTERM_TEST_ALLOW_OCCUPIED_SKIP_ENV}=1 (any non-empty value) to opt-in to skipping \
-             this test on hosts with an intentionally running lterm daemon.",
-            socket.display()
-        );
-    }
-
     let temp = tempfile::tempdir()?;
     let (mut list, tmp, _data) = cmd_for_default_fallback_test(&temp)?;
     list.arg("list");
@@ -6923,9 +6964,14 @@ fn runtime_daemon_reports_reachable_at_rejects_non_lterm_listener() -> TestResul
 #[cfg(unix)]
 fn custom_socket_requires_private_parent() -> TestResult {
     let temp = tempfile::tempdir()?;
+    let parent = temp.path().join("shared");
+    std::fs::create_dir(&parent)?;
+    let mut perms = std::fs::metadata(&parent)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&parent, perms)?;
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lterm"));
     let output = daemon
-        .env("LTERM_SOCKET", "/tmp/lterm-insecure-test.sock")
+        .env("LTERM_SOCKET", parent.join("lterm.sock"))
         .env("LTERM_DATA_DIR", temp.path().join("data"))
         .arg("daemon")
         .output()?;
@@ -6934,7 +6980,8 @@ fn custom_socket_requires_private_parent() -> TestResult {
     assert!(
         stderr.contains("owned by uid")
             || stderr.contains("must not be a symlink")
-            || stderr.contains("not a directory"),
+            || stderr.contains("not a directory")
+            || stderr.contains("must be private"),
         "{stderr}"
     );
     Ok(())
@@ -7244,8 +7291,22 @@ fn read_pty_until_child_exit<R: Read + AsRawFd>(
     let fd = stdout.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 {
+            return Err(format!(
+                "failed to read PTY stdout flags for {label}: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        if (flags & libc::O_NONBLOCK) == 0 {
+            let set = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if set < 0 {
+                return Err(format!(
+                    "failed to set PTY stdout nonblocking for {label}: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
         }
     }
 
@@ -7354,11 +7415,13 @@ fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
     let rows = session
         .get("rows")
         .and_then(|v| v.as_u64())
-        .ok_or("missing rows")? as u16;
+        .ok_or("missing rows")
+        .and_then(|value| u16::try_from(value).map_err(|_| "rows out of u16 range"))?;
     let cols = session
         .get("cols")
         .and_then(|v| v.as_u64())
-        .ok_or("missing cols")? as u16;
+        .ok_or("missing cols")
+        .and_then(|value| u16::try_from(value).map_err(|_| "cols out of u16 range"))?;
     Ok((rows, cols))
 }
 
@@ -7550,6 +7613,22 @@ fn resize_with_zero_dimensions_returns_error() -> TestResult {
         Some(false),
         "zero rows must be rejected; response={response}"
     );
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "zero-resize",
+        "rows": 24_u16,
+        "cols": 0_u16,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "zero cols must be rejected; response={response}"
+    );
     Ok(())
 }
 
@@ -7596,6 +7675,29 @@ fn resize_with_oversized_dimensions_returns_error() -> TestResult {
             .and_then(|v| v.as_str())
             .is_some_and(|msg| msg.contains("exceed maximum")),
         "oversized resize should explain the maximum; response={response}"
+    );
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "type": "resize",
+        "target": "oversized-resize",
+        "rows": 24_u16,
+        "cols": 1001_u16,
+    });
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let response = read_response_line(&mut stream)?;
+    assert_eq!(
+        response.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "oversized cols must be rejected; response={response}"
+    );
+    assert!(
+        response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|msg| msg.contains("exceed maximum")),
+        "oversized cols should explain the maximum; response={response}"
     );
 
     let mut stream = UnixStream::connect(&socket)?;
@@ -7735,8 +7837,22 @@ fn read_until_marker_bytes<R: Read + AsRawFd>(
     let fd = stdout.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 {
+            return Err(format!(
+                "failed to read marker stream flags: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        if (flags & libc::O_NONBLOCK) == 0 {
+            let set = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if set < 0 {
+                return Err(format!(
+                    "failed to set marker stream nonblocking: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
         }
     }
 

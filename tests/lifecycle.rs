@@ -15,7 +15,9 @@ use std::io::Read;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,15 +25,44 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const LTERM_BIN: &str = env!("CARGO_BIN_EXE_lterm");
 
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> TestResult<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return child
+                .wait_with_output()
+                .map_err(|err| format!("failed to collect output for {label}: {err}").into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = child.kill();
+    let output = child.wait_with_output()?;
+    Err(format!(
+        "timed out running {label} after {timeout:?}; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .into())
+}
+
 struct LifecycleEnv {
     temp: tempfile::TempDir,
 }
 
 impl LifecycleEnv {
     fn new() -> TestResult<Self> {
-        Ok(Self {
-            temp: tempfile::tempdir()?,
-        })
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("tmp"))?;
+        Ok(Self { temp })
     }
 
     fn runtime_dir(&self) -> PathBuf {
@@ -44,8 +75,12 @@ impl LifecycleEnv {
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(LTERM_BIN);
-        cmd.env("LTERM_RUNTIME_DIR", self.runtime_dir());
-        cmd.env("LTERM_DATA_DIR", self.data_dir());
+        cmd.env_remove("LTERM_SOCKET")
+            .env_remove("LTERM_PANE")
+            .env_remove("LTERM_PARENT_TOKEN")
+            .env("LTERM_RUNTIME_DIR", self.runtime_dir())
+            .env("LTERM_DATA_DIR", self.data_dir())
+            .env("TMPDIR", self.temp.path().join("tmp"));
         cmd
     }
 
@@ -406,10 +441,47 @@ fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
     let bait_dir = env.temp.path().join("bait_dir");
     fs::create_dir(&bait_dir)?;
     let bait_socket = bait_dir.join("alive.sock");
-    let _listener = UnixListener::bind(&bait_socket)?;
+    let listener = UnixListener::bind(&bait_socket)?;
+    listener.set_nonblocking(true)?;
+    let accepted = Arc::new(AtomicBool::new(false));
+    let stop_accept = Arc::new(AtomicBool::new(false));
+    let accepted_for_thread = Arc::clone(&accepted);
+    let stop_for_thread = Arc::clone(&stop_accept);
+    let accept_thread = thread::spawn(move || -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !stop_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_stream, _addr)) => {
+                    accepted_for_thread.store(true, Ordering::Release);
+                    return Ok(());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    });
     symlink(&bait_socket, &socket)?;
 
-    let out = env.cmd().args(["list"]).output()?;
+    let mut list = env.cmd();
+    list.args(["list"]);
+    let out_result = command_output_with_timeout(
+        &mut list,
+        Duration::from_secs(3),
+        "list with symlink-to-live-socket bait",
+    );
+    stop_accept.store(true, Ordering::Release);
+    accept_thread
+        .join()
+        .map_err(|_| "bait listener accept thread panicked")??;
+    assert!(
+        !accepted.load(Ordering::Acquire),
+        "lterm list followed the symlink and connected to bait socket {}",
+        bait_socket.display()
+    );
+    let out = out_result?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -417,26 +489,14 @@ fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
         String::from_utf8_lossy(&out.stdout),
         stderr
     );
-    // case 5와 동일 invariant: silently symlink를 따라가지 않음. 단 target이 살아있는
-    // Unix socket이면 connect가 성공해서 path-level이 아닌 RPC-level에서 거부되는
-    // 경로도 정상이다. 관측되는 트레이스는 다음 중 하나:
-    //   (a) path-level 거부: "symlink"/"non-socket"/"Socket operation"
-    //   (b) connect 단계 거부: "Connection refused"
-    //   (c) RPC handshake 거부: "Resource temporarily unavailable" / "os error 35"
-    //       (peer가 lterm 응답을 못 보내 read response가 EAGAIN으로 떨어짐) 또는
-    //       "read response", "peer", "version" 등의 protocol-level signal
-    // 세 경로 모두 보안 invariant는 동일하다 — silent success 금지.
+    // case 5와 동일 invariant: silently symlink를 따라가지 않음. target이 살아있는
+    // Unix socket이어도 bait listener에는 connect하지 않아야 하므로 protocol-level
+    // handshake 오류가 아니라 path-level 거부만 성공으로 인정한다.
     assert!(
         stderr.contains("symlink")
             || stderr.contains("non-socket")
-            || stderr.contains("Socket operation")
-            || stderr.contains("Connection refused")
-            || stderr.contains("Resource temporarily unavailable")
-            || stderr.contains("os error 35")
-            || stderr.contains("read response")
-            || stderr.contains("peer")
-            || stderr.contains("version"),
-        "expected refusal of symlink-to-live-socket, got: {stderr}"
+            || stderr.contains("Socket operation"),
+        "expected path-level refusal of symlink-to-live-socket, got: {stderr}"
     );
 
     // bait socket 자체는 보존되어야 한다 (거부 경로가 target을 unbind하면 안 됨).

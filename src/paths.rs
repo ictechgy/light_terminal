@@ -48,7 +48,9 @@ pub fn socket_path() -> Result<PathBuf> {
         validate_socket_parent(&path)?;
         return Ok(path);
     }
-    Ok(runtime_dir()?.join("lterm.sock"))
+    let path = runtime_dir()?.join("lterm.sock");
+    validate_socket_leaf(&path)?;
+    Ok(path)
 }
 
 pub fn log_path() -> Result<PathBuf> {
@@ -169,11 +171,24 @@ fn validate_socket_parent(socket: &Path) -> Result<()> {
     if socket.as_os_str().is_empty() {
         bail!("LTERM_SOCKET cannot be empty");
     }
+    validate_socket_leaf(socket)?;
     let parent = socket
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .context("LTERM_SOCKET must include a parent directory")?;
     ensure_user_private_dir(parent)
+}
+
+fn validate_socket_leaf(socket: &Path) -> Result<()> {
+    match fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("{} must not be a symlink", socket.display());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("lstat {}", socket.display())),
+    }
+    Ok(())
 }
 
 fn require_absolute_env_path(name: &str, path: &Path) -> Result<()> {

@@ -127,7 +127,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run v0.1.4 compatibility matrix
-        run: cargo test --test upgrade_matrix -- --nocapture --test-threads=1
+        run: cargo test --test upgrade_matrix -- --ignored --nocapture --test-threads=1
 
   soak-release-gate:
     name: soak-release-gate

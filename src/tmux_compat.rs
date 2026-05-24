@@ -769,6 +769,7 @@ fn send_keys(args: &[String]) -> Result<i32> {
     const VALUE_FLAGS: &[char] = &['N'];
     let target = parse_target_with_value_flags(args, VALUE_FLAGS)?;
     let mut literal = false;
+    let mut repeat = 1usize;
     let mut keys = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -781,6 +782,7 @@ fn send_keys(args: &[String]) -> Result<i32> {
                 i += 1;
             }
             "-N" => {
+                repeat = parse_send_keys_repeat(args.get(i + 1).cloned())?;
                 i += 2;
             }
             "--" => {
@@ -788,6 +790,11 @@ fn send_keys(args: &[String]) -> Result<i32> {
                 break;
             }
             flag if flag.starts_with('-') => {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'N', args, i, VALUE_FLAGS)
+                {
+                    repeat = parse_send_keys_repeat(value.or_else(|| args.get(i + 1).cloned()))?;
+                }
                 i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS)
             }
             _ => {
@@ -798,8 +805,21 @@ fn send_keys(args: &[String]) -> Result<i32> {
     }
     let target = target.unwrap_or_else(default_target);
     let bytes = keys_to_bytes(&keys, literal);
-    client::send(&target, bytes)?;
+    for _ in 0..repeat {
+        client::send(&target, bytes.clone())?;
+    }
     Ok(0)
+}
+
+fn parse_send_keys_repeat(value: Option<String>) -> Result<usize> {
+    let value = value.context("send-keys -N requires a repeat count")?;
+    let repeat = value
+        .parse::<usize>()
+        .with_context(|| format!("invalid send-keys -N repeat count: {value}"))?;
+    if repeat == 0 {
+        bail!("send-keys -N repeat count must be greater than zero");
+    }
+    Ok(repeat)
 }
 
 fn kill_pane(args: &[String]) -> Result<i32> {
@@ -2281,9 +2301,6 @@ fn control_key_byte(key: &str) -> Option<u8> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
@@ -2301,7 +2318,7 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: env-touching tmux_compat tests hold ENV_LOCK and restore on drop.
+            // SAFETY: env-touching tests hold crate::TEST_ENV_LOCK and restore on drop.
             unsafe {
                 for (name, value) in &self.saved {
                     match value {
@@ -3024,7 +3041,9 @@ mod tests {
 
     #[test]
     fn cmux_split_targets_identified_focused_surface_not_stale_env_surface() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let _env_guard = EnvGuard::capture(&["PATH", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"]);
         let temp = tempfile::tempdir().expect("tempdir");
         let cmux_path = temp.path().join("cmux");
@@ -3056,7 +3075,7 @@ exit 65
         permissions.set_mode(0o755);
         fs::set_permissions(&cmux_path, permissions).expect("chmod fake cmux");
 
-        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
         unsafe {
             std::env::set_var(
                 "PATH",

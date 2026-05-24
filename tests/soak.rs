@@ -49,10 +49,12 @@ impl TestEnv {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
         // 개발자 호스트의 custom socket 을 상속하지 않는다. soak command 가 fallback
         // path 를 밟더라도 sandbox 안에 머물도록 TMPDIR 도 defence-in-depth 로 고정한다.
-        cmd.env_remove("LTERM_SOCKET");
-        cmd.env("LTERM_RUNTIME_DIR", self.runtime_dir());
-        cmd.env("LTERM_DATA_DIR", self.data_dir());
-        cmd.env("TMPDIR", self.tmp_dir());
+        cmd.env_remove("LTERM_SOCKET")
+            .env_remove("LTERM_PANE")
+            .env_remove("LTERM_PARENT_TOKEN")
+            .env("LTERM_RUNTIME_DIR", self.runtime_dir())
+            .env("LTERM_DATA_DIR", self.data_dir())
+            .env("TMPDIR", self.tmp_dir());
         cmd
     }
 

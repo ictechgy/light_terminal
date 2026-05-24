@@ -50,6 +50,10 @@ const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
 
 pub fn ensure_server() -> Result<()> {
+    // Validate the socket path before the optimistic ping. If the socket leaf is
+    // a symlink or otherwise untrusted, retrying via auto-spawn only converts a
+    // path-level refusal into a slow timeout.
+    let _ = paths::socket_path()?;
     if rpc::<serde_json::Value>(&Request::Ping).is_ok() {
         warn_daemon_version_mismatch();
         return Ok(());
@@ -2326,18 +2330,8 @@ mod tests {
     };
     use std::io::{BufReader, Cursor, Read};
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-
-    /// 환경 변수를 변경하는 모든 테스트가 공유하는 직렬화 잠금. process-global env에 대한
-    /// race를 막기 위해 env-touching 테스트는 반드시 이 lock을 잡고, 종료 시 EnvGuard로
-    /// 원본 값을 복원해 다른 테스트로 누설되지 않게 한다.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// ATTACH_ACTIVE 플래그를 만지는 테스트가 공유하는 직렬화 잠금.
-    /// process-global static AtomicBool 이므로 병렬 테스트 race를 막아야 한다.
-    static ATTACH_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn compose_commit_bytes_match_input_enter_semantics() {
@@ -2502,7 +2496,7 @@ mod tests {
     }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
-    /// ENV_LOCK을 잡은 상태에서만 사용해야 한다.
+    /// crate::TEST_ENV_LOCK을 잡은 상태에서만 사용해야 한다.
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
     }
@@ -2519,7 +2513,7 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: 호출자는 ENV_LOCK을 잡고 있어야 한다 (테스트 컨벤션).
+            // SAFETY: 호출자는 crate::TEST_ENV_LOCK을 잡고 있어야 한다 (테스트 컨벤션).
             unsafe {
                 for (name, value) in &self.saved {
                     match value {
@@ -2528,6 +2522,23 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    struct AttachActiveStateGuard {
+        saved: usize,
+    }
+
+    impl AttachActiveStateGuard {
+        fn reset_to_zero() -> Self {
+            let saved = ATTACH_ACTIVE.swap(0, Ordering::AcqRel);
+            Self { saved }
+        }
+    }
+
+    impl Drop for AttachActiveStateGuard {
+        fn drop(&mut self) {
+            ATTACH_ACTIVE.store(self.saved, Ordering::Release);
         }
     }
 
@@ -2956,13 +2967,12 @@ mod tests {
 
     #[test]
     fn attach_active_guard_increments_and_decrements_depth() {
-        let _guard = ATTACH_FLAG_LOCK
+        let _guard = crate::TEST_ATTACH_FLAG_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
 
-        // 사전 capture (다른 코드 경로에서 set 했을 수 있음)
-        let prior = ATTACH_ACTIVE.load(Ordering::Acquire);
-        ATTACH_ACTIVE.store(0, Ordering::Release);
+        // 사전 capture (다른 코드 경로에서 set 했을 수 있음)는 RAII로 복원한다.
+        let _state_guard = AttachActiveStateGuard::reset_to_zero();
 
         assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
         {
@@ -2970,9 +2980,6 @@ mod tests {
             assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
         }
         assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
-
-        // 원래 상태 복원
-        ATTACH_ACTIVE.store(prior, Ordering::Release);
     }
 
     #[test]
@@ -2980,11 +2987,10 @@ mod tests {
         // nested attach (예: cmux 안에서 lterm omx로 attach 후 그 안에서 다시 lterm attach)
         // 시 inner Drop이 outer의 활성 상태를 무효화하지 않아야 한다. AtomicBool이었을 때의
         // 회귀를 회귀 테스트로 잡는다 (quad-review MEDIUM 합의).
-        let _guard = ATTACH_FLAG_LOCK
+        let _guard = crate::TEST_ATTACH_FLAG_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let prior = ATTACH_ACTIVE.load(Ordering::Acquire);
-        ATTACH_ACTIVE.store(0, Ordering::Release);
+        let _state_guard = AttachActiveStateGuard::reset_to_zero();
 
         let outer = AttachActiveGuard::enter();
         assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
@@ -2996,8 +3002,6 @@ mod tests {
         assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 1);
         drop(outer);
         assert_eq!(ATTACH_ACTIVE.load(Ordering::Acquire), 0);
-
-        ATTACH_ACTIVE.store(prior, Ordering::Release);
     }
 
     #[test]
@@ -3236,9 +3240,11 @@ mod tests {
 
     #[test]
     fn status_style_env_takes_precedence_over_ssh() {
-        // 다른 env-touching 테스트와 충돌하지 않도록 모듈 공유 ENV_LOCK으로 직렬화한 뒤,
+        // 다른 env-touching 테스트와 충돌하지 않도록 crate 공용 TEST_ENV_LOCK으로 직렬화한 뒤,
         // EnvGuard로 테스트가 끝나면 원래 환경 변수를 복원한다.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let _env_guard = EnvGuard::capture(&[
             "LTERM_STATUS_STYLE",
             "LTERM_STATUS_THEME",
@@ -3247,7 +3253,7 @@ mod tests {
             "SSH_TTY",
         ]);
 
-        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
         unsafe {
             std::env::remove_var("LTERM_STATUS_STYLE");
             std::env::remove_var("LTERM_STATUS_THEME");
@@ -3288,7 +3294,9 @@ mod tests {
 
     #[test]
     fn resolve_status_theme_prefers_session_then_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let _env_guard = EnvGuard::capture(&[
             "LTERM_STATUS_STYLE",
             "LTERM_STATUS_THEME",
@@ -3297,7 +3305,7 @@ mod tests {
             "SSH_TTY",
         ]);
 
-        // SAFETY: ENV_LOCK is held; EnvGuard restores on drop.
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
         unsafe {
             std::env::remove_var("LTERM_STATUS_STYLE");
             std::env::remove_var("SSH_CONNECTION");

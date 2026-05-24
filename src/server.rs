@@ -2440,6 +2440,18 @@ fn wait_for_session_contains(
         let (progress, changed) = &session.output_progress;
         let progress = lock(progress);
         if progress.revision != before_capture.revision {
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Ok(WaitContainsResult {
+                        session: session.info(),
+                        matched: false,
+                        timed_out: true,
+                        exited: !session.alive.load(Ordering::SeqCst),
+                    });
+                }
+            }
+            drop(progress);
+            thread::yield_now();
             continue;
         }
         if progress.closed {
