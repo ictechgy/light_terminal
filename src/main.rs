@@ -1563,22 +1563,15 @@ fn diagnostic_path_summary(path: &Path) -> DiagnosticPathSummary {
 }
 
 fn redact_command_summary(command: &str) -> String {
-    let mut saw_redacted_prefix = false;
-    let mut has_more = false;
-    let mut program = None;
     let mut parts = command.split_whitespace();
-    for token in parts.by_ref() {
-        let trimmed = token.trim_matches(['\'', '"']);
-        if is_shell_assignment_token(trimmed) {
-            saw_redacted_prefix = true;
-            continue;
-        }
-        has_more = parts.next().is_some() || saw_redacted_prefix;
-        program = safe_command_basename(trimmed);
-        break;
+    let Some(first) = parts.next() else {
+        return "<redacted>".to_string();
+    };
+    if is_shell_assignment_token(first) {
+        return "<redacted> …".to_string();
     }
-    let program = program.unwrap_or_else(|| "<redacted>".to_string());
-    if has_more || saw_redacted_prefix {
+    let program = safe_command_basename(first).unwrap_or_else(|| "<redacted>".to_string());
+    if parts.next().is_some() {
         format!("{program} …")
     } else {
         program
@@ -2598,7 +2591,15 @@ mod tests {
     fn diagnostic_command_summary_redacts_env_assignment_values() {
         assert_eq!(
             redact_command_summary("AWS_SECRET_ACCESS_KEY=supersecret cargo run"),
-            "cargo …"
+            "<redacted> …"
+        );
+        assert_eq!(
+            redact_command_summary("KEY='super secret' cargo run"),
+            "<redacted> …"
+        );
+        assert_eq!(
+            redact_command_summary(r#"KEY="super secret" cargo run"#),
+            "<redacted> …"
         );
         assert_eq!(redact_command_summary("TOKEN=supersecret"), "<redacted> …");
         assert_eq!(redact_command_summary("sh -lc 'echo secret'"), "sh …");
