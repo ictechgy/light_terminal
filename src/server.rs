@@ -927,6 +927,7 @@ enum TerminalPrefixState {
 struct TerminalPrefixTracker {
     state: TerminalPrefixState,
     pending: Vec<u8>,
+    utf8_remaining: u8,
 }
 
 impl TerminalPrefixTracker {
@@ -941,32 +942,54 @@ impl TerminalPrefixTracker {
     }
 
     fn process_byte(&mut self, byte: u8) {
+        let raw_c1 = !self.is_utf8_continuation(byte);
         match self.state {
-            TerminalPrefixState::Ground => self.process_ground(byte),
+            TerminalPrefixState::Ground => self.process_ground(byte, raw_c1),
             TerminalPrefixState::Escape => self.process_escape(byte),
-            TerminalPrefixState::Csi => self.process_csi(byte),
-            TerminalPrefixState::String => self.process_string(byte),
-            TerminalPrefixState::StringEscape => self.process_string_escape(byte),
+            TerminalPrefixState::Csi => self.process_csi(byte, raw_c1),
+            TerminalPrefixState::String => self.process_string(byte, raw_c1),
+            TerminalPrefixState::StringEscape => self.process_string_escape(byte, raw_c1),
         }
+        self.update_utf8_state(byte);
         if self.pending.len() > MAX_PENDING_ESCAPE_BYTES {
             self.pending.clear();
             self.state = TerminalPrefixState::Ground;
         }
     }
 
-    fn process_ground(&mut self, byte: u8) {
+    fn is_utf8_continuation(&self, byte: u8) -> bool {
+        self.utf8_remaining > 0 && (0x80..=0xbf).contains(&byte)
+    }
+
+    fn update_utf8_state(&mut self, byte: u8) {
+        if self.utf8_remaining > 0 {
+            if (0x80..=0xbf).contains(&byte) {
+                self.utf8_remaining -= 1;
+                return;
+            }
+            self.utf8_remaining = 0;
+        }
+        self.utf8_remaining = match byte {
+            0xc2..=0xdf => 1,
+            0xe0..=0xef => 2,
+            0xf0..=0xf4 => 3,
+            _ => 0,
+        };
+    }
+
+    fn process_ground(&mut self, byte: u8, raw_c1: bool) {
         match byte {
             0x1b => {
                 self.pending.clear();
                 self.pending.push(byte);
                 self.state = TerminalPrefixState::Escape;
             }
-            0x90 | 0x98 | 0x9d..=0x9f => {
+            0x90 | 0x98 | 0x9d..=0x9f if raw_c1 => {
                 self.pending.clear();
                 self.pending.push(byte);
                 self.state = TerminalPrefixState::String;
             }
-            0x9b => {
+            0x9b if raw_c1 => {
                 self.pending.clear();
                 self.pending.push(byte);
                 self.state = TerminalPrefixState::Csi;
@@ -994,10 +1017,14 @@ impl TerminalPrefixTracker {
         }
     }
 
-    fn process_csi(&mut self, byte: u8) {
+    fn process_csi(&mut self, byte: u8, raw_c1: bool) {
         self.pending.push(byte);
         match byte {
-            0x18 | 0x1a | 0x9c => {
+            0x18 | 0x1a => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            0x9c if raw_c1 => {
                 self.pending.clear();
                 self.state = TerminalPrefixState::Ground;
             }
@@ -1014,10 +1041,14 @@ impl TerminalPrefixTracker {
         }
     }
 
-    fn process_string(&mut self, byte: u8) {
+    fn process_string(&mut self, byte: u8, raw_c1: bool) {
         self.pending.push(byte);
         match byte {
-            0x07 | 0x18 | 0x1a | 0x9c => {
+            0x07 | 0x18 | 0x1a => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            0x9c if raw_c1 => {
                 self.pending.clear();
                 self.state = TerminalPrefixState::Ground;
             }
@@ -1026,10 +1057,14 @@ impl TerminalPrefixTracker {
         }
     }
 
-    fn process_string_escape(&mut self, byte: u8) {
+    fn process_string_escape(&mut self, byte: u8, raw_c1: bool) {
         self.pending.push(byte);
         match byte {
-            b'\\' | 0x18 | 0x1a | 0x9c => {
+            b'\\' | 0x18 | 0x1a => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            0x9c if raw_c1 => {
                 self.pending.clear();
                 self.state = TerminalPrefixState::Ground;
             }
@@ -4249,13 +4284,38 @@ mod tests {
 
     #[test]
     fn terminal_prefix_tracker_clears_completed_raw_c1_strings() {
+        for bytes in [
+            &b"\x90secret\x9cSAFE"[..],
+            &b"\x9d52;c;secret\x9cSAFE"[..],
+            &b"\x9esecret\x9cSAFE"[..],
+            &b"\x9fsecret\x9cSAFE"[..],
+        ] {
+            let mut tracker = TerminalPrefixTracker::default();
+            tracker.process(bytes);
+
+            assert!(
+                tracker.pending_bytes().is_empty(),
+                "completed raw C1 control string must not be replayed to future attach clients: {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_prefix_tracker_does_not_treat_utf8_continuations_as_raw_c1() {
         let mut tracker = TerminalPrefixTracker::default();
-        tracker.process(b"\x9d52;c;secret\x9cSAFE");
+        tracker.process(b"\x1b]0;\xe6\x9c\x9d");
 
         assert!(
-            tracker.pending_bytes().is_empty(),
-            "completed raw C1 OSC/ST sequence must not be replayed to future attach clients"
+            !tracker.pending_bytes().is_empty(),
+            "UTF-8 continuation bytes inside OSC payload must not terminate the pending control string"
         );
+
+        tracker.process(b"\x07SAFE");
+        assert!(tracker.pending_bytes().is_empty());
+
+        let mut ground_tracker = TerminalPrefixTracker::default();
+        ground_tracker.process("朝SAFE".as_bytes());
+        assert!(ground_tracker.pending_bytes().is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
+import tomllib
 import shutil
 import stat
 import subprocess
@@ -298,10 +298,8 @@ PY
             self.assertTrue(path.exists(), f"package files entry is missing: {rel_path}")
 
     def test_homebrew_formula_version_matches_package_manifests(self) -> None:
-        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
-        cargo_version = re.search(r'^version = "([^"]+)"$', cargo, re.MULTILINE)
-        self.assertIsNotNone(cargo_version)
-        version = cargo_version.group(1)
+        cargo = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        version = cargo["package"]["version"]
         package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["version"], version)
 

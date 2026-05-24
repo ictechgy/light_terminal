@@ -81,17 +81,26 @@ impl DaemonGuard {
         if child.try_wait()?.is_none() {
             match child.kill() {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                    ) => {}
                 Err(err) => {
                     kill_error = Some(format!("failed to kill daemon {child_id}: {err}"));
                 }
             }
         }
-        wait_child_exit(&mut child, Duration::from_secs(3))?;
-        if let Some(err) = kill_error {
-            return Err(err.into());
+        let wait_result = wait_child_exit(&mut child, Duration::from_secs(3));
+        match (kill_error, wait_result) {
+            (Some(kill_error), Err(wait_error)) => Err(format!(
+                "{kill_error}; additionally failed to reap daemon {child_id}: {wait_error}"
+            )
+            .into()),
+            (Some(kill_error), Ok(())) => Err(kill_error.into()),
+            (None, Err(wait_error)) => Err(wait_error),
+            (None, Ok(())) => Ok(()),
         }
-        Ok(())
     }
 }
 
