@@ -1225,6 +1225,10 @@ fn help_shows_common_aliases() -> TestResult {
         "capture compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: record]"),
+        "record compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: mobile]"),
         "mobile compose alias was not visible in help:\n{stdout}"
     );
@@ -1270,6 +1274,9 @@ fn help_exposes_utility_command_surface() -> TestResult {
     for command in [
         "install-shim",
         "env",
+        "completions",
+        "diagnose",
+        "trace",
         "tmux-compat",
         "wait",
         "watch",
@@ -1313,6 +1320,204 @@ fn help_exposes_utility_command_surface() -> TestResult {
             "top-level help should keep utility command context {expected:?}:\n{stdout}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn completions_generate_shell_scripts_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let bash = env.cmd().args(["completions", "bash"]).output()?;
+    assert!(bash.status.success(), "{bash:?}");
+    assert!(bash.stderr.is_empty(), "{bash:?}");
+    let bash_stdout = String::from_utf8_lossy(&bash.stdout);
+    assert!(
+        bash_stdout.contains("_lterm") && bash_stdout.contains("completions"),
+        "bash completion should describe lterm commands:\n{bash_stdout}"
+    );
+
+    let zsh = env.cmd().args(["completions", "zsh"]).output()?;
+    assert!(zsh.status.success(), "{zsh:?}");
+    let zsh_stdout = String::from_utf8_lossy(&zsh.stdout);
+    assert!(
+        zsh_stdout.contains("#compdef lterm"),
+        "zsh completion should include compdef header:\n{zsh_stdout}"
+    );
+
+    let fish = env.cmd().args(["completions", "fish"]).output()?;
+    assert!(fish.status.success(), "{fish:?}");
+    let fish_stdout = String::from_utf8_lossy(&fish.stdout);
+    assert!(
+        fish_stdout.contains("complete -c lterm"),
+        "fish completion should include fish complete directives:\n{fish_stdout}"
+    );
+
+    let doctor = env.cmd().args(["doctor", "--json"]).output()?;
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    assert_eq!(
+        report.get("daemon_reachable").and_then(|v| v.as_bool()),
+        Some(false),
+        "completion generation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let cold = env.cmd().args(["diagnose", "--bundle"]).output()?;
+    assert!(cold.status.success(), "{cold:?}");
+    assert!(cold.stderr.is_empty(), "{cold:?}");
+    let cold_bundle: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+    assert_eq!(
+        cold_bundle
+            .pointer("/doctor/daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "cold diagnose should not auto-start daemon: {cold_bundle:?}"
+    );
+    assert_eq!(
+        cold_bundle
+            .pointer("/privacy/raw_pty_streams_included")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "diagnose bundle must not include raw PTY bytes by default: {cold_bundle:?}"
+    );
+    assert!(
+        cold_bundle.get("sessions").is_some_and(|v| v.is_null()),
+        "cold bundle should skip sessions without daemon auto-start: {cold_bundle:?}"
+    );
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "diagnose-session",
+            "--",
+            "sh",
+            "-lc",
+            "echo DIAGNOSE_READY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("diagnose-session", "DIAGNOSE_READY")?;
+
+    let live = env.cmd().args(["diagnose", "--bundle"]).output()?;
+    assert!(live.status.success(), "{live:?}");
+    let live_bundle: serde_json::Value = serde_json::from_slice(&live.stdout)?;
+    assert_eq!(
+        live_bundle
+            .pointer("/doctor/daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "{live_bundle:?}"
+    );
+    let sessions = live_bundle
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or("live diagnose bundle must include sessions array")?;
+    assert!(
+        sessions.iter().any(|session| session
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name == "diagnose-session")),
+        "live diagnose bundle should include the created session: {live_bundle:?}"
+    );
+    assert!(
+        live_bundle.get("processes").is_some_and(|v| v.is_array()),
+        "live diagnose bundle should include process rows: {live_bundle:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "trace-session",
+            "--",
+            "sh",
+            "-lc",
+            "echo TRACE_READY; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("trace-session", "TRACE_READY")?;
+
+    let trace_path = env.temp.path().join("trace.jsonl");
+    let trace_path_str = trace_path.to_str().ok_or("non-utf8 trace path")?;
+    let output = env
+        .cmd()
+        .args([
+            "trace",
+            "trace-session",
+            "--duration",
+            "500ms",
+            "--output",
+            trace_path_str,
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "trace command should write only the file, not replay raw PTY stdout: {output:?}"
+    );
+
+    let trace = std::fs::read_to_string(&trace_path)?;
+    let events: Vec<serde_json::Value> = trace
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert!(
+        events
+            .first()
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("start"),
+        "trace must start with metadata event: {trace}"
+    );
+    assert!(
+        events
+            .last()
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("end"),
+        "trace must end with terminal event: {trace}"
+    );
+    let combined_hex = events
+        .iter()
+        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+        .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
+        .collect::<String>();
+    assert!(
+        combined_hex.contains("54524143455f5245414459"),
+        "trace output chunks should contain TRACE_READY bytes encoded as hex: {trace}"
+    );
+
+    let overwrite = env
+        .cmd()
+        .args([
+            "record",
+            "trace-session",
+            "--duration",
+            "100ms",
+            "--output",
+            trace_path_str,
+        ])
+        .output()?;
+    assert!(
+        !overwrite.status.success(),
+        "trace should refuse to overwrite without --force: {overwrite:?}"
+    );
     Ok(())
 }
 
