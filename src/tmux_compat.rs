@@ -54,7 +54,9 @@ pub fn ensure_shim() -> Result<PathBuf> {
         .context("lterm executable path must be valid UTF-8")?;
     let quoted_lterm = shlex::try_quote(lterm).context("quote lterm executable path")?;
     let script = format!("#!/bin/sh\nexec {quoted_lterm} tmux-compat \"$@\"\n");
-    fs::write(&tmux_path, script).with_context(|| format!("write {}", tmux_path.display()))?;
+    if fs::read_to_string(&tmux_path).ok().as_deref() != Some(script.as_str()) {
+        fs::write(&tmux_path, script).with_context(|| format!("write {}", tmux_path.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -242,7 +244,14 @@ fn has_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
     match client::info(&target) {
         Ok(_) => Ok(0),
-        Err(_) => Ok(1),
+        Err(err) => {
+            let message = format!("{err:#}");
+            if message.contains("no such lterm session or pane:") {
+                Ok(1)
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -854,27 +863,34 @@ fn parse_resize_dimension(flag: char, value: Option<String>) -> Result<u16> {
 }
 
 fn show_option(args: &[String]) -> Result<i32> {
-    if args.iter().any(|a| a == "-g" || a == "-v") {
+    if show_option_prints_value(args) {
         // Return a conservative default for scripts that query options.
         println!("off");
     }
     Ok(0)
 }
 
+fn show_option_prints_value(args: &[String]) -> bool {
+    has_flag(args, "-g") || has_flag(args, "-v")
+}
+
 fn display_popup(args: &[String]) -> Result<i32> {
+    const VALUE_FLAGS: &[char] = &['b', 'c', 'd', 'e', 'h', 's', 'S', 't', 'T', 'w', 'x', 'y'];
     let mut command = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-E" => {
-                command = tmux_shell_command(&args[i + 1..])?;
-                break;
-            }
             "--" => {
                 command = tmux_shell_command(&args[i + 1..])?;
                 break;
             }
-            _ => i += 1,
+            flag if flag.starts_with('-') && flag != "-" => {
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
+            _ => {
+                command = tmux_shell_command(&args[i..])?;
+                break;
+            }
         }
     }
     if let Some(command) = command {
@@ -896,7 +912,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
         match args[i].as_str() {
             "-S" => {
                 signal = true;
-                channel = args.get(i + 1).cloned();
+                channel = Some(value_for_option(args.get(i + 1).cloned(), "-S")?);
                 i += 2;
             }
             "-L" | "-U" => bail!("tmux wait-for {} is not supported by lterm", args[i]),
@@ -906,7 +922,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let channel = channel.unwrap_or_else(|| "default".to_string());
+    let channel = channel.context("tmux wait-for requires a channel")?;
     if signal {
         update_store(|store| {
             prune_wait_generations(store, None);
@@ -926,11 +942,8 @@ fn wait_for(args: &[String]) -> Result<i32> {
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
     let mut sleep_for = Duration::from_millis(100);
     while Instant::now() < deadline {
-        let current_generation = update_store(|store| {
-            prune_wait_generations(store, Some(&channel));
-            touch_existing_wait_generation(store, &channel);
-            Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
-        })?;
+        let current_generation =
+            read_store(|store| Ok(*store.wait_generations.get(&channel).unwrap_or(&0)))?;
         if current_generation > observed_generation {
             return Ok(0);
         }
@@ -1558,6 +1571,12 @@ fn update_store<T>(f: impl FnOnce(&mut CompatStore) -> Result<T>) -> Result<T> {
     let result = f(&mut store)?;
     save_store(&store)?;
     Ok(result)
+}
+
+fn read_store<T>(f: impl FnOnce(&CompatStore) -> Result<T>) -> Result<T> {
+    let _lock = StoreLock::acquire()?;
+    let store = load_store()?;
+    f(&store)
 }
 
 struct StoreLock {
@@ -2190,10 +2209,36 @@ pub fn keys_to_bytes(keys: &[String], literal: bool) -> Vec<u8> {
             "Down" | "down" => out.extend_from_slice(b"\x1b[B"),
             "Right" | "right" => out.extend_from_slice(b"\x1b[C"),
             "Left" | "left" => out.extend_from_slice(b"\x1b[D"),
-            text => out.extend_from_slice(text.as_bytes()),
+            text => {
+                if let Some(byte) = control_key_byte(text) {
+                    out.push(byte);
+                } else {
+                    out.extend_from_slice(text.as_bytes());
+                }
+            }
         }
     }
     out
+}
+
+fn control_key_byte(key: &str) -> Option<u8> {
+    let suffix = key.strip_prefix("C-")?;
+    let mut chars = suffix.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    match ch {
+        '@' | ' ' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        ch if ch.is_ascii_alphabetic() => Some((ch.to_ascii_uppercase() as u8) & 0x1f),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2243,6 +2288,84 @@ mod tests {
         assert_eq!(keys_to_bytes(&keys, false), b"echo ok\r");
         assert_eq!(keys_to_bytes(&["a".into(), "b".into()], true), b"ab");
         assert_eq!(keys_to_bytes(&["C-j".into()], false), b"\n");
+    }
+
+    #[test]
+    fn maps_generic_control_keys() {
+        assert_eq!(
+            keys_to_bytes(
+                &[
+                    "C-a".into(),
+                    "C-L".into(),
+                    "C-]".into(),
+                    "C-_".into(),
+                    "C-?".into()
+                ],
+                false
+            ),
+            [0x01, 0x0c, 0x1d, 0x1f, 0x7f]
+        );
+        assert_eq!(keys_to_bytes(&["C-xy".into()], false), b"C-xy");
+    }
+
+    #[test]
+    fn show_option_accepts_clustered_value_flags() {
+        assert!(show_option_prints_value(&args(["-gv", "status"])));
+        assert!(show_option_prints_value(&args(["-qg", "status"])));
+        assert!(!show_option_prints_value(&args(["status"])));
+    }
+
+    #[test]
+    fn display_popup_accepts_command_without_e_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("popup.out");
+        let output_path = output.display().to_string();
+        let quoted = shlex::try_quote(&output_path).expect("quote output");
+        let status = display_popup(&[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf popup > {quoted}"),
+        ])
+        .expect("display-popup command");
+
+        assert_eq!(status, 0);
+        assert_eq!(fs::read_to_string(output).expect("popup output"), "popup");
+    }
+
+    #[test]
+    fn display_popup_skips_options_before_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("popup-e.out");
+        let output_path = output.display().to_string();
+        let quoted = shlex::try_quote(&output_path).expect("quote output");
+        let status = display_popup(&[
+            "-E".to_string(),
+            "-w".to_string(),
+            "80".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf popup-e > {quoted}"),
+        ])
+        .expect("display-popup command");
+
+        assert_eq!(status, 0);
+        assert_eq!(fs::read_to_string(output).expect("popup output"), "popup-e");
+    }
+
+    #[test]
+    fn wait_for_requires_channel() {
+        assert!(
+            wait_for(&Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a channel")
+        );
+        assert!(
+            wait_for(&args(["-S"]))
+                .unwrap_err()
+                .to_string()
+                .contains("tmux option -S requires a value")
+        );
     }
 
     #[test]

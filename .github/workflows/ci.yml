@@ -39,6 +39,7 @@ jobs:
         run: |
           QUAD_BRAINSTORMING_SKILL=.codex/skills/quad-brainstorming/SKILL.md \
             python3 scripts/test_quad_brainstorming_skill_contract.py
+          python3 scripts/test_quad_brainstorming_json_schemas.py
           python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -54,6 +55,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Validate manifest validator self-test
+        run: python3 scripts/validate_contract_manifest.py --self-test
       - name: Validate public contract manifest
         run: python3 scripts/validate_contract_manifest.py docs/contract-manifest.json
 

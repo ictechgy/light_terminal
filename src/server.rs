@@ -995,23 +995,29 @@ impl TerminalPrefixTracker {
     }
 
     fn process_csi(&mut self, byte: u8) {
-        if byte == 0x1b {
-            self.pending.clear();
-            self.pending.push(byte);
-            self.state = TerminalPrefixState::Escape;
-            return;
-        }
         self.pending.push(byte);
-        if (0x40..=0x7e).contains(&byte) {
-            self.pending.clear();
-            self.state = TerminalPrefixState::Ground;
+        match byte {
+            0x18 | 0x1a | 0x9c => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            0x1b => {
+                self.pending.clear();
+                self.pending.push(byte);
+                self.state = TerminalPrefixState::Escape;
+            }
+            byte if (0x40..=0x7e).contains(&byte) => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            _ => {}
         }
     }
 
     fn process_string(&mut self, byte: u8) {
         self.pending.push(byte);
         match byte {
-            0x07 => {
+            0x07 | 0x18 | 0x1a | 0x9c => {
                 self.pending.clear();
                 self.state = TerminalPrefixState::Ground;
             }
@@ -1022,11 +1028,13 @@ impl TerminalPrefixTracker {
 
     fn process_string_escape(&mut self, byte: u8) {
         self.pending.push(byte);
-        if byte == b'\\' {
-            self.pending.clear();
-            self.state = TerminalPrefixState::Ground;
-        } else if byte != 0x1b {
-            self.state = TerminalPrefixState::String;
+        match byte {
+            b'\\' | 0x18 | 0x1a | 0x9c => {
+                self.pending.clear();
+                self.state = TerminalPrefixState::Ground;
+            }
+            0x1b => {}
+            _ => self.state = TerminalPrefixState::String,
         }
     }
 }
@@ -4237,6 +4245,33 @@ mod tests {
                 .any(|window| window == b"\x1b[2J"),
             "combined snapshot+live stream must reconstruct the split CSI"
         );
+    }
+
+    #[test]
+    fn terminal_prefix_tracker_clears_completed_raw_c1_strings() {
+        let mut tracker = TerminalPrefixTracker::default();
+        tracker.process(b"\x9d52;c;secret\x9cSAFE");
+
+        assert!(
+            tracker.pending_bytes().is_empty(),
+            "completed raw C1 OSC/ST sequence must not be replayed to future attach clients"
+        );
+    }
+
+    #[test]
+    fn terminal_prefix_tracker_clears_cancelled_control_sequences() {
+        for bytes in [
+            &b"\x1b]52;c;secret\x18"[..],
+            &b"\x1b[?1049\x1a"[..],
+            &b"\x9b?1049\x9c"[..],
+        ] {
+            let mut tracker = TerminalPrefixTracker::default();
+            tracker.process(bytes);
+            assert!(
+                tracker.pending_bytes().is_empty(),
+                "cancelled or ST-terminated control prefix must be dropped: {bytes:?}"
+            );
+        }
     }
 
     #[test]

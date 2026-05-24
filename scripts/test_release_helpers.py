@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -295,6 +296,18 @@ PY
         for rel_path in files:
             path = REPO_ROOT / rel_path
             self.assertTrue(path.exists(), f"package files entry is missing: {rel_path}")
+
+    def test_homebrew_formula_version_matches_package_manifests(self) -> None:
+        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        cargo_version = re.search(r'^version = "([^"]+)"$', cargo, re.MULTILINE)
+        self.assertIsNotNone(cargo_version)
+        version = cargo_version.group(1)
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["version"], version)
+
+        formula = (REPO_ROOT / "packaging" / "homebrew" / "lterm.rb").read_text(encoding="utf-8")
+        self.assertIn(f"/refs/tags/v{version}.tar.gz", formula)
+        self.assertIn(f'assert_match "lterm {version}"', formula)
 
 
 if __name__ == "__main__":

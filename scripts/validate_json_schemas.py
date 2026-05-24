@@ -319,6 +319,8 @@ def validate_sample(entry: dict[str, Any], schema: Json, schema_dir: Path, store
             env = os.environ.copy()
             env["LTERM_RUNTIME_DIR"] = str(Path(tmp) / "run")
             env["LTERM_DATA_DIR"] = str(Path(tmp) / "data")
+            env["TMPDIR"] = tmp
+            env.pop("LTERM_SOCKET", None)
             try:
                 for setup in spec.get("setup", []):
                     proc = run_lterm(prefix, [str(part) for part in setup], env, repo_root)

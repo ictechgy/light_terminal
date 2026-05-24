@@ -12,10 +12,6 @@ on:
         required: true
         type: boolean
         default: true
-      source_ref:
-        description: "Git ref to build and publish from"
-        required: true
-        default: "main"
       publish_platforms:
         description: "Build and publish platform packages before the wrapper"
         required: true
@@ -39,13 +35,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
 
       - name: Validate package versions
         id: meta
         shell: bash
         run: |
           set -euo pipefail
+          actual_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "${{ inputs.tag }}")"
+          if [[ "$actual_commit" != "$tag_commit" ]]; then
+            echo "checked-out commit $actual_commit does not match tag ${{ inputs.tag }} ($tag_commit)" >&2
+            exit 63
+          fi
+
           version=$(node -p 'require("./package.json").version')
           expected_tag="v${version}"
           if [[ "${{ inputs.tag }}" != "$expected_tag" ]]; then
@@ -87,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: refs/tags/${{ inputs.tag }}
 
       - uses: actions/setup-node@v6
         with:
@@ -134,7 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: refs/tags/${{ inputs.tag }}
 
       - uses: actions/setup-node@v6
         with:
@@ -206,6 +210,14 @@ jobs:
           fi
           package=$(node -p 'require("./package.json").name')
           version=$(node -p 'require("./package.json").version')
+          if [[ "${{ inputs.dry_run }}" != "true" && "${{ inputs.publish_platforms }}" != "true" ]]; then
+            for platform_package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
+              if ! npm view "${platform_package}@${version}" version >/dev/null 2>&1; then
+                echo "missing required platform package ${platform_package}@${version}; refusing to publish wrapper without platform build" >&2
+                exit 66
+              fi
+            done
+          fi
           if [[ "${{ inputs.dry_run }}" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
             echo "${package}@${version} already exists; skipping publish"
             exit 0

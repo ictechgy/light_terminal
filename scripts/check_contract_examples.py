@@ -103,6 +103,8 @@ def run_example(example: Example, entry: dict[str, Any], prefix: list[str], repo
         env = os.environ.copy()
         env["LTERM_RUNTIME_DIR"] = str(Path(tmp) / "run")
         env["LTERM_DATA_DIR"] = str(Path(tmp) / "data")
+        env["TMPDIR"] = tmp
+        env.pop("LTERM_SOCKET", None)
         try:
             proc = subprocess.run(
                 command_argv(example.command, prefix),

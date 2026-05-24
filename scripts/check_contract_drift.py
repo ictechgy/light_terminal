@@ -81,6 +81,8 @@ def run_help(lterm_bin: str, repo_root: Path) -> str:
         tmp_path = Path(tmp)
         env["LTERM_RUNTIME_DIR"] = str(tmp_path / "run")
         env["LTERM_DATA_DIR"] = str(tmp_path / "data")
+        env["TMPDIR"] = tmp
+        env.pop("LTERM_SOCKET", None)
         proc = subprocess.run(
             [lterm_bin, "--help"],
             cwd=repo_root,
