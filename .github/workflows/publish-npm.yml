@@ -48,6 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -88,6 +89,7 @@ jobs:
           done
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$actual_commit" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.package }}
@@ -113,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit_sha }}
 
       - uses: actions/setup-node@v6
         with:
@@ -160,7 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit_sha }}
 
       - uses: actions/setup-node@v6
         with:
@@ -195,6 +197,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
+          VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
           publish_flags=(--access public)
@@ -211,6 +214,10 @@ jobs:
             (
               cd "npm/platforms/${package}"
               version=$(node -p 'require("./package.json").version')
+              if [[ "$version" != "$VALIDATED_VERSION" ]]; then
+                echo "${package} version ${version} does not match validated metadata version ${VALIDATED_VERSION}" >&2
+                exit 65
+              fi
               if [[ "$DRY_RUN" != "true" ]] && npm view "${package}@${version}" version >/dev/null 2>&1; then
                 echo "${package}@${version} already exists; skipping publish"
                 exit 0
@@ -225,6 +232,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
           PUBLISH_PLATFORMS: ${{ inputs.publish_platforms }}
+          VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
           publish_flags=(--access public)
@@ -235,6 +243,10 @@ jobs:
           fi
           package=$(node -p 'require("./package.json").name')
           version=$(node -p 'require("./package.json").version')
+          if [[ "$version" != "$VALIDATED_VERSION" ]]; then
+            echo "${package} version ${version} does not match validated metadata version ${VALIDATED_VERSION}" >&2
+            exit 65
+          fi
           if [[ "$DRY_RUN" != "true" && "$PUBLISH_PLATFORMS" != "true" ]]; then
             for platform_package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
               if ! npm view "${platform_package}@${version}" version >/dev/null 2>&1; then
