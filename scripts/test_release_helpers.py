@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tomllib
 import shutil
 import stat
 import subprocess
@@ -23,6 +22,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_PYTHON = sys.executable
+
+
+def cargo_package_version(cargo_toml: str) -> str:
+    in_package = False
+    for raw_line in cargo_toml.splitlines():
+        line = raw_line.strip()
+        if line == "[package]":
+            in_package = True
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_package = False
+            continue
+        if in_package and line.startswith("version"):
+            key, _, value = line.partition("=")
+            if key.strip() == "version":
+                return value.strip().strip('"')
+    raise AssertionError("Cargo.toml package.version is missing")
 
 
 def write_executable(path: Path, text: str) -> None:
@@ -298,8 +314,7 @@ PY
             self.assertTrue(path.exists(), f"package files entry is missing: {rel_path}")
 
     def test_homebrew_formula_version_matches_package_manifests(self) -> None:
-        cargo = tomllib.loads((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        version = cargo["package"]["version"]
+        version = cargo_package_version((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["version"], version)
 

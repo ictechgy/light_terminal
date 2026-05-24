@@ -77,18 +77,19 @@ impl DaemonGuard {
             return Ok(());
         };
         let child_id = child.id();
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
         let mut kill_error = None;
-        if child.try_wait()?.is_none() {
-            match child.kill() {
-                Ok(()) => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
-                    ) => {}
-                Err(err) => {
-                    kill_error = Some(format!("failed to kill daemon {child_id}: {err}"));
-                }
+        match child.kill() {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(err) => {
+                kill_error = Some(format!("failed to kill daemon {child_id}: {err}"));
             }
         }
         let wait_result = wait_child_exit(&mut child, Duration::from_secs(3));
