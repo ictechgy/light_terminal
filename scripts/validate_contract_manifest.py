@@ -409,8 +409,6 @@ def test_target_exists(target: str, repo_root: Path, rust_tests: set[str], ci_ta
                 return False
             if not script_path.exists():
                 return False
-            if len(tokens) == 2:
-                return True
             # Keep manifest evidence honest: do not accept arbitrary flags merely
             # because the script exists. Current manifest Python targets are
             # self-test contracts, so require that exact executable surface.
@@ -596,6 +594,10 @@ def run_self_tests() -> int:
         bogus_python_flag = deepcopy(valid_entry)
         bogus_python_flag["tests"] = ["python3 scripts/validate_contract_manifest.py --does-not-exist"]
         expect_errors("bogus python flag", bogus_python_flag, ["tests name no real target"])
+
+        no_arg_python_target = deepcopy(valid_entry)
+        no_arg_python_target["tests"] = ["python3 scripts/validate_contract_manifest.py"]
+        expect_errors("no-arg python target", no_arg_python_target, ["tests name no real target"])
 
         missing_schema = deepcopy(valid_entry)
         missing_schema["json_output_stability"] = "stable"

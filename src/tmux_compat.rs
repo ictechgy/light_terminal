@@ -811,6 +811,9 @@ fn send_keys(args: &[String]) -> Result<i32> {
 }
 
 fn repeated_send_payload(bytes: &[u8], repeat: usize) -> Result<Vec<u8>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
     let total = bytes
         .len()
         .checked_mul(repeat)
@@ -2373,6 +2376,19 @@ mod tests {
             [0x01, 0x0c, 0x1d, 0x1f, 0x7f]
         );
         assert_eq!(keys_to_bytes(&["C-xy".into()], false), b"C-xy");
+    }
+
+    #[test]
+    fn repeat_empty_send_payload_returns_without_spinning() {
+        let repeated = repeated_send_payload(&[], usize::MAX).expect("empty repeated payload");
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn repeat_send_payload_rejects_oversized_result() {
+        let payload = vec![b'x'; MAX_SEND_DATA_BYTES / 2 + 1];
+        let err = repeated_send_payload(&payload, 2).expect_err("oversized payload");
+        assert!(err.to_string().contains("send data exceeds"));
     }
 
     #[test]

@@ -449,18 +449,29 @@ fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
     let stop_for_thread = Arc::clone(&stop_accept);
     let accept_thread = thread::spawn(move || -> std::io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !stop_for_thread.load(Ordering::Acquire) && Instant::now() < deadline {
+        let mark_if_accepted = |listener: &UnixListener| -> std::io::Result<bool> {
             match listener.accept() {
                 Ok((_stream, _addr)) => {
                     accepted_for_thread.store(true, Ordering::Release);
-                    return Ok(());
+                    Ok(true)
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(err) => return Err(err),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+                Err(err) => Err(err),
             }
+        };
+        loop {
+            if mark_if_accepted(&listener)? {
+                return Ok(());
+            }
+            if stop_for_thread.load(Ordering::Acquire) || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
+        // Deterministically drain once after the command has exited and the stop
+        // flag is set. This catches a forbidden connect queued just before the
+        // accept loop observed the stop flag, without relying on timing sleeps.
+        let _ = mark_if_accepted(&listener)?;
         Ok(())
     });
     symlink(&bait_socket, &socket)?;
@@ -472,9 +483,6 @@ fn symlink_socket_path_pointing_to_live_unix_socket_is_refused() -> TestResult {
         Duration::from_secs(3),
         "list with symlink-to-live-socket bait",
     );
-    // Give the nonblocking accept loop a brief post-command drain window so a
-    // forbidden connect queued just before process exit cannot be missed.
-    thread::sleep(Duration::from_millis(150));
     stop_accept.store(true, Ordering::Release);
     accept_thread
         .join()
