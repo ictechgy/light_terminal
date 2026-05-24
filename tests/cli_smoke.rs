@@ -290,6 +290,36 @@ fn wait_for_file_contents(path: &Path) -> TestResult<String> {
     .into())
 }
 
+fn wait_for_trace_start_event(path: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            last = contents;
+            if last.lines().next().is_some_and(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|event| {
+                        event
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("start")
+            }) {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "timed out waiting for trace start event in {}; last contents: {last:?}",
+        path.display()
+    )
+    .into())
+}
+
 fn wait_for_no_client_rows(env: &TestEnv, sessions: &[&str]) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last = String::new();
@@ -1491,7 +1521,7 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
                 "trace",
                 "trace-session",
                 "--duration",
-                "800ms",
+                "3s",
                 "--max-bytes",
                 "4096",
                 "--output",
@@ -1501,13 +1531,13 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
             .stderr(Stdio::piped())
             .spawn()?,
     );
-    thread::sleep(Duration::from_millis(150));
+    wait_for_trace_start_event(&trace_path)?;
     let send = env
         .cmd()
         .args(["input", "trace-session", "TRACE_DURING", "--enter"])
         .output()?;
     assert!(send.status.success(), "{send:?}");
-    let output = wait_for_child_output(trace_child, Duration::from_secs(3), "trace command")?;
+    let output = wait_for_child_output(trace_child, Duration::from_secs(5), "trace command")?;
     assert!(output.status.success(), "{output:?}");
     assert!(
         output.stdout.is_empty(),

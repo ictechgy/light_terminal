@@ -1563,18 +1563,49 @@ fn diagnostic_path_summary(path: &Path) -> DiagnosticPathSummary {
 }
 
 fn redact_command_summary(command: &str) -> String {
+    let mut saw_redacted_prefix = false;
+    let mut has_more = false;
+    let mut program = None;
     let mut parts = command.split_whitespace();
-    let program = parts
-        .next()
-        .and_then(|token| Path::new(token.trim_matches(['\'', '"'])).file_name())
-        .map(|name| sanitize::terminal_text(&name.to_string_lossy()))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "<redacted>".to_string());
-    if parts.next().is_some() {
+    for token in parts.by_ref() {
+        let trimmed = token.trim_matches(['\'', '"']);
+        if is_shell_assignment_token(trimmed) {
+            saw_redacted_prefix = true;
+            continue;
+        }
+        has_more = parts.next().is_some() || saw_redacted_prefix;
+        program = safe_command_basename(trimmed);
+        break;
+    }
+    let program = program.unwrap_or_else(|| "<redacted>".to_string());
+    if has_more || saw_redacted_prefix {
         format!("{program} …")
     } else {
         program
     }
+}
+
+fn is_shell_assignment_token(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn safe_command_basename(token: &str) -> Option<String> {
+    let basename = Path::new(token).file_name()?.to_string_lossy();
+    let sanitized = sanitize::terminal_text(&basename);
+    let mut chars = sanitized.chars();
+    let first = chars.next()?;
+    let safe_first = first.is_ascii_alphanumeric() || matches!(first, '_' | '.' | '-');
+    let safe_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-' | '+'));
+    (safe_first && safe_rest).then_some(sanitized)
 }
 
 fn sanitized_env_value(name: &str) -> Option<String> {
@@ -2561,6 +2592,18 @@ mod tests {
                 "{value:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_command_summary_redacts_env_assignment_values() {
+        assert_eq!(
+            redact_command_summary("AWS_SECRET_ACCESS_KEY=supersecret cargo run"),
+            "cargo …"
+        );
+        assert_eq!(redact_command_summary("TOKEN=supersecret"), "<redacted> …");
+        assert_eq!(redact_command_summary("sh -lc 'echo secret'"), "sh …");
+        assert_eq!(redact_command_summary("/usr/bin/cargo"), "cargo");
+        assert_eq!(redact_command_summary("$(echo secret) arg"), "<redacted> …");
     }
 
     #[test]

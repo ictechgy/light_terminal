@@ -514,6 +514,7 @@ pub fn trace_output(
             raw_stream_policy: "raw-transparent",
         },
     )?;
+    output.flush().context("flush trace start event")?;
 
     let deadline = started + duration;
     let mut reason = "duration";
