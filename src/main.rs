@@ -213,6 +213,24 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Replay a raw JSONL trace file to stdout.
+    #[command(name = "trace-replay", visible_alias = "replay-trace")]
+    TraceReplay {
+        /// JSONL trace file created by `lterm trace`.
+        input: std::path::PathBuf,
+        /// Preserve recorded inter-chunk delays while replaying.
+        #[arg(long)]
+        timing: bool,
+    },
+    /// Print raw-free metadata for a JSONL trace file.
+    #[command(name = "trace-info")]
+    TraceInfo {
+        /// JSONL trace file created by `lterm trace`.
+        input: std::path::PathBuf,
+        /// Emit the summary as JSON instead of tab-separated text rows.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compose input while viewing sanitized session output.
     #[command(name = "compose", visible_alias = "mobile")]
     Compose {
@@ -681,6 +699,8 @@ fn run() -> Result<()> {
             max_bytes,
             force,
         } => client::trace_output(&target, &output, duration, max_bytes, force),
+        Commands::TraceReplay { input, timing } => client::replay_trace(&input, timing),
+        Commands::TraceInfo { input, json } => client::print_trace_info(&input, json),
         Commands::Compose {
             target,
             tail,

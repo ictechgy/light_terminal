@@ -1259,6 +1259,10 @@ fn help_shows_common_aliases() -> TestResult {
         "record compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: replay-trace]"),
+        "trace replay compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: mobile]"),
         "mobile compose alias was not visible in help:\n{stdout}"
     );
@@ -1307,6 +1311,8 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "completions",
         "diagnose",
         "trace",
+        "trace-replay",
+        "trace-info",
         "tmux-compat",
         "wait",
         "watch",
@@ -1580,6 +1586,30 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         Some(4096),
         "trace start event should record the active byte cap: {trace}"
     );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("format"))
+            .and_then(|v| v.as_str()),
+        Some("lterm-trace-jsonl"),
+        "trace start event should record the trace file format: {trace}"
+    );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("producer"))
+            .and_then(|v| v.as_str()),
+        Some("lterm"),
+        "trace start event should record the producer: {trace}"
+    );
+    assert!(
+        events
+            .first()
+            .and_then(|v| v.get("trace_id"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|trace_id| !trace_id.is_empty()),
+        "trace start event should record a trace id: {trace}"
+    );
     let combined_hex = events
         .iter()
         .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
@@ -1588,6 +1618,60 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
     assert!(
         combined_hex.contains("54524143455f4c4956453a54524143455f445552494e47"),
         "trace output chunks should contain live TRACE_LIVE:TRACE_DURING bytes encoded as hex: {trace}"
+    );
+    let output_chunks = events
+        .iter()
+        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+        .count();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+            .all(|event| event.get("chunk_index").and_then(|v| v.as_u64()).is_some()),
+        "trace output chunks should carry chunk indexes: {trace}"
+    );
+    assert_eq!(
+        events
+            .last()
+            .and_then(|v| v.get("chunks_recorded"))
+            .and_then(|v| v.as_u64()),
+        Some(output_chunks as u64),
+        "trace end event should record chunk totals: {trace}"
+    );
+
+    let info = env
+        .cmd()
+        .args(["trace-info", trace_path_str, "--json"])
+        .output()?;
+    assert!(info.status.success(), "{info:?}");
+    let info_stdout = String::from_utf8_lossy(&info.stdout);
+    let summary: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    assert_eq!(
+        summary.get("format").and_then(|v| v.as_str()),
+        Some("lterm-trace-jsonl"),
+        "trace-info should expose raw-free metadata: {info_stdout}"
+    );
+    assert_eq!(
+        summary.get("target").and_then(|v| v.as_str()),
+        Some("trace-session"),
+        "trace-info should report the traced target: {info_stdout}"
+    );
+    assert_eq!(
+        summary.get("output_chunks").and_then(|v| v.as_u64()),
+        Some(output_chunks as u64),
+        "trace-info should summarize output chunks: {info_stdout}"
+    );
+    assert!(
+        !info_stdout.contains("TRACE_DURING") && !info_stdout.contains("bytes_hex"),
+        "trace-info must not print raw trace payloads: {info_stdout}"
+    );
+
+    let replay = env.cmd().args(["trace-replay", trace_path_str]).output()?;
+    assert!(replay.status.success(), "{replay:?}");
+    let replay_stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay_stdout.contains("TRACE_LIVE:TRACE_DURING"),
+        "trace-replay should decode output chunks to stdout: {replay_stdout:?}"
     );
 
     let before_overwrite = std::fs::read_to_string(&trace_path)?;
