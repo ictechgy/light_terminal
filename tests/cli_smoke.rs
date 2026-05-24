@@ -1501,7 +1501,7 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
 }
 
 #[test]
-fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResult {
+fn trace_records_jsonl_and_supports_info_and_replay_surfaces() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -1615,8 +1615,9 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
         .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
         .collect::<String>();
+    let known_payload_hex = "54524143455f4c4956453a54524143455f445552494e47";
     assert!(
-        combined_hex.contains("54524143455f4c4956453a54524143455f445552494e47"),
+        combined_hex.contains(known_payload_hex),
         "trace output chunks should contain live TRACE_LIVE:TRACE_DURING bytes encoded as hex: {trace}"
     );
     let output_chunks = events
@@ -1646,6 +1647,43 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
     assert!(info.status.success(), "{info:?}");
     let info_stdout = String::from_utf8_lossy(&info.stdout);
     let summary: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    let summary_object = summary
+        .as_object()
+        .ok_or("trace-info JSON summary must be an object")?;
+    let allowed_summary_keys = [
+        "path",
+        "schema_version",
+        "format",
+        "trace_id",
+        "producer",
+        "client_version",
+        "client_protocol_version",
+        "target",
+        "created_at_unix_ms",
+        "duration_ms",
+        "max_bytes",
+        "rows",
+        "cols",
+        "raw_stream_policy",
+        "event_count",
+        "output_chunks",
+        "output_bytes",
+        "first_output_elapsed_ms",
+        "last_output_elapsed_ms",
+        "end_elapsed_ms",
+        "end_reason",
+        "end_bytes_recorded",
+        "end_chunks_recorded",
+        "unknown_events",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert!(
+        summary_object
+            .keys()
+            .all(|key| allowed_summary_keys.contains(key.as_str())),
+        "trace-info should only expose raw-free summary keys: {info_stdout}"
+    );
     assert_eq!(
         summary.get("format").and_then(|v| v.as_str()),
         Some("lterm-trace-jsonl"),
@@ -1662,8 +1700,15 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         "trace-info should summarize output chunks: {info_stdout}"
     );
     assert!(
-        !info_stdout.contains("TRACE_DURING") && !info_stdout.contains("bytes_hex"),
-        "trace-info must not print raw trace payloads: {info_stdout}"
+        !info_stdout.contains("TRACE_DURING")
+            && !info_stdout.contains("bytes_hex")
+            && !info_stdout.contains(known_payload_hex)
+            && events
+                .iter()
+                .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+                .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
+                .all(|bytes_hex| !info_stdout.contains(bytes_hex)),
+        "trace-info must not print raw trace payloads or their hex encoding: {info_stdout}"
     );
 
     let replay = env.cmd().args(["trace-replay", trace_path_str]).output()?;
@@ -1672,6 +1717,16 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
     assert!(
         replay_stdout.contains("TRACE_LIVE:TRACE_DURING"),
         "trace-replay should decode output chunks to stdout: {replay_stdout:?}"
+    );
+    let timed_replay = env
+        .cmd()
+        .args(["trace-replay", trace_path_str, "--timing"])
+        .output()?;
+    assert!(timed_replay.status.success(), "{timed_replay:?}");
+    let timed_replay_stdout = String::from_utf8_lossy(&timed_replay.stdout);
+    assert!(
+        timed_replay_stdout.contains("TRACE_LIVE:TRACE_DURING"),
+        "trace-replay --timing should decode output chunks to stdout: {timed_replay_stdout:?}"
     );
 
     let before_overwrite = std::fs::read_to_string(&trace_path)?;
@@ -1714,6 +1769,93 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         std::fs::read_to_string(&trace_path)?,
         before_overwrite,
         "--force should replace the existing trace file"
+    );
+    Ok(())
+}
+
+#[test]
+fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
+    let env = TestEnv::new()?;
+    let start = r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":120000}"#;
+    let end = r#"{"type":"end","elapsed_ms":0,"reason":"duration","bytes_recorded":0,"chunks_recorded":0}"#;
+
+    let no_start_path = env.temp.path().join("no-start.jsonl");
+    std::fs::write(
+        &no_start_path,
+        r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+    )?;
+    let no_start = env.cmd().arg("trace-replay").arg(&no_start_path).output()?;
+    assert!(
+        !no_start.status.success(),
+        "trace-replay should reject output before start: {no_start:?}"
+    );
+    assert_stderr_contains(&no_start, "output before start");
+
+    let wrong_direction_path = env.temp.path().join("wrong-direction.jsonl");
+    std::fs::write(
+        &wrong_direction_path,
+        format!(
+            "{start}\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stderr","len":1,"bytes_hex":"41"}"#
+        ),
+    )?;
+    let wrong_direction = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&wrong_direction_path)
+        .output()?;
+    assert!(
+        !wrong_direction.status.success(),
+        "trace-replay should reject unsupported directions: {wrong_direction:?}"
+    );
+    assert_stderr_contains(&wrong_direction, "unsupported output direction");
+
+    let delay_cap_path = env.temp.path().join("delay-cap.jsonl");
+    std::fs::write(
+        &delay_cap_path,
+        format!(
+            "{start}\n{}\n{}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":61000,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+            r#"{"type":"end","elapsed_ms":61000,"reason":"duration","bytes_recorded":1,"chunks_recorded":1}"#
+        ),
+    )?;
+    let delay_cap = env
+        .cmd()
+        .args(["trace-replay", "--timing"])
+        .arg(&delay_cap_path)
+        .output()?;
+    assert!(
+        !delay_cap.status.success(),
+        "trace-replay --timing should cap untrusted sleep delays: {delay_cap:?}"
+    );
+    assert!(
+        delay_cap.stdout.is_empty(),
+        "trace-replay should reject oversized delays before writing raw bytes: {delay_cap:?}"
+    );
+    assert_stderr_contains(&delay_cap, "exceeds safety cap");
+
+    let info_path = env.temp.path().join("info-unknown.jsonl");
+    std::fs::write(
+        &info_path,
+        format!(
+            "{start}\nnot-json\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":2,"bytes_hex":"41"}"#
+        ),
+    )?;
+    let info = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&info_path)
+        .output()?;
+    assert!(
+        info.status.success(),
+        "trace-info should summarize around malformed non-raw lines: {info:?}"
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    assert_eq!(
+        summary.get("unknown_events").and_then(|v| v.as_u64()),
+        Some(2),
+        "trace-info should count malformed/invalid output rows as unknown: {summary:?}"
     );
     Ok(())
 }

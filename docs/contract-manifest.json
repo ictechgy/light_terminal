@@ -259,7 +259,7 @@
       "json_output_stability": "best-effort",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke trace_records_raw_output_chunks_to_jsonl_without_stdout_replay"
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
@@ -275,7 +275,8 @@
       "json_output_stability": "none",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke trace_records_raw_output_chunks_to_jsonl_without_stdout_replay"
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces",
+        "cargo test --test cli_smoke trace_replay_rejects_malformed_or_unsafe_jsonl"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
@@ -289,7 +290,8 @@
       "json_output_stability": "best-effort",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke trace_records_raw_output_chunks_to_jsonl_without_stdout_replay"
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces",
+        "cargo test --test cli_smoke trace_replay_rejects_malformed_or_unsafe_jsonl"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "best-effort",

@@ -213,10 +213,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Replay a raw JSONL trace file to stdout.
+    /// Replay raw bytes from a JSONL trace file to stdout; only use trusted traces.
     #[command(name = "trace-replay", visible_alias = "replay-trace")]
     TraceReplay {
-        /// JSONL trace file created by `lterm trace`.
+        /// JSONL trace file created by `lterm trace`; replay emits raw terminal control bytes.
         input: std::path::PathBuf,
         /// Preserve recorded inter-chunk delays while replaying.
         #[arg(long)]
