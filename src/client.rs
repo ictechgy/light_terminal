@@ -15,9 +15,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const ATTACH_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_TRACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 static VERSION_STATUS_CHECKED: AtomicBool = AtomicBool::new(false);
 /// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
@@ -324,6 +325,10 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+pub fn default_trace_max_bytes() -> u64 {
+    DEFAULT_TRACE_MAX_BYTES
+}
+
 struct ParentRequest {
     pane_id: String,
     token: String,
@@ -424,6 +429,7 @@ enum TraceEvent {
         target: String,
         created_at_unix_ms: Option<u64>,
         duration_ms: u64,
+        max_bytes: u64,
         rows: u16,
         cols: u16,
         raw_stream_policy: &'static str,
@@ -444,14 +450,12 @@ pub fn trace_output(
     target: &str,
     output_path: &Path,
     duration: Duration,
+    max_bytes: u64,
     force: bool,
 ) -> Result<()> {
     ensure_server()?;
-    if !force && output_path.exists() {
-        bail!(
-            "trace output {} already exists; pass --force to overwrite",
-            output_path.display()
-        );
+    if max_bytes == 0 {
+        bail!("trace --max-bytes must be greater than zero");
     }
 
     let (cols, rows) = terminal_size();
@@ -482,21 +486,19 @@ pub fn trace_output(
                 .unwrap_or_else(|| "trace attach failed".to_string())
         );
     }
-    reader
-        .get_ref()
-        .set_read_timeout(Some(ATTACH_OUTPUT_IDLE_TIMEOUT))
-        .context("set trace output read timeout")?;
-
     let mut output_options = OpenOptions::new();
-    output_options.write(true);
+    output_options.write(true).mode(0o600);
     if force {
+        ensure_trace_force_target_private(output_path)?;
         output_options.create(true).truncate(true);
     } else {
         output_options.create_new(true);
     }
-    let mut output = output_options
+    output_options.custom_flags(libc::O_NOFOLLOW);
+    let output_file = output_options
         .open(output_path)
-        .with_context(|| format!("create trace output {}", output_path.display()))?;
+        .with_context(|| trace_output_open_context(output_path, force))?;
+    let mut output = BufWriter::with_capacity(64 * 1024, output_file);
 
     let started = Instant::now();
     write_trace_event(
@@ -506,6 +508,7 @@ pub fn trace_output(
             target: target.to_string(),
             created_at_unix_ms: current_unix_ms(),
             duration_ms: duration_millis_u64(duration),
+            max_bytes,
             rows,
             cols,
             raw_stream_policy: "raw-transparent",
@@ -514,22 +517,46 @@ pub fn trace_output(
 
     let deadline = started + duration;
     let mut reason = "duration";
+    let mut raw_bytes_recorded = 0_u64;
     let mut buf = [0_u8; 8192];
     while Instant::now() < deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining_duration = deadline.saturating_duration_since(now);
+        let read_timeout = remaining_duration.min(ATTACH_OUTPUT_IDLE_TIMEOUT);
+        reader
+            .get_ref()
+            .set_read_timeout(Some(read_timeout))
+            .context("set trace output read timeout")?;
         match reader.read(&mut buf) {
             Ok(0) => {
                 reason = "eof";
                 break;
             }
-            Ok(n) => write_trace_event(
-                &mut output,
-                &TraceEvent::Output {
-                    elapsed_ms: duration_millis_u64(started.elapsed()),
-                    direction: "stdout",
-                    len: n,
-                    bytes_hex: hex_encode(&buf[..n]),
-                },
-            )?,
+            Ok(n) => {
+                let remaining_bytes = max_bytes.saturating_sub(raw_bytes_recorded);
+                if remaining_bytes == 0 {
+                    reason = "max_bytes";
+                    break;
+                }
+                let to_write = n.min(usize::try_from(remaining_bytes).unwrap_or(usize::MAX));
+                write_trace_event(
+                    &mut output,
+                    &TraceEvent::Output {
+                        elapsed_ms: duration_millis_u64(started.elapsed()),
+                        direction: "stdout",
+                        len: to_write,
+                        bytes_hex: hex_encode(&buf[..to_write]),
+                    },
+                )?;
+                raw_bytes_recorded += u64::try_from(to_write).unwrap_or(u64::MAX);
+                if to_write < n || raw_bytes_recorded >= max_bytes {
+                    reason = "max_bytes";
+                    break;
+                }
+            }
             Err(err)
                 if err.kind() == ErrorKind::Interrupted
                     || err.kind() == ErrorKind::WouldBlock
@@ -548,6 +575,53 @@ pub fn trace_output(
         },
     )?;
     output.flush().context("flush trace output")?;
+    Ok(())
+}
+
+fn trace_output_open_context(output_path: &Path, force: bool) -> String {
+    if force {
+        format!(
+            "create or truncate private trace output {}",
+            output_path.display()
+        )
+    } else {
+        format!(
+            "create private trace output {} (pass --force to overwrite an existing file)",
+            output_path.display()
+        )
+    }
+}
+
+fn ensure_trace_force_target_private(output_path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(output_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "refusing to overwrite symlink trace output {}",
+                    output_path.display()
+                );
+            }
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "refusing to overwrite non-file trace output {}",
+                    output_path.display()
+                );
+            }
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "refusing to overwrite trace output {} with permissions {:03o}; chmod 600 or remove it first",
+                    output_path.display(),
+                    mode
+                );
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect trace output {}", output_path.display()));
+        }
+    }
     Ok(())
 }
 

@@ -206,6 +206,9 @@ enum Commands {
         /// How long to record, e.g. 500ms, 5s, 1m. Required so traces cannot hang forever.
         #[arg(long, value_name = "DURATION", value_parser = parse_wait_duration_arg)]
         duration: Duration,
+        /// Maximum raw PTY bytes to record before ending the trace.
+        #[arg(long, value_name = "BYTES", default_value_t = client::default_trace_max_bytes(), value_parser = parse_trace_max_bytes_arg)]
+        max_bytes: u64,
         /// Overwrite an existing trace file.
         #[arg(long)]
         force: bool,
@@ -675,8 +678,9 @@ fn run() -> Result<()> {
             target,
             output,
             duration,
+            max_bytes,
             force,
-        } => client::trace_output(&target, &output, duration, force),
+        } => client::trace_output(&target, &output, duration, max_bytes, force),
         Commands::Compose {
             target,
             tail,
@@ -1089,12 +1093,49 @@ struct DiagnosticPrivacy {
     raw_pty_streams_included: bool,
     sanitized_scrollback_included: bool,
     environment_values_redacted: bool,
+    session_commands_redacted: bool,
+    process_commands_redacted: bool,
+    paths_summarized: bool,
     notes: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
+struct DiagnosticPathSummary {
+    home_relative: bool,
+    component_count: usize,
+    basename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticDoctor {
+    client_version: &'static str,
+    client_protocol_version: u32,
+    daemon_reachable: bool,
+    daemon_version: Option<String>,
+    daemon_protocol_version: Option<u32>,
+    version_match: Option<bool>,
+    daemon_session_count: Option<u64>,
+    daemon_active_connections: Option<u64>,
+    daemon_shutting_down: Option<bool>,
+    daemon_uid: Option<u32>,
+    daemon_started_at_unix_secs: Option<u64>,
+    daemon_uptime_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    runtime_dir: DiagnosticPathSummary,
+    data_dir: DiagnosticPathSummary,
+    socket_path: DiagnosticPathSummary,
+    shim_dir: DiagnosticPathSummary,
+    tmux_shim_path: DiagnosticPathSummary,
+    tmux_shim_exists: bool,
+    shim_dir_in_path: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct DiagnosticEnvironment {
-    cwd: Option<String>,
+    cwd: Option<DiagnosticPathSummary>,
     shell: Option<String>,
     term: Option<String>,
     ssh: bool,
@@ -1107,16 +1148,54 @@ struct DiagnosticEnvironment {
 }
 
 #[derive(Debug, Serialize)]
+struct DiagnosticSession {
+    id: String,
+    name: String,
+    pane_id: String,
+    command: String,
+    cwd: DiagnosticPathSummary,
+    created_unix_ms: u128,
+    alive: bool,
+    exit_code: Option<i32>,
+    rows: u16,
+    cols: u16,
+    parent_pane_id: Option<String>,
+    parent_session_id: Option<String>,
+    attached_clients: usize,
+    process_id: Option<u32>,
+    process_group_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_theme: Option<protocol::StatusTheme>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticProcess {
+    session: String,
+    pane_id: String,
+    depth: usize,
+    pid: u32,
+    ppid: u32,
+    process_group_id: Option<i32>,
+    orphan: bool,
+    stat: String,
+    cpu_percent: f32,
+    mem_percent: f32,
+    rss_kib: u64,
+    elapsed: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DiagnosticBundle {
     schema_version: &'static str,
     generated_at_unix_secs: Option<u64>,
     privacy: DiagnosticPrivacy,
-    doctor: DoctorReport,
+    doctor: DiagnosticDoctor,
     environment: DiagnosticEnvironment,
-    sessions: Option<Vec<protocol::SessionInfo>>,
+    sessions: Option<Vec<DiagnosticSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
-    processes: Option<Vec<client::ProcessInfo>>,
+    processes: Option<Vec<DiagnosticProcess>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     processes_error: Option<String>,
     notes: Vec<String>,
@@ -1311,7 +1390,15 @@ fn print_diagnose_bundle() -> Result<()> {
 
     let (sessions, sessions_error) = if doctor.daemon_reachable {
         match client::rpc::<Vec<protocol::SessionInfo>>(&protocol::Request::List) {
-            Ok(sessions) => (Some(collapse_aliases(sessions)), None),
+            Ok(sessions) => (
+                Some(
+                    collapse_aliases(sessions)
+                        .into_iter()
+                        .map(redact_session_info)
+                        .collect(),
+                ),
+                None,
+            ),
             Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
         }
     } else {
@@ -1321,13 +1408,17 @@ fn print_diagnose_bundle() -> Result<()> {
 
     let (processes, processes_error) = if sessions.is_some() {
         match client::process_tree(None, true) {
-            Ok(processes) => (Some(processes), None),
+            Ok(processes) => (
+                Some(processes.into_iter().map(redact_process_info).collect()),
+                None,
+            ),
             Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
         }
     } else {
         (None, None)
     };
 
+    let environment = diagnostic_environment(&doctor);
     let bundle = DiagnosticBundle {
         schema_version: "1.0",
         generated_at_unix_secs: current_unix_secs(),
@@ -1335,13 +1426,18 @@ fn print_diagnose_bundle() -> Result<()> {
             raw_pty_streams_included: false,
             sanitized_scrollback_included: false,
             environment_values_redacted: true,
+            session_commands_redacted: true,
+            process_commands_redacted: true,
+            paths_summarized: true,
             notes: vec![
                 "environment section reports presence flags for sensitive lterm/tmux/cmux variables",
-                "session commands and cwd values come from daemon metadata; no raw terminal scrollback is included",
+                "filesystem paths are summarized instead of emitted as full absolute paths",
+                "session/process command fields keep only the executable basename plus an argument-redaction marker",
+                "no raw terminal scrollback or PTY bytes are included",
             ],
         },
-        environment: diagnostic_environment(&doctor),
-        doctor,
+        doctor: redact_doctor_report(&doctor),
+        environment,
         sessions,
         sessions_error,
         processes,
@@ -1363,7 +1459,7 @@ fn diagnostic_environment(doctor: &DoctorReport) -> DiagnosticEnvironment {
     DiagnosticEnvironment {
         cwd: std::env::current_dir()
             .ok()
-            .map(|cwd| sanitize::terminal_text(&cwd.display().to_string())),
+            .map(|cwd| diagnostic_path_summary(cwd.as_path())),
         shell: std::env::var_os("SHELL").and_then(|shell| {
             Path::new(&shell)
                 .file_name()
@@ -1381,6 +1477,103 @@ fn diagnostic_environment(doctor: &DoctorReport) -> DiagnosticEnvironment {
         lterm_pane_set: std::env::var_os("LTERM_PANE").is_some(),
         lterm_parent_token_set: std::env::var_os("LTERM_PARENT_TOKEN").is_some(),
         path_contains_shim_dir: path_contains_dir(Path::new(&doctor.shim_dir)),
+    }
+}
+
+fn redact_doctor_report(report: &DoctorReport) -> DiagnosticDoctor {
+    DiagnosticDoctor {
+        client_version: report.client_version,
+        client_protocol_version: report.client_protocol_version,
+        daemon_reachable: report.daemon_reachable,
+        daemon_version: report.daemon_version.clone(),
+        daemon_protocol_version: report.daemon_protocol_version,
+        version_match: report.version_match,
+        daemon_session_count: report.daemon_session_count,
+        daemon_active_connections: report.daemon_active_connections,
+        daemon_shutting_down: report.daemon_shutting_down,
+        daemon_uid: report.daemon_uid,
+        daemon_started_at_unix_secs: report.daemon_started_at_unix_secs,
+        daemon_uptime_secs: report.daemon_uptime_secs,
+        daemon_error: report.daemon_error.as_deref().map(sanitize::terminal_text),
+        reason: report.reason.as_deref().map(sanitize::terminal_text),
+        runtime_dir: diagnostic_path_summary(Path::new(&report.runtime_dir)),
+        data_dir: diagnostic_path_summary(Path::new(&report.data_dir)),
+        socket_path: diagnostic_path_summary(Path::new(&report.socket_path)),
+        shim_dir: diagnostic_path_summary(Path::new(&report.shim_dir)),
+        tmux_shim_path: diagnostic_path_summary(Path::new(&report.tmux_shim_path)),
+        tmux_shim_exists: report.tmux_shim_exists,
+        shim_dir_in_path: report.shim_dir_in_path,
+    }
+}
+
+fn redact_session_info(session: protocol::SessionInfo) -> DiagnosticSession {
+    DiagnosticSession {
+        id: session.id,
+        name: sanitize::terminal_text(&session.name),
+        pane_id: sanitize::terminal_text(&session.pane_id),
+        command: redact_command_summary(&session.command),
+        cwd: diagnostic_path_summary(Path::new(&session.cwd)),
+        created_unix_ms: session.created_unix_ms,
+        alive: session.alive,
+        exit_code: session.exit_code,
+        rows: session.rows,
+        cols: session.cols,
+        parent_pane_id: session
+            .parent_pane_id
+            .map(|value| sanitize::terminal_text(&value)),
+        parent_session_id: session
+            .parent_session_id
+            .map(|value| sanitize::terminal_text(&value)),
+        attached_clients: session.attached_clients,
+        process_id: session.process_id,
+        process_group_id: session.process_group_id,
+        status_theme: session.status_theme,
+    }
+}
+
+fn redact_process_info(process: client::ProcessInfo) -> DiagnosticProcess {
+    DiagnosticProcess {
+        session: sanitize::terminal_text(&process.session),
+        pane_id: sanitize::terminal_text(&process.pane_id),
+        depth: process.depth,
+        pid: process.pid,
+        ppid: process.ppid,
+        process_group_id: process.process_group_id,
+        orphan: process.orphan,
+        stat: sanitize::terminal_text(&process.stat),
+        cpu_percent: process.cpu_percent,
+        mem_percent: process.mem_percent,
+        rss_kib: process.rss_kib,
+        elapsed: sanitize::terminal_text(&process.elapsed),
+        command: redact_command_summary(&process.command),
+    }
+}
+
+fn diagnostic_path_summary(path: &Path) -> DiagnosticPathSummary {
+    let home_relative = std::env::var_os("HOME")
+        .map(|home| path.starts_with(Path::new(&home)))
+        .unwrap_or(false);
+    DiagnosticPathSummary {
+        home_relative,
+        component_count: path.components().count(),
+        basename: path
+            .file_name()
+            .map(|name| sanitize::terminal_text(&name.to_string_lossy())),
+    }
+}
+
+fn redact_command_summary(command: &str) -> String {
+    let mut parts = command.split_whitespace();
+    let program = parts
+        .next()
+        .and_then(|token| Path::new(token.trim_matches(['\'', '"'])).file_name())
+        .map(|name| sanitize::terminal_text(&name.to_string_lossy()))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "<redacted>".to_string());
+    if parts.next().is_some() {
+        format!("{program} …")
+    } else {
+        program
     }
 }
 
@@ -1467,6 +1660,17 @@ fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String>
         .checked_mul(unit_millis)
         .ok_or_else(|| format!("duration {value:?} is too large"))?;
     Ok(Duration::from_millis(millis))
+}
+
+fn parse_trace_max_bytes_arg(value: &str) -> std::result::Result<u64, String> {
+    let value = value.trim();
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid max bytes {value:?}; expected a positive integer"))?;
+    if bytes == 0 {
+        return Err("--max-bytes must be greater than zero".to_string());
+    }
+    Ok(bytes)
 }
 
 fn parse_wait_tail_arg(value: &str) -> std::result::Result<usize, String> {

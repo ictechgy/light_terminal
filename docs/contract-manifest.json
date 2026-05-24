@@ -264,7 +264,7 @@
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
       "raw_stream_policy": "raw-transparent",
-      "stability_scope": "Opt-in local JSONL trace file for debugging raw PTY output. It records raw output bytes as hex and does not replay them to stdout; exact JSONL fields are best-effort until a stable trace schema is promoted."
+      "stability_scope": "Opt-in private local JSONL trace file for debugging raw PTY output. It records raw output bytes as hex, caps raw capture with --max-bytes, and does not replay bytes to stdout; exact JSONL fields are best-effort until a stable trace schema is promoted."
     },
     {
       "command": "lterm wait",

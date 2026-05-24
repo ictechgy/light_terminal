@@ -200,9 +200,10 @@ scrollback by default.
 `lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text; attached PTY streams remain raw.
 
 `lterm trace <target> --duration 5s --output trace.jsonl` records raw PTY
-output chunks to a local JSONL file with timestamps and hex-encoded bytes. It is
-for opt-in debugging of intermittent render issues; it does not replay bytes to
-stdout and refuses to overwrite existing trace files unless `--force` is passed.
+output chunks to a private local JSONL file with timestamps and hex-encoded
+bytes. It is for opt-in debugging of intermittent render issues; it does not
+replay bytes to stdout, caps raw capture at `--max-bytes` (default 16 MiB), and
+refuses to overwrite existing trace files unless `--force` is passed.
 
 `lterm wait <target> --exit|--contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
 
