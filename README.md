@@ -139,13 +139,16 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Record raw PTY output for debugging | `lterm trace api --duration 5s --output trace.jsonl` | `record` |
 | Open a sanitized scrollback composer for input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
 | Write input to a PTY | `lterm input api 'echo hello' --enter` | `send` |
 | Stop a session | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
+| Collect a redacted local diagnostic bundle | `lterm diagnose --bundle` | None |
 | Preview local setup steps | `lterm init --shell zsh` | None |
+| Generate shell completions | `lterm completions zsh > ~/.zfunc/_lterm` | None |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -157,6 +160,7 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
+| Generate shell completions | `lterm completions bash\|zsh\|fish` | Prints completion scripts only; it does not inspect sessions or start the daemon |
 | Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
 | Call the tmux shim namespace directly | `lterm tmux-compat list-commands` | Compatibility namespace, not a product alias table |
@@ -187,7 +191,19 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 
 `lterm doctor` (compatibility name: `lterm status`) reports client/daemon versions, protocol compatibility, runtime/data/socket/shim paths, and whether the shim directory is on `PATH`. It does not start the daemon; `daemon_reachable=no` / `false` means no compatible daemon answered on the current socket. Normal client operations warn on stderr when a reachable daemon reports a different lterm or protocol version, which usually means an old daemon survived a binary upgrade.
 
+`lterm diagnose --bundle` prints a local-only JSON diagnostic bundle for issues
+and agent handoffs. It includes `doctor` data, redacted environment presence
+flags, and — only when an existing daemon is reachable — session metadata plus
+process rows. It does not start the daemon and does not include raw PTY bytes or
+scrollback by default.
+
 `lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text; attached PTY streams remain raw.
+
+`lterm trace <target> --duration 5s --output trace.jsonl` records raw PTY
+output chunks to a private local JSONL file with timestamps and hex-encoded
+bytes. It is for opt-in debugging of intermittent render issues; it does not
+replay bytes to stdout, caps raw capture at `--max-bytes` (default 16 MiB), and
+refuses to overwrite existing trace files unless `--force` is passed.
 
 `lterm wait <target> --exit|--contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
 

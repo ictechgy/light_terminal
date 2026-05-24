@@ -12,7 +12,8 @@ static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static TEST_ATTACH_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell as CompletionOutputShell, generate};
 use client::{AttachStdinEof, ComposeOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -139,6 +140,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Build a redacted local diagnostic bundle.
+    #[command(group(
+        ArgGroup::new("diagnose_mode")
+            .required(true)
+            .args(["bundle"])
+    ))]
+    Diagnose {
+        /// Print a JSON bundle with doctor, session, process, and local environment diagnostics.
+        #[arg(long)]
+        bundle: bool,
+    },
     /// Close a session or pane.
     #[command(name = "close", visible_alias = "kill")]
     Close {
@@ -182,6 +194,24 @@ enum Commands {
         /// Inclusive ending scrollback line offset, matching tmux -E semantics.
         #[arg(short = 'E', long, allow_hyphen_values = true)]
         end: Option<i32>,
+    },
+    /// Record raw PTY output chunks from a session to a local JSONL trace file.
+    #[command(visible_alias = "record")]
+    Trace {
+        /// Session or pane target to trace.
+        target: String,
+        /// JSONL file to create with raw output chunks encoded as hex.
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        /// How long to record, e.g. 500ms, 5s, 1m. Required so traces cannot hang forever.
+        #[arg(long, value_name = "DURATION", value_parser = parse_wait_duration_arg)]
+        duration: Duration,
+        /// Maximum raw PTY bytes to record before ending the trace.
+        #[arg(long, value_name = "BYTES", default_value_t = client::default_trace_max_bytes(), value_parser = parse_trace_max_bytes_arg)]
+        max_bytes: u64,
+        /// Overwrite an existing trace file.
+        #[arg(long)]
+        force: bool,
     },
     /// Compose input while viewing sanitized session output.
     #[command(name = "compose", visible_alias = "mobile")]
@@ -266,6 +296,12 @@ enum Commands {
         /// Shell syntax to emit; defaults to POSIX exports for existing eval usage.
         #[arg(long, value_enum)]
         shell: Option<ShellKind>,
+    },
+    /// Generate shell completion scripts.
+    Completions {
+        /// Shell completion format to generate.
+        #[arg(value_enum)]
+        shell: CompletionShell,
     },
     /// Print a no-touch setup preview for enabling lterm locally.
     Init {
@@ -472,6 +508,13 @@ enum ShellKind {
     Posix,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -595,6 +638,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Doctor { json } => print_doctor_report(json),
+        Commands::Diagnose { bundle: _ } => print_diagnose_bundle(),
         Commands::Close { target } => client::kill(&target),
         Commands::Rename { target, name } => {
             let info = client::rename_session(&target, &name)?;
@@ -630,6 +674,13 @@ fn run() -> Result<()> {
             print!("{output}");
             Ok(())
         }
+        Commands::Trace {
+            target,
+            output,
+            duration,
+            max_bytes,
+            force,
+        } => client::trace_output(&target, &output, duration, max_bytes, force),
         Commands::Compose {
             target,
             tail,
@@ -685,6 +736,7 @@ fn run() -> Result<()> {
         Commands::Env { shell } => {
             tmux_compat::print_env_exports(shell.unwrap_or(ShellKind::Posix).into())
         }
+        Commands::Completions { shell } => print_completions(shell),
         Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
@@ -776,6 +828,24 @@ impl From<ShellKind> for tmux_compat::EnvShell {
             ShellKind::Fish => Self::Fish,
         }
     }
+}
+
+impl From<CompletionShell> for CompletionOutputShell {
+    fn from(value: CompletionShell) -> Self {
+        match value {
+            CompletionShell::Bash => Self::Bash,
+            CompletionShell::Zsh => Self::Zsh,
+            CompletionShell::Fish => Self::Fish,
+        }
+    }
+}
+
+fn print_completions(shell: CompletionShell) -> Result<()> {
+    let mut command = Cli::command();
+    let binary_name = command.get_name().to_string();
+    let generator: CompletionOutputShell = shell.into();
+    generate(generator, &mut command, binary_name, &mut std::io::stdout());
+    Ok(())
 }
 
 fn detect_init_shell() -> ShellKind {
@@ -1018,7 +1088,120 @@ struct DoctorReport {
     shim_dir_in_path: bool,
 }
 
-fn print_doctor_report(json: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct DiagnosticPrivacy {
+    raw_pty_streams_included: bool,
+    sanitized_scrollback_included: bool,
+    environment_values_redacted: bool,
+    session_commands_redacted: bool,
+    process_commands_redacted: bool,
+    paths_summarized: bool,
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticPathSummary {
+    home_relative: bool,
+    component_count: usize,
+    basename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticDoctor {
+    client_version: &'static str,
+    client_protocol_version: u32,
+    daemon_reachable: bool,
+    daemon_version: Option<String>,
+    daemon_protocol_version: Option<u32>,
+    version_match: Option<bool>,
+    daemon_session_count: Option<u64>,
+    daemon_active_connections: Option<u64>,
+    daemon_shutting_down: Option<bool>,
+    daemon_uid: Option<u32>,
+    daemon_started_at_unix_secs: Option<u64>,
+    daemon_uptime_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    runtime_dir: DiagnosticPathSummary,
+    data_dir: DiagnosticPathSummary,
+    socket_path: DiagnosticPathSummary,
+    shim_dir: DiagnosticPathSummary,
+    tmux_shim_path: DiagnosticPathSummary,
+    tmux_shim_exists: bool,
+    shim_dir_in_path: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticEnvironment {
+    cwd: Option<DiagnosticPathSummary>,
+    shell: Option<String>,
+    term: Option<String>,
+    ssh: bool,
+    tmux_set: bool,
+    cmux_context_set: bool,
+    lterm_socket_set: bool,
+    lterm_pane_set: bool,
+    lterm_parent_token_set: bool,
+    path_contains_shim_dir: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticSession {
+    id: String,
+    name: String,
+    pane_id: String,
+    command: String,
+    cwd: DiagnosticPathSummary,
+    created_unix_ms: u128,
+    alive: bool,
+    exit_code: Option<i32>,
+    rows: u16,
+    cols: u16,
+    parent_pane_id: Option<String>,
+    parent_session_id: Option<String>,
+    attached_clients: usize,
+    process_id: Option<u32>,
+    process_group_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_theme: Option<protocol::StatusTheme>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticProcess {
+    session: String,
+    pane_id: String,
+    depth: usize,
+    pid: u32,
+    ppid: u32,
+    process_group_id: Option<i32>,
+    orphan: bool,
+    stat: String,
+    cpu_percent: f32,
+    mem_percent: f32,
+    rss_kib: u64,
+    elapsed: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticBundle {
+    schema_version: &'static str,
+    generated_at_unix_secs: Option<u64>,
+    privacy: DiagnosticPrivacy,
+    doctor: DiagnosticDoctor,
+    environment: DiagnosticEnvironment,
+    sessions: Option<Vec<DiagnosticSession>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions_error: Option<String>,
+    processes: Option<Vec<DiagnosticProcess>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    processes_error: Option<String>,
+    notes: Vec<String>,
+}
+
+fn build_doctor_report() -> Result<DoctorReport> {
     let runtime_dir = paths::runtime_dir()?;
     let data_dir = paths::data_dir()?;
     let socket_path = paths::socket_path()?;
@@ -1086,7 +1269,7 @@ fn print_doctor_report(json: bool) -> Result<()> {
     } else {
         None
     };
-    let report = DoctorReport {
+    Ok(DoctorReport {
         client_version: env!("CARGO_PKG_VERSION"),
         client_protocol_version: protocol::PROTOCOL_VERSION,
         daemon_reachable,
@@ -1108,7 +1291,11 @@ fn print_doctor_report(json: bool) -> Result<()> {
         tmux_shim_path: tmux_shim_path.display().to_string(),
         tmux_shim_exists,
         shim_dir_in_path: path_contains_dir(&shim_dir),
-    };
+    })
+}
+
+fn print_doctor_report(json: bool) -> Result<()> {
+    let report = build_doctor_report()?;
 
     if json {
         println!("{}", client::json_pretty(&report));
@@ -1195,6 +1382,231 @@ fn print_doctor_report(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_diagnose_bundle() -> Result<()> {
+    let doctor = build_doctor_report()?;
+    let mut notes = vec![
+        "diagnose --bundle is local-only and does not include raw PTY bytes or scrollback by default".to_string(),
+    ];
+
+    let (sessions, sessions_error) = if doctor.daemon_reachable {
+        match client::rpc::<Vec<protocol::SessionInfo>>(&protocol::Request::List) {
+            Ok(sessions) => (
+                Some(
+                    collapse_aliases(sessions)
+                        .into_iter()
+                        .map(redact_session_info)
+                        .collect(),
+                ),
+                None,
+            ),
+            Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
+        }
+    } else {
+        notes.push("daemon is not reachable; skipped session and process collection without auto-starting it".to_string());
+        (None, None)
+    };
+
+    let (processes, processes_error) = if sessions.is_some() {
+        match client::process_tree(None, true) {
+            Ok(processes) => (
+                Some(processes.into_iter().map(redact_process_info).collect()),
+                None,
+            ),
+            Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
+        }
+    } else {
+        (None, None)
+    };
+
+    let environment = diagnostic_environment(&doctor);
+    let bundle = DiagnosticBundle {
+        schema_version: "1.0",
+        generated_at_unix_secs: current_unix_secs(),
+        privacy: DiagnosticPrivacy {
+            raw_pty_streams_included: false,
+            sanitized_scrollback_included: false,
+            environment_values_redacted: true,
+            session_commands_redacted: true,
+            process_commands_redacted: true,
+            paths_summarized: true,
+            notes: vec![
+                "environment section reports presence flags for sensitive lterm/tmux/cmux variables",
+                "filesystem paths are summarized instead of emitted as full absolute paths",
+                "session/process command fields keep only the executable basename plus an argument-redaction marker",
+                "no raw terminal scrollback or PTY bytes are included",
+            ],
+        },
+        doctor: redact_doctor_report(&doctor),
+        environment,
+        sessions,
+        sessions_error,
+        processes,
+        processes_error,
+        notes,
+    };
+    println!("{}", client::json_pretty(&bundle));
+    Ok(())
+}
+
+fn current_unix_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn diagnostic_environment(doctor: &DoctorReport) -> DiagnosticEnvironment {
+    DiagnosticEnvironment {
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|cwd| diagnostic_path_summary(cwd.as_path())),
+        shell: std::env::var_os("SHELL").and_then(|shell| {
+            Path::new(&shell)
+                .file_name()
+                .map(|name| sanitize::terminal_text(&name.to_string_lossy()))
+        }),
+        term: sanitized_env_value("TERM"),
+        ssh: std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_CLIENT").is_some()
+            || std::env::var_os("SSH_TTY").is_some(),
+        tmux_set: std::env::var_os("TMUX").is_some(),
+        cmux_context_set: std::env::var_os("CMUX_SURFACE_ID").is_some()
+            || std::env::var_os("CMUX_WORKSPACE_ID").is_some()
+            || std::env::var_os("CMUX_WINDOW_ID").is_some(),
+        lterm_socket_set: std::env::var_os("LTERM_SOCKET").is_some(),
+        lterm_pane_set: std::env::var_os("LTERM_PANE").is_some(),
+        lterm_parent_token_set: std::env::var_os("LTERM_PARENT_TOKEN").is_some(),
+        path_contains_shim_dir: path_contains_dir(Path::new(&doctor.shim_dir)),
+    }
+}
+
+fn redact_doctor_report(report: &DoctorReport) -> DiagnosticDoctor {
+    DiagnosticDoctor {
+        client_version: report.client_version,
+        client_protocol_version: report.client_protocol_version,
+        daemon_reachable: report.daemon_reachable,
+        daemon_version: report.daemon_version.clone(),
+        daemon_protocol_version: report.daemon_protocol_version,
+        version_match: report.version_match,
+        daemon_session_count: report.daemon_session_count,
+        daemon_active_connections: report.daemon_active_connections,
+        daemon_shutting_down: report.daemon_shutting_down,
+        daemon_uid: report.daemon_uid,
+        daemon_started_at_unix_secs: report.daemon_started_at_unix_secs,
+        daemon_uptime_secs: report.daemon_uptime_secs,
+        daemon_error: report.daemon_error.as_deref().map(sanitize::terminal_text),
+        reason: report.reason.as_deref().map(sanitize::terminal_text),
+        runtime_dir: diagnostic_path_summary(Path::new(&report.runtime_dir)),
+        data_dir: diagnostic_path_summary(Path::new(&report.data_dir)),
+        socket_path: diagnostic_path_summary(Path::new(&report.socket_path)),
+        shim_dir: diagnostic_path_summary(Path::new(&report.shim_dir)),
+        tmux_shim_path: diagnostic_path_summary(Path::new(&report.tmux_shim_path)),
+        tmux_shim_exists: report.tmux_shim_exists,
+        shim_dir_in_path: report.shim_dir_in_path,
+    }
+}
+
+fn redact_session_info(session: protocol::SessionInfo) -> DiagnosticSession {
+    DiagnosticSession {
+        id: session.id,
+        name: sanitize::terminal_text(&session.name),
+        pane_id: sanitize::terminal_text(&session.pane_id),
+        command: redact_command_summary(&session.command),
+        cwd: diagnostic_path_summary(Path::new(&session.cwd)),
+        created_unix_ms: session.created_unix_ms,
+        alive: session.alive,
+        exit_code: session.exit_code,
+        rows: session.rows,
+        cols: session.cols,
+        parent_pane_id: session
+            .parent_pane_id
+            .map(|value| sanitize::terminal_text(&value)),
+        parent_session_id: session
+            .parent_session_id
+            .map(|value| sanitize::terminal_text(&value)),
+        attached_clients: session.attached_clients,
+        process_id: session.process_id,
+        process_group_id: session.process_group_id,
+        status_theme: session.status_theme,
+    }
+}
+
+fn redact_process_info(process: client::ProcessInfo) -> DiagnosticProcess {
+    DiagnosticProcess {
+        session: sanitize::terminal_text(&process.session),
+        pane_id: sanitize::terminal_text(&process.pane_id),
+        depth: process.depth,
+        pid: process.pid,
+        ppid: process.ppid,
+        process_group_id: process.process_group_id,
+        orphan: process.orphan,
+        stat: sanitize::terminal_text(&process.stat),
+        cpu_percent: process.cpu_percent,
+        mem_percent: process.mem_percent,
+        rss_kib: process.rss_kib,
+        elapsed: sanitize::terminal_text(&process.elapsed),
+        command: redact_command_summary(&process.command),
+    }
+}
+
+fn diagnostic_path_summary(path: &Path) -> DiagnosticPathSummary {
+    let home_relative = std::env::var_os("HOME")
+        .map(|home| path.starts_with(Path::new(&home)))
+        .unwrap_or(false);
+    DiagnosticPathSummary {
+        home_relative,
+        component_count: path.components().count(),
+        basename: path
+            .file_name()
+            .map(|name| sanitize::terminal_text(&name.to_string_lossy())),
+    }
+}
+
+fn redact_command_summary(command: &str) -> String {
+    let mut parts = command.split_whitespace();
+    let Some(first) = parts.next() else {
+        return "<redacted>".to_string();
+    };
+    if is_shell_assignment_token(first) {
+        return "<redacted> …".to_string();
+    }
+    let program = safe_command_basename(first).unwrap_or_else(|| "<redacted>".to_string());
+    if parts.next().is_some() {
+        format!("{program} …")
+    } else {
+        program
+    }
+}
+
+fn is_shell_assignment_token(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn safe_command_basename(token: &str) -> Option<String> {
+    let basename = Path::new(token).file_name()?.to_string_lossy();
+    let sanitized = sanitize::terminal_text(&basename);
+    let mut chars = sanitized.chars();
+    let first = chars.next()?;
+    let safe_first = first.is_ascii_alphanumeric() || matches!(first, '_' | '.' | '-');
+    let safe_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-' | '+'));
+    (safe_first && safe_rest).then_some(sanitized)
+}
+
+fn sanitized_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| sanitize::terminal_text(&value))
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1272,6 +1684,17 @@ fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String>
         .checked_mul(unit_millis)
         .ok_or_else(|| format!("duration {value:?} is too large"))?;
     Ok(Duration::from_millis(millis))
+}
+
+fn parse_trace_max_bytes_arg(value: &str) -> std::result::Result<u64, String> {
+    let value = value.trim();
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid max bytes {value:?}; expected a positive integer"))?;
+    if bytes == 0 {
+        return Err("--max-bytes must be greater than zero".to_string());
+    }
+    Ok(bytes)
 }
 
 fn parse_wait_tail_arg(value: &str) -> std::result::Result<usize, String> {
@@ -2162,6 +2585,26 @@ mod tests {
                 "{value:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_command_summary_redacts_env_assignment_values() {
+        assert_eq!(
+            redact_command_summary("AWS_SECRET_ACCESS_KEY=supersecret cargo run"),
+            "<redacted> …"
+        );
+        assert_eq!(
+            redact_command_summary("KEY='super secret' cargo run"),
+            "<redacted> …"
+        );
+        assert_eq!(
+            redact_command_summary(r#"KEY="super secret" cargo run"#),
+            "<redacted> …"
+        );
+        assert_eq!(redact_command_summary("TOKEN=supersecret"), "<redacted> …");
+        assert_eq!(redact_command_summary("sh -lc 'echo secret'"), "sh …");
+        assert_eq!(redact_command_summary("/usr/bin/cargo"), "cargo");
+        assert_eq!(redact_command_summary("$(echo secret) arg"), "<redacted> …");
     }
 
     #[test]

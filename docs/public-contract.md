@@ -90,12 +90,14 @@ or raw output stream.
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
 | `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
+| `lterm trace` | `lterm record` | `explicit-raw-unsafe` | none; writes a private local JSONL trace file capped by --max-bytes | `best-effort` JSONL events with hex-encoded raw PTY output chunks | `raw-transparent` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm compose` | `lterm mobile` | `stable` | `best-effort` UI with stable sanitized capture display | none | `sanitized-output-only` |
 | `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |
+| `lterm diagnose --bundle` | none | `best-effort` | none | `best-effort` local diagnostic bundle; does not start the daemon and excludes raw PTY bytes/scrollback by default | `sanitized-output-only` |
 | `lterm daemon` | none | `internal` | none | none | `not-applicable` |
 | `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
 
@@ -105,6 +107,7 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | `stable` shim path text | none | `sanitized-output-only` |
 | `lterm env` | none | `stable` | `stable` shell exports; `--shell fish` emits fish syntax for `source`; quote style is not a stable visual API | none | `sanitized-output-only` |
+| `lterm completions` | none | `best-effort` | `best-effort` shell completion scripts for `bash`, `zsh`, and `fish`; generated output follows clap-complete behavior and does not start the daemon | none | `sanitized-output-only` |
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |
 | `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
@@ -184,10 +187,12 @@ error.
 
 ## Non-blocking P1 surfaces
 
-Shell completions and agent workflow cookbook recipes are useful follow-up work,
-but they are not 1.0 release blockers unless a future manifest change explicitly
-adds a completion or recipe surface as stable. Cookbook examples should not be
-used as release-gate contract examples unless they are manifest-promoted.
+Agent workflow cookbook recipes are useful follow-up work, but they are not 1.0
+release blockers unless a future manifest change explicitly adds a recipe
+surface as stable. Cookbook examples should not be used as release-gate contract
+examples unless they are manifest-promoted. `lterm completions` is now
+manifest-promoted as a best-effort utility surface, not a stable visual contract
+for exact shell-script bytes.
 
 ## Release evidence
 

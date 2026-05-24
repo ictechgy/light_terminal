@@ -290,6 +290,36 @@ fn wait_for_file_contents(path: &Path) -> TestResult<String> {
     .into())
 }
 
+fn wait_for_trace_start_event(path: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            last = contents;
+            if last.lines().next().is_some_and(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|event| {
+                        event
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("start")
+            }) {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "timed out waiting for trace start event in {}; last contents: {last:?}",
+        path.display()
+    )
+    .into())
+}
+
 fn wait_for_no_client_rows(env: &TestEnv, sessions: &[&str]) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last = String::new();
@@ -1225,6 +1255,10 @@ fn help_shows_common_aliases() -> TestResult {
         "capture compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: record]"),
+        "record compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: mobile]"),
         "mobile compose alias was not visible in help:\n{stdout}"
     );
@@ -1270,6 +1304,9 @@ fn help_exposes_utility_command_surface() -> TestResult {
     for command in [
         "install-shim",
         "env",
+        "completions",
+        "diagnose",
+        "trace",
         "tmux-compat",
         "wait",
         "watch",
@@ -1313,6 +1350,287 @@ fn help_exposes_utility_command_surface() -> TestResult {
             "top-level help should keep utility command context {expected:?}:\n{stdout}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn completions_generate_shell_scripts_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let bash = env.cmd().args(["completions", "bash"]).output()?;
+    assert!(bash.status.success(), "{bash:?}");
+    assert!(bash.stderr.is_empty(), "{bash:?}");
+    let bash_stdout = String::from_utf8_lossy(&bash.stdout);
+    assert!(
+        bash_stdout.contains("_lterm") && bash_stdout.contains("completions"),
+        "bash completion should describe lterm commands:\n{bash_stdout}"
+    );
+
+    let zsh = env.cmd().args(["completions", "zsh"]).output()?;
+    assert!(zsh.status.success(), "{zsh:?}");
+    assert!(zsh.stderr.is_empty(), "{zsh:?}");
+    let zsh_stdout = String::from_utf8_lossy(&zsh.stdout);
+    assert!(
+        zsh_stdout.contains("#compdef lterm"),
+        "zsh completion should include compdef header:\n{zsh_stdout}"
+    );
+
+    let fish = env.cmd().args(["completions", "fish"]).output()?;
+    assert!(fish.status.success(), "{fish:?}");
+    assert!(fish.stderr.is_empty(), "{fish:?}");
+    let fish_stdout = String::from_utf8_lossy(&fish.stdout);
+    assert!(
+        fish_stdout.contains("complete -c lterm"),
+        "fish completion should include fish complete directives:\n{fish_stdout}"
+    );
+
+    let doctor = env.cmd().args(["doctor", "--json"]).output()?;
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    assert_eq!(
+        report.get("daemon_reachable").and_then(|v| v.as_bool()),
+        Some(false),
+        "completion generation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let cold = env.cmd().args(["diagnose", "--bundle"]).output()?;
+    assert!(cold.status.success(), "{cold:?}");
+    assert!(cold.stderr.is_empty(), "{cold:?}");
+    let cold_bundle: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+    assert_eq!(
+        cold_bundle
+            .pointer("/doctor/daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "cold diagnose should not auto-start daemon: {cold_bundle:?}"
+    );
+    assert_eq!(
+        cold_bundle
+            .pointer("/privacy/raw_pty_streams_included")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "diagnose bundle must not include raw PTY bytes by default: {cold_bundle:?}"
+    );
+    assert!(
+        cold_bundle.get("sessions").is_some_and(|v| v.is_null()),
+        "cold bundle should skip sessions without daemon auto-start: {cold_bundle:?}"
+    );
+
+    let secret = "DIAGNOSE_SECRET_SHOULD_NOT_LEAK_7519";
+    let diagnose_command = format!("echo DIAGNOSE_READY; echo {secret}; sleep 30");
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "diagnose-session",
+            "--",
+            "sh",
+            "-lc",
+            diagnose_command.as_str(),
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("diagnose-session", secret)?;
+
+    let live = env.cmd().args(["diagnose", "--bundle"]).output()?;
+    assert!(live.status.success(), "{live:?}");
+    let live_stdout = String::from_utf8_lossy(&live.stdout);
+    assert!(
+        !live_stdout.contains(secret),
+        "diagnose bundle leaked scrollback or command args: {live_stdout}"
+    );
+    let live_bundle: serde_json::Value = serde_json::from_slice(&live.stdout)?;
+    assert_eq!(
+        live_bundle
+            .pointer("/doctor/daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "{live_bundle:?}"
+    );
+    assert_eq!(
+        live_bundle
+            .pointer("/privacy/raw_pty_streams_included")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "live diagnose bundle must not include raw PTY bytes: {live_bundle:?}"
+    );
+    assert_eq!(
+        live_bundle
+            .pointer("/privacy/session_commands_redacted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "live diagnose bundle should redact session commands: {live_bundle:?}"
+    );
+    assert_eq!(
+        live_bundle
+            .pointer("/privacy/process_commands_redacted")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "live diagnose bundle should redact process commands: {live_bundle:?}"
+    );
+    let sessions = live_bundle
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or("live diagnose bundle must include sessions array")?;
+    assert!(
+        sessions.iter().any(|session| session
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name == "diagnose-session")),
+        "live diagnose bundle should include the created session: {live_bundle:?}"
+    );
+    assert!(
+        live_bundle.get("processes").is_some_and(|v| v.is_array()),
+        "live diagnose bundle should include process rows: {live_bundle:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "trace-session",
+            "--",
+            "sh",
+            "-lc",
+            "echo TRACE_READY; while IFS= read -r line; do echo TRACE_LIVE:$line; done",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("trace-session", "TRACE_READY")?;
+
+    let trace_path = env.temp.path().join("trace.jsonl");
+    let trace_path_str = trace_path.to_str().ok_or("non-utf8 trace path")?;
+    let trace_child = ChildCleanup::new(
+        env.cmd()
+            .args([
+                "trace",
+                "trace-session",
+                "--duration",
+                "3s",
+                "--max-bytes",
+                "4096",
+                "--output",
+                trace_path_str,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    wait_for_trace_start_event(&trace_path)?;
+    let send = env
+        .cmd()
+        .args(["input", "trace-session", "TRACE_DURING", "--enter"])
+        .output()?;
+    assert!(send.status.success(), "{send:?}");
+    let output = wait_for_child_output(trace_child, Duration::from_secs(5), "trace command")?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.stdout.is_empty(),
+        "trace command should write only the file, not replay raw PTY stdout: {output:?}"
+    );
+
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&trace_path)?.permissions().mode() & 0o777,
+        0o600,
+        "trace files contain raw PTY bytes and must be owner-only"
+    );
+
+    let trace = std::fs::read_to_string(&trace_path)?;
+    let events: Vec<serde_json::Value> = trace
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("start"),
+        "trace must start with metadata event: {trace}"
+    );
+    assert_eq!(
+        events
+            .last()
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("end"),
+        "trace must end with terminal event: {trace}"
+    );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("max_bytes"))
+            .and_then(|v| v.as_u64()),
+        Some(4096),
+        "trace start event should record the active byte cap: {trace}"
+    );
+    let combined_hex = events
+        .iter()
+        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+        .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
+        .collect::<String>();
+    assert!(
+        combined_hex.contains("54524143455f4c4956453a54524143455f445552494e47"),
+        "trace output chunks should contain live TRACE_LIVE:TRACE_DURING bytes encoded as hex: {trace}"
+    );
+
+    let before_overwrite = std::fs::read_to_string(&trace_path)?;
+    let overwrite = env
+        .cmd()
+        .args([
+            "record",
+            "trace-session",
+            "--duration",
+            "100ms",
+            "--output",
+            trace_path_str,
+        ])
+        .output()?;
+    assert!(
+        !overwrite.status.success(),
+        "trace should refuse to overwrite without --force: {overwrite:?}"
+    );
+    assert_stderr_contains(&overwrite, "--force");
+    assert_eq!(
+        std::fs::read_to_string(&trace_path)?,
+        before_overwrite,
+        "failed overwrite attempt must leave existing trace file unchanged"
+    );
+
+    let forced = env
+        .cmd()
+        .args([
+            "record",
+            "trace-session",
+            "--duration",
+            "100ms",
+            "--output",
+            trace_path_str,
+            "--force",
+        ])
+        .output()?;
+    assert!(forced.status.success(), "{forced:?}");
+    assert_ne!(
+        std::fs::read_to_string(&trace_path)?,
+        before_overwrite,
+        "--force should replace the existing trace file"
+    );
     Ok(())
 }
 
