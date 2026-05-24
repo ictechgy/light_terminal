@@ -1,6 +1,6 @@
 {
   "name": "lterm-darwin-x64",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Native lterm binary for macOS x64.",
   "license": "MIT OR Apache-2.0",
   "repository": {
