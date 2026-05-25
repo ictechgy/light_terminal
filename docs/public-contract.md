@@ -91,6 +91,8 @@ or raw output stream.
 | `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm trace` | `lterm record` | `explicit-raw-unsafe` | none; writes a private local JSONL trace file capped by --max-bytes | `best-effort` JSONL events with hex-encoded raw PTY output chunks | `raw-transparent` |
+| `lterm trace-replay` | `lterm replay-trace` | `explicit-raw-unsafe` | `best-effort` raw bytes decoded from an explicit local trace file; `--timing` can preserve inter-chunk delays | none | `raw-transparent` |
+| `lterm trace-info` | none | `best-effort` | `best-effort` raw-free metadata summary for a local trace file | `best-effort` raw-free metadata summary | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm compose` | `lterm mobile` | `stable` | `best-effort` UI with stable sanitized capture display | none | `sanitized-output-only` |

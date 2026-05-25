@@ -259,12 +259,44 @@
       "json_output_stability": "best-effort",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke trace_records_raw_output_chunks_to_jsonl_without_stdout_replay"
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
       "raw_stream_policy": "raw-transparent",
       "stability_scope": "Opt-in private local JSONL trace file for debugging raw PTY output. It records raw output bytes as hex, caps raw capture with --max-bytes, and does not replay bytes to stdout; exact JSONL fields are best-effort until a stable trace schema is promoted."
+    },
+    {
+      "command": "lterm trace-replay",
+      "aliases": [
+        "lterm replay-trace"
+      ],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces",
+        "cargo test --test cli_smoke trace_replay_rejects_malformed_or_unsafe_jsonl"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "explicit-raw-unsafe",
+      "raw_stream_policy": "raw-transparent",
+      "stability_scope": "Explicitly decodes a local lterm trace JSONL file and writes recorded raw PTY output bytes to stdout. It does not connect to the daemon or sanitize replayed bytes."
+    },
+    {
+      "command": "lterm trace-info",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "best-effort",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke trace_records_jsonl_and_supports_info_and_replay_surfaces",
+        "cargo test --test cli_smoke trace_replay_rejects_malformed_or_unsafe_jsonl"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Summarizes lterm trace JSONL metadata and aggregate chunk counts without printing raw bytes_hex payloads. Exact field names are best-effort until a stable trace summary schema is promoted."
     },
     {
       "command": "lterm wait",

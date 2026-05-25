@@ -1259,6 +1259,10 @@ fn help_shows_common_aliases() -> TestResult {
         "record compatibility alias was not visible in help:\n{stdout}"
     );
     assert!(
+        stdout.contains("[aliases: replay-trace]"),
+        "trace replay compatibility alias was not visible in help:\n{stdout}"
+    );
+    assert!(
         stdout.contains("[aliases: mobile]"),
         "mobile compose alias was not visible in help:\n{stdout}"
     );
@@ -1307,6 +1311,8 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "completions",
         "diagnose",
         "trace",
+        "trace-replay",
+        "trace-info",
         "tmux-compat",
         "wait",
         "watch",
@@ -1495,7 +1501,7 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
 }
 
 #[test]
-fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResult {
+fn trace_records_jsonl_and_supports_info_and_replay_surfaces() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
         .cmd()
@@ -1580,14 +1586,147 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         Some(4096),
         "trace start event should record the active byte cap: {trace}"
     );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("format"))
+            .and_then(|v| v.as_str()),
+        Some("lterm-trace-jsonl"),
+        "trace start event should record the trace file format: {trace}"
+    );
+    assert_eq!(
+        events
+            .first()
+            .and_then(|v| v.get("producer"))
+            .and_then(|v| v.as_str()),
+        Some("lterm"),
+        "trace start event should record the producer: {trace}"
+    );
+    assert!(
+        events
+            .first()
+            .and_then(|v| v.get("trace_id"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|trace_id| !trace_id.is_empty()),
+        "trace start event should record a trace id: {trace}"
+    );
     let combined_hex = events
         .iter()
         .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
         .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
         .collect::<String>();
+    let known_payload_hex = "54524143455f4c4956453a54524143455f445552494e47";
     assert!(
-        combined_hex.contains("54524143455f4c4956453a54524143455f445552494e47"),
+        combined_hex.contains(known_payload_hex),
         "trace output chunks should contain live TRACE_LIVE:TRACE_DURING bytes encoded as hex: {trace}"
+    );
+    let output_chunks = events
+        .iter()
+        .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+        .count();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+            .all(|event| event.get("chunk_index").and_then(|v| v.as_u64()).is_some()),
+        "trace output chunks should carry chunk indexes: {trace}"
+    );
+    assert_eq!(
+        events
+            .last()
+            .and_then(|v| v.get("chunks_recorded"))
+            .and_then(|v| v.as_u64()),
+        Some(output_chunks as u64),
+        "trace end event should record chunk totals: {trace}"
+    );
+
+    let info = env
+        .cmd()
+        .args(["trace-info", trace_path_str, "--json"])
+        .output()?;
+    assert!(info.status.success(), "{info:?}");
+    let info_stdout = String::from_utf8_lossy(&info.stdout);
+    let summary: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    let summary_object = summary
+        .as_object()
+        .ok_or("trace-info JSON summary must be an object")?;
+    let allowed_summary_keys = [
+        "path",
+        "schema_version",
+        "format",
+        "trace_id",
+        "producer",
+        "client_version",
+        "client_protocol_version",
+        "target",
+        "created_at_unix_ms",
+        "duration_ms",
+        "max_bytes",
+        "rows",
+        "cols",
+        "raw_stream_policy",
+        "event_count",
+        "output_chunks",
+        "output_bytes",
+        "first_output_elapsed_ms",
+        "last_output_elapsed_ms",
+        "end_elapsed_ms",
+        "end_reason",
+        "end_bytes_recorded",
+        "end_chunks_recorded",
+        "unknown_events",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert!(
+        summary_object
+            .keys()
+            .all(|key| allowed_summary_keys.contains(key.as_str())),
+        "trace-info should only expose raw-free summary keys: {info_stdout}"
+    );
+    assert_eq!(
+        summary.get("format").and_then(|v| v.as_str()),
+        Some("lterm-trace-jsonl"),
+        "trace-info should expose raw-free metadata: {info_stdout}"
+    );
+    assert_eq!(
+        summary.get("target").and_then(|v| v.as_str()),
+        Some("trace-session"),
+        "trace-info should report the traced target: {info_stdout}"
+    );
+    assert_eq!(
+        summary.get("output_chunks").and_then(|v| v.as_u64()),
+        Some(output_chunks as u64),
+        "trace-info should summarize output chunks: {info_stdout}"
+    );
+    assert!(
+        !info_stdout.contains("TRACE_DURING")
+            && !info_stdout.contains("bytes_hex")
+            && !info_stdout.contains(known_payload_hex)
+            && events
+                .iter()
+                .filter(|event| event.get("type").and_then(|v| v.as_str()) == Some("output"))
+                .filter_map(|event| event.get("bytes_hex").and_then(|v| v.as_str()))
+                .all(|bytes_hex| !info_stdout.contains(bytes_hex)),
+        "trace-info must not print raw trace payloads or their hex encoding: {info_stdout}"
+    );
+
+    let replay = env.cmd().args(["trace-replay", trace_path_str]).output()?;
+    assert!(replay.status.success(), "{replay:?}");
+    let replay_stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(
+        replay_stdout.contains("TRACE_LIVE:TRACE_DURING"),
+        "trace-replay should decode output chunks to stdout: {replay_stdout:?}"
+    );
+    let timed_replay = env
+        .cmd()
+        .args(["trace-replay", trace_path_str, "--timing"])
+        .output()?;
+    assert!(timed_replay.status.success(), "{timed_replay:?}");
+    let timed_replay_stdout = String::from_utf8_lossy(&timed_replay.stdout);
+    assert!(
+        timed_replay_stdout.contains("TRACE_LIVE:TRACE_DURING"),
+        "trace-replay --timing should decode output chunks to stdout: {timed_replay_stdout:?}"
     );
 
     let before_overwrite = std::fs::read_to_string(&trace_path)?;
@@ -1630,6 +1769,244 @@ fn trace_records_raw_output_chunks_to_jsonl_without_stdout_replay() -> TestResul
         std::fs::read_to_string(&trace_path)?,
         before_overwrite,
         "--force should replace the existing trace file"
+    );
+    Ok(())
+}
+
+#[test]
+fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
+    let env = TestEnv::new()?;
+    let start = r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":120000}"#;
+    let end = r#"{"type":"end","elapsed_ms":0,"reason":"duration","bytes_recorded":0,"chunks_recorded":0}"#;
+
+    let no_start_path = env.temp.path().join("no-start.jsonl");
+    std::fs::write(
+        &no_start_path,
+        r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+    )?;
+    let no_start = env.cmd().arg("trace-replay").arg(&no_start_path).output()?;
+    assert!(
+        !no_start.status.success(),
+        "trace-replay should reject output before start: {no_start:?}"
+    );
+    assert_stderr_contains(&no_start, "output before start");
+
+    let wrong_direction_path = env.temp.path().join("wrong-direction.jsonl");
+    std::fs::write(
+        &wrong_direction_path,
+        format!(
+            "{start}\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stderr","len":1,"bytes_hex":"41"}"#
+        ),
+    )?;
+    let wrong_direction = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&wrong_direction_path)
+        .output()?;
+    assert!(
+        !wrong_direction.status.success(),
+        "trace-replay should reject unsupported directions: {wrong_direction:?}"
+    );
+    assert_stderr_contains(&wrong_direction, "unsupported output direction");
+
+    let delay_cap_path = env.temp.path().join("delay-cap.jsonl");
+    std::fs::write(
+        &delay_cap_path,
+        format!(
+            "{start}\n{}\n{}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":61000,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+            r#"{"type":"end","elapsed_ms":61000,"reason":"duration","bytes_recorded":1,"chunks_recorded":1}"#
+        ),
+    )?;
+    let delay_cap = env
+        .cmd()
+        .args(["trace-replay", "--timing"])
+        .arg(&delay_cap_path)
+        .output()?;
+    assert!(
+        !delay_cap.status.success(),
+        "trace-replay --timing should cap untrusted sleep delays: {delay_cap:?}"
+    );
+    assert!(
+        delay_cap.stdout.is_empty(),
+        "trace-replay should reject oversized delays before writing raw bytes: {delay_cap:?}"
+    );
+    assert_stderr_contains(&delay_cap, "exceeds safety cap");
+
+    let legacy_path = env.temp.path().join("legacy-v1-trace.jsonl");
+    std::fs::write(
+        &legacy_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","target":"legacy","created_at_unix_ms":1,"duration_ms":1000,"max_bytes":1024,"rows":24,"cols":80,"raw_stream_policy":"raw-transparent"}"#,
+            "\n",
+            r#"{"type":"output","elapsed_ms":1,"direction":"stdout","len":6,"bytes_hex":"4c4547414359"}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":2,"reason":"duration"}"#,
+            "\n"
+        ),
+    )?;
+    let legacy = env.cmd().arg("trace-replay").arg(&legacy_path).output()?;
+    assert!(
+        legacy.status.success(),
+        "trace-replay should accept v1.0.6 trace files without newer metadata: {legacy:?}"
+    );
+    assert_eq!(legacy.stdout, b"LEGACY");
+
+    let slightly_over_duration_path = env.temp.path().join("slightly-over-duration.jsonl");
+    std::fs::write(
+        &slightly_over_duration_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":1000}"#,
+            "\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":1001,"direction":"stdout","len":1,"bytes_hex":"41"}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":1001,"reason":"duration","bytes_recorded":1,"chunks_recorded":1}"#,
+            "\n"
+        ),
+    )?;
+    let slightly_over_duration = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&slightly_over_duration_path)
+        .output()?;
+    assert!(
+        slightly_over_duration.status.success(),
+        "trace-replay should tolerate scheduler drift past duration_ms: {slightly_over_duration:?}"
+    );
+    assert_eq!(slightly_over_duration.stdout, b"A");
+
+    let info_path = env.temp.path().join("info-unknown.jsonl");
+    std::fs::write(
+        &info_path,
+        format!(
+            "{start}\nnot-json\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":2,"bytes_hex":"41"}"#
+        ),
+    )?;
+    let info = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&info_path)
+        .output()?;
+    assert!(
+        info.status.success(),
+        "trace-info should summarize around malformed non-raw lines: {info:?}"
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    assert_eq!(
+        summary.get("unknown_events").and_then(|v| v.as_u64()),
+        Some(2),
+        "trace-info should count malformed/invalid output rows as unknown: {summary:?}"
+    );
+
+    let bad_len_type_path = env.temp.path().join("info-bad-len-type.jsonl");
+    std::fs::write(
+        &bad_len_type_path,
+        format!(
+            "{start}\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":"2","bytes_hex":"4142"}"#
+        ),
+    )?;
+    let bad_len_type = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&bad_len_type_path)
+        .output()?;
+    assert!(
+        bad_len_type.status.success(),
+        "trace-info should summarize around non-u64 len fields: {bad_len_type:?}"
+    );
+    let bad_len_type_summary: serde_json::Value = serde_json::from_slice(&bad_len_type.stdout)?;
+    assert_eq!(
+        bad_len_type_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count non-u64 len output rows as unknown: {bad_len_type_summary:?}"
+    );
+    assert_eq!(
+        bad_len_type_summary
+            .get("output_chunks")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "trace-info must not count non-u64 len rows as valid output chunks: {bad_len_type_summary:?}"
+    );
+
+    let duplicate_legacy_start_path = env.temp.path().join("info-duplicate-start.jsonl");
+    std::fs::write(
+        &duplicate_legacy_start_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","target":"first","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"start","schema_version":"1.0","target":"second","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":0}"#,
+            "\n"
+        ),
+    )?;
+    let duplicate_legacy_start = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&duplicate_legacy_start_path)
+        .output()?;
+    assert!(
+        duplicate_legacy_start.status.success(),
+        "trace-info should summarize duplicate legacy start events without overwrite: {duplicate_legacy_start:?}"
+    );
+    let duplicate_start_summary: serde_json::Value =
+        serde_json::from_slice(&duplicate_legacy_start.stdout)?;
+    assert_eq!(
+        duplicate_start_summary
+            .get("target")
+            .and_then(|v| v.as_str()),
+        Some("first"),
+        "trace-info should keep the first start event metadata: {duplicate_start_summary:?}"
+    );
+    assert_eq!(
+        duplicate_start_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count duplicate start events even when legacy start has no format: {duplicate_start_summary:?}"
+    );
+
+    let duplicate_reasonless_end_path = env.temp.path().join("info-duplicate-end.jsonl");
+    std::fs::write(
+        &duplicate_reasonless_end_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":0}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":1}"#,
+            "\n"
+        ),
+    )?;
+    let duplicate_reasonless_end = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&duplicate_reasonless_end_path)
+        .output()?;
+    assert!(
+        duplicate_reasonless_end.status.success(),
+        "trace-info should summarize duplicate reasonless end events without overwrite: {duplicate_reasonless_end:?}"
+    );
+    let duplicate_end_summary: serde_json::Value =
+        serde_json::from_slice(&duplicate_reasonless_end.stdout)?;
+    assert_eq!(
+        duplicate_end_summary
+            .get("end_elapsed_ms")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "trace-info should keep the first end event metadata: {duplicate_end_summary:?}"
+    );
+    assert_eq!(
+        duplicate_end_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count duplicate end events even when end has no reason: {duplicate_end_summary:?}"
     );
     Ok(())
 }

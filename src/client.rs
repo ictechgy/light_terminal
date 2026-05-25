@@ -32,6 +32,11 @@ const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const ATTACH_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_TRACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TRACE_FORMAT: &str = "lterm-trace-jsonl";
+const TRACE_SCHEMA_VERSION: &str = "1.0";
+const MAX_TRACE_JSONL_LINE_BYTES: usize = 1024 * 1024;
+const MAX_TRACE_REPLAY_CHUNK_BYTES: u64 = 1024 * 1024;
+const MAX_TRACE_REPLAY_DELAY_MS: u64 = 60 * 1000;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 static VERSION_STATUS_CHECKED: AtomicBool = AtomicBool::new(false);
 /// Status bar self-heal 주기. cmux/Termius 등에서 다른 앱→복귀 시 외부에서 DECSTBM이
@@ -426,6 +431,11 @@ pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Resu
 enum TraceEvent {
     Start {
         schema_version: &'static str,
+        format: &'static str,
+        trace_id: String,
+        producer: &'static str,
+        client_version: &'static str,
+        client_protocol_version: u32,
         target: String,
         created_at_unix_ms: Option<u64>,
         duration_ms: u64,
@@ -435,6 +445,7 @@ enum TraceEvent {
         raw_stream_policy: &'static str,
     },
     Output {
+        chunk_index: u64,
         elapsed_ms: u64,
         direction: &'static str,
         len: usize,
@@ -443,7 +454,37 @@ enum TraceEvent {
     End {
         elapsed_ms: u64,
         reason: &'static str,
+        bytes_recorded: u64,
+        chunks_recorded: u64,
     },
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceFileSummary {
+    path: String,
+    schema_version: Option<String>,
+    format: Option<String>,
+    trace_id: Option<String>,
+    producer: Option<String>,
+    client_version: Option<String>,
+    client_protocol_version: Option<u64>,
+    target: Option<String>,
+    created_at_unix_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    max_bytes: Option<u64>,
+    rows: Option<u64>,
+    cols: Option<u64>,
+    raw_stream_policy: Option<String>,
+    event_count: u64,
+    output_chunks: u64,
+    output_bytes: u64,
+    first_output_elapsed_ms: Option<u64>,
+    last_output_elapsed_ms: Option<u64>,
+    end_elapsed_ms: Option<u64>,
+    end_reason: Option<String>,
+    end_bytes_recorded: Option<u64>,
+    end_chunks_recorded: Option<u64>,
+    unknown_events: u64,
 }
 
 pub fn trace_output(
@@ -504,7 +545,12 @@ pub fn trace_output(
     write_trace_event(
         &mut output,
         &TraceEvent::Start {
-            schema_version: "1.0",
+            schema_version: TRACE_SCHEMA_VERSION,
+            format: TRACE_FORMAT,
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            producer: "lterm",
+            client_version: env!("CARGO_PKG_VERSION"),
+            client_protocol_version: PROTOCOL_VERSION,
             target: target.to_string(),
             created_at_unix_ms: current_unix_ms(),
             duration_ms: duration_millis_u64(duration),
@@ -519,6 +565,7 @@ pub fn trace_output(
     let deadline = started + duration;
     let mut reason = "duration";
     let mut raw_bytes_recorded = 0_u64;
+    let mut chunks_recorded = 0_u64;
     let mut buf = [0_u8; 8192];
     while Instant::now() < deadline {
         let now = Instant::now();
@@ -546,6 +593,7 @@ pub fn trace_output(
                 write_trace_event(
                     &mut output,
                     &TraceEvent::Output {
+                        chunk_index: chunks_recorded,
                         elapsed_ms: duration_millis_u64(started.elapsed()),
                         direction: "stdout",
                         len: to_write,
@@ -553,6 +601,7 @@ pub fn trace_output(
                     },
                 )?;
                 raw_bytes_recorded += u64::try_from(to_write).unwrap_or(u64::MAX);
+                chunks_recorded = chunks_recorded.saturating_add(1);
                 if to_write < n || raw_bytes_recorded >= max_bytes {
                     reason = "max_bytes";
                     break;
@@ -573,10 +622,560 @@ pub fn trace_output(
         &TraceEvent::End {
             elapsed_ms: duration_millis_u64(started.elapsed()),
             reason,
+            bytes_recorded: raw_bytes_recorded,
+            chunks_recorded,
         },
     )?;
     output.flush().context("flush trace output")?;
     Ok(())
+}
+
+pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
+    let file = std::fs::File::open(input_path)
+        .with_context(|| format!("open trace file {}", input_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut stdout = std::io::stdout().lock();
+    let mut start_seen = false;
+    let mut end_seen = false;
+    let mut previous_elapsed_ms = 0_u64;
+    let mut expected_chunk_index = 0_u64;
+    let mut replayed_bytes = 0_u64;
+    let mut line_number = 0_usize;
+
+    while let Some(line) = read_trace_jsonl_line(&mut reader, &mut line_number, input_path)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parse trace line {line_number} from {}",
+                input_path.display()
+            )
+        })?;
+        match required_trace_str(&event, "type", input_path, line_number)? {
+            "start" => {
+                if start_seen {
+                    bail!(
+                        "trace line {} from {} contains a duplicate start event",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                if end_seen || expected_chunk_index != 0 {
+                    bail!(
+                        "trace line {} from {} contains start after output/end",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                validate_trace_start_event(&event, input_path, line_number)?;
+                required_trace_u64(&event, "duration_ms", input_path, line_number)?;
+                start_seen = true;
+            }
+            "output" => {
+                if !start_seen {
+                    bail!(
+                        "trace line {} from {} contains output before start",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                if end_seen {
+                    bail!(
+                        "trace line {} from {} contains output after end",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                let direction = required_trace_str(&event, "direction", input_path, line_number)?;
+                if direction != "stdout" {
+                    bail!(
+                        "trace line {} from {} has unsupported output direction {:?}",
+                        line_number,
+                        input_path.display(),
+                        direction
+                    );
+                }
+                if let Some(chunk_index) = optional_trace_u64(&event, "chunk_index") {
+                    if chunk_index != expected_chunk_index {
+                        bail!(
+                            "trace line {} from {} has chunk_index {} but expected {}",
+                            line_number,
+                            input_path.display(),
+                            chunk_index,
+                            expected_chunk_index
+                        );
+                    }
+                } else if event.get("chunk_index").is_some() {
+                    bail!(
+                        "trace line {} from {} has non-u64 field chunk_index",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                let elapsed_ms = required_trace_u64(&event, "elapsed_ms", input_path, line_number)?;
+                if elapsed_ms < previous_elapsed_ms {
+                    bail!(
+                        "trace line {} from {} has non-monotonic elapsed_ms {} after {}",
+                        line_number,
+                        input_path.display(),
+                        elapsed_ms,
+                        previous_elapsed_ms
+                    );
+                }
+                let bytes_hex = required_trace_str(&event, "bytes_hex", input_path, line_number)?;
+                let encoded_len = hex_encoded_len(bytes_hex).with_context(|| {
+                    format!(
+                        "validate bytes_hex on trace line {line_number} from {}",
+                        input_path.display()
+                    )
+                })?;
+                if encoded_len > MAX_TRACE_REPLAY_CHUNK_BYTES {
+                    bail!(
+                        "trace line {} from {} decodes to {} bytes, exceeding replay chunk limit {}",
+                        line_number,
+                        input_path.display(),
+                        encoded_len,
+                        MAX_TRACE_REPLAY_CHUNK_BYTES
+                    );
+                }
+                let expected_len = required_trace_u64(&event, "len", input_path, line_number)?;
+                if expected_len != encoded_len {
+                    bail!(
+                        "trace line {} from {} has len {} but bytes_hex decodes to {} bytes",
+                        line_number,
+                        input_path.display(),
+                        expected_len,
+                        encoded_len
+                    );
+                }
+                let bytes = hex_decode(bytes_hex).with_context(|| {
+                    format!(
+                        "decode bytes_hex on trace line {line_number} from {}",
+                        input_path.display()
+                    )
+                })?;
+                if timing {
+                    let delay_ms = elapsed_ms.saturating_sub(previous_elapsed_ms);
+                    if delay_ms > MAX_TRACE_REPLAY_DELAY_MS {
+                        bail!(
+                            "trace replay delay {}ms on line {} exceeds safety cap {}ms; replay without --timing for long idle gaps",
+                            delay_ms,
+                            line_number,
+                            MAX_TRACE_REPLAY_DELAY_MS
+                        );
+                    }
+                    if delay_ms > 0 {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                }
+                previous_elapsed_ms = elapsed_ms;
+                stdout
+                    .write_all(&bytes)
+                    .with_context(|| format!("replay trace bytes from {}", input_path.display()))?;
+                replayed_bytes = replayed_bytes.saturating_add(expected_len);
+                expected_chunk_index = expected_chunk_index.saturating_add(1);
+                if timing {
+                    stdout.flush().with_context(|| {
+                        format!("flush timed trace chunk from {}", input_path.display())
+                    })?;
+                }
+            }
+            "end" => {
+                if !start_seen {
+                    bail!(
+                        "trace line {} from {} contains end before start",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                if end_seen {
+                    bail!(
+                        "trace line {} from {} contains a duplicate end event",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                if let Some(chunks_recorded) = optional_trace_u64(&event, "chunks_recorded") {
+                    if chunks_recorded != expected_chunk_index {
+                        bail!(
+                            "trace line {} from {} records {} chunks but replay saw {}",
+                            line_number,
+                            input_path.display(),
+                            chunks_recorded,
+                            expected_chunk_index
+                        );
+                    }
+                } else if event.get("chunks_recorded").is_some() {
+                    bail!(
+                        "trace line {} from {} has non-u64 field chunks_recorded",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                if let Some(bytes_recorded) = optional_trace_u64(&event, "bytes_recorded") {
+                    if bytes_recorded != replayed_bytes {
+                        bail!(
+                            "trace line {} from {} records {} bytes but replay saw {}",
+                            line_number,
+                            input_path.display(),
+                            bytes_recorded,
+                            replayed_bytes
+                        );
+                    }
+                } else if event.get("bytes_recorded").is_some() {
+                    bail!(
+                        "trace line {} from {} has non-u64 field bytes_recorded",
+                        line_number,
+                        input_path.display()
+                    );
+                }
+                end_seen = true;
+            }
+            event_type => {
+                bail!(
+                    "trace line {} from {} has unsupported event type {:?}",
+                    line_number,
+                    input_path.display(),
+                    event_type
+                );
+            }
+        }
+    }
+    if !start_seen {
+        bail!(
+            "trace file {} is missing a start event",
+            input_path.display()
+        );
+    }
+    if !end_seen {
+        bail!(
+            "trace file {} is missing an end event",
+            input_path.display()
+        );
+    }
+    stdout
+        .flush()
+        .with_context(|| format!("flush replayed trace {}", input_path.display()))
+}
+
+pub fn print_trace_info(input_path: &Path, json_output: bool) -> Result<()> {
+    let summary = trace_file_summary(input_path)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print_trace_summary_text(&summary);
+    }
+    Ok(())
+}
+
+fn trace_file_summary(input_path: &Path) -> Result<TraceFileSummary> {
+    let file = std::fs::File::open(input_path)
+        .with_context(|| format!("open trace file {}", input_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut summary = TraceFileSummary {
+        path: input_path.display().to_string(),
+        ..TraceFileSummary::default()
+    };
+    let mut line_number = 0_usize;
+    let mut start_seen = false;
+    let mut end_seen = false;
+
+    while let Some(line) = read_trace_jsonl_line(&mut reader, &mut line_number, input_path)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        summary.event_count = summary.event_count.saturating_add(1);
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                summary.unknown_events = summary.unknown_events.saturating_add(1);
+                continue;
+            }
+        };
+        match event.get("type").and_then(|value| value.as_str()) {
+            Some("start") => {
+                if start_seen {
+                    summary.unknown_events = summary.unknown_events.saturating_add(1);
+                    continue;
+                }
+                start_seen = true;
+                summary.schema_version = optional_trace_string(&event, "schema_version");
+                summary.format = optional_trace_string(&event, "format");
+                summary.trace_id = optional_trace_string(&event, "trace_id");
+                summary.producer = optional_trace_string(&event, "producer");
+                summary.client_version = optional_trace_string(&event, "client_version");
+                summary.client_protocol_version =
+                    optional_trace_u64(&event, "client_protocol_version");
+                summary.target = optional_trace_string(&event, "target");
+                summary.created_at_unix_ms = optional_trace_u64(&event, "created_at_unix_ms");
+                summary.duration_ms = optional_trace_u64(&event, "duration_ms");
+                summary.max_bytes = optional_trace_u64(&event, "max_bytes");
+                summary.rows = optional_trace_u64(&event, "rows");
+                summary.cols = optional_trace_u64(&event, "cols");
+                summary.raw_stream_policy = optional_trace_string(&event, "raw_stream_policy");
+            }
+            Some("output") => {
+                let Ok(len) = trace_output_event_len(&event, input_path, line_number) else {
+                    summary.unknown_events = summary.unknown_events.saturating_add(1);
+                    continue;
+                };
+                summary.output_chunks = summary.output_chunks.saturating_add(1);
+                summary.output_bytes = summary.output_bytes.saturating_add(len);
+                if let Some(elapsed_ms) = optional_trace_u64(&event, "elapsed_ms") {
+                    summary.first_output_elapsed_ms =
+                        summary.first_output_elapsed_ms.or(Some(elapsed_ms));
+                    summary.last_output_elapsed_ms = Some(elapsed_ms);
+                }
+            }
+            Some("end") => {
+                if end_seen {
+                    summary.unknown_events = summary.unknown_events.saturating_add(1);
+                    continue;
+                }
+                end_seen = true;
+                summary.end_elapsed_ms = optional_trace_u64(&event, "elapsed_ms");
+                summary.end_reason = optional_trace_string(&event, "reason");
+                summary.end_bytes_recorded = optional_trace_u64(&event, "bytes_recorded");
+                summary.end_chunks_recorded = optional_trace_u64(&event, "chunks_recorded");
+            }
+            Some(_) | None => {
+                summary.unknown_events = summary.unknown_events.saturating_add(1);
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn read_trace_jsonl_line(
+    reader: &mut impl BufRead,
+    line_number: &mut usize,
+    input_path: &Path,
+) -> Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let (take, done) = {
+            let available = reader.fill_buf().with_context(|| {
+                format!(
+                    "read trace line {} from {}",
+                    *line_number + 1,
+                    input_path.display()
+                )
+            })?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                (0, true)
+            } else if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
+                let take = pos + 1;
+                if line.len().saturating_add(take) > MAX_TRACE_JSONL_LINE_BYTES {
+                    bail!(
+                        "trace line {} from {} exceeds maximum JSONL line length of {} bytes",
+                        *line_number + 1,
+                        input_path.display(),
+                        MAX_TRACE_JSONL_LINE_BYTES
+                    );
+                }
+                line.extend_from_slice(&available[..take]);
+                (take, true)
+            } else {
+                let take = available.len();
+                if line.len().saturating_add(take) > MAX_TRACE_JSONL_LINE_BYTES {
+                    bail!(
+                        "trace line {} from {} exceeds maximum JSONL line length of {} bytes",
+                        *line_number + 1,
+                        input_path.display(),
+                        MAX_TRACE_JSONL_LINE_BYTES
+                    );
+                }
+                line.extend_from_slice(available);
+                (take, false)
+            }
+        };
+        if take > 0 {
+            reader.consume(take);
+        }
+        if done {
+            break;
+        }
+    }
+    *line_number += 1;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .with_context(|| {
+            format!(
+                "trace line {} from {} is not valid UTF-8 JSONL",
+                *line_number,
+                input_path.display()
+            )
+        })
+        .map(Some)
+}
+
+fn validate_trace_start_event(
+    event: &serde_json::Value,
+    input_path: &Path,
+    line_number: usize,
+) -> Result<()> {
+    let schema_version = required_trace_str(event, "schema_version", input_path, line_number)?;
+    if schema_version != TRACE_SCHEMA_VERSION {
+        bail!(
+            "trace line {} from {} has unsupported trace schema_version {:?}",
+            line_number,
+            input_path.display(),
+            schema_version
+        );
+    }
+    if let Some(format) = optional_trace_string(event, "format") {
+        if format != TRACE_FORMAT {
+            bail!(
+                "trace line {} from {} has unsupported trace format {:?}",
+                line_number,
+                input_path.display(),
+                format
+            );
+        }
+    } else if event.get("format").is_some() {
+        bail!(
+            "trace line {} from {} has non-string field format",
+            line_number,
+            input_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn print_trace_summary_text(summary: &TraceFileSummary) {
+    print_trace_summary_string("path", Some(&summary.path));
+    print_trace_summary_string("format", summary.format.as_deref());
+    print_trace_summary_string("schema_version", summary.schema_version.as_deref());
+    print_trace_summary_string("trace_id", summary.trace_id.as_deref());
+    print_trace_summary_string("producer", summary.producer.as_deref());
+    print_trace_summary_string("client_version", summary.client_version.as_deref());
+    print_trace_summary_u64("client_protocol_version", summary.client_protocol_version);
+    print_trace_summary_string("target", summary.target.as_deref());
+    print_trace_summary_u64("created_at_unix_ms", summary.created_at_unix_ms);
+    print_trace_summary_u64("duration_ms", summary.duration_ms);
+    print_trace_summary_u64("max_bytes", summary.max_bytes);
+    print_trace_summary_u64("rows", summary.rows);
+    print_trace_summary_u64("cols", summary.cols);
+    print_trace_summary_string("raw_stream_policy", summary.raw_stream_policy.as_deref());
+    println!("event_count\t{}", summary.event_count);
+    println!("output_chunks\t{}", summary.output_chunks);
+    println!("output_bytes\t{}", summary.output_bytes);
+    print_trace_summary_u64("first_output_elapsed_ms", summary.first_output_elapsed_ms);
+    print_trace_summary_u64("last_output_elapsed_ms", summary.last_output_elapsed_ms);
+    print_trace_summary_u64("end_elapsed_ms", summary.end_elapsed_ms);
+    print_trace_summary_string("end_reason", summary.end_reason.as_deref());
+    print_trace_summary_u64("end_bytes_recorded", summary.end_bytes_recorded);
+    print_trace_summary_u64("end_chunks_recorded", summary.end_chunks_recorded);
+    println!("unknown_events\t{}", summary.unknown_events);
+}
+
+fn print_trace_summary_string(key: &str, value: Option<&str>) {
+    println!(
+        "{}\t{}",
+        key,
+        sanitize::terminal_text(value.unwrap_or("unknown"))
+    );
+}
+
+fn print_trace_summary_u64(key: &str, value: Option<u64>) {
+    match value {
+        Some(value) => println!("{key}\t{value}"),
+        None => println!("{key}\tunknown"),
+    }
+}
+
+fn required_trace_str<'a>(
+    event: &'a serde_json::Value,
+    field: &str,
+    input_path: &Path,
+    line_number: usize,
+) -> Result<&'a str> {
+    event
+        .get(field)
+        .and_then(|value| value.as_str())
+        .with_context(|| {
+            format!(
+                "trace line {line_number} from {} is missing string field {field}",
+                input_path.display()
+            )
+        })
+}
+
+fn optional_trace_string(event: &serde_json::Value, field: &str) -> Option<String> {
+    event
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn optional_trace_u64(event: &serde_json::Value, field: &str) -> Option<u64> {
+    event.get(field).and_then(|value| value.as_u64())
+}
+
+fn required_trace_u64(
+    event: &serde_json::Value,
+    field: &str,
+    input_path: &Path,
+    line_number: usize,
+) -> Result<u64> {
+    match event.get(field) {
+        Some(value) => value.as_u64().with_context(|| {
+            format!(
+                "trace line {line_number} from {} has non-u64 field {field}",
+                input_path.display()
+            )
+        }),
+        None => bail!(
+            "trace line {} from {} is missing u64 field {}",
+            line_number,
+            input_path.display(),
+            field
+        ),
+    }
+}
+
+fn trace_output_event_len(
+    event: &serde_json::Value,
+    input_path: &Path,
+    line_number: usize,
+) -> Result<u64> {
+    let bytes_hex = required_trace_str(event, "bytes_hex", input_path, line_number)?;
+    let encoded_len = hex_encoded_len(bytes_hex).with_context(|| {
+        format!(
+            "validate bytes_hex on trace line {line_number} from {}",
+            input_path.display()
+        )
+    })?;
+    match event.get("len") {
+        Some(value) => {
+            let len = value.as_u64().with_context(|| {
+                format!(
+                    "trace line {line_number} from {} has non-u64 field len",
+                    input_path.display()
+                )
+            })?;
+            if len != encoded_len {
+                bail!(
+                    "trace line {} from {} has len {} but bytes_hex encodes {} bytes",
+                    line_number,
+                    input_path.display(),
+                    len,
+                    encoded_len
+                );
+            }
+            Ok(len)
+        }
+        None => Ok(encoded_len),
+    }
 }
 
 fn trace_output_open_context(output_path: &Path, force: bool) -> String {
@@ -646,6 +1245,48 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn hex_encoded_len(value: &str) -> Result<u64> {
+    if value.len() % 2 != 0 {
+        bail!("hex string has odd length");
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("hex string contains a non-hex digit");
+    }
+    Ok(u64::try_from(value.len() / 2).unwrap_or(u64::MAX))
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        bail!("hex string has odd length");
+    }
+    let decoded_len = u64::try_from(value.len() / 2).unwrap_or(u64::MAX);
+    if decoded_len > MAX_TRACE_REPLAY_CHUNK_BYTES {
+        bail!(
+            "hex string decodes to {} bytes, exceeding replay chunk limit {}",
+            decoded_len,
+            MAX_TRACE_REPLAY_CHUNK_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high =
+            hex_nibble(pair[0]).ok_or_else(|| anyhow!("hex string contains a non-hex digit"))?;
+        let low =
+            hex_nibble(pair[1]).ok_or_else(|| anyhow!("hex string contains a non-hex digit"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
