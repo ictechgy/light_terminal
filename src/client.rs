@@ -878,6 +878,8 @@ fn trace_file_summary(input_path: &Path) -> Result<TraceFileSummary> {
         ..TraceFileSummary::default()
     };
     let mut line_number = 0_usize;
+    let mut start_seen = false;
+    let mut end_seen = false;
 
     while let Some(line) = read_trace_jsonl_line(&mut reader, &mut line_number, input_path)? {
         if line.trim().is_empty() {
@@ -893,10 +895,11 @@ fn trace_file_summary(input_path: &Path) -> Result<TraceFileSummary> {
         };
         match event.get("type").and_then(|value| value.as_str()) {
             Some("start") => {
-                if summary.format.is_some() {
+                if start_seen {
                     summary.unknown_events = summary.unknown_events.saturating_add(1);
                     continue;
                 }
+                start_seen = true;
                 summary.schema_version = optional_trace_string(&event, "schema_version");
                 summary.format = optional_trace_string(&event, "format");
                 summary.trace_id = optional_trace_string(&event, "trace_id");
@@ -926,10 +929,11 @@ fn trace_file_summary(input_path: &Path) -> Result<TraceFileSummary> {
                 }
             }
             Some("end") => {
-                if summary.end_reason.is_some() {
+                if end_seen {
                     summary.unknown_events = summary.unknown_events.saturating_add(1);
                     continue;
                 }
+                end_seen = true;
                 summary.end_elapsed_ms = optional_trace_u64(&event, "elapsed_ms");
                 summary.end_reason = optional_trace_string(&event, "reason");
                 summary.end_bytes_recorded = optional_trace_u64(&event, "bytes_recorded");
@@ -1151,19 +1155,26 @@ fn trace_output_event_len(
             input_path.display()
         )
     })?;
-    if let Some(len) = optional_trace_u64(event, "len") {
-        if len != encoded_len {
-            bail!(
-                "trace line {} from {} has len {} but bytes_hex encodes {} bytes",
-                line_number,
-                input_path.display(),
-                len,
-                encoded_len
-            );
+    match event.get("len") {
+        Some(value) => {
+            let len = value.as_u64().with_context(|| {
+                format!(
+                    "trace line {line_number} from {} has non-u64 field len",
+                    input_path.display()
+                )
+            })?;
+            if len != encoded_len {
+                bail!(
+                    "trace line {} from {} has len {} but bytes_hex encodes {} bytes",
+                    line_number,
+                    input_path.display(),
+                    len,
+                    encoded_len
+                );
+            }
+            Ok(len)
         }
-        Ok(len)
-    } else {
-        Ok(encoded_len)
+        None => Ok(encoded_len),
     }
 }
 

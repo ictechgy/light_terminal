@@ -1899,6 +1899,115 @@ fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
         Some(2),
         "trace-info should count malformed/invalid output rows as unknown: {summary:?}"
     );
+
+    let bad_len_type_path = env.temp.path().join("info-bad-len-type.jsonl");
+    std::fs::write(
+        &bad_len_type_path,
+        format!(
+            "{start}\n{}\n{end}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":"2","bytes_hex":"4142"}"#
+        ),
+    )?;
+    let bad_len_type = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&bad_len_type_path)
+        .output()?;
+    assert!(
+        bad_len_type.status.success(),
+        "trace-info should summarize around non-u64 len fields: {bad_len_type:?}"
+    );
+    let bad_len_type_summary: serde_json::Value = serde_json::from_slice(&bad_len_type.stdout)?;
+    assert_eq!(
+        bad_len_type_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count non-u64 len output rows as unknown: {bad_len_type_summary:?}"
+    );
+    assert_eq!(
+        bad_len_type_summary
+            .get("output_chunks")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "trace-info must not count non-u64 len rows as valid output chunks: {bad_len_type_summary:?}"
+    );
+
+    let duplicate_legacy_start_path = env.temp.path().join("info-duplicate-start.jsonl");
+    std::fs::write(
+        &duplicate_legacy_start_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","target":"first","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"start","schema_version":"1.0","target":"second","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":0}"#,
+            "\n"
+        ),
+    )?;
+    let duplicate_legacy_start = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&duplicate_legacy_start_path)
+        .output()?;
+    assert!(
+        duplicate_legacy_start.status.success(),
+        "trace-info should summarize duplicate legacy start events without overwrite: {duplicate_legacy_start:?}"
+    );
+    let duplicate_start_summary: serde_json::Value =
+        serde_json::from_slice(&duplicate_legacy_start.stdout)?;
+    assert_eq!(
+        duplicate_start_summary
+            .get("target")
+            .and_then(|v| v.as_str()),
+        Some("first"),
+        "trace-info should keep the first start event metadata: {duplicate_start_summary:?}"
+    );
+    assert_eq!(
+        duplicate_start_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count duplicate start events even when legacy start has no format: {duplicate_start_summary:?}"
+    );
+
+    let duplicate_reasonless_end_path = env.temp.path().join("info-duplicate-end.jsonl");
+    std::fs::write(
+        &duplicate_reasonless_end_path,
+        concat!(
+            r#"{"type":"start","schema_version":"1.0","format":"lterm-trace-jsonl","duration_ms":1}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":0}"#,
+            "\n",
+            r#"{"type":"end","elapsed_ms":1}"#,
+            "\n"
+        ),
+    )?;
+    let duplicate_reasonless_end = env
+        .cmd()
+        .args(["trace-info", "--json"])
+        .arg(&duplicate_reasonless_end_path)
+        .output()?;
+    assert!(
+        duplicate_reasonless_end.status.success(),
+        "trace-info should summarize duplicate reasonless end events without overwrite: {duplicate_reasonless_end:?}"
+    );
+    let duplicate_end_summary: serde_json::Value =
+        serde_json::from_slice(&duplicate_reasonless_end.stdout)?;
+    assert_eq!(
+        duplicate_end_summary
+            .get("end_elapsed_ms")
+            .and_then(|v| v.as_u64()),
+        Some(0),
+        "trace-info should keep the first end event metadata: {duplicate_end_summary:?}"
+    );
+    assert_eq!(
+        duplicate_end_summary
+            .get("unknown_events")
+            .and_then(|v| v.as_u64()),
+        Some(1),
+        "trace-info should count duplicate end events even when end has no reason: {duplicate_end_summary:?}"
+    );
     Ok(())
 }
 
