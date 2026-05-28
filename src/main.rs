@@ -2022,13 +2022,13 @@ impl AgentProfile {
                 name: name.to_string(),
                 binary: "omx".to_string(),
                 session_base: "omx-lterm".to_string(),
-                show_status: true,
+                show_status: false,
             },
             "omc" => Self {
                 name: name.to_string(),
                 binary: "omc".to_string(),
                 session_base: "omc-lterm".to_string(),
-                show_status: true,
+                show_status: false,
             },
             _ => unreachable!("unknown built-in agent profile: {name}"),
         }
@@ -2461,11 +2461,9 @@ fn notify_with_fallback(
 ) -> Result<()> {
     if client::command_exists("cmux") {
         let mut cmd = Command::new("cmux");
-        cmd.arg("notify")
-            .arg("--title")
-            .arg(title)
-            .arg("--body")
-            .arg(body);
+        cmd.arg("notify");
+        add_cmux_notification_context_args(&mut cmd);
+        cmd.arg("--title").arg(title).arg("--body").arg(body);
         if let Some(subtitle) = subtitle {
             cmd.arg("--subtitle").arg(subtitle);
         }
@@ -2501,6 +2499,34 @@ fn notify_with_fallback(
         }
     }
     Ok(())
+}
+
+fn add_cmux_notification_context_args(cmd: &mut Command) {
+    if let Some(workspace) = valid_cmux_env_ref("CMUX_WORKSPACE_ID") {
+        cmd.arg("--workspace").arg(workspace);
+    }
+    if let Some(window) = valid_cmux_env_ref("CMUX_WINDOW_ID") {
+        cmd.arg("--window").arg(window);
+    }
+    if let Some(surface) = valid_cmux_env_ref("CMUX_SURFACE_ID") {
+        cmd.arg("--surface").arg(surface);
+    }
+}
+
+fn valid_cmux_env_ref(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    is_valid_cmux_ref(&value).then_some(value)
+}
+
+fn is_valid_cmux_ref(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.split(':').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        })
 }
 
 fn ssh_attach(host: &str, target: &str, ssh_args: Vec<String>) -> Result<()> {
@@ -2781,8 +2807,8 @@ mod tests {
             ("gemini", "gemini", "gemini-lterm", false),
             ("kimi", "kimi", "kimi-lterm", false),
             ("qwen", "qwen", "qwen-lterm", false),
-            ("omx", "omx", "omx-lterm", true),
-            ("omc", "omc", "omc-lterm", true),
+            ("omx", "omx", "omx-lterm", false),
+            ("omc", "omc", "omc-lterm", false),
         ] {
             let profile = AgentProfile::resolve(name).expect("built-in profile");
             assert_eq!(profile.binary, binary, "{name}");
@@ -2833,7 +2859,7 @@ mod tests {
             .expect("omc profile info");
         assert_eq!(omc.binary, "omc");
         assert_eq!(omc.session_base, "omc-lterm");
-        assert!(omc.status_default);
+        assert!(!omc.status_default);
     }
 
     #[test]
@@ -2955,6 +2981,17 @@ mod tests {
             ..AgentLaunchOptions::default()
         };
         assert!(!no_status.show_status(true));
+    }
+
+    #[test]
+    fn cmux_notification_context_accepts_only_safe_refs() {
+        assert!(is_valid_cmux_ref("surface:1"));
+        assert!(is_valid_cmux_ref("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!is_valid_cmux_ref(""));
+        assert!(!is_valid_cmux_ref("-bad"));
+        assert!(!is_valid_cmux_ref("surface:"));
+        assert!(!is_valid_cmux_ref("surface:bad/value"));
+        assert!(!is_valid_cmux_ref("surface:\u{1b}[31m"));
     }
 
     #[test]
