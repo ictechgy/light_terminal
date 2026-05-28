@@ -142,7 +142,6 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "send-keys" | "send" => send_keys(rest),
         "kill-pane" | "killp" => kill_pane(rest),
         "resize-pane" | "resizep" => resize_pane(rest),
-        "refresh-client" | "refresh" => Ok(0),
         "select-pane" | "selectp" => Ok(0),
         "select-layout" | "selectl" => Ok(0),
         "set-option" | "set" | "setw" | "set-window-option" => Ok(0),
@@ -920,59 +919,14 @@ fn parse_resize_dimension(flag: char, value: Option<String>) -> Result<u16> {
 
 fn show_option(args: &[String]) -> Result<i32> {
     if show_option_prints_value(args) {
-        let option = show_option_name(args);
-        let value = tmux_option_value(option.as_deref());
-        if show_option_value_only(args) {
-            println!("{value}");
-        } else if let Some(option) = option {
-            println!("{option} {value}");
-        } else {
-            println!("{value}");
-        }
+        // Return a conservative default for scripts that query options.
+        println!("off");
     }
     Ok(0)
 }
 
 fn show_option_prints_value(args: &[String]) -> bool {
     has_flag(args, "-g") || has_flag(args, "-v")
-}
-
-fn show_option_value_only(args: &[String]) -> bool {
-    has_flag(args, "-v")
-}
-
-fn show_option_name(args: &[String]) -> Option<String> {
-    const VALUE_FLAGS: &[char] = &['t'];
-    let mut option = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                option = args.get(i + 1).cloned();
-                break;
-            }
-            flag if flag.starts_with('-') && flag != "-" => {
-                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
-            }
-            value => {
-                option = Some(value.to_string());
-                i += 1;
-            }
-        }
-    }
-    option
-}
-
-fn tmux_option_value(option: Option<&str>) -> &'static str {
-    match option {
-        // Claude Code / OMC query this through the tmux shim to decide whether
-        // focus tracking and completion notifications are reliable. lterm does
-        // not run a real tmux server, but attached PTY streams are raw and focus
-        // events can pass through the host terminal/cmux layer, so reporting
-        // "on" avoids a misleading "tmux focus-events off" warning.
-        Some("focus-events") => "on",
-        _ => "off",
-    }
 }
 
 fn display_popup(args: &[String]) -> Result<i32> {
@@ -2223,7 +2177,7 @@ fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> St
 
 fn command_support_tier(command: &str) -> &'static str {
     match command {
-        "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-option"
+        "select-layout" | "select-pane" | "set-environment" | "set-option"
         | "set-window-option" | "show-environment" => "noop",
         "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
         | "list-commands" | "list-sessions" | "rename-session" | "send-keys" => "full",
@@ -2263,7 +2217,6 @@ const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
     ("load-buffer", Some("loadb"), &[]),
     ("new-session", Some("new"), &[]),
     ("paste-buffer", Some("pasteb"), &[]),
-    ("refresh-client", Some("refresh"), &[]),
     ("rename-session", Some("rename"), &[]),
     ("resize-pane", Some("resizep"), &[]),
     ("save-buffer", Some("saveb"), &[]),
@@ -2301,7 +2254,6 @@ fn command_usage(command: &str) -> &'static str {
         "load-buffer" => "path",
         "new-session" => "[-d] [-c start-directory] [-s session-name] [shell-command]",
         "paste-buffer" => "[-t target-pane]",
-        "refresh-client" => "[-S] [-t target-client]",
         "rename-session" => "[-t target-session] new-name",
         "resize-pane" => "[-x width] [-y height] [-t target-pane]",
         "save-buffer" => "path",
@@ -2492,17 +2444,6 @@ mod tests {
         assert!(show_option_prints_value(&args(["-gv", "status"])));
         assert!(show_option_prints_value(&args(["-qg", "status"])));
         assert!(!show_option_prints_value(&args(["status"])));
-    }
-
-    #[test]
-    fn show_option_reports_focus_events_on_for_agent_tuis() {
-        assert_eq!(
-            show_option_name(&args(["-gqv", "focus-events"])).as_deref(),
-            Some("focus-events")
-        );
-        assert_eq!(tmux_option_value(Some("focus-events")), "on");
-        assert_eq!(tmux_option_value(Some("status")), "off");
-        assert!(show_option_value_only(&args(["-gqv", "focus-events"])));
     }
 
     #[test]

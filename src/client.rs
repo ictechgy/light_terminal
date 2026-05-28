@@ -214,7 +214,7 @@ pub fn new_session(
     name: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
-    mut env: std::collections::HashMap<String, String>,
+    env: std::collections::HashMap<String, String>,
     status_theme: Option<StatusTheme>,
     tmux: bool,
 ) -> Result<SessionInfo> {
@@ -224,7 +224,6 @@ pub fn new_session(
     }
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
-    inherit_terminal_capability_env(&mut env);
     rpc(&Request::New {
         name,
         command,
@@ -238,39 +237,6 @@ pub fn new_session(
         tmux,
     })
 }
-
-fn inherit_terminal_capability_env(env: &mut std::collections::HashMap<String, String>) {
-    for key in TERMINAL_CAPABILITY_ENV {
-        if env.contains_key(*key) {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                env.insert((*key).to_string(), value);
-            }
-        }
-    }
-}
-
-const TERMINAL_CAPABILITY_ENV: &[&str] = &[
-    "TERM",
-    "COLORTERM",
-    "TERM_PROGRAM",
-    "TERM_PROGRAM_VERSION",
-    "LC_TERMINAL",
-    "LC_TERMINAL_VERSION",
-    "TERMINAL_EMULATOR",
-    "VTE_VERSION",
-    "KITTY_WINDOW_ID",
-    "WEZTERM_EXECUTABLE",
-    "WT_SESSION",
-    "ITERM_SESSION_ID",
-    "TERM_SESSION_ID",
-    "NO_COLOR",
-    "FORCE_COLOR",
-    "CLICOLOR",
-    "CLICOLOR_FORCE",
-];
 
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
     ensure_server()?;
@@ -2474,7 +2440,7 @@ fn resolve_status_style(session_theme: Option<StatusTheme>) -> StatusStyle {
             };
         }
     }
-    if theme_explicit || !prefers_minimal_status_style() {
+    if theme_explicit || !is_ssh_session() {
         StatusStyle::Full(theme)
     } else {
         StatusStyle::Minimal
@@ -2505,17 +2471,6 @@ fn is_ssh_session() -> bool {
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         .iter()
         .any(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
-}
-
-fn prefers_minimal_status_style() -> bool {
-    is_ssh_session() || is_termius_session()
-}
-
-fn is_termius_session() -> bool {
-    ["TERM_PROGRAM", "LC_TERMINAL", "TERMINAL_EMULATOR"]
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .any(|value| value.to_ascii_lowercase().contains("termius"))
 }
 
 struct StatusBar {
@@ -2634,14 +2589,7 @@ impl StatusBar {
             // 중간에 남아 "statusline 여러 개"처럼 보인다.
             payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
-        let current_row_clear = if self.drawn_status_rows.contains(&rows) {
-            ""
-        } else {
-            "\x1b[2K"
-        };
-        payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b8"
-        ));
+        payload.push_str(&format!("\x1b[{rows};1H\x1b[2K{sgr}{line}\x1b[0m\x1b8"));
         stdout
             .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
@@ -3648,77 +3596,6 @@ mod tests {
         status_bar.style = None;
     }
 
-    #[test]
-    fn status_bar_same_row_redraw_avoids_clear_to_reduce_flicker() {
-        let mut status_bar = StatusBar {
-            session_name: "omx-lterm".to_string(),
-            pane_id: "%0".to_string(),
-            style: Some(StatusStyle::Full(StatusTheme::Blue)),
-            drawn_status_rows: Vec::new(),
-        };
-        let mut output = Vec::new();
-
-        status_bar
-            .draw_at_size(&mut output, 80, 24)
-            .expect("initial draw");
-        output.clear();
-        status_bar
-            .draw_at_size(&mut output, 80, 24)
-            .expect("same-row redraw");
-
-        let payload = String::from_utf8(output).expect("status payload should be utf8");
-        assert!(
-            payload.contains("\x1b[24;1H\x1b[0;30;104m"),
-            "same-row redraw should repaint in place with the status style: {payload:?}"
-        );
-        assert!(
-            !payload.contains("\x1b[24;1H\x1b[2K"),
-            "same-row heartbeat redraws should not clear the current row and visibly flicker: {payload:?}"
-        );
-        status_bar.style = None;
-    }
-
-    #[test]
-    fn new_sessions_inherit_current_terminal_capability_env_without_overwriting_explicit_values() {
-        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
-        let _env_guard = EnvGuard::capture(&[
-            "TERM",
-            "COLORTERM",
-            "TERM_PROGRAM",
-            "LC_TERMINAL",
-            "LTERM_AGENT",
-        ]);
-
-        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
-            std::env::set_var("COLORTERM", "truecolor");
-            std::env::set_var("TERM_PROGRAM", "Termius");
-            std::env::set_var("LC_TERMINAL", "iTerm2");
-            std::env::set_var("LTERM_AGENT", "host-value");
-        }
-
-        let mut env = std::collections::HashMap::from([
-            ("LTERM_AGENT".to_string(), "omx".to_string()),
-            ("LC_TERMINAL".to_string(), "explicit-client".to_string()),
-        ]);
-        super::inherit_terminal_capability_env(&mut env);
-
-        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
-        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
-        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Termius"));
-        assert_eq!(
-            env.get("LC_TERMINAL").map(String::as_str),
-            Some("explicit-client"),
-            "caller-supplied session env should stay authoritative"
-        );
-        assert_eq!(
-            env.get("LTERM_AGENT").map(String::as_str),
-            Some("omx"),
-            "only terminal capability keys should be inherited"
-        );
-    }
-
     /// PR #15 quad-review HIGH 후속(#2): 성공 응답은 last 를 advance 시키는 Outcome
     /// 으로 매핑되어야 한다. resize_thread 의 정상 경로가 흔들리지 않는지 핀 박는다.
     #[test]
@@ -4305,9 +4182,6 @@ mod tests {
             "SSH_CONNECTION",
             "SSH_CLIENT",
             "SSH_TTY",
-            "TERM_PROGRAM",
-            "LC_TERMINAL",
-            "TERMINAL_EMULATOR",
         ]);
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
@@ -4317,9 +4191,6 @@ mod tests {
             std::env::remove_var("SSH_CONNECTION");
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
-            std::env::remove_var("TERM_PROGRAM");
-            std::env::remove_var("LC_TERMINAL");
-            std::env::remove_var("TERMINAL_EMULATOR");
 
             std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
             std::env::set_var("LTERM_STATUS_STYLE", "full");
@@ -4349,15 +4220,6 @@ mod tests {
             StatusStyle::Full(StatusTheme::Blue)
         );
 
-        unsafe {
-            std::env::set_var("TERM_PROGRAM", "Termius");
-        }
-        assert_eq!(
-            resolve_status_style(None),
-            StatusStyle::Minimal,
-            "Termius-style mobile terminals should default to plain status rendering"
-        );
-
         // EnvGuard 가 drop 되면서 원래 환경 변수 값을 복원한다.
     }
 
@@ -4372,9 +4234,6 @@ mod tests {
             "SSH_CONNECTION",
             "SSH_CLIENT",
             "SSH_TTY",
-            "TERM_PROGRAM",
-            "LC_TERMINAL",
-            "TERMINAL_EMULATOR",
         ]);
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
@@ -4383,9 +4242,6 @@ mod tests {
             std::env::remove_var("SSH_CONNECTION");
             std::env::remove_var("SSH_CLIENT");
             std::env::remove_var("SSH_TTY");
-            std::env::remove_var("TERM_PROGRAM");
-            std::env::remove_var("LC_TERMINAL");
-            std::env::remove_var("TERMINAL_EMULATOR");
             std::env::set_var("LTERM_STATUS_THEME", "green");
         }
         assert_eq!(
