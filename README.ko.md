@@ -209,7 +209,7 @@ recorder는 JSONL artifact만 쓰고 raw capture는 `--max-bytes`(기본 16 MiB)
 block 중인 `wait` / `watch` check 수를 제한해 자동화가 무제한 waiter를
 만들지 못하게 합니다.
 
-`LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 색이 있는 bar를 그리고, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄이지만, 세션 또는 환경 theme을 명시하면 색이 유지됩니다.
+`LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 색이 있는 bar를 그리고, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)과 Termius 계열 클라이언트(터미널 식별 환경 변수 감지)에서는 자동으로 `minimal`이 적용되어 모바일 색상 매핑 문제를 줄이지만, 세션 또는 환경 theme을 명시하면 색이 유지됩니다.
 
 `LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` 으로 attach client의 기본 status bar 색을 바꿀 수 있습니다. 세션별 override가 환경값보다 우선합니다: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, `lterm status-theme api plain`. 이 변수를 shell startup 파일에서 export하면 SSH attach도 colored status bar로 opt-in됩니다. 모바일 SSH client에서 plain text가 필요하면 unset하거나 `LTERM_STATUS_STYLE=minimal`을 설정하세요. Theme 이름은 고정 allowlist에서만 파싱되며, lterm은 사용자 입력 escape sequence를 status row에 임의 삽입하지 않습니다.
 

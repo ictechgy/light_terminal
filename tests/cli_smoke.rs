@@ -991,6 +991,68 @@ fn watch_contains_notify_invokes_cmux_with_sanitized_message() -> TestResult {
 }
 
 #[test]
+fn watch_notify_targets_cmux_context_when_available() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-context.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = std::env::join_paths([fake_bin.as_path()])?;
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-notify-context",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; exit 0",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-notify-context");
+
+    let mut watch = env.cmd();
+    watch
+        .env("PATH", path)
+        .env("CMUX_WORKSPACE_ID", "workspace:2")
+        .env("CMUX_WINDOW_ID", "window:1")
+        .env("CMUX_SURFACE_ID", "surface:7")
+        .env("CMUX_PANE_ID", "pane:ignored");
+    let output = watch
+        .args([
+            "watch",
+            "watch-notify-context",
+            "--exit",
+            "--timeout",
+            "5s",
+            "--notify",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let cmux = wait_for_file_contents(&cmux_log)?;
+    assert!(cmux.contains("notify"), "{cmux:?}");
+    assert!(cmux.contains("--workspace"), "{cmux:?}");
+    assert!(cmux.contains("workspace:2"), "{cmux:?}");
+    assert!(cmux.contains("--window"), "{cmux:?}");
+    assert!(cmux.contains("window:1"), "{cmux:?}");
+    assert!(cmux.contains("--surface"), "{cmux:?}");
+    assert!(cmux.contains("surface:7"), "{cmux:?}");
+    assert!(!cmux.contains("pane:ignored"), "{cmux:?}");
+    Ok(())
+}
+
+#[test]
 fn watch_json_notify_without_cmux_keeps_stdout_machine_readable() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -4591,6 +4653,24 @@ fn tmux_compat_display_message_accepts_empty_format_value() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_reports_focus_events_enabled() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args(["tmux-compat", "show-option", "-gqv", "focus-events"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "on");
+
+    let refresh = env
+        .cmd()
+        .args(["tmux-compat", "refresh-client", "-S"])
+        .output()?;
+    assert!(refresh.status.success(), "{refresh:?}");
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_missing_target_value_does_not_fall_back_to_default() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -6408,6 +6488,56 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
 }
 
 #[test]
+fn tmux_sessions_preserve_current_terminal_identity_for_color_detection() -> TestResult {
+    let env = TestEnv::new()?;
+    let anchor = env
+        .cmd()
+        .env_remove("TERM_PROGRAM")
+        .env_remove("LC_TERMINAL")
+        .env_remove("COLORTERM")
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "term-env-anchor",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 5",
+        ])
+        .status()?;
+    assert!(anchor.success());
+    let _anchor_cleanup = SessionCleanup::new(&env, "term-env-anchor");
+
+    let status = env
+        .cmd()
+        .env("TERM_PROGRAM", "Termius")
+        .env("LC_TERMINAL", "Termius")
+        .env("COLORTERM", "truecolor")
+        .args([
+            "new",
+            "--tmux",
+            "--detach",
+            "--name",
+            "term-env-child",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'TERM_PROGRAM:%s\\n' \"${TERM_PROGRAM-}\"; printf 'LC_TERMINAL:%s\\n' \"${LC_TERMINAL-}\"; printf 'COLORTERM:%s\\n' \"${COLORTERM-}\"; printf 'TMUX_PANE:%s\\n' \"${TMUX_PANE-}\"; sleep 1",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _child_cleanup = SessionCleanup::new(&env, "term-env-child");
+
+    let captured = env.capture_until("term-env-child", "TMUX_PANE:")?;
+    assert!(captured.contains("TERM_PROGRAM:Termius"), "{captured:?}");
+    assert!(captured.contains("LC_TERMINAL:Termius"), "{captured:?}");
+    assert!(captured.contains("COLORTERM:truecolor"), "{captured:?}");
+    assert!(captured.contains("TMUX_PANE:%1"), "{captured:?}");
+    Ok(())
+}
+
+#[test]
 fn configured_agent_profile_launches_configured_binary() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
@@ -6681,7 +6811,7 @@ fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
         );
         assert!(
             contains_subsequence(&default_output, &status_indicator),
-            "{alias} should default to the lterm status bar after cmux surface targeting was fixed: {:?}",
+            "{alias} should keep the lterm status bar by default while status rendering is hardened: {:?}",
             String::from_utf8_lossy(&default_output)
         );
 

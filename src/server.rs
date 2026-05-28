@@ -1738,7 +1738,6 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     if params.tmux {
         cmd.env("TMUX", fake_tmux_value()?);
         cmd.env("TMUX_PANE", &pane_id);
-        cmd.env("TERM_PROGRAM", "lterm");
         let shim = tmux_shim.context("missing tmux shim path")?;
         let old_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{old_path}", shim.display()));
