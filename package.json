@@ -21,6 +21,10 @@
   "bin": {
     "lterm": "bin/lterm.js"
   },
+  "scripts": {
+    "prepublishOnly": "node scripts/validate_npm_packages.mjs",
+    "validate:npm-packages": "node scripts/validate_npm_packages.mjs"
+  },
   "files": [
     "bin/lterm.js",
     "docs/assets/lterm-demo.svg",
@@ -28,7 +32,8 @@
     "README.ko.md",
     "LICENSE",
     "LICENSE-APACHE",
-    "LICENSE-MIT"
+    "LICENSE-MIT",
+    "scripts/validate_npm_packages.mjs"
   ],
   "optionalDependencies": {
     "lterm-darwin-arm64": "1.0.8",

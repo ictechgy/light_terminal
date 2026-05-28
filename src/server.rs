@@ -25,6 +25,8 @@ use uuid::Uuid;
 const RING_LIMIT: usize = 2 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
+const MAX_BLOCKING_WAITS: usize = 16;
+const MAX_WAIT_CONTAINS_NEEDLE_BYTES: usize = 4096;
 const MAX_SESSIONS: usize = 256;
 const MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
 const MAX_TERMINAL_ROWS: u16 = 1000;
@@ -127,6 +129,7 @@ struct State {
     sessions: Mutex<SessionMaps>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
+    active_blocking_waits: AtomicUsize,
     // 데몬 시작 시각(UNIX epoch seconds). doctor의 uptime 계산용. None이면
     // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
     // 보내 client가 uptime을 omit하게 한다.
@@ -165,6 +168,28 @@ impl State {
             }
         }
     }
+
+    fn try_acquire_blocking_wait(self: &Arc<Self>) -> Option<BlockingWaitGuard> {
+        let mut current = self.active_blocking_waits.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_BLOCKING_WAITS {
+                return None;
+            }
+            match self.active_blocking_waits.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(BlockingWaitGuard {
+                        state: Arc::clone(self),
+                    });
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
 }
 
 struct ConnectionGuard {
@@ -174,6 +199,18 @@ struct ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct BlockingWaitGuard {
+    state: Arc<State>,
+}
+
+impl Drop for BlockingWaitGuard {
+    fn drop(&mut self) {
+        self.state
+            .active_blocking_waits
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1497,6 +1534,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::ok(session.capture(start, end)))
         }
         Request::WaitExit { target, timeout_ms } => {
+            let _wait_guard = state.try_acquire_blocking_wait().ok_or_else(|| {
+                anyhow!(
+                    "too many concurrent wait requests (limit {MAX_BLOCKING_WAITS}); retry after another wait finishes or use --timeout"
+                )
+            })?;
             let session = resolve_session(state, &target)?;
             Ok(Response::ok(wait_for_session_exit(&session, timeout_ms)?))
         }
@@ -1506,6 +1548,12 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             start,
             timeout_ms,
         } => {
+            validate_wait_contains_needle(&needle)?;
+            let _wait_guard = state.try_acquire_blocking_wait().ok_or_else(|| {
+                anyhow!(
+                    "too many concurrent wait requests (limit {MAX_BLOCKING_WAITS}); retry after another wait finishes or use --timeout"
+                )
+            })?;
             let session = resolve_session(state, &target)?;
             Ok(Response::ok(wait_for_session_contains(
                 &session, &needle, start, timeout_ms,
@@ -2409,9 +2457,7 @@ fn wait_for_session_contains(
     start: Option<i32>,
     timeout_ms: Option<u64>,
 ) -> Result<WaitContainsResult> {
-    if needle.is_empty() {
-        bail!("wait contains text cannot be empty");
-    }
+    validate_wait_contains_needle(needle)?;
     let started = Instant::now();
     let deadline = timeout_ms
         .map(Duration::from_millis)
@@ -2500,6 +2546,19 @@ fn wait_for_session_contains(
             };
         }
     }
+}
+
+fn validate_wait_contains_needle(needle: &str) -> Result<()> {
+    if needle.is_empty() {
+        bail!("wait contains text cannot be empty");
+    }
+    if needle.len() > MAX_WAIT_CONTAINS_NEEDLE_BYTES {
+        bail!(
+            "wait contains text exceeds {} bytes",
+            MAX_WAIT_CONTAINS_NEEDLE_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn terminate_process_group_for_request(session: &Session) {

@@ -17,10 +17,19 @@ on:
         required: true
         type: boolean
         default: true
+      allow_existing_platforms:
+        description: "Allow non-dry-run wrapper publish without rebuilding platform packages"
+        required: true
+        type: boolean
+        default: false
+      allow_npm_token_fallback:
+        description: "Expose NPM_TOKEN to publish steps instead of using trusted publishing/OIDC only"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: publish-npm-${{ inputs.tag }}
@@ -50,7 +59,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       commit_sha: ${{ steps.meta.outputs.commit_sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
@@ -79,6 +88,8 @@ jobs:
             echo "input tag $TAG does not match package version $version" >&2
             exit 64
           fi
+
+          node scripts/validate_npm_packages.mjs
 
           for dir in npm/platforms/lterm-darwin-arm64 npm/platforms/lterm-darwin-x64 npm/platforms/lterm-linux-arm64 npm/platforms/lterm-linux-x64; do
             package_version=$(node -p "require('./${dir}/package.json').version")
@@ -113,11 +124,11 @@ jobs:
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.metadata.outputs.commit_sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -146,7 +157,7 @@ jobs:
           set -euo pipefail
           scripts/prepare-npm-platform-package.sh "${{ matrix.target }}" target/release/lterm
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.package }}
           path: npm/platforms/${{ matrix.package }}/bin/lterm
@@ -159,18 +170,21 @@ jobs:
     if: ${{ always() && needs.metadata.result == 'success' && (!inputs.publish_platforms || needs.build.result == 'success') }}
     runs-on: ubuntu-latest
     environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.metadata.outputs.commit_sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         if: ${{ inputs.publish_platforms }}
         with:
           path: artifacts
@@ -187,6 +201,18 @@ jobs:
             ls -lh "npm/platforms/${package}/bin/lterm"
           done
 
+      - name: Validate npm package graph
+        shell: bash
+        env:
+          PUBLISH_PLATFORMS: ${{ inputs.publish_platforms }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_PLATFORMS" == "true" ]]; then
+            node scripts/validate_npm_packages.mjs --require-binaries
+          else
+            node scripts/validate_npm_packages.mjs
+          fi
+
       - name: Show npm version
         shell: bash
         run: npm --version
@@ -195,7 +221,7 @@ jobs:
         if: ${{ inputs.publish_platforms }}
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ inputs.allow_npm_token_fallback && secrets.NPM_TOKEN || '' }}
           DRY_RUN: ${{ inputs.dry_run }}
           VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
@@ -206,7 +232,7 @@ jobs:
           else
             publish_flags+=(--provenance)
             if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-              echo "NPM_TOKEN secret is empty; npm will try trusted publishing/OIDC. This only works after trusted publishers are configured for existing packages." >&2
+              echo "NPM_TOKEN fallback is disabled or empty; npm will try trusted publishing/OIDC. This requires trusted publishers for existing packages." >&2
             fi
           fi
 
@@ -229,7 +255,7 @@ jobs:
       - name: Publish wrapper package last
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ inputs.allow_npm_token_fallback && secrets.NPM_TOKEN || '' }}
           DRY_RUN: ${{ inputs.dry_run }}
           PUBLISH_PLATFORMS: ${{ inputs.publish_platforms }}
           VALIDATED_VERSION: ${{ needs.metadata.outputs.version }}
@@ -248,6 +274,10 @@ jobs:
             exit 65
           fi
           if [[ "$DRY_RUN" != "true" && "$PUBLISH_PLATFORMS" != "true" ]]; then
+            if [[ "${{ inputs.allow_existing_platforms }}" != "true" ]]; then
+              echo "non-dry-run wrapper publish requires publish_platforms=true unless allow_existing_platforms=true" >&2
+              exit 67
+            fi
             for platform_package in lterm-darwin-arm64 lterm-darwin-x64 lterm-linux-arm64 lterm-linux-x64; do
               if ! npm view "${platform_package}@${version}" version >/dev/null 2>&1; then
                 echo "missing required platform package ${platform_package}@${version}; refusing to publish wrapper without platform build" >&2

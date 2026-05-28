@@ -93,6 +93,21 @@ def command_argv(command: str, prefix: list[str]) -> list[str]:
     return [*prefix, *parts[1:]]
 
 
+SESSION_ENV_KEYS = (
+    "LTERM_SOCKET",
+    "LTERM_SESSION",
+    "LTERM_PANE",
+    "LTERM_PARENT_TOKEN",
+    "TMUX",
+    "TMUX_PANE",
+)
+
+
+def scrub_lterm_session_env(env: dict[str, str]) -> None:
+    for key in SESSION_ENV_KEYS:
+        env.pop(key, None)
+
+
 def expected_success(entry: dict[str, Any]) -> bool:
     return entry.get("expected_exit_code", 0) == 0
 
@@ -104,7 +119,7 @@ def run_example(example: Example, entry: dict[str, Any], prefix: list[str], repo
         env["LTERM_RUNTIME_DIR"] = str(Path(tmp) / "run")
         env["LTERM_DATA_DIR"] = str(Path(tmp) / "data")
         env["TMPDIR"] = tmp
-        env.pop("LTERM_SOCKET", None)
+        scrub_lterm_session_env(env)
         try:
             proc = subprocess.run(
                 command_argv(example.command, prefix),

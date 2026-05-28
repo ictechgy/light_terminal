@@ -30,6 +30,14 @@ DOC_OWNER_PATHS = {
     "docs/public-contract.md": Path("docs/public-contract.md"),
     "docs/agent-install.md": Path("docs/agent-install.md"),
 }
+SESSION_ENV_KEYS = (
+    "LTERM_SOCKET",
+    "LTERM_SESSION",
+    "LTERM_PANE",
+    "LTERM_PARENT_TOKEN",
+    "TMUX",
+    "TMUX_PANE",
+)
 
 
 def repo_root_for(manifest_path: Path) -> Path:
@@ -41,6 +49,11 @@ def repo_root_for(manifest_path: Path) -> Path:
 def load_json(path: Path) -> Any:
     with path.open(encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def scrub_lterm_session_env(env: dict[str, str]) -> None:
+    for key in SESSION_ENV_KEYS:
+        env.pop(key, None)
 
 
 def manifest_entries(manifest: Any) -> list[dict[str, Any]]:
@@ -82,7 +95,7 @@ def run_help(lterm_bin: str, repo_root: Path) -> str:
         env["LTERM_RUNTIME_DIR"] = str(tmp_path / "run")
         env["LTERM_DATA_DIR"] = str(tmp_path / "data")
         env["TMPDIR"] = tmp
-        env.pop("LTERM_SOCKET", None)
+        scrub_lterm_session_env(env)
         proc = subprocess.run(
             [lterm_bin, "--help"],
             cwd=repo_root,

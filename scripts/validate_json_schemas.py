@@ -297,6 +297,21 @@ def lterm_prefix(repo_root: Path, explicit: str | None) -> list[str]:
     return ["cargo", "run", "--quiet", "--"]
 
 
+SESSION_ENV_KEYS = (
+    "LTERM_SOCKET",
+    "LTERM_SESSION",
+    "LTERM_PANE",
+    "LTERM_PARENT_TOKEN",
+    "TMUX",
+    "TMUX_PANE",
+)
+
+
+def scrub_lterm_session_env(env: dict[str, str]) -> None:
+    for key in SESSION_ENV_KEYS:
+        env.pop(key, None)
+
+
 def run_lterm(prefix: list[str], argv: list[str], env: dict[str, str], cwd: Path, timeout: int = 15) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [*prefix, *argv],
@@ -333,7 +348,7 @@ def validate_sample(entry: dict[str, Any], schema: Json, schema_dir: Path, store
             env["LTERM_RUNTIME_DIR"] = str(Path(tmp) / "run")
             env["LTERM_DATA_DIR"] = str(Path(tmp) / "data")
             env["TMPDIR"] = tmp
-            env.pop("LTERM_SOCKET", None)
+            scrub_lterm_session_env(env)
             try:
                 for setup in spec.get("setup", []):
                     proc = run_lterm(prefix, [str(part) for part in setup], env, repo_root)

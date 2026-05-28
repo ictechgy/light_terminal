@@ -36,6 +36,8 @@ const TRACE_FORMAT: &str = "lterm-trace-jsonl";
 const TRACE_SCHEMA_VERSION: &str = "1.0";
 const MAX_TRACE_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_TRACE_REPLAY_CHUNK_BYTES: u64 = 1024 * 1024;
+const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = DEFAULT_TRACE_MAX_BYTES;
+const MAX_TRACE_REPLAY_CHUNKS: u64 = 16 * 1024;
 const MAX_TRACE_REPLAY_DELAY_MS: u64 = 60 * 1000;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 static VERSION_STATUS_CHECKED: AtomicBool = AtomicBool::new(false);
@@ -487,6 +489,19 @@ struct TraceFileSummary {
     unknown_events: u64,
 }
 
+#[derive(Debug)]
+struct TraceReplayChunk {
+    line_number: usize,
+    elapsed_ms: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct TraceReplayPlan {
+    chunks: Vec<TraceReplayChunk>,
+    total_bytes: u64,
+}
+
 pub fn trace_output(
     target: &str,
     output_path: &Path,
@@ -631,16 +646,48 @@ pub fn trace_output(
 }
 
 pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
+    let plan = validate_trace_replay(input_path, timing)?;
+    let mut stdout = std::io::stdout().lock();
+    let mut previous_elapsed_ms = 0_u64;
+
+    for chunk in plan.chunks {
+        if timing {
+            let delay_ms = chunk.elapsed_ms.saturating_sub(previous_elapsed_ms);
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+        }
+        previous_elapsed_ms = chunk.elapsed_ms;
+        stdout.write_all(&chunk.bytes).with_context(|| {
+            format!(
+                "replay trace bytes from {} line {}",
+                input_path.display(),
+                chunk.line_number
+            )
+        })?;
+        if timing {
+            stdout.flush().with_context(|| {
+                format!("flush timed trace chunk from {}", input_path.display())
+            })?;
+        }
+    }
+
+    stdout
+        .flush()
+        .with_context(|| format!("flush replayed trace {}", input_path.display()))
+}
+
+fn validate_trace_replay(input_path: &Path, timing: bool) -> Result<TraceReplayPlan> {
     let file = std::fs::File::open(input_path)
         .with_context(|| format!("open trace file {}", input_path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut stdout = std::io::stdout().lock();
     let mut start_seen = false;
     let mut end_seen = false;
     let mut previous_elapsed_ms = 0_u64;
     let mut expected_chunk_index = 0_u64;
     let mut replayed_bytes = 0_u64;
     let mut line_number = 0_usize;
+    let mut plan = TraceReplayPlan::default();
 
     while let Some(line) = read_trace_jsonl_line(&mut reader, &mut line_number, input_path)? {
         if line.trim().is_empty() {
@@ -713,6 +760,12 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                         input_path.display()
                     );
                 }
+                if expected_chunk_index >= MAX_TRACE_REPLAY_CHUNKS {
+                    bail!(
+                        "trace replay chunk count exceeds safety cap {}",
+                        MAX_TRACE_REPLAY_CHUNKS
+                    );
+                }
                 let elapsed_ms = required_trace_u64(&event, "elapsed_ms", input_path, line_number)?;
                 if elapsed_ms < previous_elapsed_ms {
                     bail!(
@@ -749,6 +802,12 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                         encoded_len
                     );
                 }
+                if plan.total_bytes.saturating_add(expected_len) > MAX_TRACE_REPLAY_TOTAL_BYTES {
+                    bail!(
+                        "trace replay total bytes exceed safety cap {}",
+                        MAX_TRACE_REPLAY_TOTAL_BYTES
+                    );
+                }
                 let bytes = hex_decode(bytes_hex).with_context(|| {
                     format!(
                         "decode bytes_hex on trace line {line_number} from {}",
@@ -765,21 +824,16 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                             MAX_TRACE_REPLAY_DELAY_MS
                         );
                     }
-                    if delay_ms > 0 {
-                        thread::sleep(Duration::from_millis(delay_ms));
-                    }
                 }
                 previous_elapsed_ms = elapsed_ms;
-                stdout
-                    .write_all(&bytes)
-                    .with_context(|| format!("replay trace bytes from {}", input_path.display()))?;
+                plan.total_bytes = plan.total_bytes.saturating_add(expected_len);
                 replayed_bytes = replayed_bytes.saturating_add(expected_len);
                 expected_chunk_index = expected_chunk_index.saturating_add(1);
-                if timing {
-                    stdout.flush().with_context(|| {
-                        format!("flush timed trace chunk from {}", input_path.display())
-                    })?;
-                }
+                plan.chunks.push(TraceReplayChunk {
+                    line_number,
+                    elapsed_ms,
+                    bytes,
+                });
             }
             "end" => {
                 if !start_seen {
@@ -814,6 +868,12 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
                     );
                 }
                 if let Some(bytes_recorded) = optional_trace_u64(&event, "bytes_recorded") {
+                    if bytes_recorded > MAX_TRACE_REPLAY_TOTAL_BYTES {
+                        bail!(
+                            "trace replay total bytes exceed safety cap {}",
+                            MAX_TRACE_REPLAY_TOTAL_BYTES
+                        );
+                    }
                     if bytes_recorded != replayed_bytes {
                         bail!(
                             "trace line {} from {} records {} bytes but replay saw {}",
@@ -854,9 +914,7 @@ pub fn replay_trace(input_path: &Path, timing: bool) -> Result<()> {
             input_path.display()
         );
     }
-    stdout
-        .flush()
-        .with_context(|| format!("flush replayed trace {}", input_path.display()))
+    Ok(plan)
 }
 
 pub fn print_trace_info(input_path: &Path, json_output: bool) -> Result<()> {
