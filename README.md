@@ -6,8 +6,8 @@
 
 - **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI agent tooling. Detach and reattach by name or pane id.
 - **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
-- **How** — `lterm start` to create, `lterm resume` to (re)connect, `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` and other built-in shortcuts for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
-- **Status** — alpha MVP. A same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
+- **How** — `lterm start` to create, `lterm resume` to (re)connect, and `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` as examples of built-in shortcuts for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
+- **Status** — alpha MVP with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
 
@@ -64,7 +64,7 @@ npm install -g @ictechgy/lterm
 
 Homebrew and npm both install the `lterm` command on your `PATH`; verify with `lterm --version`.
 
-Too lazy to install it manually? Copy the prompt in
+Prefer an agent-assisted install? Copy the prompt in
 [`docs/agent-install.md`](docs/agent-install.md) into Claude Code, Codex CLI,
 OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, or another terminal coding agent. It asks the agent to detect your
 platform, install `lterm`, verify it with a smoke test, and avoid modifying
@@ -74,13 +74,14 @@ For the 1.0 command/output stability boundary, see the
 [public contract](docs/public-contract.md) and its machine-readable
 [contract manifest](docs/contract-manifest.json).
 
-With Cargo from GitHub (use the latest tag from the Releases page):
+With Cargo from GitHub, pin a release tag. The example below uses the current
+README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.7
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.8
 ```
 
-From this checkout, use Rust 1.85 or newer:
+Building from this checkout requires Rust 1.85 or newer:
 
 ```bash
 cargo build --release --locked
@@ -97,7 +98,8 @@ To expose the tmux shim:
 
 ```bash
 lterm install-shim
-# Add the printed directory to PATH ahead of the real tmux, or eval the helper:
+# Add the printed directory to PATH ahead of the real tmux, or inspect and eval the helper:
+lterm env
 eval "$(lterm env)"
 # fish:
 lterm env --shell fish | source
@@ -113,7 +115,7 @@ lterm env --shell fish | source
 lterm start -n api -- npm run dev
 ```
 
-**Create detached, attach later:**
+**Create a detached session and attach later:**
 
 ```bash
 lterm start -d -n api -- npm run dev
@@ -148,7 +150,7 @@ lterm -a api
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
 | Collect a redacted local diagnostic bundle | `lterm diagnose --bundle` | None |
 | Preview local setup steps | `lterm init --shell zsh` | None |
-| Generate shell completions | `lterm completions zsh > ~/.zfunc/_lterm` | None |
+| Generate shell completions | `mkdir -p ~/.zfunc && lterm completions zsh > ~/.zfunc/_lterm` | None |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -168,6 +170,8 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 Use `eval "$(lterm env)"` only when you trust the `lterm` binary on your `PATH`.
 It emits fixed `export` lines that prepend the shim directory to `$PATH`.
 For fish, use `lterm env --shell fish | source` after the same trust check.
+If you do not want to eval or source generated shell, run `lterm env` first and
+copy only the export lines you expect into your shell startup file.
 
 `lterm ssh` forwards remote PTY bytes to the local terminal without sanitizing
 terminal control sequences, so a compromised remote can drive terminal features
@@ -183,9 +187,9 @@ Compatibility names are subcommands unless shown as a leading flag: `-a` is the 
 
 This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime.
 
-`lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), or set `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
+`lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), set `LTERM_NO_STATUS=1`, or use the equivalent `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
 
-`lterm rename <target> <new-name>` renames a running session without restarting its process. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. `<target>` accepts a session name, session id, pane id (`%0`), or bare pane number (`0`); `<new-name>` follows the same syntax rules as `--name`.
+`lterm rename <target> <new-name>` renames a running session without restarting its process. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. `<target>` accepts a session name, session id, pane id (`%0`), or bare pane number (`0`); a bare numeric target is interpreted as a pane number because session names cannot be all digits. `<new-name>` follows the same syntax rules as `--name`.
 
 `lterm status-theme <target> <theme>` (alias: `lterm theme`) stores a per-session status bar theme without restarting the PTY; pane ids resolve to their session. Use `default`, `clear`, or `none` to remove the session override and return to the attaching client's default. Already-attached clients keep their current status color until they detach and reattach. New sessions can set the same metadata at creation time with `lterm start --status-theme green -n api -- npm run dev` (or alias `--status-color`).
 
@@ -205,7 +209,7 @@ bytes. It is for opt-in debugging of intermittent render issues; it does not
 replay bytes to stdout, caps raw capture at `--max-bytes` (default 16 MiB), and
 refuses to overwrite existing trace files unless `--force` is passed.
 
-`lterm wait <target> --exit|--contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
+`lterm wait <target> --exit / --contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) draws a colored bar; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius, unless a session or environment theme is explicitly set.
 
@@ -242,11 +246,11 @@ Reset a session override with `lterm status-theme api default` (or `clear` / `no
 
 When the attached PTY enters the alternate screen buffer (e.g. `vim`, `less`, `htop` via `\x1b[?1049h`), lterm suspends its status bar to avoid conflicting with the application's UI. The status bar is redrawn immediately when the application exits alt-screen.
 
-If `lterm resume` / `lterm attach` panics or aborts mid-session, a process-wide hook emits a minimal recovery sequence (scroll region reset, cursor visible, alt-screen exit, SGR reset) so the user's terminal isn't left in raw mode or with hidden cursor.
+If `lterm resume` / `lterm attach` panics or exits unexpectedly and reaches lterm's recovery hook, it emits a minimal best-effort recovery sequence (scroll region reset, cursor visible, alt-screen exit, SGR reset) so the user's terminal is less likely to be left in raw mode or with a hidden cursor.
 
 Session names containing CJK characters or emoji (including ZWJ families, country flags, and combining marks) are aligned by display width using `unicode-width` and `unicode-segmentation`, so the status bar stays correctly padded across mixed-width content.
 
-When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and best-effort restores the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
+When a child application enables the Kitty keyboard protocol through `CSI u` enhancement sequences, lterm tracks that and makes a best-effort attempt to restore the terminal keyboard mode when attach exits so a crashed child does not leave later shell input looking like `1;1:3u` escape fragments.
 
 **Inspect or control a session:**
 
@@ -310,7 +314,7 @@ lterm amp
 lterm crush
 lterm kimi
 lterm qwen
-lterm gemini -- -p "summarize this repo"  # legacy-compatible
+lterm gemini -- -p "summarize this repo"  # Gemini CLI also accepts -p
 lterm agents
 ```
 
@@ -336,11 +340,17 @@ lterm agy --status -- -p "keep lterm status visible"
 
 Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. OMX/OMC keep the lterm status bar visible by default for continuity with their existing lightweight status/HUD workflow; use `--no-status` if a specific OMX/OMC run needs a fully raw surface. Use `--status` to force the lterm status bar on, or `--no-status` to suppress it for any launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
-Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
+Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
-Explicit `--name` values use lterm's normal session-name syntax and must be free; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
+Explicit `--name` values use lterm's normal session-name syntax and must not already be in use; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not consist only of digits, must not look like a UUID, and are limited to 128 bytes.
-Use `lterm agents` (or `lterm agents --json`) to inspect profile defaults and whether their binaries are currently available in `PATH`. JSON rows use `kind` values of `built-in`, `custom`, or `configured`. Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom/configured set; availability is a point-in-time PATH probe. Built-ins resolve the binary names shown by `lterm agents`; most match the profile name, while `kiro` resolves `kiro-cli`. If a provider installs a different command name, use `lterm agent <command>` or a configured profile rather than relying on a guessed alias.
+Use `lterm agents` (or `lterm agents --json`) to inspect profile defaults and whether their binaries are currently available in `PATH`. JSON rows use `kind` values of:
+
+- `built-in` for profiles shipped by lterm, such as `claude`, `codex`, or `kiro`;
+- `custom` for safe bare commands discovered from the names you request; and
+- `configured` for profiles loaded from an explicit `--agent-config` file.
+
+Pass profile names, such as `lterm agents codex my-agent --json`, to inspect a selected built-in/custom/configured set; availability is a point-in-time PATH probe. Built-ins resolve the binary names shown by `lterm agents`; most match the profile name, while `kiro` resolves `kiro-cli`. If a provider installs a different command name, use `lterm agent <command>` or a configured profile rather than relying on a guessed alias.
 For reusable custom aliases, pass an explicit JSON config file:
 
 ```bash
@@ -352,7 +362,14 @@ lterm agent repo-review --agent-config agents.json -- exec "review this repo"
 ```
 
 Configured names and binaries use the same safe profile syntax as `lterm agent <profile>`; built-in names cannot be redefined.
-`binary` must be a bare command name resolved from `PATH`, not a shell fragment or path. `binary` defaults to `name`, `session_base` defaults to `<name>-lterm`, `status_default` defaults to `true` and must be a boolean when present, duplicate names and unknown JSON fields are rejected, and when `--agent-config` is supplied non-built-in selected names must exist in that file.
+Configured profile rules:
+
+- `binary` must be a bare command name resolved from `PATH`, not a shell fragment or path.
+- `binary` defaults to `name`.
+- `session_base` defaults to `<name>-lterm`.
+- `status_default` defaults to `true` and must be a boolean when present.
+- duplicate names and unknown JSON fields are rejected.
+- when `--agent-config` is supplied, non-built-in selected names must exist in that file.
 
 **Run Oh My Codex inside a shimmed session:**
 
@@ -409,7 +426,7 @@ This gives cmux a real pane to decorate while `lterm` retains scrollback capture
 lterm notify --title 'Task complete' --body 'All checks passed'
 ```
 
-`lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC; subtitle/body separators such as newlines are normalized to spaces rather than concatenated.
+`lterm notify` first tries `cmux notify`. If that's unavailable, it emits OSC 777 so cmux or another compatible terminal can still surface the notification. Notification fields are stripped of terminal control characters before falling back to OSC; subtitle/body separators such as newlines are replaced with spaces rather than emitted verbatim, which keeps the OSC 777 framing intact.
 
 For agent workflows, prefer `lterm watch <target> --exit --notify` or `lterm watch <target> --contains DONE --notify` when the notification should be tied to a specific session condition.
 
@@ -443,7 +460,7 @@ the old code until they are stopped.
 
 **Terminal output is forwarded as-is.** `lterm resume` (compatibility name: `lterm attach`) passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
-**Capture output is sanitized for human/AI consumption.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip common terminal control sequences before printing scrollback. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
+**Capture output is terminal-control-sanitized before display/logging.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip common terminal control sequences before printing scrollback. Scrollback text can still be untrusted program output, so review it before feeding it to humans or agents. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
 
 **Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, including process-group ids. Add `--orphans` to also include same-process-group rows that are no longer descendants of the recorded session root, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
@@ -451,7 +468,7 @@ the old code until they are stopped.
 
 **Popup commands.** `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior. **Do not pass untrusted popup commands.**
 
-**Build reproducibility.** Use the committed lockfile for release builds: `cargo build --release --locked`. The current lockfile pins `serde_json 1.0.149`. Its transitive `zmij` dependency is part of the official serde_json package metadata on docs.rs/crates.io — not a local vendored crate.
+**Build reproducibility.** Use the committed lockfile for release builds: `cargo build --release --locked`. The current lockfile pins `serde_json 1.0.149` and its registry dependency `zmij 1.0.21`; both are resolved by Cargo from the lockfile, not vendored locally. Verify the dependency set with `cargo tree --locked -p serde_json`.
 
 ## Current limitations
 

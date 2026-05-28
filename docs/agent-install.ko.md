@@ -11,14 +11,14 @@ Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, 
 persistent agent session 시작 명령을 알려준다.
 
 Repository: https://github.com/ictechgy/light_terminal
-Source install에서 우선 사용할 현재 release tag: v1.0.7
+Source install에서 우선 사용할 현재 release tag: v1.0.8
 
 규칙:
 - OS, CPU architecture, shell, Homebrew/npm/Cargo 사용 가능 여부를 감지한다.
 - 이 machine에서 가장 덜 놀라운 package manager를 우선한다.
   - macOS + Homebrew: `brew install ictechgy/tap/lterm`
   - 지원되는 macOS/Linux + npm: `npm install -g @ictechgy/lterm`
-  - Rust/Cargo fallback: `cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.7`
+  - Rust/Cargo fallback: `cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.8`
 - Upgrade 뒤 오래된 `lterm` daemon이 살아 있을 수 있으면 먼저 `lterm sessions --all`로 현재 session을 보여주고, `lterm shutdown` 실행 전에는 물어본다.
 - Shell startup file을 덮어쓰지 않는다. PATH/shim 설정 때문에 `.zshrc`, `.bashrc`, `.profile`, fish config 변경이 필요하면 정확한 diff를 보여주고 먼저 확인한다.
 - Raw terminal attach 동작은 건드리지 않는다. Safe하고 되돌릴 수 있는 smoke-test 명령만 실행한다.
