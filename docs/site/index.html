@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Light Terminal (lterm) — Browser Guide / 브라우저 가이드</title>
-  <meta name="description" content="A browser-friendly English and Korean guide for lterm, a lightweight tmux-compatible terminal session daemon for AI agent workflows. AI agent workflow를 위한 lterm 브라우저 가이드입니다.">
+  <title>Light Terminal (lterm) — Browser Guide / 한국어 가이드</title>
+  <meta name="description" content="A browser-friendly English and Korean guide for lterm, a lightweight tmux-compatible terminal session daemon for AI agent workflows. AI 에이전트 작업을 오래 유지하는 lterm 한국어 가이드입니다.">
   <style>
     :root {
       --bg: #08111f;
@@ -321,7 +321,7 @@
       <nav class="nav" aria-label="Primary navigation">
         <a href="#install"><span data-lang="en">Install</span><span data-lang="ko">설치</span></a>
         <a href="#quickstart"><span data-lang="en">Quick start</span><span data-lang="ko">빠른 시작</span></a>
-        <a href="#commands"><span data-lang="en">Commands</span><span data-lang="ko">명령</span></a>
+        <a href="#commands"><span data-lang="en">Commands</span><span data-lang="ko">명령어</span></a>
         <a href="#security"><span data-lang="en">Security</span><span data-lang="ko">보안</span></a>
         <a href="https://github.com/ictechgy/light_terminal">GitHub</a>
         <span class="lang-toggle" aria-label="Language">
@@ -337,16 +337,16 @@
       <div class="wrap hero-grid">
         <div>
           <span class="eyebrow" data-lang="en">Persistent terminals for AI agents</span>
-          <span class="eyebrow" data-lang="ko">AI agent를 위한 영속 터미널</span>
+          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널</span>
           <h1 data-lang="en"><span class="gradient-text">lterm</span> keeps agents running.</h1>
-          <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 agent를 계속 살립니다.</h1>
+          <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible terminal session daemon for Claude Code, Codex CLI,
             Gemini CLI, OpenCode, cmux, and other terminal-first agent workflows.
           </p>
           <p class="lead" data-lang="ko">
-            Claude Code, Codex CLI, Gemini CLI, OpenCode, cmux 같은 terminal-first agent workflow를 위해 만든
-            가벼운 tmux 호환 터미널 세션 daemon입니다.
+            Claude Code, Codex CLI, Gemini CLI, OpenCode, cmux 같은 터미널 기반 AI 에이전트 워크플로를 위해
+            만든 가벼운 tmux 호환 세션 데몬입니다.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#install" data-lang="en">Install lterm</a>
@@ -379,32 +379,32 @@
         <div class="section-title">
           <div>
             <h2 data-lang="en">Why it exists</h2>
-            <h2 data-lang="ko">왜 필요한가요?</h2>
+            <h2 data-lang="ko">왜 쓰나요?</h2>
             <p class="section-kicker" data-lang="en">Use tmux for a full multiplexer. Use lterm when agents need a smaller, scriptable persistence layer.</p>
-            <p class="section-kicker" data-lang="ko">완전한 multiplexer가 필요하면 tmux가 맞습니다. lterm은 agent가 자주 쓰는 더 작은 영속 세션 표면에 집중합니다.</p>
+            <p class="section-kicker" data-lang="ko">완전한 멀티플렉서가 필요하면 tmux를 쓰면 됩니다. lterm은 에이전트 작업에 필요한 가벼운 세션 유지와 스크립트 자동화에 집중합니다.</p>
           </div>
         </div>
         <div class="grid three">
           <article class="card">
             <span class="badge">01</span>
             <h3 data-lang="en">Agent-first persistence</h3>
-            <h3 data-lang="ko">Agent 중심 지속성</h3>
+            <h3 data-lang="ko">에이전트 작업이 끊기지 않습니다</h3>
             <p data-lang="en">Named PTY sessions keep running after clients detach, so long agent tasks survive terminal churn.</p>
-            <p data-lang="ko">Named PTY session이 client detach 이후에도 계속 살아 있어, 오래 걸리는 agent 작업이 터미널 변화에 덜 흔들립니다.</p>
+            <p data-lang="ko">이름을 붙인 PTY 세션은 클라이언트가 접속을 끊어도 계속 실행됩니다. 오래 걸리는 에이전트 작업은 터미널을 닫았다 다시 열어도 중단되지 않습니다.</p>
           </article>
           <article class="card">
             <span class="badge">02</span>
             <h3 data-lang="en">tmux-compatible where agents expect it</h3>
-            <h3 data-lang="ko">Agent가 기대하는 tmux 호환성</h3>
+            <h3 data-lang="ko">에이전트 도구가 필요로 하는 tmux 호환성</h3>
             <p data-lang="en">A focused <code>tmux-compat</code> shim covers the commands common orchestration tools rely on.</p>
-            <p data-lang="ko">자주 쓰이는 orchestration 명령을 중심으로 <code>tmux-compat</code> shim을 제공합니다.</p>
+            <p data-lang="ko">오케스트레이션 도구가 자주 쓰는 명령을 <code>tmux-compat</code> shim으로 지원합니다.</p>
           </article>
           <article class="card">
             <span class="badge">03</span>
             <h3 data-lang="en">Raw attach, safe reports</h3>
-            <h3 data-lang="ko">Raw attach와 안전한 report</h3>
+            <h3 data-lang="ko">Raw 연결과 정제된 리포트</h3>
             <p data-lang="en">Attached PTY bytes stay raw for TUIs. Report surfaces strip terminal controls while preserving UTF-8 text.</p>
-            <p data-lang="ko">Attach된 PTY byte는 TUI를 위해 raw로 유지하고, report surface는 terminal control을 제거하면서 UTF-8 text를 보존합니다.</p>
+            <p data-lang="ko">TUI가 깨지지 않도록 PTY 연결에서는 바이트를 raw로 전달합니다. 대신 리포트 출력은 터미널 제어 코드를 제거하고 UTF-8 텍스트는 그대로 보존합니다.</p>
           </article>
         </div>
       </div>
@@ -417,26 +417,26 @@
             <h2 data-lang="en">Install</h2>
             <h2 data-lang="ko">설치</h2>
             <p class="section-kicker" data-lang="en">Homebrew and npm are the easiest paths. Cargo from GitHub is useful for source-pinned installs.</p>
-            <p class="section-kicker" data-lang="ko">Homebrew와 npm이 가장 쉽습니다. GitHub tag를 고정한 Cargo 설치도 가능합니다.</p>
+            <p class="section-kicker" data-lang="ko">Homebrew와 npm이 가장 간편합니다. 소스에서 특정 버전을 고정해 설치하려면 Cargo를 쓰세요.</p>
           </div>
         </div>
         <div class="install-grid">
           <article class="card install-card">
             <h3>Homebrew</h3>
             <p data-lang="en">Recommended on macOS when Homebrew is already your package manager.</p>
-            <p data-lang="ko">macOS에서 Homebrew를 쓰고 있다면 가장 자연스러운 방법입니다.</p>
+            <p data-lang="ko">macOS에서 Homebrew를 쓰고 있다면 가장 무난한 설치 방법입니다.</p>
             <pre>brew install ictechgy/tap/lterm</pre>
           </article>
           <article class="card install-card">
             <h3>npm</h3>
             <p data-lang="en">Installs a wrapper plus native platform package on supported macOS/Linux targets.</p>
-            <p data-lang="ko">지원되는 macOS/Linux에서 wrapper와 native platform package를 설치합니다.</p>
+            <p data-lang="ko">지원되는 macOS/Linux 환경에서는 래퍼와 네이티브 패키지를 한 번에 설치합니다.</p>
             <pre>npm install -g @ictechgy/lterm</pre>
           </article>
           <article class="card install-card">
             <h3>Cargo</h3>
             <p data-lang="en">Pin the release tag when installing from source; check GitHub Releases for newer tags.</p>
-            <p data-lang="ko">Source install은 release tag를 고정하고, 더 최신 tag는 GitHub Releases에서 확인하세요.</p>
+            <p data-lang="ko">소스에서 설치할 때는 릴리스 태그를 고정하세요. 최신 태그는 GitHub Releases에서 확인할 수 있습니다.</p>
             <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.9</pre>
           </article>
         </div>
@@ -450,35 +450,35 @@
             <h2 data-lang="en">Quick start</h2>
             <h2 data-lang="ko">빠른 시작</h2>
             <p class="section-kicker" data-lang="en">Create a named session, detach safely, inspect it, then resume when you need the live terminal.</p>
-            <p class="section-kicker" data-lang="ko">이름 있는 session을 만들고, 안전하게 detach한 뒤, 필요할 때 live terminal로 다시 붙습니다.</p>
+            <p class="section-kicker" data-lang="ko">이름을 붙인 세션을 시작하고, 안전하게 분리한 뒤, 필요할 때 다시 실시간 터미널에 연결합니다.</p>
           </div>
         </div>
         <div class="steps">
           <div class="step">
             <div>
               <h3 data-lang="en">Start a persistent process</h3>
-              <h3 data-lang="ko">영속 process 시작</h3>
+              <h3 data-lang="ko">계속 실행할 프로세스 시작</h3>
               <pre>lterm start -d -n api -- npm run dev</pre>
               <p data-lang="en">The process keeps running after your current terminal exits.</p>
-              <p data-lang="ko">현재 터미널을 닫아도 process는 계속 실행됩니다.</p>
+              <p data-lang="ko">현재 터미널을 닫아도 프로세스는 계속 실행됩니다.</p>
             </div>
           </div>
           <div class="step">
             <div>
               <h3 data-lang="en">Read sanitized scrollback</h3>
-              <h3 data-lang="ko">정제된 scrollback 읽기</h3>
+              <h3 data-lang="ko">정제된 scrollback 확인</h3>
               <pre>lterm logs api --start=-80 --end=-1</pre>
               <p data-lang="en">Good for agents and scripts because terminal controls are stripped from report output.</p>
-              <p data-lang="ko">Report 출력에서는 terminal control이 제거되어 agent와 script가 읽기 좋습니다.</p>
+              <p data-lang="ko">리포트 출력에서는 터미널 제어 코드를 제거하므로 에이전트와 스크립트가 읽기 쉽습니다.</p>
             </div>
           </div>
           <div class="step">
             <div>
               <h3 data-lang="en">Resume the live terminal</h3>
-              <h3 data-lang="ko">Live terminal에 다시 붙기</h3>
+              <h3 data-lang="ko">실시간 터미널에 다시 연결하기</h3>
               <pre>lterm resume api</pre>
               <p data-lang="en">Compatibility names such as <code>attach</code>, <code>a</code>, and <code>-a</code> remain available.</p>
-              <p data-lang="ko"><code>attach</code>, <code>a</code>, <code>-a</code> 같은 호환 이름도 계속 사용할 수 있습니다.</p>
+              <p data-lang="ko"><code>attach</code>, <code>a</code>, <code>-a</code> 같은 호환 이름도 그대로 쓸 수 있습니다.</p>
             </div>
           </div>
         </div>
@@ -490,9 +490,9 @@
         <div class="section-title">
           <div>
             <h2 data-lang="en">Command map</h2>
-            <h2 data-lang="ko">명령 지도</h2>
+            <h2 data-lang="ko">명령어 목록</h2>
             <p class="section-kicker" data-lang="en">These are the product CLI commands people and agents usually need first.</p>
-            <p class="section-kicker" data-lang="ko">사람과 agent가 가장 먼저 쓰게 되는 제품 CLI 명령입니다.</p>
+            <p class="section-kicker" data-lang="ko">사람과 에이전트 모두 먼저 알아두면 좋은 주요 CLI 명령어입니다.</p>
           </div>
         </div>
         <div class="table-wrap">
@@ -503,19 +503,19 @@
             </thead>
             <tbody>
               <tr data-lang="en"><td>Start a persistent process</td><td><code>lterm start -n api -- npm run dev</code></td><td><code>new</code></td></tr>
-              <tr data-lang="ko"><td>영속 process 시작</td><td><code>lterm start -n api -- npm run dev</code></td><td><code>new</code></td></tr>
+              <tr data-lang="ko"><td>계속 실행할 프로세스 시작</td><td><code>lterm start -n api -- npm run dev</code></td><td><code>new</code></td></tr>
               <tr data-lang="en"><td>Open or create a session</td><td><code>lterm open main</code></td><td><code>attach-or-new</code></td></tr>
               <tr data-lang="ko"><td>세션 열기 또는 생성</td><td><code>lterm open main</code></td><td><code>attach-or-new</code></td></tr>
               <tr data-lang="en"><td>Resume a session</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
-              <tr data-lang="ko"><td>기존 세션 재개</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
+              <tr data-lang="ko"><td>기존 세션에 다시 연결</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
               <tr data-lang="en"><td>Read sanitized scrollback</td><td><code>lterm logs api --start=-80</code></td><td><code>capture</code></td></tr>
-              <tr data-lang="ko"><td>정제된 scrollback 읽기</td><td><code>lterm logs api --start=-80</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="ko"><td>정제된 scrollback 확인</td><td><code>lterm logs api --start=-80</code></td><td><code>capture</code></td></tr>
               <tr data-lang="en"><td>Wait for a marker or exit</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>none</td></tr>
-              <tr data-lang="ko"><td>marker 또는 종료 대기</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>없음</td></tr>
+              <tr data-lang="ko"><td>마커가 나오거나 종료될 때까지 대기</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Notify on completion</td><td><code>lterm watch api --exit --notify</code></td><td>none</td></tr>
               <tr data-lang="ko"><td>완료 시 알림</td><td><code>lterm watch api --exit --notify</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Launch an agent profile</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
-              <tr data-lang="ko"><td>agent profile 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
+              <tr data-lang="ko"><td>에이전트 프로파일 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
               <tr data-lang="en"><td>Diagnose local state</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="ko"><td>로컬 상태 진단</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
             </tbody>
@@ -529,19 +529,19 @@
         <div class="section-title">
           <div>
             <h2 data-lang="en">Security model in plain language</h2>
-            <h2 data-lang="ko">보안 모델을 쉽게 설명하면</h2>
+            <h2 data-lang="ko">보안 모델을 쉽게 말하면</h2>
             <p class="section-kicker" data-lang="en">lterm is a same-user convenience daemon. It is not a sandbox.</p>
-            <p class="section-kicker" data-lang="ko">lterm은 같은 OS 사용자 안에서 쓰는 편의용 daemon입니다. sandbox가 아닙니다.</p>
+            <p class="section-kicker" data-lang="ko">lterm은 같은 OS 사용자 범위 안에서 쓰는 편의 목적의 데몬입니다. 샌드박스가 아닙니다.</p>
           </div>
         </div>
         <div class="grid two">
           <div class="callout">
             <p data-lang="en"><strong>Attached terminals are raw.</strong> Full-screen apps, shells, and remote PTY streams can emit terminal escape sequences just like they can under tmux or screen.</p>
-            <p data-lang="ko"><strong>Attach된 터미널은 raw입니다.</strong> Full-screen app, shell, remote PTY stream은 tmux/screen에서처럼 terminal escape sequence를 출력할 수 있습니다.</p>
+            <p data-lang="ko"><strong>연결된 터미널은 raw 모드입니다.</strong> 전체화면 앱, 셸, 원격 PTY 스트림은 tmux/screen에서와 마찬가지로 터미널 이스케이프 시퀀스를 출력할 수 있습니다.</p>
           </div>
           <div class="callout">
             <p data-lang="en"><strong>Reports are sanitized.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, diagnostics, and notification fallback paths strip terminal controls while preserving valid UTF-8 text.</p>
-            <p data-lang="ko"><strong>Report는 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, 진단, notification fallback 경로는 terminal control을 제거하고 정상 UTF-8 text는 보존합니다.</p>
+            <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
           </div>
         </div>
       </div>
@@ -553,7 +553,7 @@
   <footer class="footer">
     <div class="wrap">
       <span data-lang="en">Light Terminal is dual-licensed under MIT or Apache-2.0.</span>
-      <span data-lang="ko">Light Terminal은 MIT 또는 Apache-2.0 중 하나로 사용할 수 있습니다.</span>
+      <span data-lang="ko">Light Terminal은 MIT 또는 Apache-2.0 라이선스로 이용할 수 있습니다.</span>
       <span><a href="https://github.com/ictechgy/light_terminal">GitHub</a> · <a href="https://www.npmjs.com/package/@ictechgy/lterm">npm</a></span>
     </div>
   </footer>
@@ -582,7 +582,7 @@
       document.body.classList.toggle('lang-ko', next === 'ko');
       document.documentElement.lang = next;
       document.title = next === 'ko'
-        ? 'Light Terminal (lterm) — 브라우저 가이드'
+        ? 'Light Terminal (lterm) — 한국어 가이드'
         : 'Light Terminal (lterm) — Browser Guide';
       document.querySelectorAll('[data-lang]').forEach((node) => {
         node.setAttribute('aria-hidden', String(node.dataset.lang !== next));
