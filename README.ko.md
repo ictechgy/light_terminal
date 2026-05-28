@@ -29,8 +29,9 @@ agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
   CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, OMX/OMC 같은 terminal-first tooling이 쓰는 tmux command
   subset을 구현합니다.
 - **Raw attach, safe reports** — attach된 PTY stream은 TUI/interactive shell을
-  위해 raw로 유지하고, `logs`, `capture`, `list`, `doctor` 같은 report surface는
-  출력 전에 terminal control sequence를 sanitize합니다.
+  위해 raw로 유지합니다. 대신 `logs`, `capture`, `compose`, `doctor`,
+  `diagnose`, `notify` fallback 경로 같은 report surface는 terminal
+  control을 제거하면서도 한국어, CJK, emoji 같은 UTF-8 text는 보존합니다.
 - **cmux-friendly 설계** — notification과 tmux shim call이 generic desktop
   multiplexer보다 cmux/agent pane orchestration에 맞춰져 있습니다.
 - **내장 관측성** — `doctor` / `status`, bounded `logs --start/--end`,
@@ -75,7 +76,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.8
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.9
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
@@ -137,6 +138,7 @@ lterm -a api
 | 세션 status theme 설정 | `lterm status-theme api green` | `theme` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80 --end=-1` | `capture` |
 | 디버깅용 raw PTY 출력 기록 | `lterm trace api --duration 5s --output trace.jsonl` | `record` |
+| 신뢰하는 raw PTY trace 재생 | `lterm trace-replay trace.jsonl` | `replay-trace` |
 | 정제된 scrollback 위에 입력 컴포저 열기 | `lterm compose api` | `mobile` |
 | 세션 출력 또는 종료 대기 | `lterm wait api --contains READY --timeout 30s --json` | 없음 |
 | 세션을 감시하고 완료 시 알림 | `lterm watch api --exit --notify` | 없음 |
@@ -191,9 +193,21 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
 
-`lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text이며, attach된 PTY stream은 raw 그대로 유지됩니다.
+`lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text입니다. 즉 terminal control은 제거하고 한국어, CJK, emoji 같은 UTF-8 text는 보존합니다. attach된 PTY stream은 raw 그대로 유지됩니다.
+
+`lterm trace <target> --duration 5s --output trace.jsonl`은 timestamp와
+hex-encoded bytes를 담은 private local JSONL 파일로 raw PTY 출력 chunk를
+기록합니다. 간헐적인 render 문제를 opt-in으로 디버깅하기 위한 기능이며,
+recorder는 JSONL artifact만 쓰고 raw capture는 `--max-bytes`(기본 16 MiB)
+한도 안에서 멈춥니다. 기존 trace file은 `--force` 없이는 덮어쓰지 않습니다.
+재생은 신뢰할 수 있는 trace에만 `lterm trace-replay <file>`로 수행하세요.
+`trace-replay`는 raw terminal bytes를 출력하기 전에 JSONL 전체를 먼저
+검증하고, 기본 trace capture 크기와 trace당 chunk 수 한도를 적용합니다.
 
 `lterm wait <target> --exit / --contains <text>`는 세션이 종료되거나 정제된 scrollback에 marker가 나타날 때까지 block합니다. 자동화용 health check에는 `--timeout 250ms|2s|5m|1h`, `--tail N`, `--json`을 함께 쓰세요. Timeout 시 `wait` / `watch`는 exit code `124`를 반환하고 JSON에는 `timed_out: true`가 들어갑니다. `lterm watch`는 같은 조건을 쓰며, `--notify`를 더하면 attach된 PTY bytes는 건드리지 않고 cmux-friendly 완료 알림을 보냅니다. `--json`을 함께 쓸 때는 notification fallback이 필요해도 stdout을 machine-readable JSON으로 유지합니다.
+지나치게 큰 `--contains` needle은 명시적 오류로 거부되며, daemon은 동시에
+block 중인 `wait` / `watch` check 수를 제한해 자동화가 무제한 waiter를
+만들지 못하게 합니다.
 
 `LTERM_STATUS_STYLE=full` 또는 `LTERM_STATUS_STYLE=minimal` 로 시각 스타일을 선택할 수 있습니다. `full`(로컬 터미널 기본값)은 색이 있는 bar를 그리고, `minimal`은 SGR 색을 모두 생략한 plain text로 동작합니다. SSH 세션(`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` 감지)에서는 자동으로 `minimal`이 적용되어 Termius 같은 모바일 SSH 클라이언트의 색 충돌을 줄이지만, 세션 또는 환경 theme을 명시하면 색이 유지됩니다.
 
@@ -403,7 +417,7 @@ tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니�
 
 1. worker 명령을 위한 새 `lterm` PTY 세션을 시작합니다.
 2. cmux에 native split 생성을 요청합니다 (`cmux new-split right/down`).
-3. `LTERM_BIN`이 `resume`을 모르는 구버전 `lterm`을 가리켜도 cmux pane이 계속 동작하도록, 생성된 split에는 호환 명령인 `lterm attach <pane>`을 보냅니다.
+3. 생성된 split에는 호환 명령인 `lterm attach <pane>`을 보냅니다. 안전한 absolute executable이 `LTERM_BIN`으로 지정되어 있으면 그 값을 사용하고, 아니면 현재 executable로 fallback합니다. 이 호환 명령 덕분에 `resume`을 모르는 구버전 build에서도 cmux pane이 계속 동작합니다.
 
 이렇게 하면 실제 pane은 cmux가 그리고, scrollback capture와 `send-keys` 호환은 `lterm`이 유지합니다.
 
@@ -447,11 +461,18 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **터미널 출력은 그대로 전달됩니다.** `lterm resume`(호환 이름: `lterm attach`)은 full-screen 터미널 프로그램과 cmux/OSC 알림이 정상 동작하도록 PTY byte를 그대로 통과시킵니다. 로컬 상태 바는 클라이언트 쪽 표시 요소일 뿐이며, 완전한 raw 모드 터미널이 필요하면 `--no-status`를 사용하세요. 신뢰할 수 없는 child 프로그램은 tmux/screen에서와 마찬가지로 attach된 터미널에 escape sequence를 출력할 수 있습니다. **`lterm`을 escape-sequence sanitizer나 sandbox로 사용하지 마세요.**
 
-**Capture 출력은 표시/로깅 전에 terminal control sequence를 제거합니다.** `lterm logs`(호환 이름: `lterm capture`), `lterm compose`(alias: `lterm mobile`), `tmux capture-pane`은 captured scrollback을 출력할 때 일반적인 터미널 제어 시퀀스를 제거합니다. 그래도 scrollback text는 신뢰할 수 없는 프로그램 출력일 수 있으므로 사람이나 agent에게 넘기기 전에 확인하세요. `compose`는 attach가 아닌 view에서 기존 input/send 경로로 텍스트를 commit하며, raw attached PTY stream을 변환하지 않습니다.
+**Capture 출력은 표시/로깅 전에 terminal control sequence를 제거합니다.** `lterm logs`(호환 이름: `lterm capture`), `lterm compose`(alias: `lterm mobile`), `tmux capture-pane`은 captured scrollback을 출력할 때 raw 또는 UTF-8 encoded C1 control을 포함한 터미널 제어 시퀀스를 제거합니다. 정상 UTF-8 text인 한국어, CJK, emoji는 보존합니다. 그래도 scrollback text는 신뢰할 수 없는 프로그램 출력일 수 있으므로 사람이나 agent에게 넘기기 전에 확인하세요. `compose`는 attach가 아닌 view에서 기존 input/send 경로로 텍스트를 commit하며, raw attached PTY stream을 변환하지 않습니다.
 
 **프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 process-group id와 함께 각 세션 child 아래의 process tree를 보여 줍니다. `--orphans`를 추가하면 기록된 session root의 descendant가 아니지만 같은 process group에 남아 있는 row도 함께 보여 주므로, Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인할 수 있습니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
 
 **Socket 위치.** 커스텀 `LTERM_SOCKET` 경로는 소유자 전용 디렉터리 안에 있어야 합니다. 격리된 socket 위치가 필요할 때는 `LTERM_RUNTIME_DIR`를 우선 사용하세요.
+
+**Binary override.** `LTERM_BIN`은 cmux split attach command처럼 child
+`lterm`을 다시 호출할 때 쓰는 신뢰된 개발자용 override입니다. Absolute
+path이고, control character가 없고, 실행 가능한 regular file일 때만
+override로 인정합니다. 유효하지 않은 값은 무시하고 현재 executable 또는
+`PATH`의 `lterm`으로 fallback합니다. 신뢰할 수 없는 environment data에서
+`LTERM_BIN`을 설정하지 마세요.
 
 **Popup 명령.** `tmux-compat display-popup`은 tmux와 비슷한 동작을 위해 요청된 명령을 사용자 shell로 실행합니다. **신뢰할 수 없는 popup 명령을 전달하지 마세요.**
 
@@ -482,6 +503,20 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- start --nam
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- logs test -S=-20
 LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 ```
+
+릴리스/계약 preflight 헬퍼:
+
+```bash
+scripts/release-preflight.sh --contract-only
+scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+scripts/dependency-minor-dry-run.sh
+```
+
+`scripts/release-preflight.sh`의 `--run-soak`은 manual release-gate soak
+profile에서만 사용하세요. Tagging 또는 publishing 전에 release, audit,
+contract, dependency, soak evidence를 남길 때는
+[`docs/release-evidence-template.md`](docs/release-evidence-template.md)를
+사용하세요.
 
 ## 라이선스
 

@@ -30,8 +30,9 @@ need:
   CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp,
   Crush, Kimi, Qwen, Gemini CLI, OMX/OMC, and similar terminal-first tooling.
 - **Raw attach, safe reports** — attached PTY streams remain raw for TUIs and
-  interactive shells, while `logs`, `capture`, `list`, `doctor`, and other
-  report surfaces sanitize terminal control sequences before printing.
+  interactive shells, while `logs`, `capture`, `compose`, `doctor`,
+  `diagnose`, the `notify` fallback path, and other report surfaces strip
+  terminal controls while preserving UTF-8 text such as Korean, CJK, and emoji.
 - **cmux-friendly by design** — notifications and tmux shim calls are shaped for
   cmux/agent pane orchestration instead of generic desktop multiplexing.
 - **Built-in observability** — `doctor` / `status`, bounded `logs --start/--end`,
@@ -78,7 +79,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.8
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.9
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
@@ -142,6 +143,7 @@ lterm -a api
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
 | Record raw PTY output for debugging | `lterm trace api --duration 5s --output trace.jsonl` | `record` |
+| Replay a trusted raw PTY trace | `lterm trace-replay trace.jsonl` | `replay-trace` |
 | Open a sanitized scrollback composer for input | `lterm compose api` | `mobile` |
 | Wait for session output or exit | `lterm wait api --contains READY --timeout 30s --json` | None |
 | Watch a session and notify on completion | `lterm watch api --exit --notify` | None |
@@ -201,15 +203,22 @@ flags, and — only when an existing daemon is reachable — session metadata pl
 process rows. It does not start the daemon and does not include raw PTY bytes or
 scrollback by default.
 
-`lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text; attached PTY streams remain raw.
+`lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text: terminal controls are removed, while UTF-8 text such as Korean, CJK, and emoji is preserved. Attached PTY streams remain raw.
 
 `lterm trace <target> --duration 5s --output trace.jsonl` records raw PTY
 output chunks to a private local JSONL file with timestamps and hex-encoded
-bytes. It is for opt-in debugging of intermittent render issues; it does not
-replay bytes to stdout, caps raw capture at `--max-bytes` (default 16 MiB), and
-refuses to overwrite existing trace files unless `--force` is passed.
+bytes. It is for opt-in debugging of intermittent render issues; the recorder
+only writes the JSONL artifact, caps raw capture at `--max-bytes` (default
+16 MiB), and refuses to overwrite existing trace files unless `--force` is
+passed. To replay, use `lterm trace-replay <file>` only with traces you trust:
+it validates the whole JSONL file before emitting any raw terminal bytes and
+caps replay at the default trace capture size plus a per-trace chunk-count
+limit.
 
 `lterm wait <target> --exit / --contains <text>` blocks until a session exits or its sanitized scrollback contains a marker. Add `--timeout 250ms|2s|5m|1h`, `--tail N`, and `--json` for automation-friendly health checks. On timeout, `wait` / `watch` return exit code `124` and JSON reports `timed_out: true`. `lterm watch` uses the same conditions and can add `--notify` to emit a cmux-friendly completion notification without altering attached PTY bytes; with `--json`, stdout stays machine-readable even when notification fallback is needed.
+Oversized `--contains` needles are rejected with an explicit error, and the
+daemon caps concurrent blocking `wait` / `watch` checks so automation cannot fan
+out unbounded waiters.
 
 Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) draws a colored bar; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius, unless a session or environment theme is explicitly set.
 
@@ -416,7 +425,7 @@ When `lterm tmux-compat split-window` detects cmux (via `CMUX_WORKSPACE_ID`, `CM
 
 1. Starts a new `lterm` PTY session for the worker command.
 2. Asks cmux to create a native split (`cmux new-split right/down`).
-3. Sends the compatibility command `lterm attach <pane>` into that split, so cmux panes still work if `LTERM_BIN` points at an older `lterm` build that predates `resume`.
+3. Sends the compatibility command `lterm attach <pane>` into that split. If a safe absolute executable is supplied through `LTERM_BIN`, lterm uses it; otherwise it falls back to the current executable. The compatibility command keeps cmux panes working even with older builds that predate `resume`.
 
 This gives cmux a real pane to decorate while `lterm` retains scrollback capture and `send-keys` compatibility.
 
@@ -460,11 +469,17 @@ the old code until they are stopped.
 
 **Terminal output is forwarded as-is.** `lterm resume` (compatibility name: `lterm attach`) passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
-**Capture output is terminal-control-sanitized before display/logging.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip common terminal control sequences before printing scrollback. Scrollback text can still be untrusted program output, so review it before feeding it to humans or agents. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
+**Capture output is terminal-control-sanitized before display/logging.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip terminal control sequences, including raw or UTF-8-encoded C1 controls, before printing scrollback. Valid UTF-8 text such as Korean, CJK, and emoji is preserved. Scrollback text can still be untrusted program output, so review it before feeding it to humans or agents. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
 
 **Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, including process-group ids. Add `--orphans` to also include same-process-group rows that are no longer descendants of the recorded session root, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
 **Socket location.** Custom `LTERM_SOCKET` paths must live in an owner-only directory. Prefer `LTERM_RUNTIME_DIR` when you need an isolated socket location.
+
+**Binary override.** `LTERM_BIN` is a trusted developer override for child
+`lterm` invocations such as cmux split attach commands. Overrides are accepted
+only when they are absolute paths to executable regular files and contain no
+control characters; invalid values are ignored in favor of the current
+executable or `lterm` on `PATH`. Do not set it from untrusted environment data.
 
 **Popup commands.** `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior. **Do not pass untrusted popup commands.**
 

@@ -1,13 +1,19 @@
 {
   "name": "lterm-darwin-x64",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Native lterm binary for macOS x64.",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ictechgy/light_terminal.git"
   },
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "files": ["bin/lterm"]
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/lterm"
+  ]
 }
