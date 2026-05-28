@@ -917,6 +917,78 @@ fn watch_exit_notify_invokes_cmux_with_sanitized_message() -> TestResult {
 }
 
 #[test]
+fn watch_exit_notify_runs_after_observed_session_exit() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-exit-order.log");
+    let exit_marker = env.temp.path().join("watch-exit-marker");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" > {}\n\
+             if [ -f {} ]; then\n\
+               printf '%s\\n' MARKER_PRESENT >> {}\n\
+             else\n\
+               printf '%s\\n' EARLY_NOTIFY >> {}\n\
+               exit 70\n\
+             fi\n",
+            shlex::try_quote(&cmux_log.display().to_string())?,
+            shlex::try_quote(&exit_marker.display().to_string())?,
+            shlex::try_quote(&cmux_log.display().to_string())?,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let marker_path = exit_marker.display().to_string();
+    let marker = shlex::try_quote(&marker_path)?;
+    let payload = format!("sleep 0.2; printf done > {marker}; exit 0");
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-exit-order",
+            "--",
+            "sh",
+            "-lc",
+            payload.as_str(),
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-exit-order");
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .args([
+            "watch",
+            "watch-exit-order",
+            "--exit",
+            "--timeout",
+            "5s",
+            "--notify",
+            "--json",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["event"], "exit");
+    assert_eq!(result["matched"], true);
+
+    let cmux = wait_for_file_contents(&cmux_log)?;
+    assert!(cmux.contains("MARKER_PRESENT"), "{cmux:?}");
+    assert!(
+        !cmux.contains("EARLY_NOTIFY"),
+        "cmux notifications must not fire before the watched session exits: {cmux:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn watch_contains_notify_invokes_cmux_with_sanitized_message() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("bin");
@@ -1049,6 +1121,65 @@ fn watch_notify_targets_cmux_context_when_available() -> TestResult {
     assert!(cmux.contains("--surface"), "{cmux:?}");
     assert!(cmux.contains("surface:7"), "{cmux:?}");
     assert!(!cmux.contains("pane:ignored"), "{cmux:?}");
+    Ok(())
+}
+
+#[test]
+fn watch_notify_ignores_unsafe_cmux_context_refs() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-context-filter.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "watch-notify-context-filter",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 0.2; exit 0",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "watch-notify-context-filter");
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("CMUX_WORKSPACE_ID", "-workspace:bad")
+        .env("CMUX_WINDOW_ID", "window:1")
+        .env("CMUX_SURFACE_ID", "surface:bad/value")
+        .args([
+            "watch",
+            "watch-notify-context-filter",
+            "--exit",
+            "--timeout",
+            "5s",
+            "--notify",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let cmux = wait_for_file_contents(&cmux_log)?;
+    assert!(cmux.contains("notify"), "{cmux:?}");
+    assert!(cmux.contains("--window"), "{cmux:?}");
+    assert!(cmux.contains("window:1"), "{cmux:?}");
+    assert!(!cmux.contains("--workspace"), "{cmux:?}");
+    assert!(!cmux.contains("-workspace:bad"), "{cmux:?}");
+    assert!(!cmux.contains("--surface"), "{cmux:?}");
+    assert!(!cmux.contains("surface:bad/value"), "{cmux:?}");
     Ok(())
 }
 
@@ -6534,6 +6665,40 @@ fn tmux_sessions_preserve_current_terminal_identity_for_color_detection() -> Tes
     assert!(captured.contains("LC_TERMINAL:Termius"), "{captured:?}");
     assert!(captured.contains("COLORTERM:truecolor"), "{captured:?}");
     assert!(captured.contains("TMUX_PANE:%1"), "{captured:?}");
+    Ok(())
+}
+
+#[test]
+fn agent_alias_preserves_terminal_identity_for_color_detection() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omx"),
+        r#"#!/bin/sh
+printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
+printf 'TERM_PROGRAM:%s\n' "${TERM_PROGRAM-}"
+printf 'LC_TERMINAL:%s\n' "${LC_TERMINAL-}"
+printf 'COLORTERM:%s\n' "${COLORTERM-}"
+"#,
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("TERM_PROGRAM", "Termius")
+        .env("LC_TERMINAL", "Termius")
+        .env("COLORTERM", "truecolor")
+        .stdin(Stdio::null())
+        .args(["omx", "--no-status", "--", "probe"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("LTERM_AGENT:omx"), "{stdout:?}");
+    assert!(stdout.contains("TERM_PROGRAM:Termius"), "{stdout:?}");
+    assert!(stdout.contains("LC_TERMINAL:Termius"), "{stdout:?}");
+    assert!(stdout.contains("COLORTERM:truecolor"), "{stdout:?}");
     Ok(())
 }
 

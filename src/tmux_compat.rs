@@ -2506,6 +2506,23 @@ mod tests {
     }
 
     #[test]
+    fn show_option_skips_target_values_before_option_name() {
+        assert_eq!(
+            show_option_name(&args(["-g", "-t", "%1", "focus-events"])).as_deref(),
+            Some("focus-events")
+        );
+        assert_eq!(
+            show_option_name(&args(["-gqt%1", "focus-events"])).as_deref(),
+            Some("focus-events")
+        );
+        assert_eq!(
+            show_option_name(&args(["-g", "--", "focus-events"])).as_deref(),
+            Some("focus-events")
+        );
+        assert!(!show_option_value_only(&args(["-g", "focus-events"])));
+    }
+
+    #[test]
     fn display_popup_accepts_command_without_e_flag() {
         let temp = tempfile::tempdir().expect("tempdir");
         let output = temp.path().join("popup.out");

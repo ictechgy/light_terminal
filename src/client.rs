@@ -4372,6 +4372,57 @@ mod tests {
     }
 
     #[test]
+    fn mobile_terminal_identity_envs_prefer_minimal_status_style() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_STATUS_STYLE",
+            "LTERM_STATUS_THEME",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "TERMINAL_EMULATOR",
+        ]);
+
+        for (name, value) in [
+            ("TERM_PROGRAM", "Termius"),
+            ("LC_TERMINAL", "com.termius.ssh"),
+            ("TERMINAL_EMULATOR", "termius-mobile"),
+        ] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::remove_var("LTERM_STATUS_STYLE");
+                std::env::remove_var("LTERM_STATUS_THEME");
+                std::env::remove_var("SSH_CONNECTION");
+                std::env::remove_var("SSH_CLIENT");
+                std::env::remove_var("SSH_TTY");
+                std::env::remove_var("TERM_PROGRAM");
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+                std::env::set_var(name, value);
+            }
+            assert_eq!(
+                resolve_status_style(None),
+                StatusStyle::Minimal,
+                "{name}={value} should select plain mobile-safe status rendering"
+            );
+        }
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_STATUS_THEME", "green");
+        }
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Full(StatusTheme::Green),
+            "explicit status themes should remain authoritative even on mobile terminals"
+        );
+    }
+
+    #[test]
     fn resolve_status_theme_prefers_session_then_env() {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
