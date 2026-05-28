@@ -220,7 +220,7 @@ Oversized `--contains` needles are rejected with an explicit error, and the
 daemon caps concurrent blocking `wait` / `watch` checks so automation cannot fan
 out unbounded waiters.
 
-Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) draws a colored bar; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) default to `minimal` to avoid color-mapping issues on mobile SSH clients like Termius, unless a session or environment theme is explicitly set.
+Set `LTERM_STATUS_STYLE=full` or `LTERM_STATUS_STYLE=minimal` to choose the visual style. `full` (default for local terminals) draws a colored bar; `minimal` drops all SGR colors in favor of plain text. SSH sessions (detected via `SSH_CONNECTION`, `SSH_CLIENT`, or `SSH_TTY`) and Termius-style clients (detected via terminal identity variables) default to `minimal` to avoid mobile color-mapping issues, unless a session or environment theme is explicitly set.
 
 Set `LTERM_STATUS_THEME=blue|green|magenta|cyan|amber|red|gray|plain` to change the default colored status bar for the attaching client. Per-session overrides win over the environment: `lterm start --status-theme amber -n api -- npm run dev`, `lterm run --status-color cyan -- cargo test`, or `lterm status-theme api plain`. If you export this variable from shell startup files, it also opts SSH attaches into colored status bars; leave it unset or set `LTERM_STATUS_STYLE=minimal` on mobile SSH clients that need plain text. Theme names are parsed from a fixed allowlist; lterm never injects arbitrary user-provided terminal escape sequences into the status row.
 
