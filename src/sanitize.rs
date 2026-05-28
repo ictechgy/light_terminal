@@ -18,21 +18,38 @@ pub fn terminal_text(value: &str) -> String {
 }
 
 pub fn terminal_capture(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = String::with_capacity(bytes.len());
     let mut state = EscapeState::Ground;
+    let mut index = 0_usize;
 
-    for byte in bytes {
+    while index < bytes.len() {
+        let byte = bytes[index];
         match state {
-            EscapeState::Ground => match *byte {
+            EscapeState::Ground => match byte {
                 0x1b => state = EscapeState::Esc,
                 0x9b => state = EscapeState::Csi,
                 0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
                 0x80..=0x9f => {}
-                b'\t' | b'\n' | b'\r' => out.push(*byte),
+                b'\t' | b'\n' | b'\r' => out.push(byte as char),
                 0x00..=0x1f | 0x7f => {}
-                _ => out.push(*byte),
+                0x00..=0x7f => out.push(byte as char),
+                _ => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        match ch {
+                            '\u{009b}' => state = EscapeState::Csi,
+                            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                                state = EscapeState::String
+                            }
+                            ch if is_c0_or_c1(ch) => {}
+                            _ => out.push(ch),
+                        }
+                        index += len;
+                        continue;
+                    }
+                    out.push('\u{fffd}');
+                }
             },
-            EscapeState::Esc => match *byte {
+            EscapeState::Esc => match byte {
                 0x18 | 0x1a => state = EscapeState::Ground,
                 0x1b => state = EscapeState::Esc,
                 b'[' => state = EscapeState::Csi,
@@ -43,20 +60,20 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
                 0x20..=0x2f => {}
                 _ => state = EscapeState::Ground,
             },
-            EscapeState::Csi => match *byte {
+            EscapeState::Csi => match byte {
                 0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::Esc,
                 byte if (0x40..=0x7e).contains(&byte) => state = EscapeState::Ground,
                 _ => {}
             },
-            EscapeState::String => match *byte {
+            EscapeState::String => match byte {
                 0x18 | 0x1a => state = EscapeState::Ground,
                 0x07 | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::StringEsc,
                 _ => {}
             },
             EscapeState::StringEsc => {
-                state = if *byte == b'\\' {
+                state = if byte == b'\\' {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
@@ -64,13 +81,35 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
             }
             EscapeState::Charset => state = EscapeState::Ground,
         }
+        index += 1;
     }
 
-    String::from_utf8_lossy(&out).to_string()
+    out
 }
 
 fn is_c0_or_c1(ch: char) -> bool {
     matches!(ch, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}')
+}
+
+fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let first = *bytes.first()?;
+    let width = utf8_char_width(first)?;
+    if bytes.len() < width {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[..width]).ok()?;
+    let ch = text.chars().next()?;
+    Some((ch, width))
+}
+
+fn utf8_char_width(byte: u8) -> Option<usize> {
+    match byte {
+        0x00..=0x7f => Some(1),
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +154,18 @@ mod tests {
     #[test]
     fn terminal_capture_strips_raw_c1_sequences() {
         let text = terminal_capture(b"ok \x9b31mred\x9b0m \x9d52;c;secret\x9cdone\n");
+        assert_eq!(text, "ok red done\n");
+    }
+
+    #[test]
+    fn terminal_capture_preserves_utf8_text_while_stripping_controls() {
+        let text = terminal_capture("ok \x1b[31m완료 테스트 ✅\x1b[0m done\n".as_bytes());
+        assert_eq!(text, "ok 완료 테스트 ✅ done\n");
+    }
+
+    #[test]
+    fn terminal_capture_strips_utf8_encoded_c1_controls() {
+        let text = terminal_capture("ok \u{009b}31mred\u{009b}0m done\n".as_bytes());
         assert_eq!(text, "ok red done\n");
     }
 

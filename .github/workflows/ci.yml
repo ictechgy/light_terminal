@@ -20,7 +20,7 @@ jobs:
     name: rust-standard-checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
       - name: Install stable Rust
@@ -52,7 +52,7 @@ jobs:
     name: contract-manifest-validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
       - name: Validate manifest validator self-test
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: contract-manifest-validate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install stable Rust
         shell: bash
         run: |
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: json-schema-validate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install stable Rust
         shell: bash
         run: |
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: contract-manifest-validate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install stable Rust
         shell: bash
         run: |
@@ -117,7 +117,7 @@ jobs:
     name: upgrade-matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
       - name: Install stable Rust
@@ -134,7 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.run_soak_release_gate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install stable Rust
         shell: bash
         run: |

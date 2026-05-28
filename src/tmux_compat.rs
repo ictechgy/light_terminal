@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -1212,11 +1212,7 @@ fn is_valid_cmux_json_ref(value: &str) -> bool {
 }
 
 fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) -> Result<()> {
-    let lterm = std::env::var("LTERM_BIN").ok().unwrap_or_else(|| {
-        std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "lterm".to_string())
-    });
+    let lterm = child_lterm_executable();
     let attach_cmd = format!("exec {} attach {}\n", quote(&lterm), quote(&info.pane_id));
     let mut send = Command::new("cmux");
     if let Some(surface) = surface {
@@ -1236,6 +1232,30 @@ fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) ->
         );
     }
     Ok(())
+}
+
+fn child_lterm_executable() -> String {
+    if let Ok(value) = std::env::var("LTERM_BIN") {
+        if is_safe_lterm_bin_override(&value) {
+            return value;
+        }
+    }
+    if let Ok(path) = std::env::current_exe() {
+        return path.display().to_string();
+    }
+    "lterm".to_string()
+}
+
+fn is_safe_lterm_bin_override(value: &str) -> bool {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || value.chars().any(|ch| ch.is_control()) {
+        return false;
+    }
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
+        .unwrap_or(false)
 }
 
 fn rollback_cmux_split(surface: Option<&CmuxSurfaceContext>) {
@@ -3147,6 +3167,44 @@ exit 65
         assert!(!preview.contains('\x1b'));
         assert!(!preview.contains("secret"));
         assert!(preview.chars().count() <= 513);
+    }
+
+    #[test]
+    fn child_lterm_executable_prefers_safe_absolute_override() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_BIN"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lterm = temp.path().join("lterm");
+        fs::write(&lterm, b"#!/bin/sh\n").expect("write fake lterm");
+        let mut permissions = fs::metadata(&lterm)
+            .expect("fake lterm metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&lterm, permissions).expect("chmod fake lterm");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_BIN", &lterm);
+        }
+
+        assert_eq!(child_lterm_executable(), lterm.display().to_string());
+    }
+
+    #[test]
+    fn child_lterm_executable_ignores_unsafe_override() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_BIN"]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_BIN", "relative/lterm");
+        }
+
+        assert_ne!(child_lterm_executable(), "relative/lterm");
     }
 
     struct InterruptedOnceReader {

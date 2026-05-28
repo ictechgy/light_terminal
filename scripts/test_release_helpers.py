@@ -119,6 +119,9 @@ import sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
 PY
                 fi
+                if [[ "${{1:-}}" == "scripts/validate_npm_packages.mjs" ]]; then
+                  exit 0
+                fi
                 echo "unexpected node invocation: $*" >&2
                 exit 2
                 """,
@@ -183,6 +186,7 @@ PY
             self.assertNotIn("cargo\ttest\t--locked\t--test\tupgrade_matrix", log)
             self.assertNotIn("cargo\taudit", log)
             self.assertIn("python3\tscripts/validate_contract_manifest.py\tdocs/contract-manifest.json", log)
+            self.assertIn("node\tscripts/validate_npm_packages.mjs", log)
             self.assertIn("python3\tscripts/check_contract_drift.py\t--self-test", log)
 
     def test_release_preflight_full_mode_command_plan_and_audit_modes(self) -> None:
@@ -195,6 +199,7 @@ PY
                 "cargo\tclippy\t--locked\t--all-targets\t--\t-D\twarnings",
                 "cargo\ttest\t--locked\t--\t--test-threads=1",
                 "cargo\tbuild\t--release\t--locked",
+                "node\tscripts/validate_npm_packages.mjs",
                 "cargo\ttest\t--locked\t--test\tupgrade_matrix\t--\t--include-ignored\t--nocapture\t--test-threads=1",
                 "cargo\taudit",
             ]:

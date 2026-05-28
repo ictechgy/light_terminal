@@ -23,6 +23,7 @@ const ERR_INVALID_SESSION_CHARS: &str = "may only contain ASCII";
 const ERR_LEADING_DASH_NAME: &str = "cannot start with '-'";
 const ERR_SESSION_EXISTS: &str = "session name already exists";
 const ERR_SESSION_NAME: &str = "session name";
+const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 
 struct TestEnv {
     temp: tempfile::TempDir,
@@ -803,6 +804,45 @@ fn wait_contains_timeout_returns_nonzero_and_json_timeout_status() -> TestResult
     assert_eq!(result["matched"], false);
     assert_eq!(result["timed_out"], true);
     assert_eq!(result["needle"], "NEVER_READY");
+    Ok(())
+}
+
+#[test]
+fn wait_contains_rejects_oversized_needles() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "wait-needle-cap",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "wait-needle-cap");
+
+    let oversized = "x".repeat(4097);
+    let output = env
+        .cmd()
+        .args([
+            "wait",
+            "wait-needle-cap",
+            "--contains",
+            &oversized,
+            "--timeout",
+            "5s",
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "oversized wait needle should fail before waiting: {output:?}"
+    );
+    assert_stderr_contains(&output, "wait contains text exceeds 4096 bytes");
     Ok(())
 }
 
@@ -1789,7 +1829,34 @@ fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
         !no_start.status.success(),
         "trace-replay should reject output before start: {no_start:?}"
     );
+    assert!(
+        no_start.stdout.is_empty(),
+        "trace-replay should validate malformed traces before writing raw bytes: {no_start:?}"
+    );
     assert_stderr_contains(&no_start, "output before start");
+
+    let missing_end_path = env.temp.path().join("missing-end.jsonl");
+    std::fs::write(
+        &missing_end_path,
+        format!(
+            "{start}\n{}\n",
+            r#"{"type":"output","chunk_index":0,"elapsed_ms":0,"direction":"stdout","len":9,"bytes_hex":"1b5d35323b633b5807"}"#
+        ),
+    )?;
+    let missing_end = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&missing_end_path)
+        .output()?;
+    assert!(
+        !missing_end.status.success(),
+        "trace-replay should reject missing end events: {missing_end:?}"
+    );
+    assert!(
+        missing_end.stdout.is_empty(),
+        "trace-replay should not emit raw bytes before validating the full trace: {missing_end:?}"
+    );
+    assert_stderr_contains(&missing_end, "missing an end event");
 
     let wrong_direction_path = env.temp.path().join("wrong-direction.jsonl");
     std::fs::write(
@@ -1833,6 +1900,33 @@ fn trace_replay_rejects_malformed_or_unsafe_jsonl() -> TestResult {
         "trace-replay should reject oversized delays before writing raw bytes: {delay_cap:?}"
     );
     assert_stderr_contains(&delay_cap, "exceeds safety cap");
+
+    let aggregate_cap_path = env.temp.path().join("aggregate-cap.jsonl");
+    let oversized_len = MAX_TRACE_REPLAY_TOTAL_BYTES + 1;
+    std::fs::write(
+        &aggregate_cap_path,
+        format!(
+            "{start}\n{}\n",
+            format_args!(
+                r#"{{"type":"end","elapsed_ms":0,"reason":"duration","bytes_recorded":{},"chunks_recorded":0}}"#,
+                oversized_len
+            )
+        ),
+    )?;
+    let aggregate_cap = env
+        .cmd()
+        .arg("trace-replay")
+        .arg(&aggregate_cap_path)
+        .output()?;
+    assert!(
+        !aggregate_cap.status.success(),
+        "trace-replay should reject aggregate replay byte counts above the safety cap: {aggregate_cap:?}"
+    );
+    assert!(
+        aggregate_cap.stdout.is_empty(),
+        "trace-replay should reject aggregate caps before writing raw bytes: {aggregate_cap:?}"
+    );
+    assert_stderr_contains(&aggregate_cap, "total bytes exceed safety cap");
 
     let legacy_path = env.temp.path().join("legacy-v1-trace.jsonl");
     std::fs::write(
@@ -3590,6 +3684,12 @@ fn explicit_cwd_works_when_callers_current_directory_was_removed() -> TestResult
     let output = Command::new("sh")
         .env("LTERM_RUNTIME_DIR", env.temp.path().join("run"))
         .env("LTERM_DATA_DIR", env.temp.path().join("data"))
+        .env_remove("LTERM_SOCKET")
+        .env_remove("LTERM_SESSION")
+        .env_remove("LTERM_PANE")
+        .env_remove("LTERM_PARENT_TOKEN")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .env("LTERM_BIN", env!("CARGO_BIN_EXE_lterm"))
         .env("REMOVED_CWD", &removed)
         .env("TARGET_CWD", &target)

@@ -15,11 +15,29 @@ const SUPPORTED = new Map([
 
 function isExecutable(file) {
   try {
+    if (!fs.statSync(file).isFile()) {
+      return false;
+    }
     fs.accessSync(file, fs.constants.X_OK);
     return true;
   } catch (_) {
     return false;
   }
+}
+
+function hasControlChars(value) {
+  return /[\x00-\x1f\x7f-\x9f]/.test(value);
+}
+
+function overrideBinary(value) {
+  if (hasControlChars(value)) {
+    throw new Error('LTERM_BIN must not contain control characters.');
+  }
+  const resolved = path.resolve(value);
+  if (!isExecutable(resolved)) {
+    throw new Error(`LTERM_BIN is not executable: ${resolved}`);
+  }
+  return resolved;
 }
 
 function packageBinary(packageName) {
@@ -39,7 +57,7 @@ function repoFallbackBinary() {
 
 function resolveBinary() {
   if (process.env.LTERM_BIN) {
-    return process.env.LTERM_BIN;
+    return overrideBinary(process.env.LTERM_BIN);
   }
 
   const key = `${process.platform}:${process.arch}`;
