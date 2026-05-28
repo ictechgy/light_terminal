@@ -2642,7 +2642,7 @@ impl StatusBar {
             "\x1b[2K"
         };
         payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b8"
+            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K\x1b8"
         ));
         stdout
             .write_all(payload.as_bytes())
@@ -3676,6 +3676,10 @@ mod tests {
         assert!(
             !payload.contains("\x1b[24;1H\x1b[2K"),
             "same-row heartbeat redraws should not clear the current row and visibly flicker: {payload:?}"
+        );
+        assert!(
+            payload.contains("\x1b[0m\x1b[K\x1b8"),
+            "same-row redraws should still clear from the padded status text to line end, covering the intentionally unwritten final column without a full-row clear: {payload:?}"
         );
         status_bar.style = None;
     }
