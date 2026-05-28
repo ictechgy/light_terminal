@@ -1,6 +1,6 @@
 # Light Terminal (`lterm`)
 
-한국어 | [English](README.md)
+한국어 | [English](README.md) | 🌐 [브라우저용 HTML 가이드](https://ictechgy.github.io/light_terminal/)
 
 ## TL;DR
 
