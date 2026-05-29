@@ -35,13 +35,14 @@ the shell-evaluable exports and variable names, not the exact visual quote style
 
 ## Sanitization and raw PTY boundary
 
-Attached PTY streams are raw by design. `lterm resume`, compatibility aliases
-such as `lterm attach` / `lterm a` / `lterm -a`, `lterm open`, default attached
-`lterm start`, `lterm run`, profiled agent launchers, and `lterm ssh` forward PTY
-bytes without escape-sequence sanitization. This preserves full-screen programs,
-OSC notifications, cmux passthrough, and shell behavior, but it also means
-untrusted programs can emit terminal escape sequences to the attaching terminal.
-Do not use attached `lterm` streams as a sanitizer or sandbox.
+Attached PTY streams are raw by design. Raw `lterm resume`, compatibility aliases
+such as `lterm attach` / `lterm a` / `lterm -a`, raw `lterm open`, default
+attached `lterm start`, `lterm run`, raw profiled agent launchers, and
+`lterm ssh` forward PTY bytes without escape-sequence sanitization. This
+preserves full-screen programs, OSC notifications, cmux passthrough, and shell
+behavior, but it also means untrusted programs can emit terminal escape
+sequences to the attaching terminal. Do not use raw attached `lterm` streams as
+a sanitizer or sandbox.
 
 Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
 `wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
@@ -56,6 +57,18 @@ append Enter (`\r`), `--no-enter` sends exact message bytes, and compose must no
 attach, resize, or alter attached-client counts or PTY geometry. Sanitization
 belongs only to these non-attached surfaces; adding sanitization to attach/resume
 would violate the 1.0 contract.
+
+Mobile transcript attach is a pre-attach policy shim, not raw-stream
+sanitization. `LTERM_ATTACH_MODE=auto` is the default: desktop clients keep the
+raw attach path, while Termius-style clients or clients with `LTERM_MOBILE=1`
+use a normal-screen transcript when the target looks like an agent session. The
+transcript surface is non-attached: it displays sanitized capture output, sends
+input through the existing `input` / `send` path, does not enter alternate
+screen, does not increment attached-client counts, and does not resize PTY
+geometry. `--raw` / `LTERM_ATTACH_MODE=raw` forces the raw path; `--mobile` /
+`LTERM_ATTACH_MODE=mobile` forces the transcript path. CLI flags (`--raw`,
+`--mobile`, `--attach-mode`) are explicit user intent and take precedence over
+`LTERM_ATTACH_MODE`.
 
 Compose target resolution uses the same session-or-pane target model as
 `lterm logs`. The display sub-surface captures the last `--tail` sanitized
@@ -82,8 +95,8 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm start` | `lterm new` | `stable` | `best-effort` at command level; `stable` for the `--detach` summary row; attached stream is raw | none | `raw-transparent` when attached |
 | `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
-| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
-| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none | none | `raw-transparent` |
+| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none for raw attach; `best-effort` transcript UI when mobile policy selects it | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none for raw attach; `best-effort` transcript UI when mobile policy selects it | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
@@ -95,7 +108,7 @@ or raw output stream.
 | `lterm trace-info` | none | `best-effort` | `best-effort` raw-free metadata summary for a local trace file | `best-effort` raw-free metadata summary | `sanitized-output-only` |
 | `lterm wait` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
 | `lterm watch` | none | `stable` | `stable` status row | `stable` | `sanitized-output-only` |
-| `lterm compose` | `lterm mobile` | `stable` | `best-effort` UI with stable sanitized capture display | none | `sanitized-output-only` |
+| `lterm compose` | `lterm mobile` | `stable` | `best-effort` UI with stable sanitized capture display; `--transcript` uses the normal-screen transcript UI | none | `sanitized-output-only` |
 | `lterm input` | `lterm send` | `stable` | none | none | `not-applicable` |
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |
@@ -113,7 +126,7 @@ or raw output stream.
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |
 | `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
-| `lterm agent` | `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; attached agent PTY stream is raw and external agent CLI behavior is outside the lterm contract | none | `raw-transparent` |
+| `lterm agent` | `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; raw attached agent PTY stream and external agent CLI behavior are outside the lterm sanitized-output contract; mobile transcript is sanitized capture UI | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm tmux-compat list-commands` | none | `compatibility-stable` | `stable` tmux shim command list | `stable` | `sanitized-output-only` |
 
 ## tmux compatibility boundary

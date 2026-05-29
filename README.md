@@ -137,6 +137,7 @@ lterm -a api
 | Run a command with tmux compatibility enabled | `lterm run -- codex exec "summarize"` | None (`--no-tmux` opts out) |
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
+| Review an agent session from mobile scrollback | `LTERM_MOBILE=1 lterm resume codex-lterm` | Force with `--mobile`; bypass with `--raw` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
@@ -190,6 +191,8 @@ Compatibility names are subcommands unless shown as a leading flag: `-a` is the 
 This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime.
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The compatibility names `lterm list` and `lterm ls` keep the same output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. For the older raw full-terminal resume, use `lterm resume --no-status api` (or compatibility name `lterm attach --no-status api`), set `LTERM_NO_STATUS=1`, or use the equivalent `LTERM_STATUS=0` for clients whose status-line handling conflicts with lterm.
+
+`lterm resume` / `lterm open` use `LTERM_ATTACH_MODE=auto` by default. Desktop clients still get the raw PTY attach path. Termius-style clients, or clients with `LTERM_MOBILE=1`, are routed to a normal-screen mobile transcript when the target looks like an agent session. That transcript reads sanitized capture output and sends input through the existing `input` path; it does not enter the alternate screen, does not become an attached client, and does not resize the PTY. CLI flags take precedence over the environment: use `--raw` or `LTERM_ATTACH_MODE=raw` to force the old raw path, and `--mobile` or `LTERM_ATTACH_MODE=mobile` to force the transcript path. `--tail`, `--refresh`, and `--read-only` tune the transcript view.
 
 `lterm rename <target> <new-name>` renames a running session without restarting its process. Renaming a session to its current name is a no-op success, while renaming over a different in-use name fails with a conflict error. `<target>` accepts a session name, session id, pane id (`%0`), or bare pane number (`0`); a bare numeric target is interpreted as a pane number because session names cannot be all digits. `<new-name>` follows the same syntax rules as `--name`.
 
@@ -272,15 +275,18 @@ lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
 lterm compose api
+LTERM_MOBILE=1 lterm resume codex-lterm
+lterm resume --raw codex-lterm
 lterm wait api --contains READY --timeout 30s --json
 lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `mobile` is a visible alias for `compose`; the compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
+The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, mobile transcript attach gives phone clients native scrollback for long agent output, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `mobile` is a visible alias for `compose`; the compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
 
 For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
 In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
+`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output.
 
 **Stop a session:**
 
@@ -344,12 +350,13 @@ Agent launchers accept the same session controls across built-in profiles and cu
 ```bash
 lterm claude --name repo-review --cwd /path/to/repo
 lterm codex --detach --name repo-codex -- exec "summarize this repo"
+lterm codex --mobile --read-only
 lterm agy --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. OMX/OMC keep the lterm status bar visible by default for continuity with their existing lightweight status/HUD workflow; use `--no-status` if a specific OMX/OMC run needs a fully raw surface. Use `--status` to force the lterm status bar on, or `--no-status` to suppress it for any launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini profiles default to the `auto` attach policy. On desktop that means a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. On Termius-style mobile clients, `auto` uses the normal-screen transcript described above so long agent output can be reviewed with native mobile scrollback. OMX/OMC keep the lterm status bar visible by default for desktop continuity with their lightweight status/HUD workflow; mobile auto transcript still takes precedence when the attaching client is detected as mobile. Use `--raw` to force raw attach, `--mobile` to force transcript attach, `--status` to force the lterm status bar on, or `--no-status` to suppress it for any raw launch/profile that would otherwise show it. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
-Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
+Launcher controls are long-only (`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`, `--attach-mode`, `--raw`, `--mobile`, `--read-only`) so common agent short flags such as `-c` pass through naturally. They apply uniformly to built-in agent shortcuts such as `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, and `agent <profile>`. Use `--status-theme` / `--status-color` on agent launches when you want that session to keep a specific lterm status color across future attaches.
 `--detach` prints `name<TAB>pane<TAB>command` with control characters and Unicode line/paragraph separators in each field replaced by spaces; resume later with `lterm resume <name>` or compatibility name `lterm attach <name>`. The detach record does not echo `--cwd`; query the session if you need to inspect it later.
 Explicit `--name` values use lterm's normal session-name syntax and must not already be in use; they do not auto-suffix on conflict, so an in-use name fails with a conflict error.
 Names may contain ASCII letters, digits, `.`, `_`, and `-`, must not start with `-` or `%`, must not consist only of digits, must not look like a UUID, and are limited to 128 bytes.

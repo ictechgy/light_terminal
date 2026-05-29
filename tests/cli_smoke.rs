@@ -6619,6 +6619,179 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
 }
 
 #[test]
+fn agent_launcher_persists_agent_name_metadata() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    let config_path = env.temp.path().join("agents.json");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        "#!/bin/sh\nprintf 'READY\\n'\nsleep 5\n",
+    )?;
+    std::fs::write(
+        &config_path,
+        r#"{
+  "profiles": [
+    {
+      "name": "repo-review",
+      "binary": "codex",
+      "session_base": "repo-review-session",
+      "status_default": false
+    }
+  ]
+}"#,
+    )?;
+    let path = std::env::join_paths([fake_bin.as_path()])?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .args([
+            "agent",
+            "repo-review",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+            "--detach",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let _cleanup = SessionCleanup::new(&env, "repo-review-session");
+
+    let sessions = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions.status.success(), "{sessions:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout)?;
+    let session = sessions
+        .as_array()
+        .ok_or("sessions should be an array")?
+        .iter()
+        .find(|session| session["name"] == "repo-review-session")
+        .ok_or("missing repo-review-session")?;
+    assert_eq!(session["agent_name"], "repo-review");
+    Ok(())
+}
+
+#[test]
+fn mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'READY\\n'; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    env.capture_until("codex-lterm", "READY")?;
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lterm mobile transcript"),
+        "auto mobile attach should route to transcript mode: {stdout:?}"
+    );
+    assert!(stdout.contains("READY"), "{stdout:?}");
+    assert!(
+        !stdout.contains("\x1b[?1049h"),
+        "mobile transcript must stay on the normal screen: {stdout:?}"
+    );
+
+    let sessions = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions.status.success(), "{sessions:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout)?;
+    let session = sessions
+        .as_array()
+        .ok_or("sessions should be an array")?
+        .iter()
+        .find(|session| session["name"] == "codex-lterm")
+        .ok_or("missing codex-lterm")?;
+    assert_eq!(
+        session["attached_clients"], 0,
+        "transcript mode must not register as a raw attach client"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn mobile_auto_transcript_does_not_perturb_raw_attach_geometry() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'READY\\n'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    wait_for_socket(&socket)?;
+    env.capture_until("codex-lterm", "READY")?;
+    let (_desktop_stream, _desktop_id) = attach_with_geometry(&socket, "codex-lterm", 40, 152)?;
+    wait_for_size(&env, "codex-lterm", (40, 152))?;
+
+    let before = read_session_json(&env, "codex-lterm")?;
+    assert_eq!(
+        before
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "pre-mobile raw desktop attach should be the only attached client: {before}"
+    );
+
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("lterm mobile transcript"), "{stdout:?}");
+    assert!(stdout.contains("READY"), "{stdout:?}");
+
+    let after = read_session_json(&env, "codex-lterm")?;
+    assert_eq!(
+        after
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "mobile transcript must not become a second attach client: {after}"
+    );
+    assert_eq!(
+        (
+            after.get("rows").and_then(serde_json::Value::as_u64),
+            after.get("cols").and_then(serde_json::Value::as_u64)
+        ),
+        (Some(40), Some(152)),
+        "mobile transcript must not shrink or otherwise resize the raw desktop PTY geometry: {after}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_sessions_preserve_current_terminal_identity_for_color_detection() -> TestResult {
     let env = TestEnv::new()?;
     let anchor = env
@@ -6691,7 +6864,7 @@ printf 'COLORTERM:%s\n' "${COLORTERM-}"
         .env("LC_TERMINAL", "Termius")
         .env("COLORTERM", "truecolor")
         .stdin(Stdio::null())
-        .args(["omx", "--no-status", "--", "probe"])
+        .args(["omx", "--raw", "--no-status", "--", "probe"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);

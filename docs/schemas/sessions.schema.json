@@ -37,7 +37,8 @@
       "attached_clients": { "type": "integer", "minimum": 0 },
       "process_id": { "type": ["integer", "null"], "minimum": 1 },
       "process_group_id": { "type": ["integer", "null"] },
-      "status_theme": { "type": "string", "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"] }
+      "status_theme": { "type": "string", "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"] },
+      "agent_name": { "type": "string", "minLength": 1 }
     },
     "additionalProperties": false
   }
