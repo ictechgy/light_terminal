@@ -1928,11 +1928,10 @@ fn mobile_transcript_incremental_suffix<'a>(previous: &str, next: &'a str) -> Op
         return Some(suffix);
     }
 
-    let mut starts = previous
+    let starts = previous
         .char_indices()
         .filter_map(|(index, _)| (index > 0 && previous[..index].ends_with('\n')).then_some(index))
         .collect::<Vec<_>>();
-    starts.reverse();
     for start in starts {
         let overlap = &previous[start..];
         if overlap.is_empty() || overlap.len() > next.len() || !next.is_char_boundary(overlap.len())
@@ -3915,8 +3914,18 @@ mod tests {
             write_mobile_transcript_update(&mut previous, "two\nthree\nfour\n", &mut out).unwrap(),
             "tail-window rollover should append only unseen complete-line suffix"
         );
-        assert_eq!(String::from_utf8(out).unwrap(), "four\n");
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "four\n");
         assert_eq!(previous, "two\nthree\nfour\n");
+
+        previous = "alpha\nrepeat\nrepeat\n".to_string();
+        out.clear();
+        assert!(
+            write_mobile_transcript_update(&mut previous, "repeat\nrepeat\nomega\n", &mut out)
+                .unwrap(),
+            "tail-window rollover should prefer the longest repeated-line overlap"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "omega\n");
+        assert_eq!(previous, "repeat\nrepeat\nomega\n");
     }
 
     #[test]
