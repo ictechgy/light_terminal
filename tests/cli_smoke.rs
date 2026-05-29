@@ -6641,7 +6641,7 @@ fn agent_launcher_persists_agent_name_metadata() -> TestResult {
   ]
 }"#,
     )?;
-    let path = std::env::join_paths([fake_bin.as_path()])?;
+    let path = path_with_prepended(&fake_bin)?;
 
     let output = env
         .cmd()
