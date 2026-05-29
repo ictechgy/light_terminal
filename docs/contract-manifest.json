@@ -673,7 +673,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI selected by auto mobile policy or explicit --mobile and must not resize or register as an attached client."
+      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy."
     },
     {
       "command": "lterm tmux-compat list-commands",
