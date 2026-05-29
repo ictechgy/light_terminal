@@ -262,6 +262,7 @@ struct Session {
     created_unix_ms: u128,
     process_id: Option<u32>,
     process_group_id: Option<i32>,
+    agent_name: Option<String>,
     status_theme: Mutex<Option<StatusTheme>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -390,6 +391,7 @@ impl Session {
             process_id: self.process_id,
             process_group_id: self.process_group_id,
             status_theme: *lock(&self.status_theme),
+            agent_name: self.agent_name.clone(),
         }
     }
 
@@ -1712,6 +1714,11 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         })
         .unwrap_or_else(|| ".".to_string());
     let command = params.command.unwrap_or_else(default_shell_command);
+    let agent_name = params
+        .env
+        .get("LTERM_AGENT")
+        .map(|value| sanitize::terminal_text(value))
+        .filter(|value| !value.trim().is_empty());
     let mut spawn_command = command.clone();
     let tmux_shim = if params.tmux {
         let shim = paths::shim_dir()?;
@@ -1772,6 +1779,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         created_unix_ms: now_unix_ms(),
         process_id: Some(process_id),
         process_group_id,
+        agent_name,
         status_theme: Mutex::new(params.status_theme),
         child: Mutex::new(child),
         killer: Mutex::new(killer),
@@ -3702,6 +3710,7 @@ mod tests {
             parent_token: String::new(),
             command: "true".to_string(),
             cwd: ".".to_string(),
+            agent_name: None,
             created_unix_ms: 0,
             process_id: None,
             process_group_id: None,

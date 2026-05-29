@@ -1392,6 +1392,55 @@ pub struct ComposeOptions {
     pub append_enter: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachMode {
+    Auto,
+    Raw,
+    Mobile,
+}
+
+impl AttachMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "raw" => Some(Self::Raw),
+            "mobile" | "transcript" => Some(Self::Mobile),
+            _ => None,
+        }
+    }
+
+    pub fn allowed_values() -> &'static str {
+        "auto, raw, mobile"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MobileTranscriptOptions {
+    pub tail: usize,
+    pub refresh: Duration,
+    pub read_only: bool,
+    pub append_enter: bool,
+    pub banner: bool,
+}
+
+impl Default for MobileTranscriptOptions {
+    fn default() -> Self {
+        Self {
+            tail: 120,
+            refresh: Duration::from_millis(500),
+            read_only: false,
+            append_enter: true,
+            banner: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachPolicyOptions {
+    pub mode: AttachMode,
+    pub transcript: MobileTranscriptOptions,
+}
+
 pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
     let tail_start = compose_tail_start(options.tail)?;
     if options.once {
@@ -1413,6 +1462,110 @@ pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
         bail!("interactive compose requires a terminal; use --once --message for automation");
     }
     run_interactive_compose(target, tail_start, refresh, options.append_enter)
+}
+
+pub fn resolve_attach_mode(explicit: Option<AttachMode>) -> Result<AttachMode> {
+    if let Some(mode) = explicit {
+        return Ok(mode);
+    }
+    match std::env::var("LTERM_ATTACH_MODE") {
+        Ok(value) if !value.trim().is_empty() => AttachMode::parse(&value).ok_or_else(|| {
+            anyhow!(
+                "invalid LTERM_ATTACH_MODE {:?}; expected {}",
+                value,
+                AttachMode::allowed_values()
+            )
+        }),
+        _ => Ok(AttachMode::Auto),
+    }
+}
+
+pub fn should_mobile_transcript_auto(info: &SessionInfo) -> bool {
+    mobile_client_detected() && likely_agent_session(info)
+}
+
+pub fn mobile_client_detected() -> bool {
+    env_flag_enabled("LTERM_MOBILE") || is_termius_session()
+}
+
+pub fn likely_agent_session(info: &SessionInfo) -> bool {
+    if info
+        .agent_name
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    known_agent_name_from_session(&info.name) || known_agent_name_from_command(&info.command)
+}
+
+fn known_agent_name_from_session(name: &str) -> bool {
+    let Some(base) = name.strip_suffix("-lterm") else {
+        return false;
+    };
+    known_agent_name(base)
+}
+
+fn known_agent_name_from_command(command: &str) -> bool {
+    let first = shlex::split(command)
+        .and_then(|parts| parts.into_iter().next())
+        .unwrap_or_else(|| command.split_whitespace().next().unwrap_or("").to_string());
+    let basename = first.rsplit('/').next().unwrap_or(&first);
+    known_agent_name(basename)
+}
+
+fn known_agent_name(name: &str) -> bool {
+    matches!(
+        name,
+        "claude"
+            | "codex"
+            | "opencode"
+            | "copilot"
+            | "cursor-agent"
+            | "agy"
+            | "jules"
+            | "kiro"
+            | "kiro-cli"
+            | "aider"
+            | "goose"
+            | "amp"
+            | "crush"
+            | "gemini"
+            | "kimi"
+            | "qwen"
+            | "omx"
+            | "omc"
+    )
+}
+
+pub fn attach_with_policy(
+    target: &str,
+    show_status: bool,
+    stdin_eof: AttachStdinEof,
+    options: AttachPolicyOptions,
+) -> Result<()> {
+    let info = info(target)?;
+    attach_info_with_policy(&info, show_status, stdin_eof, options)
+}
+
+pub fn attach_info_with_policy(
+    info: &SessionInfo,
+    show_status: bool,
+    stdin_eof: AttachStdinEof,
+    options: AttachPolicyOptions,
+) -> Result<()> {
+    let use_mobile = match options.mode {
+        AttachMode::Raw => false,
+        AttachMode::Mobile => true,
+        AttachMode::Auto => should_mobile_transcript_auto(info),
+    };
+    if use_mobile {
+        mobile_transcript(&info.pane_id, options.transcript)
+    } else if options.transcript.read_only {
+        bail!("--read-only requires mobile transcript mode");
+    } else {
+        attach(&info.pane_id, show_status, stdin_eof)
+    }
 }
 
 const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -1592,6 +1745,210 @@ fn render_compose_prompt_at(
     queue!(stdout, cursor::MoveTo(cursor_col, prompt_row), cursor::Show)
         .context("position compose cursor")?;
     Ok(())
+}
+
+pub fn mobile_transcript(target: &str, options: MobileTranscriptOptions) -> Result<()> {
+    ensure_server()?;
+    let tail_start = compose_tail_start(options.tail)?;
+    let refresh = compose_refresh_interval(options.refresh)?;
+    let mut stdout = std::io::stdout();
+    let mut last_capture = String::new();
+
+    if options.banner {
+        let info = info(target)?;
+        writeln!(
+            stdout,
+            "lterm mobile transcript · target={} · pane={} · raw attach: {}",
+            sanitize::terminal_text(&info.name),
+            sanitize::terminal_text(&info.pane_id),
+            raw_attach_command_hint(&info.name)?
+        )
+        .context("write mobile transcript banner")?;
+    }
+    wait_and_render_initial_mobile_transcript(target, tail_start, refresh, &mut last_capture)?;
+
+    if options.read_only {
+        follow_mobile_transcript_read_only(target, tail_start, refresh, &mut last_capture)?;
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+    run_interactive_mobile_transcript(target, tail_start, refresh, options, last_capture)
+}
+
+fn wait_and_render_initial_mobile_transcript(
+    target: &str,
+    tail_start: i32,
+    refresh: Duration,
+    last_capture: &mut String,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let capture = capture_range(target, Some(tail_start), None)?;
+        let info = info(target)?;
+        let wrote = write_mobile_transcript_update(last_capture, &capture, &mut std::io::stdout())?;
+        if wrote || !info.alive || Instant::now() >= deadline {
+            return Ok(());
+        }
+        thread::sleep(refresh.min(Duration::from_millis(100)));
+    }
+}
+
+fn follow_mobile_transcript_read_only(
+    target: &str,
+    tail_start: i32,
+    refresh: Duration,
+    last_capture: &mut String,
+) -> Result<()> {
+    loop {
+        thread::sleep(refresh);
+        let capture = capture_range(target, Some(tail_start), None)?;
+        write_mobile_transcript_update(last_capture, &capture, &mut std::io::stdout())?;
+        if !info(target)?.alive {
+            return Ok(());
+        }
+    }
+}
+
+fn run_interactive_mobile_transcript(
+    target: &str,
+    tail_start: i32,
+    refresh: Duration,
+    options: MobileTranscriptOptions,
+    mut last_capture: String,
+) -> Result<()> {
+    let (input_tx, input_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = BufReader::new(stdin);
+        loop {
+            let mut input = String::new();
+            match stdin.read_line(&mut input) {
+                Ok(0) => {
+                    let _ = input_tx.send(Ok(None));
+                    return;
+                }
+                Ok(_) => {
+                    if input_tx.send(Ok(Some(input))).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = input_tx.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    let mut stdout = std::io::stdout();
+    write!(stdout, "> ").context("write mobile prompt")?;
+    stdout.flush().context("flush mobile prompt")?;
+    loop {
+        match input_rx.recv_timeout(refresh) {
+            Ok(Ok(Some(input))) => {
+                let input = trim_line_endings(&input);
+                match input {
+                    "/exit" | "/quit" => return Ok(()),
+                    "/refresh" => {
+                        let capture = capture_range(target, Some(tail_start), None)?;
+                        last_capture.clear();
+                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    }
+                    "/raw" => {
+                        writeln!(stdout, "raw attach: {}", raw_attach_command_hint(target)?)
+                            .context("write raw attach hint")?;
+                    }
+                    _ => {
+                        send(target, compose_commit_bytes(input, options.append_enter))?;
+                        let capture = capture_range(target, Some(tail_start), None)?;
+                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    }
+                }
+                write!(stdout, "\n> ").context("redraw mobile prompt")?;
+                stdout.flush().context("flush mobile prompt")?;
+            }
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(err)) => bail!("read mobile transcript input: {err}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let capture = capture_range(target, Some(tail_start), None)?;
+                if mobile_transcript_capture_changed(&last_capture, &capture) {
+                    writeln!(stdout).context("separate mobile prompt from transcript update")?;
+                    write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    write!(stdout, "\n> ").context("redraw mobile prompt")?;
+                    stdout.flush().context("flush mobile prompt")?;
+                }
+                if !info(target)?.alive {
+                    return Ok(());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
+    sanitize::terminal_capture(next.as_bytes()) != previous
+}
+
+fn trim_line_endings(value: &str) -> &str {
+    value.trim_end_matches(['\r', '\n'])
+}
+
+fn raw_attach_command_hint(target: &str) -> Result<String> {
+    shell_join(&[
+        "lterm".to_string(),
+        "attach".to_string(),
+        "--raw".to_string(),
+        "--".to_string(),
+        sanitize::terminal_text(target),
+    ])
+}
+
+fn write_mobile_transcript_update(
+    previous: &mut String,
+    next: &str,
+    stdout: &mut impl Write,
+) -> Result<bool> {
+    let next = sanitize::terminal_capture(next.as_bytes());
+    if next == *previous {
+        return Ok(false);
+    }
+    if previous.is_empty() {
+        write!(stdout, "{next}").context("write mobile transcript")?;
+    } else if let Some(suffix) = mobile_transcript_incremental_suffix(previous, &next) {
+        write!(stdout, "{suffix}").context("write mobile transcript suffix")?;
+    } else {
+        writeln!(stdout, "\n--- lterm transcript refresh ---")
+            .context("write mobile transcript refresh separator")?;
+        write!(stdout, "{next}").context("write mobile transcript refresh")?;
+    }
+    stdout.flush().context("flush mobile transcript")?;
+    previous.clear();
+    previous.push_str(&next);
+    Ok(true)
+}
+
+fn mobile_transcript_incremental_suffix<'a>(previous: &str, next: &'a str) -> Option<&'a str> {
+    if let Some(suffix) = next.strip_prefix(previous) {
+        return Some(suffix);
+    }
+
+    let starts = previous
+        .char_indices()
+        .filter_map(|(index, _)| (index > 0 && previous[..index].ends_with('\n')).then_some(index))
+        .collect::<Vec<_>>();
+    for start in starts {
+        let overlap = &previous[start..];
+        if overlap.is_empty() || overlap.len() > next.len() || !next.is_char_boundary(overlap.len())
+        {
+            continue;
+        }
+        if let Some(suffix) = next.strip_prefix(overlap) {
+            return Some(suffix);
+        }
+    }
+    None
 }
 
 fn compose_refresh_interval(refresh: Duration) -> Result<Duration> {
@@ -3300,18 +3657,21 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::{
         ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
-        AttachActiveGuard, ComposeRenderAction, DaemonStatus, KeyboardProtocolRestoreState,
-        MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme, TerminalOutputTracker,
-        alt_screen_param_matches, attach_pty_rows, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, format_status_line, handle_resize_tick, heartbeat_due,
-        keyboard_protocol_restore_bytes, matches_env_bool, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_style, read_attach_response_header,
-        resolve_status_style, status_theme_protocol_error,
+        AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
+        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme,
+        TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows, compose_commit_bytes,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, likely_agent_session,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, resolve_attach_mode,
+        resolve_status_style, should_mobile_transcript_auto, status_theme_protocol_error,
+        write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, Read};
     use std::sync::Arc;
@@ -3338,6 +3698,268 @@ mod tests {
         assert_eq!(
             compose_refresh_interval(Duration::from_millis(50)).expect("minimum refresh"),
             Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn attach_mode_parse_accepts_public_values() {
+        assert_eq!(AttachMode::parse("auto"), Some(AttachMode::Auto));
+        assert_eq!(AttachMode::parse(" RAW "), Some(AttachMode::Raw));
+        assert_eq!(AttachMode::parse("mobile"), Some(AttachMode::Mobile));
+        assert_eq!(AttachMode::parse("transcript"), Some(AttachMode::Mobile));
+        assert_eq!(AttachMode::parse("copy"), None);
+    }
+
+    #[test]
+    fn resolve_attach_mode_prefers_explicit_then_env_then_auto() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_ATTACH_MODE"]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_ATTACH_MODE", "mobile");
+        }
+        assert_eq!(resolve_attach_mode(None).unwrap(), AttachMode::Mobile);
+        assert_eq!(
+            resolve_attach_mode(Some(AttachMode::Raw)).unwrap(),
+            AttachMode::Raw,
+            "CLI flags must override LTERM_ATTACH_MODE"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_ATTACH_MODE", "bogus");
+        }
+        assert!(resolve_attach_mode(None).is_err());
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_ATTACH_MODE");
+        }
+        assert_eq!(resolve_attach_mode(None).unwrap(), AttachMode::Auto);
+    }
+
+    #[test]
+    fn mobile_client_detection_is_explicit_or_termius_not_plain_ssh() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_MOBILE",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "TERMINAL_EMULATOR",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_MOBILE");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("TERMINAL_EMULATOR");
+            std::env::set_var("SSH_TTY", "/dev/ttys001");
+        }
+        assert!(
+            !mobile_client_detected(),
+            "plain SSH must not be treated as mobile"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("TERM_PROGRAM", "Termius");
+        }
+        assert!(mobile_client_detected());
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::set_var("LTERM_MOBILE", "1");
+        }
+        assert!(mobile_client_detected());
+    }
+
+    fn sample_session_info(
+        name: &str,
+        command: &str,
+        agent_name: Option<&str>,
+    ) -> crate::protocol::SessionInfo {
+        crate::protocol::SessionInfo {
+            id: format!("{name}-id"),
+            name: name.to_string(),
+            pane_id: "%test".to_string(),
+            parent_pane_id: None,
+            parent_session_id: None,
+            command: command.to_string(),
+            cwd: "/tmp".to_string(),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            attached_clients: 0,
+            process_id: None,
+            process_group_id: None,
+            status_theme: None,
+            agent_name: agent_name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn likely_agent_session_prefers_metadata_and_uses_conservative_fallbacks() {
+        assert!(
+            likely_agent_session(&sample_session_info(
+                "repo-review-session",
+                "/bin/sh",
+                Some("repo-review")
+            )),
+            "persisted LTERM_AGENT metadata should identify configured agents"
+        );
+        assert!(likely_agent_session(&sample_session_info(
+            "omx-lterm",
+            "/bin/sh",
+            None
+        )));
+        assert!(likely_agent_session(&sample_session_info(
+            "plain",
+            "/usr/local/bin/codex --model gpt",
+            None
+        )));
+        assert!(
+            !likely_agent_session(&sample_session_info("plain", "/bin/zsh -l", None)),
+            "ordinary shells must stay on raw attach in auto mode"
+        );
+    }
+
+    #[test]
+    fn mobile_auto_requires_both_mobile_client_and_likely_agent() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_MOBILE",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "TERMINAL_EMULATOR",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_MOBILE");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("TERMINAL_EMULATOR");
+        }
+        let agent = sample_session_info("codex-lterm", "/bin/sh", Some("codex"));
+        assert!(!should_mobile_transcript_auto(&agent));
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_MOBILE", "1");
+        }
+        assert!(should_mobile_transcript_auto(&agent));
+        assert!(!should_mobile_transcript_auto(&sample_session_info(
+            "shell", "/bin/zsh", None
+        )));
+    }
+
+    #[test]
+    fn mobile_transcript_update_appends_suffix_and_refreshes_on_divergence() {
+        let mut previous = String::new();
+        let mut out = Vec::new();
+        assert!(write_mobile_transcript_update(&mut previous, "one\n", &mut out).unwrap());
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "one\n");
+        assert_eq!(previous, "one\n");
+
+        out.clear();
+        assert!(
+            write_mobile_transcript_update(&mut previous, "one\ntwo\n", &mut out).unwrap(),
+            "longer capture should write only the suffix"
+        );
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "two\n");
+
+        out.clear();
+        assert!(!write_mobile_transcript_update(&mut previous, "one\ntwo\n", &mut out).unwrap());
+        assert!(out.is_empty());
+
+        out.clear();
+        assert!(write_mobile_transcript_update(&mut previous, "fresh\n", &mut out).unwrap());
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("--- lterm transcript refresh ---"));
+        assert!(rendered.ends_with("fresh\n"));
+        assert!(
+            !rendered.contains("\x1b[?1049h"),
+            "normal-screen transcript helper must not enter alternate screen"
+        );
+    }
+
+    #[test]
+    fn mobile_transcript_update_sanitizes_controls_and_handles_tail_rollover() {
+        let mut previous = String::new();
+        let mut out = Vec::new();
+        assert!(
+            write_mobile_transcript_update(
+                &mut previous,
+                "safe \x1b[31mred\x1b[0m \x1b]52;c;secret\x07done\n",
+                &mut out,
+            )
+            .unwrap()
+        );
+        let rendered = String::from_utf8(out.clone()).unwrap();
+        assert_eq!(rendered, "safe red done\n");
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains("secret"));
+        assert_eq!(previous, "safe red done\n");
+
+        previous = "one\ntwo\nthree\n".to_string();
+        out.clear();
+        assert!(
+            write_mobile_transcript_update(&mut previous, "two\nthree\nfour\n", &mut out).unwrap(),
+            "tail-window rollover should append only unseen complete-line suffix"
+        );
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "four\n");
+        assert_eq!(previous, "two\nthree\nfour\n");
+
+        previous = "alpha\nrepeat\nrepeat\n".to_string();
+        out.clear();
+        assert!(
+            write_mobile_transcript_update(&mut previous, "repeat\nrepeat\nomega\n", &mut out)
+                .unwrap(),
+            "tail-window rollover should prefer the longest repeated-line overlap"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "omega\n");
+        assert_eq!(previous, "repeat\nrepeat\nomega\n");
+    }
+
+    #[test]
+    fn mobile_transcript_capture_changed_compares_sanitized_text() {
+        assert!(
+            !mobile_transcript_capture_changed("red\n", "\x1b[31mred\x1b[0m\n"),
+            "stable raw terminal controls must not force repeated transcript redraws"
+        );
+        assert!(mobile_transcript_capture_changed(
+            "red\n",
+            "\x1b[31mred\x1b[0m\nnext\n"
+        ));
+    }
+
+    #[test]
+    fn raw_attach_hint_quotes_target_and_uses_option_terminator() {
+        assert_eq!(
+            raw_attach_command_hint("codex-lterm").unwrap(),
+            "lterm attach --raw -- codex-lterm"
+        );
+        assert_eq!(
+            raw_attach_command_hint("-leading").unwrap(),
+            "lterm attach --raw -- -leading"
+        );
+        assert_eq!(
+            raw_attach_command_hint("bad name;rm -rf /").unwrap(),
+            "lterm attach --raw -- 'bad name;rm -rf /'"
         );
     }
 

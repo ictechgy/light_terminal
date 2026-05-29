@@ -1075,7 +1075,7 @@ fn watch_notify_targets_cmux_context_when_available() -> TestResult {
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
-    let path = std::env::join_paths([fake_bin.as_path()])?;
+    let path = path_with_prepended(&fake_bin)?;
 
     let status = env
         .cmd()
@@ -6619,6 +6619,393 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
 }
 
 #[test]
+fn agent_launcher_persists_agent_name_metadata() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    let config_path = env.temp.path().join("agents.json");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        "#!/bin/sh\nprintf 'READY\\n'\nsleep 5\n",
+    )?;
+    std::fs::write(
+        &config_path,
+        r#"{
+  "profiles": [
+    {
+      "name": "repo-review",
+      "binary": "codex",
+      "session_base": "repo-review-session",
+      "status_default": false
+    }
+  ]
+}"#,
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .args([
+            "agent",
+            "repo-review",
+            "--agent-config",
+            config_path
+                .to_str()
+                .ok_or("agent config path should be UTF-8")?,
+            "--detach",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let _cleanup = SessionCleanup::new(&env, "repo-review-session");
+
+    let sessions = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions.status.success(), "{sessions:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout)?;
+    let session = sessions
+        .as_array()
+        .ok_or("sessions should be an array")?
+        .iter()
+        .find(|session| session["name"] == "repo-review-session")
+        .ok_or("missing repo-review-session")?;
+    assert_eq!(session["agent_name"], "repo-review");
+    Ok(())
+}
+
+#[test]
+fn mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'READY\\n'; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    env.capture_until("codex-lterm", "READY")?;
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lterm mobile transcript"),
+        "auto mobile attach should route to transcript mode: {stdout:?}"
+    );
+    assert!(stdout.contains("READY"), "{stdout:?}");
+    assert!(
+        !stdout.contains("\x1b[?1049h"),
+        "mobile transcript must stay on the normal screen: {stdout:?}"
+    );
+
+    let sessions = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(sessions.status.success(), "{sessions:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout)?;
+    let session = sessions
+        .as_array()
+        .ok_or("sessions should be an array")?
+        .iter()
+        .find(|session| session["name"] == "codex-lterm")
+        .ok_or("missing codex-lterm")?;
+    assert_eq!(
+        session["attached_clients"], 0,
+        "transcript mode must not register as a raw attach client"
+    );
+    Ok(())
+}
+
+#[test]
+fn mobile_auto_transcript_prints_sanitized_capture() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'VISIBLE \\033[31mRED\\033[0m \\033]52;c;secret\\007DONE\\n'; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    env.capture_until("codex-lterm", "VISIBLE RED DONE")?;
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("VISIBLE RED DONE"), "{stdout:?}");
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains("secret"),
+        "mobile transcript must not print active escape/control payloads: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn mobile_auto_transcript_does_not_perturb_raw_attach_geometry() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'READY\\n'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    wait_for_socket(&socket)?;
+    env.capture_until("codex-lterm", "READY")?;
+    let (_desktop_stream, _desktop_id) = attach_with_geometry(&socket, "codex-lterm", 40, 152)?;
+    wait_for_size(&env, "codex-lterm", (40, 152))?;
+
+    let before = read_session_json(&env, "codex-lterm")?;
+    assert_eq!(
+        before
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "pre-mobile raw desktop attach should be the only attached client: {before}"
+    );
+
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("lterm mobile transcript"), "{stdout:?}");
+    assert!(stdout.contains("READY"), "{stdout:?}");
+
+    let after = read_session_json(&env, "codex-lterm")?;
+    assert_eq!(
+        after
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "mobile transcript must not become a second attach client: {after}"
+    );
+    assert_eq!(
+        (
+            after.get("rows").and_then(serde_json::Value::as_u64),
+            after.get("cols").and_then(serde_json::Value::as_u64)
+        ),
+        (Some(40), Some(152)),
+        "mobile transcript must not shrink or otherwise resize the raw desktop PTY geometry: {after}"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_attach_mode_env_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .env("LTERM_ATTACH_MODE", "bogus")
+        .stdin(Stdio::null())
+        .args(["open", "bad-env-open"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "invalid LTERM_ATTACH_MODE");
+    assert!(
+        !session_names_json(&env)?.contains("bad-env-open"),
+        "open must validate attach policy before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_raw_read_only_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .env("LTERM_ATTACH_MODE", "raw")
+        .stdin(Stdio::null())
+        .args(["open", "raw-read-only-open", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("raw-read-only-open"),
+        "open must reject env-selected raw read-only before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn auto_read_only_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["open", "auto-read-only-open", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(
+        &output,
+        "--read-only in auto attach mode requires an existing target",
+    );
+    assert!(
+        !session_names_json(&env)?.contains("auto-read-only-open"),
+        "open must not create a session when auto read-only has no target to classify"
+    );
+    Ok(())
+}
+
+#[test]
+fn auto_read_only_rejects_plain_raw_attach_without_sending_input() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "plain-read-only",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo GOT:$line; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "plain-read-only");
+    env.capture_until("plain-read-only", "READY")?;
+
+    let mut attach = env
+        .cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["attach", "plain-read-only", "--read-only"])
+        .spawn()?;
+    let write_result = attach
+        .stdin
+        .as_mut()
+        .ok_or("missing attach stdin")?
+        .write_all(b"SHOULD_NOT_SEND\n");
+    if let Err(err) = write_result {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(err.into());
+        }
+    }
+    let output = attach.wait_with_output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+
+    let capture = env
+        .cmd()
+        .args(["logs", "plain-read-only", "-S=-20"])
+        .output()?;
+    assert!(capture.status.success(), "{capture:?}");
+    let captured = String::from_utf8_lossy(&capture.stdout);
+    assert!(
+        !captured.contains("GOT:SHOULD_NOT_SEND"),
+        "read-only auto fallback must not open a writable raw attach: {captured:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_attach_mode_env_does_not_create_agent_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("LTERM_ATTACH_MODE", "bogus")
+        .stdin(Stdio::null())
+        .args(["codex"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "invalid LTERM_ATTACH_MODE");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must validate attach policy before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn agent_auto_read_only_without_mobile_does_not_create_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .args(["codex", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must not create a desktop raw session when --read-only is auto-only"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_raw_read_only_does_not_create_agent_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("LTERM_ATTACH_MODE", "raw")
+        .stdin(Stdio::null())
+        .args(["codex", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must reject env-selected raw read-only before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_sessions_preserve_current_terminal_identity_for_color_detection() -> TestResult {
     let env = TestEnv::new()?;
     let anchor = env
@@ -6691,7 +7078,7 @@ printf 'COLORTERM:%s\n' "${COLORTERM-}"
         .env("LC_TERMINAL", "Termius")
         .env("COLORTERM", "truecolor")
         .stdin(Stdio::null())
-        .args(["omx", "--no-status", "--", "probe"])
+        .args(["omx", "--raw", "--no-status", "--", "probe"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);

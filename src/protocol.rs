@@ -79,6 +79,8 @@ pub struct SessionInfo {
     pub process_group_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_theme: Option<StatusTheme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
