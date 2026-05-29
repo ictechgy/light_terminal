@@ -174,7 +174,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI selected by auto mobile policy or explicit --mobile."
+      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI selected by auto mobile policy or explicit --mobile and must not resize or register as an attached client."
     },
     {
       "command": "lterm sessions",
@@ -673,7 +673,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI selected by auto mobile policy or explicit --mobile."
+      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI selected by auto mobile policy or explicit --mobile and must not resize or register as an attached client."
     },
     {
       "command": "lterm tmux-compat list-commands",

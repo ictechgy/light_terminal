@@ -1816,54 +1816,74 @@ fn run_interactive_mobile_transcript(
     options: MobileTranscriptOptions,
     mut last_capture: String,
 ) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdin_fd = stdin.as_raw_fd();
-    let mut stdin = BufReader::new(stdin);
+    let (input_tx, input_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = BufReader::new(stdin);
+        loop {
+            let mut input = String::new();
+            match stdin.read_line(&mut input) {
+                Ok(0) => {
+                    let _ = input_tx.send(Ok(None));
+                    return;
+                }
+                Ok(_) => {
+                    if input_tx.send(Ok(Some(input))).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = input_tx.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+    });
     let mut stdout = std::io::stdout();
+    write!(stdout, "> ").context("write mobile prompt")?;
+    stdout.flush().context("flush mobile prompt")?;
     loop {
-        write!(stdout, "> ").context("write mobile prompt")?;
-        stdout.flush().context("flush mobile prompt")?;
-        while !stdin_has_input(stdin_fd, refresh)? {
-            let capture = capture_range(target, Some(tail_start), None)?;
-            if capture != last_capture {
-                writeln!(stdout).context("separate mobile prompt from transcript update")?;
-                write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+        match input_rx.recv_timeout(refresh) {
+            Ok(Ok(Some(input))) => {
+                let input = trim_line_endings(&input);
+                match input {
+                    "/exit" | "/quit" => return Ok(()),
+                    "/refresh" => {
+                        let capture = capture_range(target, Some(tail_start), None)?;
+                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    }
+                    "/raw" => {
+                        writeln!(
+                            stdout,
+                            "raw attach: lterm attach --raw {}",
+                            sanitize::terminal_text(target)
+                        )
+                        .context("write raw attach hint")?;
+                    }
+                    _ => {
+                        send(target, compose_commit_bytes(input, options.append_enter))?;
+                        let capture = capture_range(target, Some(tail_start), None)?;
+                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    }
+                }
                 write!(stdout, "\n> ").context("redraw mobile prompt")?;
                 stdout.flush().context("flush mobile prompt")?;
             }
-            if !info(target)?.alive {
-                return Ok(());
-            }
-        }
-
-        let mut input = String::new();
-        if stdin
-            .read_line(&mut input)
-            .context("read mobile transcript input")?
-            == 0
-        {
-            return Ok(());
-        }
-        let input = trim_line_endings(&input);
-        match input {
-            "/exit" | "/quit" => return Ok(()),
-            "/refresh" => {
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(err)) => bail!("read mobile transcript input: {err}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 let capture = capture_range(target, Some(tail_start), None)?;
-                write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                if capture != last_capture {
+                    writeln!(stdout).context("separate mobile prompt from transcript update")?;
+                    write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
+                    write!(stdout, "\n> ").context("redraw mobile prompt")?;
+                    stdout.flush().context("flush mobile prompt")?;
+                }
+                if !info(target)?.alive {
+                    return Ok(());
+                }
             }
-            "/raw" => {
-                writeln!(
-                    stdout,
-                    "raw attach: lterm attach --raw {}",
-                    sanitize::terminal_text(target)
-                )
-                .context("write raw attach hint")?;
-            }
-            _ => {
-                send(target, compose_commit_bytes(input, options.append_enter))?;
-                let capture = capture_range(target, Some(tail_start), None)?;
-                write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 }
@@ -1877,12 +1897,13 @@ fn write_mobile_transcript_update(
     next: &str,
     stdout: &mut impl Write,
 ) -> Result<bool> {
-    if next == previous {
+    let next = sanitize::terminal_capture(next.as_bytes());
+    if next == *previous {
         return Ok(false);
     }
     if previous.is_empty() {
         write!(stdout, "{next}").context("write mobile transcript")?;
-    } else if let Some(suffix) = next.strip_prefix(previous.as_str()) {
+    } else if let Some(suffix) = mobile_transcript_incremental_suffix(previous, &next) {
         write!(stdout, "{suffix}").context("write mobile transcript suffix")?;
     } else {
         writeln!(stdout, "\n--- lterm transcript refresh ---")
@@ -1891,8 +1912,31 @@ fn write_mobile_transcript_update(
     }
     stdout.flush().context("flush mobile transcript")?;
     previous.clear();
-    previous.push_str(next);
+    previous.push_str(&next);
     Ok(true)
+}
+
+fn mobile_transcript_incremental_suffix<'a>(previous: &str, next: &'a str) -> Option<&'a str> {
+    if let Some(suffix) = next.strip_prefix(previous) {
+        return Some(suffix);
+    }
+
+    let mut starts = previous
+        .char_indices()
+        .filter_map(|(index, _)| (index > 0 && previous[..index].ends_with('\n')).then_some(index))
+        .collect::<Vec<_>>();
+    starts.reverse();
+    for start in starts {
+        let overlap = &previous[start..];
+        if overlap.is_empty() || overlap.len() > next.len() || !next.is_char_boundary(overlap.len())
+        {
+            continue;
+        }
+        if let Some(suffix) = next.strip_prefix(overlap) {
+            return Some(suffix);
+        }
+    }
+    None
 }
 
 fn compose_refresh_interval(refresh: Duration) -> Result<Duration> {
@@ -3838,6 +3882,34 @@ mod tests {
             !rendered.contains("\x1b[?1049h"),
             "normal-screen transcript helper must not enter alternate screen"
         );
+    }
+
+    #[test]
+    fn mobile_transcript_update_sanitizes_controls_and_handles_tail_rollover() {
+        let mut previous = String::new();
+        let mut out = Vec::new();
+        assert!(
+            write_mobile_transcript_update(
+                &mut previous,
+                "safe \x1b[31mred\x1b[0m \x1b]52;c;secret\x07done\n",
+                &mut out,
+            )
+            .unwrap()
+        );
+        let rendered = String::from_utf8(out.clone()).unwrap();
+        assert_eq!(rendered, "safe red done\n");
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains("secret"));
+        assert_eq!(previous, "safe red done\n");
+
+        previous = "one\ntwo\nthree\n".to_string();
+        out.clear();
+        assert!(
+            write_mobile_transcript_update(&mut previous, "two\nthree\nfour\n", &mut out).unwrap(),
+            "tail-window rollover should append only unseen complete-line suffix"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "four\n");
+        assert_eq!(previous, "two\nthree\nfour\n");
     }
 
     #[test]

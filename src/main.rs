@@ -115,7 +115,7 @@ enum Commands {
         #[arg(long, value_name = "DURATION", default_value = "500ms", value_parser = parse_wait_duration_arg)]
         refresh: Duration,
         /// Do not prompt for input in mobile transcript mode.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "raw")]
         read_only: bool,
     },
     /// Attach to a session, creating it first when missing.
@@ -143,7 +143,7 @@ enum Commands {
         #[arg(long, value_name = "DURATION", default_value = "500ms", value_parser = parse_wait_duration_arg)]
         refresh: Duration,
         /// Do not prompt for input in mobile transcript mode.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "raw")]
         read_only: bool,
     },
     /// List sessions.
@@ -290,7 +290,7 @@ enum Commands {
         #[arg(long)]
         no_enter: bool,
         /// Use the normal-screen transcript view instead of the alternate-screen composer.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["once", "message"])]
         transcript: bool,
         /// In transcript mode, do not prompt for input.
         #[arg(long, requires = "transcript")]
@@ -654,12 +654,14 @@ fn run() -> Result<()> {
             refresh,
             read_only,
         } => {
+            let attach_policy =
+                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
             let info = client::attach_or_new(&target)?;
             client::attach_info_with_policy(
                 &info,
                 !no_status,
                 AttachStdinEof::Detach,
-                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?,
+                attach_policy,
             )
         }
         Commands::Sessions {
@@ -781,9 +783,6 @@ fn run() -> Result<()> {
             read_only,
         } => {
             if transcript {
-                if once || message.is_some() {
-                    bail!("--transcript does not support --once or --message");
-                }
                 client::mobile_transcript(
                     &target,
                     MobileTranscriptOptions {
@@ -1783,8 +1782,12 @@ fn attach_policy_options(
         (None, false, false) => None,
         _ => bail!("choose only one of --attach-mode, --raw, or --mobile"),
     };
+    let mode = client::resolve_attach_mode(explicit)?;
+    if read_only && mode == AttachMode::Raw {
+        bail!("--read-only requires mobile transcript mode");
+    }
     Ok(AttachPolicyOptions {
-        mode: client::resolve_attach_mode(explicit)?,
+        mode,
         transcript: MobileTranscriptOptions {
             tail,
             refresh,
@@ -1989,7 +1992,7 @@ struct AgentLaunchOptions {
     #[arg(long)]
     cwd: Option<String>,
     /// Create the agent session without attaching to it.
-    #[arg(long, conflicts_with_all = ["status", "no_status", "attach_mode", "raw", "mobile", "read_only"])]
+    #[arg(long, conflicts_with_all = ["status", "no_status", "attach_mode", "raw", "mobile", "tail", "refresh", "read_only"])]
     detach: bool,
     /// Force-enable the lterm status bar while attached.
     #[arg(long, conflicts_with = "no_status")]
@@ -2009,8 +2012,14 @@ struct AgentLaunchOptions {
     /// Force the mobile transcript view after launching.
     #[arg(long)]
     mobile: bool,
+    /// Number of sanitized transcript lines to show in mobile transcript mode (default: 120).
+    #[arg(long, value_parser = parse_compose_tail_arg, conflicts_with = "raw")]
+    tail: Option<usize>,
+    /// Refresh interval for mobile transcript mode (default: 500ms).
+    #[arg(long, value_name = "DURATION", value_parser = parse_wait_duration_arg, conflicts_with = "raw")]
+    refresh: Option<Duration>,
     /// Do not prompt for input in mobile transcript mode.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "raw")]
     read_only: bool,
 }
 
@@ -2047,8 +2056,8 @@ impl AgentLaunchOptions {
             self.attach_mode,
             self.raw,
             self.mobile,
-            transcript.tail,
-            transcript.refresh,
+            self.tail.unwrap_or(transcript.tail),
+            self.refresh.unwrap_or(transcript.refresh),
             self.read_only,
         )
     }
@@ -2415,6 +2424,11 @@ fn run_agent_profile(
     if args.first().is_some_and(|arg| arg == "--") {
         args.remove(0);
     }
+    let attach_policy = if launch.detach() {
+        None
+    } else {
+        Some(launch.attach_policy_options()?)
+    };
     let binary_path = client::find_command(&profile.binary)
         .with_context(|| format!("{} not found in PATH", profile.binary))?;
     tmux_compat::ensure_shim()?;
@@ -2461,7 +2475,9 @@ fn run_agent_profile(
                     &info,
                     launch.show_status(profile.show_status),
                     AttachStdinEof::KeepAttached,
-                    launch.attach_policy_options()?,
+                    attach_policy
+                        .clone()
+                        .context("attach policy should be validated before agent launch")?,
                 );
             }
             Err(err) if is_session_name_conflict(&err) => {
@@ -2919,6 +2935,21 @@ mod tests {
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "0"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--tail", "2147483648"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "compose", "main", "--refresh", "0ms"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "compose", "main", "--read-only"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lterm", "compose", "main", "--transcript", "--once"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lterm",
+                "compose",
+                "main",
+                "--transcript",
+                "--message",
+                "hello"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2972,6 +3003,32 @@ mod tests {
             Cli::try_parse_from(["lterm", "open", "main", "--attach-mode", "mobile", "--raw"])
                 .is_err()
         );
+        let raw_read_only = Cli::try_parse_from([
+            "lterm",
+            "attach",
+            "main",
+            "--attach-mode",
+            "raw",
+            "--read-only",
+        ])
+        .expect("--attach-mode raw conflict is semantic");
+        let Commands::Resume {
+            attach_mode,
+            raw,
+            mobile,
+            tail,
+            refresh,
+            read_only,
+            ..
+        } = raw_read_only.command
+        else {
+            panic!("expected resume command");
+        };
+        assert!(
+            attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only).is_err(),
+            "--read-only must not be accepted with an explicit raw attach mode"
+        );
+        assert!(Cli::try_parse_from(["lterm", "attach", "main", "--read-only", "--raw"]).is_err());
     }
 
     #[test]
@@ -3251,6 +3308,10 @@ mod tests {
             "lterm",
             "omx",
             "--mobile",
+            "--tail",
+            "24",
+            "--refresh",
+            "250ms",
             "--read-only",
             "--",
             "--model",
@@ -3261,10 +3322,10 @@ mod tests {
             Commands::Omx { launch, args } => {
                 assert!(launch.mobile);
                 assert!(launch.read_only);
-                assert_eq!(
-                    launch.attach_policy_options().unwrap().mode,
-                    AttachMode::Mobile
-                );
+                let policy = launch.attach_policy_options().unwrap();
+                assert_eq!(policy.mode, AttachMode::Mobile);
+                assert_eq!(policy.transcript.tail, 24);
+                assert_eq!(policy.transcript.refresh, Duration::from_millis(250));
                 assert_eq!(args, vec!["--model", "gpt"]);
             }
             other => panic!("expected omx command, got {other:?}"),
@@ -3284,7 +3345,22 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["lterm", "codex", "--raw", "--mobile"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "codex", "--raw", "--read-only"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "codex", "--raw", "--tail", "24"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "codex", "--detach", "--mobile"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "codex", "--detach", "--tail", "24"]).is_err());
+
+        let cli = Cli::try_parse_from(["lterm", "codex", "--attach-mode", "raw", "--read-only"])
+            .expect("--attach-mode raw conflict is semantic");
+        match cli.command {
+            Commands::Codex { launch, .. } => {
+                assert!(
+                    launch.attach_policy_options().is_err(),
+                    "agent --read-only must not be accepted with an explicit raw attach mode"
+                );
+            }
+            other => panic!("expected codex command, got {other:?}"),
+        }
     }
 
     #[test]

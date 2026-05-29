@@ -59,16 +59,20 @@ belongs only to these non-attached surfaces; adding sanitization to attach/resum
 would violate the 1.0 contract.
 
 Mobile transcript attach is a pre-attach policy shim, not raw-stream
-sanitization. `LTERM_ATTACH_MODE=auto` is the default: desktop clients keep the
-raw attach path, while Termius-style clients or clients with `LTERM_MOBILE=1`
-use a normal-screen transcript when the target looks like an agent session. The
-transcript surface is non-attached: it displays sanitized capture output, sends
-input through the existing `input` / `send` path, does not enter alternate
-screen, does not increment attached-client counts, and does not resize PTY
-geometry. `--raw` / `LTERM_ATTACH_MODE=raw` forces the raw path; `--mobile` /
-`LTERM_ATTACH_MODE=mobile` forces the transcript path. CLI flags (`--raw`,
-`--mobile`, `--attach-mode`) are explicit user intent and take precedence over
-`LTERM_ATTACH_MODE`.
+sanitization. `--attach-mode=auto` / `LTERM_ATTACH_MODE=auto` is the default,
+and accepted values are `auto`, `raw`, and `mobile` (`mobile` means the
+normal-screen transcript view). Desktop clients keep the raw attach path. Auto
+mobile detection is conservative best effort: `LTERM_MOBILE=1` or a Termius
+terminal identity marks the client as mobile, and the target must look like an
+agent session via persisted `LTERM_AGENT` metadata, a built-in `*-lterm` agent
+session name, or a known agent command basename. Scripts that need deterministic
+behavior should use explicit flags/env. The transcript surface is non-attached:
+it displays sanitized capture output, sends input through the existing `input` /
+`send` path, does not enter alternate screen, does not increment attached-client
+counts, and does not resize PTY geometry. `--raw` / `LTERM_ATTACH_MODE=raw`
+forces the raw path; `--mobile` / `LTERM_ATTACH_MODE=mobile` forces the
+transcript path. CLI flags (`--raw`, `--mobile`, `--attach-mode`) are explicit
+user intent and take precedence over `LTERM_ATTACH_MODE`.
 
 Compose target resolution uses the same session-or-pane target model as
 `lterm logs`. The display sub-surface captures the last `--tail` sanitized
@@ -128,6 +132,11 @@ or raw output stream.
 | `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
 | `lterm agent` | `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; raw attached agent PTY stream and external agent CLI behavior are outside the lterm sanitized-output contract; mobile transcript is sanitized capture UI | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm tmux-compat list-commands` | none | `compatibility-stable` | `stable` tmux shim command list | `stable` | `sanitized-output-only` |
+
+`lterm sessions --json` and the embedded `session` object in `lterm wait/watch
+--json` may include `agent_name` for sessions launched through an agent profile.
+The value is sanitized profile metadata persisted from `LTERM_AGENT`; non-agent
+sessions omit the field rather than emitting `null`.
 
 ## tmux compatibility boundary
 

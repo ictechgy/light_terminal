@@ -46,7 +46,7 @@
         "process_id": { "type": ["integer", "null"], "minimum": 1 },
         "process_group_id": { "type": ["integer", "null"] },
         "status_theme": { "type": "string", "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"] },
-        "agent_name": { "type": "string", "minLength": 1 }
+        "agent_name": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Optional sanitized agent profile name persisted from LTERM_AGENT; omitted for non-agent sessions." }
       },
       "additionalProperties": false
     }

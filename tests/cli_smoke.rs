@@ -6727,6 +6727,42 @@ fn mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions() -> Test
 }
 
 #[test]
+fn mobile_auto_transcript_prints_sanitized_capture() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-lterm",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'VISIBLE \\033[31mRED\\033[0m \\033]52;c;secret\\007DONE\\n'; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+
+    env.capture_until("codex-lterm", "VISIBLE RED DONE")?;
+    let output = env
+        .cmd()
+        .env("LTERM_MOBILE", "1")
+        .stdin(Stdio::null())
+        .args(["attach", "codex-lterm"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("VISIBLE RED DONE"), "{stdout:?}");
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains("secret"),
+        "mobile transcript must not print active escape/control payloads: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 #[cfg(unix)]
 fn mobile_auto_transcript_does_not_perturb_raw_attach_geometry() -> TestResult {
     let env = TestEnv::new()?;
@@ -6787,6 +6823,88 @@ fn mobile_auto_transcript_does_not_perturb_raw_attach_geometry() -> TestResult {
         ),
         (Some(40), Some(152)),
         "mobile transcript must not shrink or otherwise resize the raw desktop PTY geometry: {after}"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_attach_mode_env_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .env("LTERM_ATTACH_MODE", "bogus")
+        .stdin(Stdio::null())
+        .args(["open", "bad-env-open"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "invalid LTERM_ATTACH_MODE");
+    assert!(
+        !session_names_json(&env)?.contains("bad-env-open"),
+        "open must validate attach policy before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_raw_read_only_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .env("LTERM_ATTACH_MODE", "raw")
+        .stdin(Stdio::null())
+        .args(["open", "raw-read-only-open", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("raw-read-only-open"),
+        "open must reject env-selected raw read-only before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_attach_mode_env_does_not_create_agent_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("LTERM_ATTACH_MODE", "bogus")
+        .stdin(Stdio::null())
+        .args(["codex"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "invalid LTERM_ATTACH_MODE");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must validate attach policy before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_raw_read_only_does_not_create_agent_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("LTERM_ATTACH_MODE", "raw")
+        .stdin(Stdio::null())
+        .args(["codex", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must reject env-selected raw read-only before creating a session"
     );
     Ok(())
 }
