@@ -99,8 +99,8 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm start` | `lterm new` | `stable` | `best-effort` at command level; `stable` for the `--detach` summary row; attached stream is raw | none | `raw-transparent` when attached |
 | `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
-| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none for raw attach; `best-effort` transcript UI when mobile policy selects it | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
-| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none for raw attach; `best-effort` transcript UI when mobile policy selects it | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
