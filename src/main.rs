@@ -656,7 +656,14 @@ fn run() -> Result<()> {
         } => {
             let attach_policy =
                 attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
-            let info = client::attach_or_new(&target)?;
+            let info = if attach_policy.transcript.read_only
+                && matches!(attach_policy.mode, AttachMode::Auto)
+            {
+                client::info(&target)
+                    .context("--read-only in auto attach mode requires an existing target")?
+            } else {
+                client::attach_or_new(&target)?
+            };
             client::attach_info_with_policy(
                 &info,
                 !no_status,
@@ -2429,6 +2436,13 @@ fn run_agent_profile(
     } else {
         Some(launch.attach_policy_options()?)
     };
+    if attach_policy.as_ref().is_some_and(|policy| {
+        policy.transcript.read_only
+            && matches!(policy.mode, AttachMode::Auto)
+            && !client::mobile_client_detected()
+    }) {
+        bail!("--read-only requires mobile transcript mode");
+    }
     let binary_path = client::find_command(&profile.binary)
         .with_context(|| format!("{} not found in PATH", profile.binary))?;
     tmux_compat::ensure_shim()?;

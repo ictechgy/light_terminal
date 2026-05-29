@@ -87,7 +87,7 @@
         "lterm a",
         "lterm -a"
       ],
-      "text_output_stability": "best-effort",
+      "text_output_stability": "none",
       "json_output_stability": "none",
       "schema_path": null,
       "tests": [
@@ -135,7 +135,7 @@
       "aliases": [
         "lterm attach-or-new"
       ],
-      "text_output_stability": "best-effort",
+      "text_output_stability": "none",
       "json_output_stability": "none",
       "schema_path": null,
       "tests": [

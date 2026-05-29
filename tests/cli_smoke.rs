@@ -6864,6 +6864,75 @@ fn env_raw_read_only_does_not_create_open_session() -> TestResult {
 }
 
 #[test]
+fn auto_read_only_does_not_create_open_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["open", "auto-read-only-open", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(
+        &output,
+        "--read-only in auto attach mode requires an existing target",
+    );
+    assert!(
+        !session_names_json(&env)?.contains("auto-read-only-open"),
+        "open must not create a session when auto read-only has no target to classify"
+    );
+    Ok(())
+}
+
+#[test]
+fn auto_read_only_rejects_plain_raw_attach_without_sending_input() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "plain-read-only",
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read line; echo GOT:$line; sleep 5",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "plain-read-only");
+    env.capture_until("plain-read-only", "READY")?;
+
+    let mut attach = env
+        .cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["attach", "plain-read-only", "--read-only"])
+        .spawn()?;
+    attach
+        .stdin
+        .as_mut()
+        .ok_or("missing attach stdin")?
+        .write_all(b"SHOULD_NOT_SEND\n")?;
+    let output = attach.wait_with_output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+
+    let capture = env
+        .cmd()
+        .args(["logs", "plain-read-only", "-S=-20"])
+        .output()?;
+    assert!(capture.status.success(), "{capture:?}");
+    let captured = String::from_utf8_lossy(&capture.stdout);
+    assert!(
+        !captured.contains("GOT:SHOULD_NOT_SEND"),
+        "read-only auto fallback must not open a writable raw attach: {captured:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn invalid_attach_mode_env_does_not_create_agent_session() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
@@ -6882,6 +6951,28 @@ fn invalid_attach_mode_env_does_not_create_agent_session() -> TestResult {
     assert!(
         !session_names_json(&env)?.contains("codex-lterm"),
         "agent launcher must validate attach policy before creating a session"
+    );
+    Ok(())
+}
+
+#[test]
+fn agent_auto_read_only_without_mobile_does_not_create_session() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("codex"), "#!/bin/sh\nsleep 5\n")?;
+    let path = path_with_prepended(&fake_bin)?;
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .args(["codex", "--read-only"])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
+    assert!(
+        !session_names_json(&env)?.contains("codex-lterm"),
+        "agent launcher must not create a desktop raw session when --read-only is auto-only"
     );
     Ok(())
 }

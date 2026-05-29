@@ -1561,6 +1561,8 @@ pub fn attach_info_with_policy(
     };
     if use_mobile {
         mobile_transcript(&info.pane_id, options.transcript)
+    } else if options.transcript.read_only {
+        bail!("--read-only requires mobile transcript mode");
     } else {
         attach(&info.pane_id, show_status, stdin_eof)
     }
@@ -1850,6 +1852,7 @@ fn run_interactive_mobile_transcript(
                     "/exit" | "/quit" => return Ok(()),
                     "/refresh" => {
                         let capture = capture_range(target, Some(tail_start), None)?;
+                        last_capture.clear();
                         write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
                     }
                     "/raw" => {
@@ -1873,7 +1876,7 @@ fn run_interactive_mobile_transcript(
             Ok(Err(err)) => bail!("read mobile transcript input: {err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let capture = capture_range(target, Some(tail_start), None)?;
-                if capture != last_capture {
+                if mobile_transcript_capture_changed(&last_capture, &capture) {
                     writeln!(stdout).context("separate mobile prompt from transcript update")?;
                     write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
                     write!(stdout, "\n> ").context("redraw mobile prompt")?;
@@ -1886,6 +1889,10 @@ fn run_interactive_mobile_transcript(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
+}
+
+fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
+    sanitize::terminal_capture(next.as_bytes()) != previous
 }
 
 fn trim_line_endings(value: &str) -> &str {
@@ -3655,10 +3662,10 @@ mod tests {
         compose_terminal_enter_sequence, compose_terminal_leave_sequence,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_style, read_attach_response_header,
-        resolve_attach_mode, resolve_status_style, should_mobile_transcript_auto,
-        status_theme_protocol_error, write_mobile_transcript_update,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        read_attach_response_header, resolve_attach_mode, resolve_status_style,
+        should_mobile_transcript_auto, status_theme_protocol_error, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, Read};
     use std::sync::Arc;
@@ -3910,6 +3917,18 @@ mod tests {
         );
         assert_eq!(String::from_utf8(out).unwrap(), "four\n");
         assert_eq!(previous, "two\nthree\nfour\n");
+    }
+
+    #[test]
+    fn mobile_transcript_capture_changed_compares_sanitized_text() {
+        assert!(
+            !mobile_transcript_capture_changed("red\n", "\x1b[31mred\x1b[0m\n"),
+            "stable raw terminal controls must not force repeated transcript redraws"
+        );
+        assert!(mobile_transcript_capture_changed(
+            "red\n",
+            "\x1b[31mred\x1b[0m\nnext\n"
+        ));
     }
 
     #[test]
