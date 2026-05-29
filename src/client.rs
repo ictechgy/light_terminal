@@ -1758,10 +1758,10 @@ pub fn mobile_transcript(target: &str, options: MobileTranscriptOptions) -> Resu
         let info = info(target)?;
         writeln!(
             stdout,
-            "lterm mobile transcript · target={} · pane={} · raw attach: lterm attach --raw {}",
+            "lterm mobile transcript · target={} · pane={} · raw attach: {}",
             sanitize::terminal_text(&info.name),
             sanitize::terminal_text(&info.pane_id),
-            sanitize::terminal_text(&info.name)
+            raw_attach_command_hint(&info.name)?
         )
         .context("write mobile transcript banner")?;
     }
@@ -1856,12 +1856,8 @@ fn run_interactive_mobile_transcript(
                         write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
                     }
                     "/raw" => {
-                        writeln!(
-                            stdout,
-                            "raw attach: lterm attach --raw {}",
-                            sanitize::terminal_text(target)
-                        )
-                        .context("write raw attach hint")?;
+                        writeln!(stdout, "raw attach: {}", raw_attach_command_hint(target)?)
+                            .context("write raw attach hint")?;
                     }
                     _ => {
                         send(target, compose_commit_bytes(input, options.append_enter))?;
@@ -1897,6 +1893,16 @@ fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
 
 fn trim_line_endings(value: &str) -> &str {
     value.trim_end_matches(['\r', '\n'])
+}
+
+fn raw_attach_command_hint(target: &str) -> Result<String> {
+    shell_join(&[
+        "lterm".to_string(),
+        "attach".to_string(),
+        "--raw".to_string(),
+        "--".to_string(),
+        sanitize::terminal_text(target),
+    ])
 }
 
 fn write_mobile_transcript_update(
@@ -3663,8 +3669,9 @@ mod tests {
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, likely_agent_session,
         matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
-        read_attach_response_header, resolve_attach_mode, resolve_status_style,
-        should_mobile_transcript_auto, status_theme_protocol_error, write_mobile_transcript_update,
+        raw_attach_command_hint, read_attach_response_header, resolve_attach_mode,
+        resolve_status_style, should_mobile_transcript_auto, status_theme_protocol_error,
+        write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, Read};
     use std::sync::Arc;
@@ -3938,6 +3945,22 @@ mod tests {
             "red\n",
             "\x1b[31mred\x1b[0m\nnext\n"
         ));
+    }
+
+    #[test]
+    fn raw_attach_hint_quotes_target_and_uses_option_terminator() {
+        assert_eq!(
+            raw_attach_command_hint("codex-lterm").unwrap(),
+            "lterm attach --raw -- codex-lterm"
+        );
+        assert_eq!(
+            raw_attach_command_hint("-leading").unwrap(),
+            "lterm attach --raw -- -leading"
+        );
+        assert_eq!(
+            raw_attach_command_hint("bad name;rm -rf /").unwrap(),
+            "lterm attach --raw -- 'bad name;rm -rf /'"
+        );
     }
 
     #[test]

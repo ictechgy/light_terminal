@@ -1075,7 +1075,7 @@ fn watch_notify_targets_cmux_context_when_available() -> TestResult {
             shlex::try_quote(&cmux_log.display().to_string())?
         ),
     )?;
-    let path = std::env::join_paths([fake_bin.as_path()])?;
+    let path = path_with_prepended(&fake_bin)?;
 
     let status = env
         .cmd()
@@ -6910,11 +6910,16 @@ fn auto_read_only_rejects_plain_raw_attach_without_sending_input() -> TestResult
         .stderr(Stdio::piped())
         .args(["attach", "plain-read-only", "--read-only"])
         .spawn()?;
-    attach
+    let write_result = attach
         .stdin
         .as_mut()
         .ok_or("missing attach stdin")?
-        .write_all(b"SHOULD_NOT_SEND\n")?;
+        .write_all(b"SHOULD_NOT_SEND\n");
+    if let Err(err) = write_result {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(err.into());
+        }
+    }
     let output = attach.wait_with_output()?;
     assert!(!output.status.success(), "{output:?}");
     assert_stderr_contains(&output, "--read-only requires mobile transcript mode");
