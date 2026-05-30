@@ -495,7 +495,12 @@ fn create_sleep_session(env: &TestEnv, name: &str) -> TestResult<String> {
     let Some(pane_id) = fields.next() else {
         panic!("unexpected detached output: {stdout:?}");
     };
-    Ok(pane_id.to_string())
+    let pane_id = pane_id.to_string();
+    // Managed attach fallback assertions expect an already-observable screen
+    // snapshot. On faster CI hosts, attaching immediately after `new --detach`
+    // can race the PTY reader and produce an otherwise-successful empty replay.
+    env.capture_until(&pane_id, &format!("SESSION_READY:{name}"))?;
+    Ok(pane_id)
 }
 
 fn assert_stderr_contains(output: &std::process::Output, expected: &str) {
