@@ -312,18 +312,19 @@ fn seed_managed_attach_store_with_token_and_pid(
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .expect("managed_attaches object");
-    leases.insert(
-        pane_id.to_string(),
-        serde_json::json!({
-            "pane_id": pane_id,
-            "token": token,
-            "pid": pid,
-            "cmux_surface_id": surface_id,
-            "cmux_workspace_id": "workspace:owner",
-            "cmux_window_id": "window:owner",
-            "updated_secs": updated_secs
-        }),
-    );
+    let mut lease = serde_json::json!({
+        "pane_id": pane_id,
+        "token": token,
+        "pid": pid,
+        "cmux_surface_id": surface_id,
+        "cmux_workspace_id": "workspace:owner",
+        "cmux_window_id": "window:owner",
+        "updated_secs": updated_secs
+    });
+    if let Some(process_start_id) = process_start_identity_for_test(pid) {
+        lease["process_start_id"] = serde_json::json!(process_start_id);
+    }
+    leases.insert(pane_id.to_string(), lease);
     std::fs::write(path, serde_json::to_vec_pretty(&store)?)?;
     Ok(())
 }
@@ -364,7 +365,60 @@ fn fresh_managed_attach_timestamp() -> u64 {
 }
 
 fn dead_test_pid() -> u32 {
-    9_999_999
+    (4_000_000..4_010_000)
+        .rev()
+        .find(|pid| !pid_is_live_for_test(*pid))
+        .unwrap_or(u32::MAX - 1)
+}
+
+fn pid_is_live_for_test(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_identity_for_test(pid: u32) -> Option<String> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size_i32 = libc::c_int::try_from(size).ok()?;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_i32,
+        )
+    };
+    if usize::try_from(read).ok()? != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(format!(
+        "macos:{}:{}:{}",
+        info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity_for_test(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut fields = after_comm.split_whitespace();
+    let start_ticks = fields.nth(19)?;
+    Some(format!("linux:{pid}:{start_ticks}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_identity_for_test(_pid: u32) -> Option<String> {
+    None
 }
 
 fn create_sleep_session(env: &TestEnv, name: &str) -> TestResult<String> {
@@ -4291,6 +4345,7 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
         .cmd()
         .env("CMUX_SURFACE_ID", "surface:stale")
         .env("CMUX_WORKSPACE_ID", "workspace:stale")
+        .env("CMUX_SOCKET_PATH", "/tmp/cmux-socket-current.sock")
         .env("PATH", &path)
         .args([
             "tmux-compat",
@@ -4347,6 +4402,12 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
             .lines()
             .any(|line| line == "CMUX_WINDOW_ID=window:focused"),
         "split child should inherit created cmux window fallback from focused source: {child_env}"
+    );
+    assert!(
+        child_env
+            .lines()
+            .any(|line| line == "CMUX_SOCKET_PATH=/tmp/cmux-socket-current.sock"),
+        "split child should preserve the current cmux socket path: {child_env}"
     );
     assert!(
         !child_env.contains("surface:stale") && !child_env.contains("workspace:stale"),
@@ -4437,6 +4498,73 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
             .and_then(serde_json::Value::as_str),
         Some("surface:owner"),
         "duplicate attach must preserve the owner surface lease: {owner_lease}"
+    );
+    assert_eq!(
+        managed_attach_count(&env)?,
+        1,
+        "duplicate attach must not leave an extra transient lease"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_close_failure_returns_error() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-close-fail")?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-close-fail.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"focused":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
+  close-surface) printf 'close failed\n' >&2; exit 72 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "close-surface failure should propagate instead of reporting a clean detach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cmux managed duplicate close-surface failed"),
+        "stderr should explain duplicate close failure: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .any(|line| line.starts_with("close-surface --surface surface:duplicate")),
+        "duplicate surface close should have been attempted: {cmux_calls:?}"
+    );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "failed duplicate close must not overwrite or release the owner lease: {owner_lease}"
     );
     Ok(())
 }
@@ -4551,6 +4679,69 @@ fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> Tes
             .lines()
             .all(|line| !line.starts_with("close-surface")),
         "malformed current refs must not be passed to cmux close-surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_unknown_live_owner_surface_replaces_without_close() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-unknown-live-owner")?;
+    seed_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        None,
+        "seed-owner",
+        std::process::id(),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-unknown-live-owner.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"focused":{{"surface_ref":"surface:replacement","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
+  close-surface) printf 'owner unknown; close should not run\n' >&2; exit 70 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "live owner without a known surface should be replaced by a normally-detaching attach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("SESSION_READY:managed-unknown-live-owner"),
+        "unknown-live-owner replacement should replay the session output: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .all(|line| !line.starts_with("close-surface")),
+        "unknown live owner surface must not permit closing current surface: {cmux_calls:?}"
+    );
+    assert_eq!(
+        managed_attach_count(&env)?,
+        0,
+        "replacement attach should claim and release its own lease after normal detach"
     );
     Ok(())
 }
@@ -4798,6 +4989,7 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
         .env("CMUX_WORKSPACE_ID", "workspace:current")
         .env("CMUX_SURFACE_ID", "surface:current")
         .env("CMUX_WINDOW_ID", "window:current")
+        .env("CMUX_SOCKET_PATH", "/tmp/cmux-current.sock")
         .env("CMUX_EXTRA_CONTEXT", "extra:current")
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
@@ -4844,6 +5036,12 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
             .lines()
             .any(|line| line == "CMUX_WINDOW_ID=window:current"),
         "tmux-enabled session should inherit the current client CMUX window: {contents}"
+    );
+    assert!(
+        contents
+            .lines()
+            .any(|line| line == "CMUX_SOCKET_PATH=/tmp/cmux-current.sock"),
+        "tmux-enabled session should inherit the current client CMUX socket: {contents}"
     );
     assert!(
         !contents

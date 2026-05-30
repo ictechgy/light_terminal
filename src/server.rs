@@ -1736,7 +1736,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     cmd.arg(&spawn_command);
     cmd.cwd(PathBuf::from(&cwd));
     scrub_ambient_multiplexer_env(&mut cmd);
-    for (key, value) in sanitize_child_env(params.env)? {
+    for (key, value) in sanitize_child_env(params.env, params.tmux)? {
         cmd.env(key, value);
     }
     cmd.env("LTERM_SESSION", &name);
@@ -2916,15 +2916,28 @@ fn scrub_ambient_multiplexer_env(cmd: &mut CommandBuilder) {
         cmd.env_remove(key);
     }
     for (key, _) in std::env::vars_os() {
-        if key.as_os_str().as_bytes().starts_with(b"CMUX_") {
+        if os_key_starts_with_cmux_prefix(key.as_os_str()) {
             cmd.env_remove(key);
         }
     }
 }
 
+fn os_key_starts_with_cmux_prefix(key: &std::ffi::OsStr) -> bool {
+    let bytes = key.as_bytes();
+    bytes.len() >= 5
+        && bytes[0].eq_ignore_ascii_case(&b'C')
+        && bytes[1].eq_ignore_ascii_case(&b'M')
+        && bytes[2].eq_ignore_ascii_case(&b'U')
+        && bytes[3].eq_ignore_ascii_case(&b'X')
+        && bytes[4] == b'_'
+}
+
 const AMBIENT_MULTIPLEXER_ENV: &[&str] = &["TMUX", "TMUX_PANE", "LTERM_CMUX_MANAGED_ATTACH"];
 
-fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, String>> {
+fn sanitize_child_env(
+    env: HashMap<String, String>,
+    allow_cmux_context: bool,
+) -> Result<HashMap<String, String>> {
     let mut safe = HashMap::with_capacity(env.len());
     for (key, value) in env {
         validate_env_key(&key)?;
@@ -2932,7 +2945,7 @@ fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, St
         if is_dangerous_env_key(&key) {
             bail!("refusing dangerous child environment variable: {key}");
         }
-        if is_private_multiplexer_env_key(&key) {
+        if is_private_multiplexer_env_key(&key, allow_cmux_context) {
             bail!("refusing private child environment variable: {key}");
         }
         safe.insert(key, value);
@@ -2989,12 +3002,13 @@ fn is_dangerous_env_key(key: &str) -> bool {
         || upper.starts_with("BASH_FUNC_")
 }
 
-fn is_private_multiplexer_env_key(key: &str) -> bool {
+fn is_private_multiplexer_env_key(key: &str, allow_cmux_context: bool) -> bool {
     let upper = key.to_ascii_uppercase();
     matches!(
         upper.as_str(),
         "TMUX" | "TMUX_PANE" | "LTERM_CMUX_MANAGED_ATTACH"
-    ) || (upper.starts_with("CMUX_") && !is_allowed_child_cmux_env_key(&upper))
+    ) || (upper.starts_with("CMUX_")
+        && (!allow_cmux_context || !is_allowed_child_cmux_env_key(&upper)))
 }
 
 fn is_allowed_child_cmux_env_key(upper_key: &str) -> bool {
@@ -3369,7 +3383,8 @@ mod tests {
         ] {
             let mut env = HashMap::new();
             env.insert(key.to_string(), "value".to_string());
-            let err = sanitize_child_env(env).expect_err("private multiplexer key should fail");
+            let err =
+                sanitize_child_env(env, true).expect_err("private multiplexer key should fail");
             assert!(
                 err.to_string()
                     .contains("refusing private child environment variable"),
@@ -3385,7 +3400,16 @@ mod tests {
         env.insert("CMUX_SURFACE_ID".to_string(), "surface:current".to_string());
         env.insert("CMUX_WINDOW_ID".to_string(), "window:current".to_string());
         env.insert("CMUX_SOCKET_PATH".to_string(), "/tmp/cmux.sock".to_string());
-        let safe = sanitize_child_env(env).expect("cmux context allowlist should pass");
+        let plain_err = sanitize_child_env(env.clone(), false)
+            .expect_err("plain sessions must reject even allowlisted CMUX context");
+        assert!(
+            plain_err
+                .to_string()
+                .contains("refusing private child environment variable"),
+            "unexpected plain-session error: {plain_err:#}"
+        );
+
+        let safe = sanitize_child_env(env, true).expect("tmux cmux context allowlist should pass");
         assert_eq!(safe["CMUX_SURFACE_ID"], "surface:current");
     }
 

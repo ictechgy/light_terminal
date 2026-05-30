@@ -49,6 +49,7 @@ struct ManagedAttachLease {
     pane_id: String,
     token: String,
     pid: u32,
+    process_start_id: Option<String>,
     cmux_surface_id: Option<String>,
     cmux_workspace_id: Option<String>,
     cmux_window_id: Option<String>,
@@ -1393,7 +1394,7 @@ pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
         .as_deref()
         .is_some_and(|owner| owner != current_surface.surface_ref)
     {
-        close_duplicate_cmux_surface(&current_surface);
+        close_duplicate_cmux_surface(&current_surface)?;
     }
     Ok(ManagedAttachDecision::Exit)
 }
@@ -1420,7 +1421,7 @@ fn claim_managed_attach(
     update_store(|store| {
         prune_managed_attach_leases(store);
         if let Some(existing) = store.managed_attaches.get(pane_id).cloned() {
-            if !process_is_live(existing.pid) {
+            if !lease_owner_is_live(&existing) {
                 store.managed_attaches.remove(pane_id);
             } else if existing
                 .cmux_surface_id
@@ -1434,12 +1435,14 @@ fn claim_managed_attach(
             }
         }
 
+        let process_start_id = process_start_identity(std::process::id());
         store.managed_attaches.insert(
             pane_id.to_string(),
             ManagedAttachLease {
                 pane_id: pane_id.to_string(),
                 token: token.to_string(),
                 pid: std::process::id(),
+                process_start_id,
                 cmux_surface_id: Some(current_surface.surface_ref.clone()),
                 cmux_workspace_id: current_surface.workspace_ref.clone(),
                 cmux_window_id: current_surface.window_ref.clone(),
@@ -1526,7 +1529,17 @@ fn prune_managed_attach_leases(store: &mut CompatStore) {
     let cutoff = now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS);
     store
         .managed_attaches
-        .retain(|_, lease| lease.updated_secs >= cutoff && process_is_live(lease.pid));
+        .retain(|_, lease| lease.updated_secs >= cutoff && lease_owner_is_live(lease));
+}
+
+fn lease_owner_is_live(lease: &ManagedAttachLease) -> bool {
+    if !process_is_live(lease.pid) {
+        return false;
+    }
+    let Some(expected) = lease.process_start_id.as_deref() else {
+        return false;
+    };
+    process_start_identity(lease.pid).as_deref() == Some(expected)
 }
 
 fn process_is_live(pid: u32) -> bool {
@@ -1543,14 +1556,60 @@ fn process_is_live(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn close_duplicate_cmux_surface(surface: &CmuxSurfaceContext) {
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: u32) -> Option<String> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size_i32 = libc::c_int::try_from(size).ok()?;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_i32,
+        )
+    };
+    if usize::try_from(read).ok()? != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(format!(
+        "macos:{}:{}:{}",
+        info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut fields = after_comm.split_whitespace();
+    let start_ticks = fields.nth(19)?;
+    Some(format!("linux:{pid}:{start_ticks}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_identity(_pid: u32) -> Option<String> {
+    None
+}
+
+fn close_duplicate_cmux_surface(surface: &CmuxSurfaceContext) -> Result<()> {
     let mut close = Command::new("cmux");
     close.arg("close-surface");
     add_cmux_surface_context_args(&mut close, surface);
-    report_cmux_rollback_failure(
-        "managed cmux attach duplicate close-surface",
-        run_cmux_command(&mut close),
-    );
+    let close_output =
+        run_cmux_command(&mut close).context("cmux managed duplicate close-surface")?;
+    if !close_output.status.success() {
+        let detail = cmux_stderr_suffix(&close_output.stderr.bytes);
+        bail!(
+            "cmux managed duplicate close-surface failed with {}{}",
+            close_output.status,
+            detail
+        );
+    }
+    Ok(())
 }
 
 fn child_lterm_executable() -> String {
@@ -3641,6 +3700,51 @@ exit 65
         assert!(
             replacement_claim.proceed,
             "dead owner pid should not suppress a legitimate replacement attach"
+        );
+    }
+
+    #[test]
+    fn managed_attach_claim_replaces_pid_reuse_identity_mismatch() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let replacement = CmuxSurfaceContext {
+            surface_ref: "surface:replacement".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%13", "token-owner", &owner).expect("owner claim");
+        assert!(claim.proceed);
+        update_store(|store| {
+            let lease = store
+                .managed_attaches
+                .get_mut("%13")
+                .expect("owner lease should exist");
+            lease.process_start_id = Some("reused-pid-different-process".to_string());
+            Ok(())
+        })
+        .expect("mark lease identity mismatch");
+
+        let replacement_claim = claim_managed_attach("%13", "token-replacement", &replacement)
+            .expect("replacement claim");
+        assert!(
+            replacement_claim.proceed,
+            "a live reused pid with mismatched start identity must not suppress replacement"
         );
     }
 
