@@ -266,29 +266,64 @@ fn seed_managed_attach_store_with_token(
     surface_id: Option<&str>,
     token: &str,
 ) -> TestResult {
+    seed_managed_attach_store_with_token_and_pid(
+        env,
+        pane_id,
+        updated_secs,
+        surface_id,
+        token,
+        std::process::id(),
+    )
+}
+
+fn seed_managed_attach_store_with_token_and_pid(
+    env: &TestEnv,
+    pane_id: &str,
+    updated_secs: u64,
+    surface_id: Option<&str>,
+    token: &str,
+    pid: u32,
+) -> TestResult {
     let path = data_store_path(env);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut leases = serde_json::Map::new();
+    let mut store = if path.exists() {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path)?)?
+    } else {
+        serde_json::json!({
+            "panes": {},
+            "wait_generations": {},
+            "wait_generation_touched_secs": {},
+            "managed_attaches": {}
+        })
+    };
+    if !store.is_object() {
+        store = serde_json::json!({});
+    }
+    let obj = store.as_object_mut().expect("store object");
+    obj.entry("panes").or_insert_with(|| serde_json::json!({}));
+    obj.entry("wait_generations")
+        .or_insert_with(|| serde_json::json!({}));
+    obj.entry("wait_generation_touched_secs")
+        .or_insert_with(|| serde_json::json!({}));
+    let leases = obj
+        .entry("managed_attaches")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("managed_attaches object");
     leases.insert(
         pane_id.to_string(),
         serde_json::json!({
             "pane_id": pane_id,
-                "token": token,
-            "pid": 12345,
+            "token": token,
+            "pid": pid,
             "cmux_surface_id": surface_id,
             "cmux_workspace_id": "workspace:owner",
             "cmux_window_id": "window:owner",
             "updated_secs": updated_secs
         }),
     );
-    let store = serde_json::json!({
-        "panes": {},
-        "wait_generations": {},
-        "wait_generation_touched_secs": {},
-        "managed_attaches": leases
-    });
     std::fs::write(path, serde_json::to_vec_pretty(&store)?)?;
     Ok(())
 }
@@ -321,17 +356,50 @@ fn managed_attach_entry(env: &TestEnv, pane_id: &str) -> TestResult<Option<serde
         .cloned())
 }
 
+fn fresh_managed_attach_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn dead_test_pid() -> u32 {
+    9_999_999
+}
+
 fn create_sleep_session(env: &TestEnv, name: &str) -> TestResult<String> {
+    let shell = command_path("sh")?.display().to_string();
     let sleep = command_path("sleep")?.display().to_string();
+    let script = format!(
+        "printf 'SESSION_READY:%s\\n' {}; {} 30",
+        shlex::try_quote(name)?,
+        shlex::try_quote(&sleep)?
+    );
     let output = env
         .cmd()
-        .args(["new", "--detach", "-n", name, "--", sleep.as_str(), "5"])
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            name,
+            "--",
+            shell.as_str(),
+            "-lc",
+            script.as_str(),
+        ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let fields: Vec<&str> = stdout.trim().split('\t').collect();
-    assert!(fields.len() >= 2, "unexpected detached output: {stdout:?}");
-    Ok(fields[1].to_string())
+    let first_line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let mut fields = first_line.split('\t');
+    let _name = fields.next();
+    let Some(pane_id) = fields.next() else {
+        panic!("unexpected detached output: {stdout:?}");
+    };
+    Ok(pane_id.to_string())
 }
 
 fn assert_stderr_contains(output: &std::process::Output, expected: &str) {
@@ -4170,7 +4238,7 @@ fn tmux_compat_split_window_print_format_suppresses_cmux_noise() -> TestResult {
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
         cmux_calls.lines().any(|line| line.starts_with(
-            "send --surface surface:42 --workspace workspace:1 LTERM_CMUX_MANAGED_ATTACH=1 exec "
+            "send --surface surface:42 --workspace workspace:1 exec env LTERM_CMUX_MANAGED_ATTACH=1 "
         )),
         "managed attach command should target the new-split surface from stdout: {cmux_calls:?}"
     );
@@ -4199,7 +4267,7 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
                  exit 0 ;;\n\
                send)\n\
                  case \"$*\" in\n\
-                   'send --surface surface:created --workspace workspace:focused --window window:focused LTERM_CMUX_MANAGED_ATTACH=1 exec '*) exit 0 ;;\n\
+                   'send --surface surface:created --workspace workspace:focused --window window:focused exec env LTERM_CMUX_MANAGED_ATTACH=1 '*) exit 0 ;;\n\
                    *) printf 'unexpected send args: %s\\n' \"$*\" >&2; exit 65 ;;\n\
                  esac ;;\n\
                close-surface) exit 0 ;;\n\
@@ -4212,8 +4280,12 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
     let shell = command_path("sh")?.display().to_string();
     let sleep = shlex::try_quote(&command_path("sleep")?.display().to_string())?.into_owned();
     let env_dump = env.temp.path().join("split-live-context-env.txt");
+    let env_dump_tmp = env.temp.path().join("split-live-context-env.tmp");
     let env_dump_arg = shlex::try_quote(&env_dump.display().to_string())?.into_owned();
-    let payload = format!("env > {env_dump_arg}; echo SPLIT_LIVE_CONTEXT_READY; {sleep} 2");
+    let env_dump_tmp_arg = shlex::try_quote(&env_dump_tmp.display().to_string())?.into_owned();
+    let payload = format!(
+        "env > {env_dump_tmp_arg}; mv {env_dump_tmp_arg} {env_dump_arg}; echo SPLIT_LIVE_CONTEXT_READY; {sleep} 2"
+    );
 
     let output = env
         .cmd()
@@ -4248,7 +4320,7 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
     assert!(
         cmux_calls.lines().any(|line| {
             line.starts_with(
-                "send --surface surface:created --workspace workspace:focused --window window:focused LTERM_CMUX_MANAGED_ATTACH=1 exec ",
+                "send --surface surface:created --workspace workspace:focused --window window:focused exec env LTERM_CMUX_MANAGED_ATTACH=1 ",
             )
         }),
         "attach send should preserve created surface plus inherited workspace/window context: {cmux_calls:?}"
@@ -4280,6 +4352,12 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
         !child_env.contains("surface:stale") && !child_env.contains("workspace:stale"),
         "split child must not inherit stale caller cmux context: {child_env}"
     );
+    assert!(
+        !child_env
+            .lines()
+            .any(|line| line.starts_with("LTERM_CMUX_MANAGED_ATTACH=")),
+        "split child must not inherit private managed attach marker: {child_env}"
+    );
     Ok(())
 }
 
@@ -4287,7 +4365,12 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
 fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-duplicate")?;
-    seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -4312,10 +4395,15 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
         .env("PATH", &path)
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
         .output()?;
     assert!(
         output.status.success(),
         "duplicate managed attach should exit cleanly: {output:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-duplicate"),
+        "duplicate managed attach must not enter the PTY stream: {output:?}"
     );
     assert!(
         session_names_json(&env)?.contains("managed-duplicate"),
@@ -4357,7 +4445,12 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
 fn managed_cmux_attach_identify_none_proceeds_without_managed_cleanup() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-identify-none")?;
-    seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -4388,6 +4481,10 @@ fn managed_cmux_attach_identify_none_proceeds_without_managed_cleanup() -> TestR
         output.status.success(),
         "managed attach without current cmux identity should fall back to normal attach: {output:?}"
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-identify-none"),
+        "fallback attach should replay the session output: {output:?}"
+    );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
         cmux_calls
@@ -4408,7 +4505,12 @@ fn managed_cmux_attach_identify_none_proceeds_without_managed_cleanup() -> TestR
 fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-malformed")?;
-    seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -4433,10 +4535,15 @@ fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> Tes
         .env("PATH", &path)
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
         .output()?;
     assert!(
         output.status.success(),
         "malformed current cmux ref should fall back to normal attach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-malformed"),
+        "malformed-identity fallback should replay the session output: {output:?}"
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
@@ -4452,7 +4559,14 @@ fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> Tes
 fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-unknown-owner")?;
-    seed_managed_attach_store(&env, &pane, 4_102_444_800, None)?;
+    seed_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        None,
+        "seed-owner",
+        dead_test_pid(),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -4482,6 +4596,10 @@ fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestRes
     assert!(
         output.status.success(),
         "unknown owner surface should be replaced by a normally-detaching attach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-unknown-owner"),
+        "unknown-owner replacement should replay the session output: {output:?}"
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
@@ -4533,6 +4651,10 @@ fn managed_cmux_attach_stale_lease_allows_attach_and_releases() -> TestResult {
         output.status.success(),
         "stale managed attach lease should not block attach: {output:?}"
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-stale"),
+        "stale lease replacement should replay the session output: {output:?}"
+    );
     assert_eq!(
         managed_attach_count(&env)?,
         0,
@@ -4552,7 +4674,12 @@ fn managed_cmux_attach_stale_lease_allows_attach_and_releases() -> TestResult {
 fn unmarked_attach_is_not_managed_even_with_active_lease() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-unmarked")?;
-    seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -4586,6 +4713,19 @@ fn unmarked_attach_is_not_managed_even_with_active_lease() -> TestResult {
         !cmux_log.exists(),
         "unmarked attach must not consult cmux managed-attach guard"
     );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "unmarked attach must not alter the managed owner lease: {owner_lease}"
+    );
+    assert_eq!(
+        owner_lease
+            .get("cmux_surface_id")
+            .and_then(serde_json::Value::as_str),
+        Some("surface:owner"),
+        "unmarked attach must preserve owner surface metadata: {owner_lease}"
+    );
     Ok(())
 }
 
@@ -4593,8 +4733,10 @@ fn unmarked_attach_is_not_managed_even_with_active_lease() -> TestResult {
 fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
     let env = TestEnv::new()?;
     let env_dump = env.temp.path().join("plain-env.txt");
+    let env_dump_tmp = env.temp.path().join("plain-env.tmp");
     let env_dump_arg = shlex::try_quote(&env_dump.display().to_string())?.into_owned();
-    let script = format!("env > {env_dump_arg}; sleep 1");
+    let env_dump_tmp_arg = shlex::try_quote(&env_dump_tmp.display().to_string())?.into_owned();
+    let script = format!("env > {env_dump_tmp_arg}; mv {env_dump_tmp_arg} {env_dump_arg}; sleep 1");
 
     let output = env
         .cmd()
@@ -4644,8 +4786,10 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
 fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
     let env = TestEnv::new()?;
     let env_dump = env.temp.path().join("tmux-env.txt");
+    let env_dump_tmp = env.temp.path().join("tmux-env.tmp");
     let env_dump_arg = shlex::try_quote(&env_dump.display().to_string())?.into_owned();
-    let script = format!("env > {env_dump_arg}; sleep 1");
+    let env_dump_tmp_arg = shlex::try_quote(&env_dump_tmp.display().to_string())?.into_owned();
+    let script = format!("env > {env_dump_tmp_arg}; mv {env_dump_tmp_arg} {env_dump_arg}; sleep 1");
 
     let output = env
         .cmd()
@@ -4768,7 +4912,7 @@ fn prompt_time_visible_split_semantics_are_not_globally_hidden() -> TestResult {
     assert!(
         cmux_calls.lines().any(|line| {
             line.starts_with(
-                "send --surface surface:prompt --workspace workspace:1 LTERM_CMUX_MANAGED_ATTACH=1 exec ",
+                "send --surface surface:prompt --workspace workspace:1 exec env LTERM_CMUX_MANAGED_ATTACH=1 ",
             )
         }),
         "visible split should send a marker-bearing managed attach: {cmux_calls:?}"

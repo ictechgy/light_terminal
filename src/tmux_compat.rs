@@ -1284,7 +1284,7 @@ fn is_valid_cmux_json_ref(value: &str) -> bool {
 fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) -> Result<()> {
     let lterm = child_lterm_executable();
     let attach_cmd = format!(
-        "{}=1 exec {} attach {}\n",
+        "exec env {}=1 {} attach {}\n",
         MANAGED_ATTACH_ENV,
         quote(&lterm),
         quote(&info.pane_id)
@@ -1373,7 +1373,7 @@ pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
             return Ok(ManagedAttachDecision::Proceed(None));
         }
     };
-    let token = format!("{}-{}", std::process::id(), now_unix_secs());
+    let token = managed_attach_token();
     let claim = claim_managed_attach(&info.pane_id, &token, &current_surface)?;
     if claim.proceed {
         let running = Arc::new(AtomicBool::new(true));
@@ -1419,8 +1419,10 @@ fn claim_managed_attach(
 ) -> Result<ManagedAttachClaim> {
     update_store(|store| {
         prune_managed_attach_leases(store);
-        if let Some(existing) = store.managed_attaches.get(pane_id) {
-            if existing
+        if let Some(existing) = store.managed_attaches.get(pane_id).cloned() {
+            if !process_is_live(existing.pid) {
+                store.managed_attaches.remove(pane_id);
+            } else if existing
                 .cmux_surface_id
                 .as_deref()
                 .is_some_and(|owner| owner != current_surface.surface_ref)
@@ -1449,6 +1451,21 @@ fn claim_managed_attach(
             owner_surface_id: Some(current_surface.surface_ref.clone()),
         })
     })
+}
+
+fn managed_attach_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{nanos}", std::process::id(), thread_id_token())
+}
+
+fn thread_id_token() -> String {
+    format!("{:?}", thread::current().id())
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
 }
 
 fn release_managed_attach(pane_id: &str, token: &str) -> Result<()> {
@@ -1499,7 +1516,6 @@ fn spawn_managed_attach_renewer(
                         sanitize::terminal_text(&pane_id),
                         sanitize::terminal_text(&err.to_string())
                     );
-                    break;
                 }
             }
         }
@@ -1510,7 +1526,21 @@ fn prune_managed_attach_leases(store: &mut CompatStore) {
     let cutoff = now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS);
     store
         .managed_attaches
-        .retain(|_, lease| lease.updated_secs >= cutoff);
+        .retain(|_, lease| lease.updated_secs >= cutoff && process_is_live(lease.pid));
+}
+
+fn process_is_live(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn close_duplicate_cmux_surface(surface: &CmuxSurfaceContext) {
@@ -3566,6 +3596,51 @@ exit 65
         assert!(
             same_surface.proceed,
             "same cmux surface may replace a stale restarted attach owner"
+        );
+    }
+
+    #[test]
+    fn managed_attach_claim_replaces_dead_owner_pid() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:dead-owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let replacement = CmuxSurfaceContext {
+            surface_ref: "surface:replacement".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%12", "token-owner", &owner).expect("owner claim");
+        assert!(claim.proceed);
+        update_store(|store| {
+            let lease = store
+                .managed_attaches
+                .get_mut("%12")
+                .expect("owner lease should exist");
+            lease.pid = 9_999_999;
+            Ok(())
+        })
+        .expect("mark lease dead");
+
+        let replacement_claim = claim_managed_attach("%12", "token-replacement", &replacement)
+            .expect("replacement claim");
+        assert!(
+            replacement_claim.proceed,
+            "dead owner pid should not suppress a legitimate replacement attach"
         );
     }
 

@@ -639,16 +639,13 @@ fn run() -> Result<()> {
             refresh,
             read_only,
         } => {
+            let attach_policy =
+                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
             let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&target)? {
                 tmux_compat::ManagedAttachDecision::Proceed(guard) => guard,
                 tmux_compat::ManagedAttachDecision::Exit => return Ok(()),
             };
-            client::attach_with_policy(
-                &target,
-                !no_status,
-                AttachStdinEof::Detach,
-                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?,
-            )
+            client::attach_with_policy(&target, !no_status, AttachStdinEof::Detach, attach_policy)
         }
         Commands::AttachOrNew {
             target,
@@ -669,6 +666,10 @@ fn run() -> Result<()> {
                     .context("--read-only in auto attach mode requires an existing target")?
             } else {
                 client::attach_or_new(&target)?
+            };
+            let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&info.pane_id)? {
+                tmux_compat::ManagedAttachDecision::Proceed(guard) => guard,
+                tmux_compat::ManagedAttachDecision::Exit => return Ok(()),
             };
             client::attach_info_with_policy(
                 &info,
