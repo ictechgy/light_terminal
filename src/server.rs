@@ -3008,12 +3008,12 @@ fn is_private_multiplexer_env_key(key: &str, allow_cmux_context: bool) -> bool {
         upper.as_str(),
         "TMUX" | "TMUX_PANE" | "LTERM_CMUX_MANAGED_ATTACH"
     ) || (upper.starts_with("CMUX_")
-        && (!allow_cmux_context || !is_allowed_child_cmux_env_key(&upper)))
+        && (!allow_cmux_context || !is_allowed_child_cmux_env_key(key)))
 }
 
-fn is_allowed_child_cmux_env_key(upper_key: &str) -> bool {
+fn is_allowed_child_cmux_env_key(key: &str) -> bool {
     matches!(
-        upper_key,
+        key,
         "CMUX_WORKSPACE_ID" | "CMUX_SURFACE_ID" | "CMUX_WINDOW_ID" | "CMUX_SOCKET_PATH"
     )
 }
@@ -3347,9 +3347,9 @@ mod tests {
         MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
         Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
-        process_group_still_owns_child, read_request_frame_with_limit,
-        read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        validate_terminal_geometry, wait_for_session_contains,
+        os_key_starts_with_cmux_prefix, process_group_still_owns_child,
+        read_request_frame_with_limit, read_request_frame_with_timeout, request_frame_from_chunk,
+        sanitize_child_env, validate_terminal_geometry, wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -3371,6 +3371,28 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    #[test]
+    fn cmux_prefix_detection_is_case_insensitive_and_boundary_safe() {
+        assert!(os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "CMUX_SOCKET_PATH"
+        )));
+        assert!(os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "cmux_socket_path"
+        )));
+        assert!(os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "CmUx_Surface_Id"
+        )));
+        assert!(!os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "CMUX"
+        )));
+        assert!(!os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "CMUX"
+        )));
+        assert!(!os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
+            "CMUX-FOO"
+        )));
     }
 
     #[test]
@@ -3411,6 +3433,17 @@ mod tests {
 
         let safe = sanitize_child_env(env, true).expect("tmux cmux context allowlist should pass");
         assert_eq!(safe["CMUX_SURFACE_ID"], "surface:current");
+
+        let mut lowercase_env = HashMap::new();
+        lowercase_env.insert("cmux_surface_id".to_string(), "surface:lower".to_string());
+        let lowercase_err = sanitize_child_env(lowercase_env, true)
+            .expect_err("tmux sessions must reject non-canonical CMUX key casing");
+        assert!(
+            lowercase_err
+                .to_string()
+                .contains("refusing private child environment variable"),
+            "unexpected lowercase CMUX error: {lowercase_err:#}"
+        );
     }
 
     #[test]
