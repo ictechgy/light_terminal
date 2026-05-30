@@ -1322,6 +1322,11 @@ fn cmux_session_env(surface: Option<&CmuxSurfaceContext>) -> HashMap<String, Str
     if let Some(window_ref) = surface.window_ref.as_deref() {
         env.insert("CMUX_WINDOW_ID".to_string(), window_ref.to_string());
     }
+    if let Ok(socket_path) = std::env::var("CMUX_SOCKET_PATH") {
+        if !socket_path.is_empty() {
+            env.insert("CMUX_SOCKET_PATH".to_string(), socket_path);
+        }
+    }
     env
 }
 
@@ -1527,9 +1532,10 @@ fn spawn_managed_attach_renewer(
 
 fn prune_managed_attach_leases(store: &mut CompatStore) {
     let cutoff = now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS);
-    store
-        .managed_attaches
-        .retain(|_, lease| lease.updated_secs >= cutoff && lease_owner_is_live(lease));
+    store.managed_attaches.retain(|_, lease| {
+        lease_owner_is_live(lease)
+            || lease.updated_secs >= cutoff && lease.process_start_id.is_none()
+    });
 }
 
 fn lease_owner_is_live(lease: &ManagedAttachLease) -> bool {
@@ -3866,6 +3872,51 @@ exit 65
         assert_eq!(
             proceeded, 1,
             "exactly one near-simultaneous managed attach may own a pane"
+        );
+    }
+
+    #[test]
+    fn managed_attach_prune_keeps_live_owner_across_stale_timestamp() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let duplicate = CmuxSurfaceContext {
+            surface_ref: "surface:duplicate".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%14", "token-owner", &owner).expect("claim owner");
+        assert!(claim.proceed);
+        update_store(|store| {
+            let lease = store
+                .managed_attaches
+                .get_mut("%14")
+                .expect("owner lease should exist");
+            lease.updated_secs = 1;
+            Ok(())
+        })
+        .expect("age live owner lease");
+
+        let duplicate_claim =
+            claim_managed_attach("%14", "token-duplicate", &duplicate).expect("duplicate claim");
+        assert!(
+            !duplicate_claim.proceed,
+            "a live owner with matching process identity must survive stale timestamps after sleep/wake"
         );
     }
 

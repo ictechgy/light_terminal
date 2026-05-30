@@ -5074,7 +5074,14 @@ fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestRes
 fn managed_cmux_attach_stale_lease_allows_attach_and_releases() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-stale")?;
-    seed_managed_attach_store(&env, &pane, 1, Some("surface:stale-owner"))?;
+    seed_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        1,
+        Some("surface:stale-owner"),
+        "seed-owner",
+        dead_test_pid(),
+    )?;
 
     let fake_bin = env.temp.path().join("fake-cmux-bin");
     std::fs::create_dir(&fake_bin)?;
@@ -5199,6 +5206,7 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
         .env("CMUX_WORKSPACE_ID", "workspace:ambient")
         .env("CMUX_SURFACE_ID", "surface:ambient")
         .env("CMUX_WINDOW_ID", "window:ambient")
+        .env("CMUX_SOCKET_PATH", "/tmp/cmux-ambient.sock")
         .env("CMUX_EXTRA_CONTEXT", "extra:ambient")
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
