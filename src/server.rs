@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -2915,7 +2916,7 @@ fn scrub_ambient_multiplexer_env(cmd: &mut CommandBuilder) {
         cmd.env_remove(key);
     }
     for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("CMUX_")) {
+        if key.as_os_str().as_bytes().starts_with(b"CMUX_") {
             cmd.env_remove(key);
         }
     }
@@ -2930,6 +2931,9 @@ fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, St
         validate_env_value(&key, &value)?;
         if is_dangerous_env_key(&key) {
             bail!("refusing dangerous child environment variable: {key}");
+        }
+        if is_private_multiplexer_env_key(&key) {
+            bail!("refusing private child environment variable: {key}");
         }
         safe.insert(key, value);
     }
@@ -2983,6 +2987,21 @@ fn is_dangerous_env_key(key: &str) -> bool {
         || matches!(upper.as_str(), "PS0" | "PS1" | "PS2" | "PS3" | "PS4")
         || upper.starts_with("DYLD_")
         || upper.starts_with("BASH_FUNC_")
+}
+
+fn is_private_multiplexer_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "TMUX" | "TMUX_PANE" | "LTERM_CMUX_MANAGED_ATTACH"
+    ) || (upper.starts_with("CMUX_") && !is_allowed_child_cmux_env_key(&upper))
+}
+
+fn is_allowed_child_cmux_env_key(upper_key: &str) -> bool {
+    matches!(
+        upper_key,
+        "CMUX_WORKSPACE_ID" | "CMUX_SURFACE_ID" | "CMUX_WINDOW_ID" | "CMUX_SOCKET_PATH"
+    )
 }
 
 fn normalize_target(target: &str) -> String {
@@ -3315,11 +3334,11 @@ mod tests {
         Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
         process_group_still_owns_child, read_request_frame_with_limit,
-        read_request_frame_with_timeout, request_frame_from_chunk, validate_terminal_geometry,
-        wait_for_session_contains,
+        read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
+        validate_terminal_geometry, wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
@@ -3338,6 +3357,36 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    #[test]
+    fn child_env_rejects_private_multiplexer_keys_but_allows_cmux_context() {
+        for key in [
+            "TMUX",
+            "TMUX_PANE",
+            "LTERM_CMUX_MANAGED_ATTACH",
+            "CMUX_EXTRA_CONTEXT",
+        ] {
+            let mut env = HashMap::new();
+            env.insert(key.to_string(), "value".to_string());
+            let err = sanitize_child_env(env).expect_err("private multiplexer key should fail");
+            assert!(
+                err.to_string()
+                    .contains("refusing private child environment variable"),
+                "unexpected error for {key}: {err:#}"
+            );
+        }
+
+        let mut env = HashMap::new();
+        env.insert(
+            "CMUX_WORKSPACE_ID".to_string(),
+            "workspace:current".to_string(),
+        );
+        env.insert("CMUX_SURFACE_ID".to_string(), "surface:current".to_string());
+        env.insert("CMUX_WINDOW_ID".to_string(), "window:current".to_string());
+        env.insert("CMUX_SOCKET_PATH".to_string(), "/tmp/cmux.sock".to_string());
+        let safe = sanitize_child_env(env).expect("cmux context allowlist should pass");
+        assert_eq!(safe["CMUX_SURFACE_ID"], "surface:current");
     }
 
     #[test]
