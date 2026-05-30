@@ -14,12 +14,17 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const WAIT_GENERATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const WAIT_GENERATION_MAX_CHANNELS: usize = 4_096;
 const WAIT_GENERATION_TOUCH_INTERVAL_SECS: u64 = 30;
+const MANAGED_ATTACH_ENV: &str = "LTERM_CMUX_MANAGED_ATTACH";
+const MANAGED_ATTACH_LEASE_TTL_SECS: u64 = 120;
+const MANAGED_ATTACH_RENEW_SECS: u64 = 30;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -27,6 +32,7 @@ struct CompatStore {
     panes: HashMap<String, CompatPane>,
     wait_generations: HashMap<String, u64>,
     wait_generation_touched_secs: HashMap<String, u64>,
+    managed_attaches: HashMap<String, ManagedAttachLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +42,17 @@ struct CompatPane {
     cmux_surface_id: Option<String>,
     cmux_workspace_id: Option<String>,
     cmux_window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedAttachLease {
+    pane_id: String,
+    token: String,
+    pid: u32,
+    cmux_surface_id: Option<String>,
+    cmux_workspace_id: Option<String>,
+    cmux_window_id: Option<String>,
+    updated_secs: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1259,7 +1276,12 @@ fn is_valid_cmux_json_ref(value: &str) -> bool {
 
 fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) -> Result<()> {
     let lterm = child_lterm_executable();
-    let attach_cmd = format!("exec {} attach {}\n", quote(&lterm), quote(&info.pane_id));
+    let attach_cmd = format!(
+        "{}=1 exec {} attach {}\n",
+        MANAGED_ATTACH_ENV,
+        quote(&lterm),
+        quote(&info.pane_id)
+    );
     let mut send = Command::new("cmux");
     if let Some(surface) = surface {
         send.arg("send");
@@ -1278,6 +1300,200 @@ fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) ->
         );
     }
     Ok(())
+}
+
+pub enum ManagedAttachDecision {
+    Proceed(Option<ManagedAttachGuard>),
+    Exit,
+}
+
+pub struct ManagedAttachGuard {
+    pane_id: String,
+    token: String,
+    running: Arc<AtomicBool>,
+    renewer: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ManagedAttachGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = self.renewer.take();
+        if let Err(err) = release_managed_attach(&self.pane_id, &self.token) {
+            eprintln!(
+                "warning: managed cmux attach lease release failed for {}: {}",
+                sanitize::terminal_text(&self.pane_id),
+                sanitize::terminal_text(&err.to_string())
+            );
+        }
+    }
+}
+
+pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
+    if !managed_attach_env_enabled() {
+        return Ok(ManagedAttachDecision::Proceed(None));
+    }
+
+    let info = client::info(target)?;
+    let current_surface = match cmux_identify_surface() {
+        Ok(surface) => surface,
+        Err(err) => {
+            eprintln!(
+                "warning: managed cmux attach could not identify current surface: {}",
+                sanitize::terminal_text(&err.to_string())
+            );
+            None
+        }
+    };
+    let token = format!("{}-{}", std::process::id(), now_unix_secs());
+    let claim = claim_managed_attach(&info.pane_id, &token, current_surface.as_ref())?;
+    if claim.proceed {
+        let running = Arc::new(AtomicBool::new(true));
+        let pane_id = info.pane_id;
+        let renewer =
+            spawn_managed_attach_renewer(pane_id.clone(), token.clone(), Arc::clone(&running));
+        return Ok(ManagedAttachDecision::Proceed(Some(ManagedAttachGuard {
+            pane_id,
+            token,
+            running: Arc::clone(&running),
+            renewer: Some(renewer),
+        })));
+    }
+
+    if let Some(surface) = current_surface.as_ref() {
+        if claim
+            .owner_surface_id
+            .as_deref()
+            .is_some_and(|owner| owner != surface.surface_ref)
+        {
+            close_duplicate_cmux_surface(surface);
+        }
+    }
+    Ok(ManagedAttachDecision::Exit)
+}
+
+struct ManagedAttachClaim {
+    proceed: bool,
+    owner_surface_id: Option<String>,
+}
+
+fn managed_attach_env_enabled() -> bool {
+    std::env::var(MANAGED_ATTACH_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn claim_managed_attach(
+    pane_id: &str,
+    token: &str,
+    current_surface: Option<&CmuxSurfaceContext>,
+) -> Result<ManagedAttachClaim> {
+    update_store(|store| {
+        prune_managed_attach_leases(store);
+        if let Some(existing) = store.managed_attaches.get(pane_id) {
+            let same_surface = existing.cmux_surface_id.as_deref().is_some()
+                && existing.cmux_surface_id.as_deref()
+                    == current_surface.map(|surface| surface.surface_ref.as_str());
+            if !same_surface {
+                return Ok(ManagedAttachClaim {
+                    proceed: false,
+                    owner_surface_id: existing.cmux_surface_id.clone(),
+                });
+            }
+        }
+
+        store.managed_attaches.insert(
+            pane_id.to_string(),
+            ManagedAttachLease {
+                pane_id: pane_id.to_string(),
+                token: token.to_string(),
+                pid: std::process::id(),
+                cmux_surface_id: current_surface.map(|surface| surface.surface_ref.clone()),
+                cmux_workspace_id: current_surface
+                    .and_then(|surface| surface.workspace_ref.clone()),
+                cmux_window_id: current_surface.and_then(|surface| surface.window_ref.clone()),
+                updated_secs: now_unix_secs(),
+            },
+        );
+        Ok(ManagedAttachClaim {
+            proceed: true,
+            owner_surface_id: current_surface.map(|surface| surface.surface_ref.clone()),
+        })
+    })
+}
+
+fn release_managed_attach(pane_id: &str, token: &str) -> Result<()> {
+    update_store(|store| {
+        prune_managed_attach_leases(store);
+        if store
+            .managed_attaches
+            .get(pane_id)
+            .is_some_and(|lease| lease.token == token)
+        {
+            store.managed_attaches.remove(pane_id);
+        }
+        Ok(())
+    })
+}
+
+fn renew_managed_attach(pane_id: &str, token: &str) -> Result<bool> {
+    update_store(|store| {
+        prune_managed_attach_leases(store);
+        let Some(lease) = store.managed_attaches.get_mut(pane_id) else {
+            return Ok(false);
+        };
+        if lease.token != token {
+            return Ok(false);
+        }
+        lease.updated_secs = now_unix_secs();
+        Ok(true)
+    })
+}
+
+fn spawn_managed_attach_renewer(
+    pane_id: String,
+    token: String,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(MANAGED_ATTACH_RENEW_SECS));
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            match renew_managed_attach(&pane_id, &token) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) => {
+                    eprintln!(
+                        "warning: managed cmux attach lease renewal failed for {}: {}",
+                        sanitize::terminal_text(&pane_id),
+                        sanitize::terminal_text(&err.to_string())
+                    );
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn prune_managed_attach_leases(store: &mut CompatStore) {
+    let cutoff = now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS);
+    store
+        .managed_attaches
+        .retain(|_, lease| lease.updated_secs >= cutoff);
+}
+
+fn close_duplicate_cmux_surface(surface: &CmuxSurfaceContext) {
+    let mut close = Command::new("cmux");
+    close.arg("close-surface");
+    add_cmux_surface_context_args(&mut close, surface);
+    report_cmux_rollback_failure(
+        "managed cmux attach duplicate close-surface",
+        run_cmux_command(&mut close),
+    );
 }
 
 fn child_lterm_executable() -> String {
@@ -3283,6 +3499,165 @@ exit 65
         }
 
         assert_ne!(child_lterm_executable(), "relative/lterm");
+    }
+
+    #[test]
+    fn managed_attach_claim_serializes_duplicate_owners() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let duplicate = CmuxSurfaceContext {
+            surface_ref: "surface:duplicate".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let first = claim_managed_attach("%9", "token-owner", Some(&owner)).expect("first claim");
+        assert!(first.proceed);
+
+        let second =
+            claim_managed_attach("%9", "token-duplicate", Some(&duplicate)).expect("second claim");
+        assert!(!second.proceed);
+        assert_eq!(second.owner_surface_id.as_deref(), Some("surface:owner"));
+
+        let same_surface =
+            claim_managed_attach("%9", "token-restart", Some(&owner)).expect("same-surface claim");
+        assert!(
+            same_surface.proceed,
+            "same cmux surface may replace a stale restarted attach owner"
+        );
+    }
+
+    #[test]
+    fn managed_attach_claim_serializes_near_simultaneous_threads() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let claims = [("token-a", "surface:a"), ("token-b", "surface:b")]
+            .into_iter()
+            .map(|(token, surface)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let current = CmuxSurfaceContext {
+                        surface_ref: surface.to_string(),
+                        workspace_ref: Some("workspace:1".to_string()),
+                        window_ref: None,
+                    };
+                    barrier.wait();
+                    claim_managed_attach("%10", token, Some(&current))
+                        .expect("concurrent managed attach claim")
+                        .proceed
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let proceeded = claims
+            .into_iter()
+            .map(|claim| claim.join().expect("claim thread"))
+            .filter(|proceeded| *proceeded)
+            .count();
+        assert_eq!(
+            proceeded, 1,
+            "exactly one near-simultaneous managed attach may own a pane"
+        );
+    }
+
+    #[test]
+    fn managed_attach_renewal_keeps_owner_from_expiring() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let duplicate = CmuxSurfaceContext {
+            surface_ref: "surface:duplicate".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%11", "token-owner", Some(&owner)).expect("claim owner");
+        assert!(claim.proceed);
+        assert!(renew_managed_attach("%11", "token-owner").expect("renew owner"));
+
+        let duplicate_claim = claim_managed_attach("%11", "token-duplicate", Some(&duplicate))
+            .expect("duplicate claim");
+        assert!(
+            !duplicate_claim.proceed,
+            "renewed owner lease must keep suppressing duplicate attaches"
+        );
+        assert_eq!(
+            duplicate_claim.owner_surface_id.as_deref(),
+            Some("surface:owner")
+        );
+    }
+
+    #[test]
+    fn compat_store_loads_without_managed_attach_field() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        let mut permissions = fs::metadata(&data_dir)
+            .expect("data dir metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&data_dir, permissions).expect("chmod data dir");
+        fs::write(
+            data_dir.join("tmux-compat-store.json"),
+            br#"{
+              "panes": {},
+              "wait_generations": {},
+              "wait_generation_touched_secs": {}
+            }"#,
+        )
+        .expect("write old store");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let store = load_store().expect("old store should load with serde defaults");
+        assert!(store.managed_attaches.is_empty());
     }
 
     struct InterruptedOnceReader {

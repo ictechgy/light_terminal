@@ -638,12 +638,18 @@ fn run() -> Result<()> {
             tail,
             refresh,
             read_only,
-        } => client::attach_with_policy(
-            &target,
-            !no_status,
-            AttachStdinEof::Detach,
-            attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?,
-        ),
+        } => {
+            let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&target)? {
+                tmux_compat::ManagedAttachDecision::Proceed(guard) => guard,
+                tmux_compat::ManagedAttachDecision::Exit => return Ok(()),
+            };
+            client::attach_with_policy(
+                &target,
+                !no_status,
+                AttachStdinEof::Detach,
+                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?,
+            )
+        }
         Commands::AttachOrNew {
             target,
             no_status,
