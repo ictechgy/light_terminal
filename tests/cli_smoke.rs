@@ -409,7 +409,19 @@ fn fresh_managed_attach_timestamp() -> u64 {
 }
 
 fn dead_test_pid() -> u32 {
-    0
+    let mut child = Command::new(command_path("sh").expect("locate sh for dead pid helper"))
+        .arg("-c")
+        .arg("exit 0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn short-lived child for dead pid helper");
+    let pid = child.id();
+    let status = child.wait().expect("wait for dead pid helper");
+    assert!(status.success(), "dead pid helper should exit successfully");
+    assert_ne!(pid, 0, "dead pid helper must return a positive pid");
+    pid
 }
 
 #[cfg(target_os = "macos")]
