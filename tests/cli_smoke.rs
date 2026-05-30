@@ -5109,7 +5109,7 @@ fn managed_cmux_attach_stale_live_owner_still_suppresses_duplicate() -> TestResu
             r#"#!/bin/sh
 printf '%s\n' "$*" >> {}
 case "$1" in
-  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
+               identify) printf '%s\n' '{{"caller":{{"surface_ref":"--not-safe"}},"current":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
   close-surface) exit 0 ;;
   *) exit 0 ;;
 esac
