@@ -641,11 +641,17 @@ fn run() -> Result<()> {
         } => {
             let attach_policy =
                 attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
-            let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&target)? {
+            let info = client::info(&target)?;
+            let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&info.pane_id)? {
                 tmux_compat::ManagedAttachDecision::Proceed(guard) => guard,
                 tmux_compat::ManagedAttachDecision::Exit => return Ok(()),
             };
-            client::attach_with_policy(&target, !no_status, AttachStdinEof::Detach, attach_policy)
+            client::attach_info_with_policy(
+                &info,
+                !no_status,
+                AttachStdinEof::Detach,
+                attach_policy,
+            )
         }
         Commands::AttachOrNew {
             target,
