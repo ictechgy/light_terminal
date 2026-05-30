@@ -1561,16 +1561,6 @@ fn known_agent_name(name: &str) -> bool {
     )
 }
 
-pub fn attach_with_policy(
-    target: &str,
-    show_status: bool,
-    stdin_eof: AttachStdinEof,
-    options: AttachPolicyOptions,
-) -> Result<()> {
-    let info = info(target)?;
-    attach_info_with_policy(&info, show_status, stdin_eof, options)
-}
-
 pub fn attach_info_with_policy(
     info: &SessionInfo,
     show_status: bool,

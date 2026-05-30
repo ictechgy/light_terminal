@@ -1312,6 +1312,11 @@ fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) ->
 
 fn cmux_session_env(surface: Option<&CmuxSurfaceContext>) -> HashMap<String, String> {
     let mut env = HashMap::new();
+    if let Ok(socket_path) = std::env::var("CMUX_SOCKET_PATH") {
+        if !socket_path.is_empty() {
+            env.insert("CMUX_SOCKET_PATH".to_string(), socket_path);
+        }
+    }
     let Some(surface) = surface else {
         return env;
     };
@@ -1321,11 +1326,6 @@ fn cmux_session_env(surface: Option<&CmuxSurfaceContext>) -> HashMap<String, Str
     }
     if let Some(window_ref) = surface.window_ref.as_deref() {
         env.insert("CMUX_WINDOW_ID".to_string(), window_ref.to_string());
-    }
-    if let Ok(socket_path) = std::env::var("CMUX_SOCKET_PATH") {
-        if !socket_path.is_empty() {
-            env.insert("CMUX_SOCKET_PATH".to_string(), socket_path);
-        }
     }
     env
 }
