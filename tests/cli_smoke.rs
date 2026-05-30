@@ -329,6 +329,25 @@ fn seed_managed_attach_store_with_token_and_pid(
     Ok(())
 }
 
+fn seed_identityless_managed_attach_store_with_token_and_pid(
+    env: &TestEnv,
+    pane_id: &str,
+    updated_secs: u64,
+    surface_id: Option<&str>,
+    token: &str,
+    pid: u32,
+) -> TestResult {
+    seed_managed_attach_store_with_token_and_pid(
+        env,
+        pane_id,
+        updated_secs,
+        surface_id,
+        token,
+        pid,
+    )?;
+    override_managed_attach_process_start_id(env, pane_id, None)
+}
+
 fn seed_managed_attach_store(
     env: &TestEnv,
     pane_id: &str,
@@ -390,21 +409,7 @@ fn fresh_managed_attach_timestamp() -> u64 {
 }
 
 fn dead_test_pid() -> u32 {
-    (4_000_000..4_010_000)
-        .rev()
-        .find(|pid| !pid_is_live_for_test(*pid))
-        .unwrap_or(u32::MAX - 1)
-}
-
-fn pid_is_live_for_test(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    0
 }
 
 #[cfg(target_os = "macos")]
@@ -5129,6 +5134,79 @@ esac
         owner_lease.get("token").and_then(serde_json::Value::as_str),
         Some("seed-owner"),
         "stale but live owner lease must remain active: {owner_lease}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_fresh_identityless_live_owner_suppresses_duplicate() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-fresh-identityless-live-owner")?;
+    seed_identityless_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+        "seed-owner",
+        std::process::id(),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env
+        .temp
+        .path()
+        .join("cmux-managed-fresh-identityless-live-owner.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
+  close-surface) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "fresh identityless live owner should suppress duplicate and close duplicate surface: {output:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .contains("SESSION_READY:managed-fresh-identityless-live-owner"),
+        "duplicate attach must not enter PTY stream when fresh identityless owner process is still live: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "close-surface --surface surface:duplicate --workspace workspace:1 --window window:1"
+        }),
+        "fresh identityless live owner should close only the duplicate caller surface: {cmux_calls:?}"
+    );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "fresh identityless live owner lease must remain active: {owner_lease}"
+    );
+    assert!(
+        owner_lease
+            .get("process_start_id")
+            .is_none_or(serde_json::Value::is_null),
+        "test fixture should exercise identityless legacy/unsupported leases: {owner_lease}"
     );
     Ok(())
 }

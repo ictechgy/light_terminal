@@ -1426,7 +1426,7 @@ fn claim_managed_attach(
     update_store(|store| {
         prune_managed_attach_leases(store);
         if let Some(existing) = store.managed_attaches.get(pane_id).cloned() {
-            if !lease_owner_is_live(&existing) {
+            if !lease_owner_blocks_duplicate(&existing) {
                 store.managed_attaches.remove(pane_id);
             } else if existing
                 .cmux_surface_id
@@ -1531,11 +1531,18 @@ fn spawn_managed_attach_renewer(
 }
 
 fn prune_managed_attach_leases(store: &mut CompatStore) {
-    let cutoff = now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS);
-    store.managed_attaches.retain(|_, lease| {
-        lease_owner_is_live(lease)
-            || lease.updated_secs >= cutoff && lease.process_start_id.is_none()
-    });
+    store
+        .managed_attaches
+        .retain(|_, lease| lease_owner_blocks_duplicate(lease));
+}
+
+fn lease_owner_blocks_duplicate(lease: &ManagedAttachLease) -> bool {
+    if lease_owner_is_live(lease) {
+        return true;
+    }
+    lease.process_start_id.is_none()
+        && process_is_live(lease.pid)
+        && lease.updated_secs >= now_unix_secs().saturating_sub(MANAGED_ATTACH_LEASE_TTL_SECS)
 }
 
 fn lease_owner_is_live(lease: &ManagedAttachLease) -> bool {
@@ -3828,6 +3835,102 @@ exit 65
         assert!(
             replacement_claim.proceed,
             "a live reused pid with mismatched start identity must not suppress replacement"
+        );
+    }
+
+    #[test]
+    fn managed_attach_claim_suppresses_fresh_identityless_live_owner() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let duplicate = CmuxSurfaceContext {
+            surface_ref: "surface:duplicate".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%15", "token-owner", &owner).expect("owner claim");
+        assert!(claim.proceed);
+        update_store(|store| {
+            let lease = store
+                .managed_attaches
+                .get_mut("%15")
+                .expect("owner lease should exist");
+            lease.process_start_id = None;
+            lease.updated_secs = now_unix_secs();
+            Ok(())
+        })
+        .expect("simulate legacy identityless owner");
+
+        let duplicate_claim =
+            claim_managed_attach("%15", "token-duplicate", &duplicate).expect("duplicate claim");
+        assert!(
+            !duplicate_claim.proceed,
+            "fresh identityless but live owner leases must suppress duplicate attaches"
+        );
+        assert_eq!(
+            duplicate_claim.owner_surface_id.as_deref(),
+            Some("surface:owner")
+        );
+    }
+
+    #[test]
+    fn managed_attach_claim_replaces_stale_identityless_live_owner() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let owner = CmuxSurfaceContext {
+            surface_ref: "surface:owner".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+        let replacement = CmuxSurfaceContext {
+            surface_ref: "surface:replacement".to_string(),
+            workspace_ref: Some("workspace:1".to_string()),
+            window_ref: None,
+        };
+
+        let claim = claim_managed_attach("%16", "token-owner", &owner).expect("owner claim");
+        assert!(claim.proceed);
+        update_store(|store| {
+            let lease = store
+                .managed_attaches
+                .get_mut("%16")
+                .expect("owner lease should exist");
+            lease.process_start_id = None;
+            lease.updated_secs = 1;
+            Ok(())
+        })
+        .expect("simulate stale legacy identityless owner");
+
+        let replacement_claim = claim_managed_attach("%16", "token-replacement", &replacement)
+            .expect("replacement claim");
+        assert!(
+            replacement_claim.proceed,
+            "stale identityless owner leases must expire instead of blocking future attaches"
         );
     }
 
