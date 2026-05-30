@@ -4423,6 +4423,121 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
 }
 
 #[test]
+fn managed_cmux_attach_duplicate_closes_caller_not_focused_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-caller-not-focused")?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-caller-not-focused.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1","window_ref":"window:1"}},"focused":{{"surface_ref":"surface:owner","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
+  close-surface) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "duplicate managed attach should exit cleanly after closing caller surface: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    let close_surface_calls = cmux_calls
+        .lines()
+        .filter(|line| line.starts_with("close-surface"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        close_surface_calls,
+        vec!["close-surface --surface surface:duplicate --workspace workspace:1 --window window:1"],
+        "managed duplicate cleanup must close the caller surface, not focused/owner: {cmux_calls:?}"
+    );
+    assert!(
+        close_surface_calls
+            .iter()
+            .all(|line| !line.contains("surface:owner")),
+        "focused owner surface must never be closed by duplicate cleanup: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_focused_without_caller_proceeds_without_close() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-focused-no-caller")?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-focused-no-caller.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"focused":{{"surface_ref":"surface:owner","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
+  close-surface) printf 'focused-only identify must not close\n' >&2; exit 70 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "focused-only identify should fall back to normal attach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-focused-no-caller"),
+        "focused-only fallback should replay the session output: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .all(|line| !line.starts_with("close-surface")),
+        "focused-only identify must not trigger cmux close-surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-duplicate")?;
@@ -4442,7 +4557,7 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:duplicate\",\"workspace_ref\":\"workspace:1\",\"window_ref\":\"window:1\"}}}}'; exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:duplicate\",\"workspace_ref\":\"workspace:1\",\"window_ref\":\"window:1\"}}}}'; exit 0 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
              esac\n",
@@ -4527,7 +4642,7 @@ fn managed_cmux_attach_close_failure_returns_error() -> TestResult {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> {}
 case "$1" in
-  identify) printf '%s\n' '{{"focused":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
   close-surface) printf 'close failed\n' >&2; exit 72 ;;
   *) exit 0 ;;
 esac
@@ -4705,7 +4820,7 @@ fn managed_cmux_attach_unknown_live_owner_surface_replaces_without_close() -> Te
             r#"#!/bin/sh
 printf '%s\n' "$*" >> {}
 case "$1" in
-  identify) printf '%s\n' '{{"focused":{{"surface_ref":"surface:replacement","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:replacement","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
   close-surface) printf 'owner unknown; close should not run\n' >&2; exit 70 ;;
   *) exit 0 ;;
 esac
@@ -4768,7 +4883,7 @@ fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestRes
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:maybe-owner\",\"workspace_ref\":\"workspace:1\"}}}}'; exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:maybe-owner\",\"workspace_ref\":\"workspace:1\"}}}}'; exit 0 ;;\n\
                close-surface) printf 'owner unknown; close should not run\\n' >&2; exit 70 ;;\n\
                *) exit 0 ;;\n\
              esac\n",
@@ -4822,7 +4937,7 @@ fn managed_cmux_attach_stale_lease_allows_attach_and_releases() -> TestResult {
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> {}\n\
              case \"$1\" in\n\
-               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:fresh\",\"workspace_ref\":\"workspace:1\"}}}}'; exit 0 ;;\n\
+               identify) printf '%s\\n' '{{\"caller\":{{\"surface_ref\":\"surface:fresh\",\"workspace_ref\":\"workspace:1\"}}}}'; exit 0 ;;\n\
                close-surface) exit 0 ;;\n\
                *) exit 0 ;;\n\
              esac\n",

@@ -1357,7 +1357,7 @@ pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
     }
 
     let info = client::info(target)?;
-    let current_surface = match cmux_identify_surface() {
+    let current_surface = match cmux_identify_managed_attach_surface() {
         Ok(Some(surface)) => surface,
         Ok(None) => {
             eprintln!(
@@ -1833,6 +1833,16 @@ fn inside_cmux() -> bool {
 }
 
 fn cmux_identify_surface() -> Result<Option<CmuxSurfaceContext>> {
+    cmux_identify_surface_with(find_cmux_surface_context)
+}
+
+fn cmux_identify_managed_attach_surface() -> Result<Option<CmuxSurfaceContext>> {
+    cmux_identify_surface_with(find_cmux_managed_attach_surface_context)
+}
+
+fn cmux_identify_surface_with(
+    select_surface: fn(&serde_json::Value) -> Option<CmuxSurfaceContext>,
+) -> Result<Option<CmuxSurfaceContext>> {
     let mut identify = Command::new("cmux");
     identify.arg("identify").arg("--json");
     let output = run_cmux_command(&mut identify)?;
@@ -1846,12 +1856,17 @@ fn cmux_identify_surface() -> Result<Option<CmuxSurfaceContext>> {
         );
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)?;
-    Ok(find_cmux_surface_context(&value))
+    Ok(select_surface(&value))
 }
 
 #[cfg(test)]
 fn find_cmux_surface_ref(value: &serde_json::Value) -> Option<String> {
     find_cmux_surface_context(value).map(|surface| surface.surface_ref)
+}
+
+#[cfg(test)]
+fn find_cmux_managed_attach_surface_ref(value: &serde_json::Value) -> Option<String> {
+    find_cmux_managed_attach_surface_context(value).map(|surface| surface.surface_ref)
 }
 
 fn find_cmux_surface_context(value: &serde_json::Value) -> Option<CmuxSurfaceContext> {
@@ -1863,6 +1878,25 @@ fn find_cmux_surface_context(value: &serde_json::Value) -> Option<CmuxSurfaceCon
         return cmux_surface_context_from_json(focused);
     }
     if value.get("caller").is_some() {
+        return None;
+    }
+    cmux_surface_context_from_json(value)
+}
+
+fn find_cmux_managed_attach_surface_context(
+    value: &serde_json::Value,
+) -> Option<CmuxSurfaceContext> {
+    // Duplicate attach cleanup must close the surface executing this attach,
+    // not whichever surface is currently focused. Modern cmux identify payloads
+    // carry that as caller/current metadata; if it is missing or malformed,
+    // fall back to a normal attach without cleanup instead of risking a close
+    // against an unrelated focused surface.
+    for key in ["caller", "current", "executing"] {
+        if let Some(surface) = value.get(key) {
+            return cmux_surface_context_from_json(surface);
+        }
+    }
+    if value.get("focused").is_some() {
         return None;
     }
     cmux_surface_context_from_json(value)
@@ -3396,6 +3430,42 @@ mod tests {
         });
 
         assert_eq!(find_cmux_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_managed_attach_surface_prefers_caller_over_focused() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:caller",
+                "workspace_ref": "workspace:caller",
+                "window_ref": "window:caller"
+            },
+            "focused": {
+                "surface_ref": "surface:focused",
+                "workspace_ref": "workspace:focused",
+                "window_ref": "window:focused"
+            }
+        });
+
+        assert_eq!(
+            find_cmux_managed_attach_surface_ref(&value).as_deref(),
+            Some("surface:caller")
+        );
+        let context = find_cmux_managed_attach_surface_context(&value)
+            .expect("managed attach caller context");
+        assert_eq!(context.workspace_ref.as_deref(), Some("workspace:caller"));
+        assert_eq!(context.window_ref.as_deref(), Some("window:caller"));
+    }
+
+    #[test]
+    fn cmux_managed_attach_surface_rejects_focused_without_caller() {
+        let value = serde_json::json!({
+            "focused": {
+                "surface_ref": "surface:focused"
+            }
+        });
+
+        assert_eq!(find_cmux_managed_attach_surface_ref(&value), None);
     }
 
     #[test]
