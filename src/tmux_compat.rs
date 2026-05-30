@@ -1901,12 +1901,15 @@ fn find_cmux_managed_attach_surface_context(
 ) -> Option<CmuxSurfaceContext> {
     // Duplicate attach cleanup must close the surface executing this attach,
     // not whichever surface is currently focused. Modern cmux identify payloads
-    // carry that as caller/current metadata; if it is missing or malformed,
-    // fall back to a normal attach without cleanup instead of risking a close
-    // against an unrelated focused surface.
+    // carry that as caller/current metadata. Try only those explicit executing
+    // surface identities, skipping malformed candidates; if all are missing or
+    // malformed, fall back to a normal attach without cleanup instead of
+    // risking a close against an unrelated focused surface.
     for key in ["caller", "current", "executing"] {
         if let Some(surface) = value.get(key) {
-            return cmux_surface_context_from_json(surface);
+            if let Some(context) = cmux_surface_context_from_json(surface) {
+                return Some(context);
+            }
         }
     }
     None
@@ -3476,6 +3479,26 @@ mod tests {
         });
 
         assert_eq!(find_cmux_managed_attach_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_managed_attach_surface_skips_malformed_explicit_candidate() {
+        let value = serde_json::json!({
+            "caller": {
+                "surface_ref": "--not-safe"
+            },
+            "current": {
+                "surface_ref": "surface:current",
+                "workspace_ref": "workspace:current",
+                "window_ref": "window:current"
+            }
+        });
+
+        let context = find_cmux_managed_attach_surface_context(&value)
+            .expect("valid current context should be used after malformed caller");
+        assert_eq!(context.surface_ref, "surface:current");
+        assert_eq!(context.workspace_ref.as_deref(), Some("workspace:current"));
+        assert_eq!(context.window_ref.as_deref(), Some("window:current"));
     }
 
     #[test]
