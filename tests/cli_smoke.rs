@@ -338,6 +338,31 @@ fn seed_managed_attach_store(
     seed_managed_attach_store_with_token(env, pane_id, updated_secs, surface_id, "seed-owner")
 }
 
+fn override_managed_attach_process_start_id(
+    env: &TestEnv,
+    pane_id: &str,
+    process_start_id: Option<&str>,
+) -> TestResult {
+    let path = data_store_path(env);
+    let mut store: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let lease = store
+        .get_mut("managed_attaches")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|leases| leases.get_mut(pane_id))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("managed attach lease object");
+    match process_start_id {
+        Some(value) => {
+            lease.insert("process_start_id".to_string(), serde_json::json!(value));
+        }
+        None => {
+            lease.remove("process_start_id");
+        }
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&store)?)?;
+    Ok(())
+}
+
 fn managed_attach_count(env: &TestEnv) -> TestResult<usize> {
     let bytes = std::fs::read(data_store_path(env))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -4685,6 +4710,62 @@ esac
 }
 
 #[test]
+fn managed_cmux_attach_top_level_identity_proceeds_without_close() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-top-level-identity")?;
+    seed_managed_attach_store(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-top-level-identity.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"surface_ref":"surface:ambiguous","workspace_ref":"workspace:1"}}'; exit 0 ;;
+  close-surface) printf 'top-level identity must not close\n' >&2; exit 70 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "top-level-only identify should fall back to normal attach: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("SESSION_READY:managed-top-level-identity"),
+        "top-level-only fallback should replay session output: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .all(|line| !line.starts_with("close-surface")),
+        "ambiguous top-level identity must not trigger cmux close-surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn managed_cmux_attach_identify_none_proceeds_without_managed_cleanup() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-identify-none")?;
@@ -4794,6 +4875,73 @@ fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> Tes
             .lines()
             .all(|line| !line.starts_with("close-surface")),
         "malformed current refs must not be passed to cmux close-surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_live_pid_identity_mismatch_replaces_without_close() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-live-pid-reused")?;
+    seed_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        fresh_managed_attach_timestamp(),
+        Some("surface:owner"),
+        "seed-owner",
+        std::process::id(),
+    )?;
+    override_managed_attach_process_start_id(
+        &env,
+        &pane,
+        Some("definitely-not-this-process-start"),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-live-pid-reused.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:replacement","workspace_ref":"workspace:1"}}}}'; exit 0 ;;
+  close-surface) printf 'reused pid must not close duplicate\n' >&2; exit 70 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "live PID with mismatched start identity should be treated as stale: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-live-pid-reused"),
+        "identity-mismatch replacement should replay the session output: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .all(|line| !line.starts_with("close-surface")),
+        "PID reuse identity mismatch must not trigger duplicate close: {cmux_calls:?}"
+    );
+    assert_eq!(
+        managed_attach_count(&env)?,
+        0,
+        "replacement attach should claim and release after normal detach"
     );
     Ok(())
 }
@@ -5217,10 +5365,10 @@ fn prompt_time_visible_split_semantics_are_not_globally_hidden() -> TestResult {
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
-        cmux_calls
-            .lines()
-            .any(|line| line.starts_with("new-split right ")),
-        "non-detached split-window should still create a visible cmux split; prompt-time flicker needs a scoped fix, not global hiding: {cmux_calls:?}"
+        cmux_calls.lines().any(|line| {
+            line == "new-split right --surface surface:source --workspace workspace:1 --focus true"
+        }),
+        "non-detached split-window should create the exact visible cmux split without hidden/no-focus flags: {cmux_calls:?}"
     );
     assert!(
         cmux_calls.lines().any(|line| {

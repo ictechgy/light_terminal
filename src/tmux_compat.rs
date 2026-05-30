@@ -1896,10 +1896,7 @@ fn find_cmux_managed_attach_surface_context(
             return cmux_surface_context_from_json(surface);
         }
     }
-    if value.get("focused").is_some() {
-        return None;
-    }
-    cmux_surface_context_from_json(value)
+    None
 }
 
 fn cmux_surface_context_from_json(value: &serde_json::Value) -> Option<CmuxSurfaceContext> {
@@ -3463,6 +3460,16 @@ mod tests {
             "focused": {
                 "surface_ref": "surface:focused"
             }
+        });
+
+        assert_eq!(find_cmux_managed_attach_surface_ref(&value), None);
+    }
+
+    #[test]
+    fn cmux_managed_attach_surface_rejects_top_level_legacy_identity() {
+        let value = serde_json::json!({
+            "surface_ref": "surface:ambiguous",
+            "workspace_ref": "workspace:1"
         });
 
         assert_eq!(find_cmux_managed_attach_surface_ref(&value), None);
