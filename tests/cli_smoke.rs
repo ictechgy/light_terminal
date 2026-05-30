@@ -4322,13 +4322,19 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
         "duplicate managed attach must not kill the underlying session"
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
-    assert!(
-        cmux_calls.lines().any(|line| line
-            == "close-surface --surface surface:duplicate --workspace workspace:1 --window window:1"),
-        "duplicate should close only its current cmux surface: {cmux_calls:?}"
+    let close_surface_calls = cmux_calls
+        .lines()
+        .filter(|line| line.starts_with("close-surface"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        close_surface_calls,
+        vec!["close-surface --surface surface:duplicate --workspace workspace:1 --window window:1"],
+        "duplicate should close exactly its current cmux surface and never the owner: {cmux_calls:?}"
     );
     assert!(
-        !cmux_calls.contains("surface:owner --workspace"),
+        close_surface_calls
+            .iter()
+            .all(|line| !line.contains("surface:owner")),
         "duplicate must not close the stored owner surface: {cmux_calls:?}"
     );
     let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
@@ -4348,7 +4354,58 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
 }
 
 #[test]
-fn managed_cmux_attach_malformed_current_surface_exits_without_close() -> TestResult {
+fn managed_cmux_attach_identify_none_proceeds_without_managed_cleanup() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-identify-none")?;
+    seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-identify-none.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{}}'; exit 0 ;;\n\
+               close-surface) printf 'close should not run without current surface identity\\n' >&2; exit 70 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "managed attach without current cmux identity should fall back to normal attach: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls
+            .lines()
+            .all(|line| !line.starts_with("close-surface")),
+        "unknown current surface identity must not trigger cmux close-surface: {cmux_calls:?}"
+    );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("seed owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "fallback attach must not overwrite existing managed owner lease: {owner_lease}"
+    );
+    Ok(())
+}
+
+#[test]
+fn managed_cmux_attach_malformed_current_surface_proceeds_without_close() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-malformed")?;
     seed_managed_attach_store(&env, &pane, 4_102_444_800, Some("surface:owner"))?;
@@ -4379,7 +4436,7 @@ fn managed_cmux_attach_malformed_current_surface_exits_without_close() -> TestRe
         .output()?;
     assert!(
         output.status.success(),
-        "duplicate with malformed current cmux ref should exit safely: {output:?}"
+        "malformed current cmux ref should fall back to normal attach: {output:?}"
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
@@ -4392,7 +4449,7 @@ fn managed_cmux_attach_malformed_current_surface_exits_without_close() -> TestRe
 }
 
 #[test]
-fn managed_cmux_attach_unknown_owner_surface_exits_without_close() -> TestResult {
+fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-unknown-owner")?;
     seed_managed_attach_store(&env, &pane, 4_102_444_800, None)?;
@@ -4420,10 +4477,11 @@ fn managed_cmux_attach_unknown_owner_surface_exits_without_close() -> TestResult
         .env("PATH", &path)
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
         .output()?;
     assert!(
         output.status.success(),
-        "duplicate with unknown owner surface should exit safely: {output:?}"
+        "unknown owner surface should be replaced by a normally-detaching attach: {output:?}"
     );
     let cmux_calls = wait_for_file_contents(&cmux_log)?;
     assert!(
@@ -4431,6 +4489,11 @@ fn managed_cmux_attach_unknown_owner_surface_exits_without_close() -> TestResult
             .lines()
             .all(|line| !line.starts_with("close-surface")),
         "unknown owner surface must not permit closing current surface: {cmux_calls:?}"
+    );
+    assert_eq!(
+        managed_attach_count(&env)?,
+        0,
+        "replacement attach should claim and release its own lease after normal detach"
     );
     Ok(())
 }

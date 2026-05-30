@@ -1357,17 +1357,24 @@ pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
 
     let info = client::info(target)?;
     let current_surface = match cmux_identify_surface() {
-        Ok(surface) => surface,
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            eprintln!(
+                "warning: managed cmux attach could not identify current surface; \
+                 proceeding without duplicate-surface cleanup"
+            );
+            return Ok(ManagedAttachDecision::Proceed(None));
+        }
         Err(err) => {
             eprintln!(
                 "warning: managed cmux attach could not identify current surface: {}",
                 sanitize::terminal_text(&err.to_string())
             );
-            None
+            return Ok(ManagedAttachDecision::Proceed(None));
         }
     };
     let token = format!("{}-{}", std::process::id(), now_unix_secs());
-    let claim = claim_managed_attach(&info.pane_id, &token, current_surface.as_ref())?;
+    let claim = claim_managed_attach(&info.pane_id, &token, &current_surface)?;
     if claim.proceed {
         let running = Arc::new(AtomicBool::new(true));
         let pane_id = info.pane_id;
@@ -1381,14 +1388,12 @@ pub fn prepare_managed_attach(target: &str) -> Result<ManagedAttachDecision> {
         })));
     }
 
-    if let Some(surface) = current_surface.as_ref() {
-        if claim
-            .owner_surface_id
-            .as_deref()
-            .is_some_and(|owner| owner != surface.surface_ref)
-        {
-            close_duplicate_cmux_surface(surface);
-        }
+    if claim
+        .owner_surface_id
+        .as_deref()
+        .is_some_and(|owner| owner != current_surface.surface_ref)
+    {
+        close_duplicate_cmux_surface(&current_surface);
     }
     Ok(ManagedAttachDecision::Exit)
 }
@@ -1410,15 +1415,16 @@ fn managed_attach_env_enabled() -> bool {
 fn claim_managed_attach(
     pane_id: &str,
     token: &str,
-    current_surface: Option<&CmuxSurfaceContext>,
+    current_surface: &CmuxSurfaceContext,
 ) -> Result<ManagedAttachClaim> {
     update_store(|store| {
         prune_managed_attach_leases(store);
         if let Some(existing) = store.managed_attaches.get(pane_id) {
-            let same_surface = existing.cmux_surface_id.as_deref().is_some()
-                && existing.cmux_surface_id.as_deref()
-                    == current_surface.map(|surface| surface.surface_ref.as_str());
-            if !same_surface {
+            if existing
+                .cmux_surface_id
+                .as_deref()
+                .is_some_and(|owner| owner != current_surface.surface_ref)
+            {
                 return Ok(ManagedAttachClaim {
                     proceed: false,
                     owner_surface_id: existing.cmux_surface_id.clone(),
@@ -1432,16 +1438,15 @@ fn claim_managed_attach(
                 pane_id: pane_id.to_string(),
                 token: token.to_string(),
                 pid: std::process::id(),
-                cmux_surface_id: current_surface.map(|surface| surface.surface_ref.clone()),
-                cmux_workspace_id: current_surface
-                    .and_then(|surface| surface.workspace_ref.clone()),
-                cmux_window_id: current_surface.and_then(|surface| surface.window_ref.clone()),
+                cmux_surface_id: Some(current_surface.surface_ref.clone()),
+                cmux_workspace_id: current_surface.workspace_ref.clone(),
+                cmux_window_id: current_surface.window_ref.clone(),
                 updated_secs: now_unix_secs(),
             },
         );
         Ok(ManagedAttachClaim {
             proceed: true,
-            owner_surface_id: current_surface.map(|surface| surface.surface_ref.clone()),
+            owner_surface_id: Some(current_surface.surface_ref.clone()),
         })
     })
 }
@@ -3548,16 +3553,16 @@ exit 65
             window_ref: None,
         };
 
-        let first = claim_managed_attach("%9", "token-owner", Some(&owner)).expect("first claim");
+        let first = claim_managed_attach("%9", "token-owner", &owner).expect("first claim");
         assert!(first.proceed);
 
         let second =
-            claim_managed_attach("%9", "token-duplicate", Some(&duplicate)).expect("second claim");
+            claim_managed_attach("%9", "token-duplicate", &duplicate).expect("second claim");
         assert!(!second.proceed);
         assert_eq!(second.owner_surface_id.as_deref(), Some("surface:owner"));
 
         let same_surface =
-            claim_managed_attach("%9", "token-restart", Some(&owner)).expect("same-surface claim");
+            claim_managed_attach("%9", "token-restart", &owner).expect("same-surface claim");
         assert!(
             same_surface.proceed,
             "same cmux surface may replace a stale restarted attach owner"
@@ -3590,7 +3595,7 @@ exit 65
                         window_ref: None,
                     };
                     barrier.wait();
-                    claim_managed_attach("%10", token, Some(&current))
+                    claim_managed_attach("%10", token, &current)
                         .expect("concurrent managed attach claim")
                         .proceed
                 })
@@ -3633,12 +3638,12 @@ exit 65
             window_ref: None,
         };
 
-        let claim = claim_managed_attach("%11", "token-owner", Some(&owner)).expect("claim owner");
+        let claim = claim_managed_attach("%11", "token-owner", &owner).expect("claim owner");
         assert!(claim.proceed);
         assert!(renew_managed_attach("%11", "token-owner").expect("renew owner"));
 
-        let duplicate_claim = claim_managed_attach("%11", "token-duplicate", Some(&duplicate))
-            .expect("duplicate claim");
+        let duplicate_claim =
+            claim_managed_attach("%11", "token-duplicate", &duplicate).expect("duplicate claim");
         assert!(
             !duplicate_claim.proceed,
             "renewed owner lease must keep suppressing duplicate attaches"
