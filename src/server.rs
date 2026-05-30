@@ -2916,10 +2916,26 @@ fn scrub_ambient_multiplexer_env(cmd: &mut CommandBuilder) {
         cmd.env_remove(key);
     }
     for (key, _) in std::env::vars_os() {
-        if os_key_starts_with_cmux_prefix(key.as_os_str()) {
+        if os_key_is_private_multiplexer_env(key.as_os_str()) {
             cmd.env_remove(key);
         }
     }
+}
+
+fn os_key_is_private_multiplexer_env(key: &std::ffi::OsStr) -> bool {
+    os_key_eq_ignore_ascii_case(key, b"TMUX")
+        || os_key_eq_ignore_ascii_case(key, b"TMUX_PANE")
+        || os_key_eq_ignore_ascii_case(key, b"LTERM_CMUX_MANAGED_ATTACH")
+        || os_key_starts_with_cmux_prefix(key)
+}
+
+fn os_key_eq_ignore_ascii_case(key: &std::ffi::OsStr, expected: &[u8]) -> bool {
+    let bytes = key.as_bytes();
+    bytes.len() == expected.len()
+        && bytes
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
 }
 
 fn os_key_starts_with_cmux_prefix(key: &std::ffi::OsStr) -> bool {
@@ -3347,9 +3363,10 @@ mod tests {
         MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
         Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
-        os_key_starts_with_cmux_prefix, process_group_still_owns_child,
-        read_request_frame_with_limit, read_request_frame_with_timeout, request_frame_from_chunk,
-        sanitize_child_env, validate_terminal_geometry, wait_for_session_contains,
+        os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
+        process_group_still_owns_child, read_request_frame_with_limit,
+        read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
+        validate_terminal_geometry, wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -3393,6 +3410,29 @@ mod tests {
         assert!(!os_key_starts_with_cmux_prefix(std::ffi::OsStr::new(
             "CMUX-FOO"
         )));
+    }
+
+    #[test]
+    fn private_multiplexer_env_detection_is_case_insensitive() {
+        for key in [
+            "TMUX",
+            "tmux",
+            "TmUx_PaNe",
+            "lterm_cmux_managed_attach",
+            "CMUX_SOCKET_PATH",
+            "cmux_socket_path",
+        ] {
+            assert!(
+                os_key_is_private_multiplexer_env(std::ffi::OsStr::new(key)),
+                "{key} should be detected as private multiplexer env"
+            );
+        }
+        for key in ["TMUX_EXTRA", "TMUXPANE", "CMUX", "LC_TERMINAL", "TERM"] {
+            assert!(
+                !os_key_is_private_multiplexer_env(std::ffi::OsStr::new(key)),
+                "{key} should not be detected as private multiplexer env"
+            );
+        }
     }
 
     #[test]

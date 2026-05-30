@@ -5266,6 +5266,8 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
         .cmd()
         .env("TMUX", "/tmp/real-tmux,1,2")
         .env("TMUX_PANE", "%real")
+        .env("tmux", "/tmp/lower-tmux,3,4")
+        .env("TmUx_PaNe", "%mixed")
         .env("CMUX_WORKSPACE_ID", "workspace:ambient")
         .env("CMUX_SURFACE_ID", "surface:ambient")
         .env("CMUX_WINDOW_ID", "window:ambient")
@@ -5298,8 +5300,22 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
         "plain lterm new must not leak ambient TMUX_PANE: {contents}"
     );
     assert!(
+        !contents.lines().any(|line| {
+            let key = line.split_once('=').map_or(line, |(key, _)| key);
+            key.eq_ignore_ascii_case("TMUX") || key.eq_ignore_ascii_case("TMUX_PANE")
+        }),
+        "plain lterm new must not leak ambient TMUX keys with non-canonical casing: {contents}"
+    );
+    assert!(
         !contents.lines().any(|line| line.starts_with("CMUX_")),
         "plain lterm new must not leak ambient CMUX context: {contents}"
+    );
+    assert!(
+        !contents.lines().any(|line| {
+            let bytes = line.as_bytes();
+            bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"CMUX_")
+        }),
+        "plain lterm new must not leak ambient CMUX context with non-canonical casing: {contents}"
     );
     assert!(
         !contents
@@ -5323,6 +5339,8 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
         .cmd()
         .env("TMUX", "/tmp/real-tmux,1,2")
         .env("TMUX_PANE", "%real")
+        .env("tmux", "/tmp/lower-tmux,3,4")
+        .env("TmUx_PaNe", "%mixed")
         .env("CMUX_WORKSPACE_ID", "workspace:current")
         .env("CMUX_SURFACE_ID", "surface:current")
         .env("CMUX_WINDOW_ID", "window:current")
@@ -5352,8 +5370,15 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
             line.starts_with("TMUX=")
                 && line.contains("lterm.sock")
                 && !line.contains("/tmp/real-tmux")
+                && !line.contains("/tmp/lower-tmux")
         }),
         "tmux-enabled session should get lterm fake TMUX, not the ambient real one: {contents}"
+    );
+    assert!(
+        !contents
+            .lines()
+            .any(|line| { line.starts_with("tmux=") || line.starts_with("TmUx_PaNe=") }),
+        "tmux-enabled session should not inherit non-canonical ambient TMUX keys: {contents}"
     );
     assert!(
         contents.lines().any(|line| line == "TMUX_PANE=%0"),
