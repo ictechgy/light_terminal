@@ -1734,6 +1734,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     cmd.arg("-lc");
     cmd.arg(&spawn_command);
     cmd.cwd(PathBuf::from(&cwd));
+    scrub_ambient_multiplexer_env(&mut cmd);
     for (key, value) in sanitize_child_env(params.env)? {
         cmd.env(key, value);
     }
@@ -2908,6 +2909,19 @@ fn validate_session_name_syntax(name: &str) -> Result<()> {
 fn session_name_looks_like_bare_pane_id(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit())
 }
+
+fn scrub_ambient_multiplexer_env(cmd: &mut CommandBuilder) {
+    for key in AMBIENT_MULTIPLEXER_ENV {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| key.starts_with("CMUX_")) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+const AMBIENT_MULTIPLEXER_ENV: &[&str] = &["TMUX", "TMUX_PANE", "LTERM_CMUX_MANAGED_ATTACH"];
 
 fn sanitize_child_env(env: HashMap<String, String>) -> Result<HashMap<String, String>> {
     let mut safe = HashMap::with_capacity(env.len());

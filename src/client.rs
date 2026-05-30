@@ -227,6 +227,9 @@ pub fn new_session(
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
     inherit_terminal_capability_env(&mut env);
+    if tmux {
+        inherit_cmux_context_env(&mut env);
+    }
     rpc(&Request::New {
         name,
         command,
@@ -243,6 +246,19 @@ pub fn new_session(
 
 fn inherit_terminal_capability_env(env: &mut std::collections::HashMap<String, String>) {
     for key in TERMINAL_CAPABILITY_ENV {
+        if env.contains_key(*key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.insert((*key).to_string(), value);
+            }
+        }
+    }
+}
+
+fn inherit_cmux_context_env(env: &mut std::collections::HashMap<String, String>) {
+    for key in CMUX_CONTEXT_ENV {
         if env.contains_key(*key) {
             continue;
         }
@@ -272,6 +288,13 @@ const TERMINAL_CAPABILITY_ENV: &[&str] = &[
     "FORCE_COLOR",
     "CLICOLOR",
     "CLICOLOR_FORCE",
+];
+
+const CMUX_CONTEXT_ENV: &[&str] = &[
+    "CMUX_WORKSPACE_ID",
+    "CMUX_SURFACE_ID",
+    "CMUX_WINDOW_ID",
+    "CMUX_SOCKET_PATH",
 ];
 
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
