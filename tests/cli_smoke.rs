@@ -311,6 +311,16 @@ fn managed_attach_count(env: &TestEnv) -> TestResult<usize> {
         .map_or(0, serde_json::Map::len))
 }
 
+fn managed_attach_entry(env: &TestEnv, pane_id: &str) -> TestResult<Option<serde_json::Value>> {
+    let bytes = std::fs::read(data_store_path(env))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(value
+        .get("managed_attaches")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|leases| leases.get(pane_id))
+        .cloned())
+}
+
 fn create_sleep_session(env: &TestEnv, name: &str) -> TestResult<String> {
     let sleep = command_path("sleep")?.display().to_string();
     let output = env
@@ -4201,7 +4211,9 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
     let path = path_with_prepended(&fake_bin)?;
     let shell = command_path("sh")?.display().to_string();
     let sleep = shlex::try_quote(&command_path("sleep")?.display().to_string())?.into_owned();
-    let payload = format!("echo SPLIT_LIVE_CONTEXT_READY; {sleep} 2");
+    let env_dump = env.temp.path().join("split-live-context-env.txt");
+    let env_dump_arg = shlex::try_quote(&env_dump.display().to_string())?.into_owned();
+    let payload = format!("env > {env_dump_arg}; echo SPLIT_LIVE_CONTEXT_READY; {sleep} 2");
 
     let output = env
         .cmd()
@@ -4244,6 +4256,29 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
     assert!(
         !cmux_calls.contains("surface:stale"),
         "stale cmux env refs must not be used: {cmux_calls:?}"
+    );
+    let child_env = wait_for_file_contents(&env_dump)?;
+    assert!(
+        child_env
+            .lines()
+            .any(|line| line == "CMUX_SURFACE_ID=surface:created"),
+        "split child should inherit created cmux surface, not stale caller env: {child_env}"
+    );
+    assert!(
+        child_env
+            .lines()
+            .any(|line| line == "CMUX_WORKSPACE_ID=workspace:focused"),
+        "split child should inherit created cmux workspace: {child_env}"
+    );
+    assert!(
+        child_env
+            .lines()
+            .any(|line| line == "CMUX_WINDOW_ID=window:focused"),
+        "split child should inherit created cmux window fallback from focused source: {child_env}"
+    );
+    assert!(
+        !child_env.contains("surface:stale") && !child_env.contains("workspace:stale"),
+        "split child must not inherit stale caller cmux context: {child_env}"
     );
     Ok(())
 }
@@ -4295,6 +4330,19 @@ fn managed_cmux_attach_duplicate_exits_and_closes_current_surface() -> TestResul
     assert!(
         !cmux_calls.contains("surface:owner --workspace"),
         "duplicate must not close the stored owner surface: {cmux_calls:?}"
+    );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "duplicate attach must not overwrite or release the owner lease: {owner_lease}"
+    );
+    assert_eq!(
+        owner_lease
+            .get("cmux_surface_id")
+            .and_then(serde_json::Value::as_str),
+        Some("surface:owner"),
+        "duplicate attach must preserve the owner surface lease: {owner_lease}"
     );
     Ok(())
 }
@@ -4491,6 +4539,8 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
         .env("TMUX_PANE", "%real")
         .env("CMUX_WORKSPACE_ID", "workspace:ambient")
         .env("CMUX_SURFACE_ID", "surface:ambient")
+        .env("CMUX_WINDOW_ID", "window:ambient")
+        .env("CMUX_EXTRA_CONTEXT", "extra:ambient")
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
             "new",
@@ -4541,6 +4591,8 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
         .env("CMUX_WORKSPACE_ID", "workspace:current")
         .env("CMUX_SURFACE_ID", "surface:current")
         .env("CMUX_WINDOW_ID", "window:current")
+        .env("CMUX_EXTRA_CONTEXT", "extra:current")
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
             "new",
             "--tmux",
@@ -4585,6 +4637,18 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
             .lines()
             .any(|line| line == "CMUX_WINDOW_ID=window:current"),
         "tmux-enabled session should inherit the current client CMUX window: {contents}"
+    );
+    assert!(
+        !contents
+            .lines()
+            .any(|line| line.starts_with("CMUX_EXTRA_CONTEXT=")),
+        "tmux-enabled session should not inherit unallowlisted ambient CMUX variables: {contents}"
+    );
+    assert!(
+        !contents
+            .lines()
+            .any(|line| line.starts_with("LTERM_CMUX_MANAGED_ATTACH=")),
+        "tmux-enabled session must not leak private managed attach marker: {contents}"
     );
     Ok(())
 }

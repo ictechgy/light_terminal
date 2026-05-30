@@ -580,7 +580,14 @@ fn split_window(args: &[String]) -> Result<i32> {
     } else {
         open_cmux_split(direction)?
     };
-    let info = match client::new_session(None, command, cwd, HashMap::new(), None, true) {
+    let info = match client::new_session(
+        None,
+        command,
+        cwd,
+        cmux_session_env(cmux_surface.as_ref()),
+        None,
+        true,
+    ) {
         Ok(info) => info,
         Err(err) => {
             rollback_cmux_split(cmux_surface.as_ref());
@@ -1300,6 +1307,21 @@ fn send_cmux_attach(surface: Option<&CmuxSurfaceContext>, info: &SessionInfo) ->
         );
     }
     Ok(())
+}
+
+fn cmux_session_env(surface: Option<&CmuxSurfaceContext>) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let Some(surface) = surface else {
+        return env;
+    };
+    env.insert("CMUX_SURFACE_ID".to_string(), surface.surface_ref.clone());
+    if let Some(workspace_ref) = surface.workspace_ref.as_deref() {
+        env.insert("CMUX_WORKSPACE_ID".to_string(), workspace_ref.to_string());
+    }
+    if let Some(window_ref) = surface.window_ref.as_deref() {
+        env.insert("CMUX_WINDOW_ID".to_string(), window_ref.to_string());
+    }
+    env
 }
 
 pub enum ManagedAttachDecision {
