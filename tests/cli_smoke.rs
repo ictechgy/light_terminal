@@ -5071,6 +5071,69 @@ fn managed_cmux_attach_unknown_owner_surface_replaces_without_close() -> TestRes
 }
 
 #[test]
+fn managed_cmux_attach_stale_live_owner_still_suppresses_duplicate() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "managed-stale-live-owner")?;
+    seed_managed_attach_store_with_token_and_pid(
+        &env,
+        &pane,
+        1,
+        Some("surface:owner"),
+        "seed-owner",
+        std::process::id(),
+    )?;
+
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-managed-stale-live-owner.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  identify) printf '%s\n' '{{"caller":{{"surface_ref":"surface:duplicate","workspace_ref":"workspace:1","window_ref":"window:1"}}}}'; exit 0 ;;
+  close-surface) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", &path)
+        .env("LTERM_CMUX_MANAGED_ATTACH", "1")
+        .args(["attach", pane.as_str(), "--no-status"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "stale but live owner should suppress duplicate and close duplicate surface: {output:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("SESSION_READY:managed-stale-live-owner"),
+        "duplicate attach must not enter PTY stream when stale owner process is still live: {output:?}"
+    );
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "close-surface --surface surface:duplicate --workspace workspace:1 --window window:1"
+        }),
+        "stale but live owner should close only the duplicate caller surface: {cmux_calls:?}"
+    );
+    let owner_lease = managed_attach_entry(&env, &pane)?.expect("owner lease should remain");
+    assert_eq!(
+        owner_lease.get("token").and_then(serde_json::Value::as_str),
+        Some("seed-owner"),
+        "stale but live owner lease must remain active: {owner_lease}"
+    );
+    Ok(())
+}
+
+#[test]
 fn managed_cmux_attach_stale_lease_allows_attach_and_releases() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-stale")?;
@@ -5207,6 +5270,9 @@ fn plain_new_scrubs_ambient_tmux_and_cmux_environment() -> TestResult {
         .env("CMUX_SURFACE_ID", "surface:ambient")
         .env("CMUX_WINDOW_ID", "window:ambient")
         .env("CMUX_SOCKET_PATH", "/tmp/cmux-ambient.sock")
+        .env("cmux_workspace_id", "workspace:lower")
+        .env("Cmux_SURFACE_ID", "surface:mixed")
+        .env("cmux_socket_path", "/tmp/cmux-lower.sock")
         .env("CMUX_EXTRA_CONTEXT", "extra:ambient")
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
@@ -5261,6 +5327,9 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
         .env("CMUX_SURFACE_ID", "surface:current")
         .env("CMUX_WINDOW_ID", "window:current")
         .env("CMUX_SOCKET_PATH", "/tmp/cmux-current.sock")
+        .env("cmux_workspace_id", "workspace:lower")
+        .env("Cmux_SURFACE_ID", "surface:mixed")
+        .env("cmux_socket_path", "/tmp/cmux-lower.sock")
         .env("CMUX_EXTRA_CONTEXT", "extra:current")
         .env("LTERM_CMUX_MANAGED_ATTACH", "1")
         .args([
@@ -5319,6 +5388,12 @@ fn tmux_enabled_new_gets_fake_tmux_and_current_cmux_context() -> TestResult {
             .lines()
             .any(|line| line.starts_with("CMUX_EXTRA_CONTEXT=")),
         "tmux-enabled session should not inherit unallowlisted ambient CMUX variables: {contents}"
+    );
+    assert!(
+        !contents
+            .lines()
+            .any(|line| line.starts_with("cmux_") || line.starts_with("Cmux_")),
+        "tmux-enabled session must not inherit non-canonical lowercase/mixed-case cmux variables: {contents}"
     );
     assert!(
         !contents
