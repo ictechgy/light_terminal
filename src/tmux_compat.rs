@@ -491,6 +491,13 @@ fn rename_session(args: &[String]) -> Result<i32> {
 }
 
 fn split_window(args: &[String]) -> Result<i32> {
+    // tmux accepts layout/size/environment options such as `-l 3`
+    // before `-d`; these are placement hints for a real tmux pane, but
+    // they must still consume their values so detached helper panes stay
+    // detached instead of being mistaken for visible commands. `-F`, `-t`,
+    // and `-c` are handled explicitly below; `VALUE_FLAGS` covers the
+    // split-window-local value flags that the generic parser does not know.
+    const VALUE_FLAGS: &[char] = &['e', 'l', 'p'];
     let mut direction = "right";
     let mut print = false;
     let mut format = "#{pane_id}".to_string();
@@ -498,6 +505,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     let mut cwd = None;
     let mut detached = false;
     let mut command = Vec::new();
+    let mut pane_env = HashMap::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -529,36 +537,57 @@ fn split_window(args: &[String]) -> Result<i32> {
                 cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
+            "-e" => {
+                parse_split_window_env_assignment(
+                    value_for_option(args.get(i + 1).cloned(), "-e")?,
+                    &mut pane_env,
+                )?;
+                i += 2;
+            }
             "--" => {
                 command.extend_from_slice(&args[i + 1..]);
                 break;
             }
             flag if flag.starts_with('-') => {
-                if has_flag_in_arg(flag, 'h') {
+                if has_flag_in_arg_with_value_flags(flag, 'h', VALUE_FLAGS) {
                     direction = "right";
                 }
-                if has_flag_in_arg(flag, 'v') {
+                if has_flag_in_arg_with_value_flags(flag, 'v', VALUE_FLAGS) {
                     direction = "down";
                 }
-                if has_flag_in_arg(flag, 'd') {
+                if has_flag_in_arg_with_value_flags(flag, 'd', VALUE_FLAGS) {
                     detached = true;
                 }
-                if has_flag_in_arg(flag, 'P') {
+                if has_flag_in_arg_with_value_flags(flag, 'P', VALUE_FLAGS) {
                     print = true;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'F', args, i, VALUE_FLAGS)
+                {
                     format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
+                {
                     target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'c', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'c', args, i, VALUE_FLAGS)
+                {
                     cwd = Some(value_for_option(
                         value.or_else(|| args.get(i + 1).cloned()),
                         "-c",
                     )?);
                 }
-                i += flag_arg_width(flag, args, i);
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'e', args, i, VALUE_FLAGS)
+                {
+                    parse_split_window_env_assignment(
+                        value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-e")?,
+                        &mut pane_env,
+                    )?;
+                }
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
             }
             _ => {
                 command.extend_from_slice(&args[i..]);
@@ -567,12 +596,16 @@ fn split_window(args: &[String]) -> Result<i32> {
         }
     }
     if let Some(target) = target.as_deref() {
-        let target = sanitize::terminal_text(target);
-        bail!(
-            "tmux split-window -t {target} is not supported by lterm compat; \
-             refusing to create a session. Use -d for a detached lterm session \
-             or run `lterm tmux-compat list-commands` for supported commands."
-        );
+        if detached {
+            validate_detached_split_target(target)?;
+        } else {
+            let target = sanitize::terminal_text(target);
+            bail!(
+                "tmux split-window -t {target} is not supported by lterm compat; \
+                 refusing to create a session. Use -d for a detached lterm session \
+                 or run `lterm tmux-compat list-commands` for supported commands."
+            );
+        }
     }
 
     let command = tmux_shell_command(&command)?;
@@ -581,14 +614,9 @@ fn split_window(args: &[String]) -> Result<i32> {
     } else {
         open_cmux_split(direction)?
     };
-    let info = match client::new_session(
-        None,
-        command,
-        cwd,
-        cmux_session_env(cmux_surface.as_ref()),
-        None,
-        true,
-    ) {
+    let mut env = cmux_session_env(cmux_surface.as_ref());
+    env.extend(pane_env);
+    let info = match client::new_session(None, command, cwd, env, None, true) {
         Ok(info) => info,
         Err(err) => {
             rollback_cmux_split(cmux_surface.as_ref());
@@ -613,6 +641,42 @@ fn split_window(args: &[String]) -> Result<i32> {
         println!("{}", expand_format(&format, &info));
     }
     Ok(0)
+}
+
+fn validate_detached_split_target(target: &str) -> Result<()> {
+    let safe_target = sanitize::terminal_text(target);
+    let target_info = client::info(target)
+        .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
+    let current_target = default_target();
+    let current_info = client::info(&current_target).with_context(|| {
+        format!(
+            "tmux split-window -d requires a current lterm pane target; default target {} was not found",
+            sanitize::terminal_text(&current_target)
+        )
+    })?;
+    if target_info.pane_id != current_info.pane_id {
+        bail!(
+            "tmux split-window -d -t only supports the current lterm pane target; \
+             requested {} but current pane is {}",
+            safe_target,
+            sanitize::terminal_text(&current_info.pane_id)
+        );
+    }
+    Ok(())
+}
+
+fn parse_split_window_env_assignment(
+    assignment: String,
+    env: &mut HashMap<String, String>,
+) -> Result<()> {
+    let Some((key, value)) = assignment.split_once('=') else {
+        bail!("tmux split-window -e requires NAME=value");
+    };
+    if key.is_empty() {
+        bail!("tmux split-window -e requires a non-empty variable name");
+    }
+    env.insert(key.to_string(), value.to_string());
+    Ok(())
 }
 
 fn list_panes(args: &[String]) -> Result<i32> {
@@ -3139,6 +3203,30 @@ mod tests {
         );
         assert!(parse_target(&args(["-t"])).is_err());
         assert!(parse_target(&args(["-t="])).is_err());
+    }
+
+    #[test]
+    fn parses_split_window_env_assignments_explicitly() {
+        let mut env = HashMap::new();
+        parse_split_window_env_assignment("FOO=bar".to_string(), &mut env)
+            .expect("valid environment assignment");
+        parse_split_window_env_assignment("EMPTY=".to_string(), &mut env)
+            .expect("empty values are valid tmux -e assignments");
+
+        assert_eq!(env["FOO"], "bar");
+        assert_eq!(env["EMPTY"], "");
+        assert!(
+            parse_split_window_env_assignment("FOO".to_string(), &mut env)
+                .unwrap_err()
+                .to_string()
+                .contains("requires NAME=value")
+        );
+        assert!(
+            parse_split_window_env_assignment("=value".to_string(), &mut env)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty variable name")
+        );
     }
 
     #[test]

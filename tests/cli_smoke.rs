@@ -5675,7 +5675,7 @@ fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
 }
 
 #[test]
-fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> TestResult {
+fn tmux_compat_split_window_rejects_non_detached_target() -> TestResult {
     let env = TestEnv::new()?;
     let before = session_names_json(&env)?;
 
@@ -5684,7 +5684,6 @@ fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> Test
         .args([
             "tmux-compat",
             "split-window",
-            "-d",
             "-t",
             "some-target",
             "sh",
@@ -5703,6 +5702,292 @@ fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> Test
         "split-window -t must not create a hidden session"
     );
     Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_detached_hud_options_do_not_open_cmux_split() -> TestResult {
+    let env = TestEnv::new()?;
+    let parent_status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "split-detached-parent",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(parent_status.success(), "{parent_status:?}");
+    wait_for_session_present(&env, "split-detached-parent")?;
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_stdout = String::from_utf8_lossy(&listed.stdout);
+    let parent_row = list_row(&listed_stdout, "split-detached-parent")
+        .ok_or_else(|| format!("split-detached-parent row missing: {listed_stdout:?}"))?;
+    let parent_pane = parent_row
+        .get(1)
+        .ok_or_else(|| format!("split-detached-parent row missing pane id: {parent_row:?}"))?;
+    let fake_bin = env.temp.path().join("fake-cmux-detached-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-detached-hud-options.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             exit 97\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let marker = env.temp.path().join("split-detached-hud-marker.txt");
+    let cwd = env.temp.path().display().to_string();
+    let shell = command_path("sh")?.display().to_string();
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .env("TMUX_PANE", parent_pane)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-v",
+            "-l",
+            "3",
+            "-d",
+            "-t",
+            parent_pane,
+            "-c",
+            cwd.as_str(),
+            shell.as_str(),
+            "-lc",
+            "printf SPLIT_DETACHED_HUD_READY > \"$1\"",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "detached HUD-style split-window should not be treated as a visible split: {output:?}"
+    );
+    assert!(
+        !cmux_log.exists(),
+        "detached split-window must not call cmux new-split/send; calls were: {}",
+        std::fs::read_to_string(&cmux_log).unwrap_or_default()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(
+            std::fs::read_to_string(&marker).as_deref(),
+            Ok("SPLIT_DETACHED_HUD_READY")
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("detached HUD-style split-window payload did not run".into())
+}
+
+#[test]
+fn tmux_compat_split_window_detached_rejects_missing_target_without_side_effect() -> TestResult {
+    let env = TestEnv::new()?;
+    let before = session_names_json(&env)?;
+    let marker = env
+        .temp
+        .path()
+        .join("split-detached-missing-target-marker.txt");
+    let shell = command_path("sh")?.display().to_string();
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-t",
+            "%999",
+            shell.as_str(),
+            "-lc",
+            "printf SHOULD_NOT_RUN > \"$1\"",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "detached split-window with missing -t must fail before creating a session: {output:?}"
+    );
+    assert_stderr_contains(&output, "tmux split-window -d target not found");
+    assert!(
+        !marker.exists(),
+        "rejected split-window target must not execute payload"
+    );
+    let after = session_names_json(&env)?;
+    assert_eq!(
+        after, before,
+        "rejected detached split-window target must not create a hidden session"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_detached_rejects_non_current_target_without_side_effect() -> TestResult
+{
+    let env = TestEnv::new()?;
+    for name in ["split-current", "split-other"] {
+        let status = env
+            .cmd()
+            .args(["tmux-compat", "new-session", "-d", "-s", name, "sleep 30"])
+            .status()?;
+        assert!(status.success(), "{status:?}");
+        wait_for_session_present(&env, name)?;
+    }
+    let before = session_names_json(&env)?;
+    let marker = env.temp.path().join("split-detached-other-marker.txt");
+    let shell = command_path("sh")?.display().to_string();
+
+    let output = env
+        .cmd()
+        .env("TMUX_PANE", "%0")
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-t",
+            "split-other",
+            shell.as_str(),
+            "-lc",
+            "printf SHOULD_NOT_RUN > \"$1\"",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "detached split-window must not silently ignore a non-current live target: {output:?}"
+    );
+    assert_stderr_contains(&output, "only supports the current lterm pane target");
+    assert!(
+        !marker.exists(),
+        "rejected non-current target must not execute payload"
+    );
+    let after = session_names_json(&env)?;
+    assert_eq!(
+        after, before,
+        "rejected non-current target must not create a hidden session"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_detached_e_applies_environment_and_cluster_values() -> TestResult {
+    let env = TestEnv::new()?;
+    let parent_status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "split-env-parent",
+            "sleep 30",
+        ])
+        .status()?;
+    assert!(parent_status.success(), "{parent_status:?}");
+    wait_for_session_present(&env, "split-env-parent")?;
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_stdout = String::from_utf8_lossy(&listed.stdout);
+    let parent_row = list_row(&listed_stdout, "split-env-parent")
+        .ok_or_else(|| format!("split-env-parent row missing: {listed_stdout:?}"))?;
+    let parent_pane = parent_row
+        .get(1)
+        .ok_or_else(|| format!("split-env-parent row missing pane id: {parent_row:?}"))?;
+    let marker = env.temp.path().join("split-detached-env-marker.txt");
+    let marker_separate = env
+        .temp
+        .path()
+        .join("split-detached-env-marker-separate.txt");
+    let shell = command_path("sh")?.display().to_string();
+
+    let output = env
+        .cmd()
+        .env("TMUX_PANE", parent_pane)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-vl3",
+            "-d",
+            "-t",
+            "split-env-parent",
+            "-eSPLIT_WINDOW_ENV=from-e",
+            shell.as_str(),
+            "-lc",
+            "printf '%s' \"$SPLIT_WINDOW_ENV\" > \"$1\"",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "detached split-window should apply -e and consume -l inline value: {output:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_inline_env = false;
+    while Instant::now() < deadline {
+        if matches!(std::fs::read_to_string(&marker).as_deref(), Ok("from-e")) {
+            saw_inline_env = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !saw_inline_env {
+        return Err("detached split-window payload did not receive inline -e environment".into());
+    }
+
+    let output = env
+        .cmd()
+        .env("TMUX_PANE", parent_pane)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-v",
+            "-l",
+            "3",
+            "-d",
+            "-t",
+            "split-env-parent",
+            "-e",
+            "SPLIT_WINDOW_ENV=from-separate-e",
+            shell.as_str(),
+            "-lc",
+            "printf '%s' \"$SPLIT_WINDOW_ENV\" > \"$1\"",
+            "sh",
+            marker_separate
+                .to_str()
+                .ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "detached split-window should apply separate -e and consume -l value: {output:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(
+            std::fs::read_to_string(&marker_separate).as_deref(),
+            Ok("from-separate-e")
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("detached split-window payload did not receive both -e forms".into())
 }
 
 #[test]
