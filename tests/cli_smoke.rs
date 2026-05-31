@@ -255,6 +255,23 @@ fn session_names_json(env: &TestEnv) -> TestResult<BTreeSet<String>> {
         .collect())
 }
 
+fn wait_for_session_names_eq(
+    env: &TestEnv,
+    expected: &BTreeSet<String>,
+    timeout: Duration,
+) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    let mut last = BTreeSet::new();
+    while Instant::now() < deadline {
+        last = session_names_json(env)?;
+        if &last == expected {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("timed out waiting for session set {expected:?}; last={last:?}").into())
+}
+
 fn data_store_path(env: &TestEnv) -> PathBuf {
     env.temp.path().join("data").join("tmux-compat-store.json")
 }
@@ -5951,11 +5968,7 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
         marker_contents, "SPLIT_NON_CURRENT_TARGET_READY",
         "accepted non-current target should execute payload"
     );
-    let after = session_names_json(&env)?;
-    assert!(
-        before.is_subset(&after),
-        "accepted detached split-window should preserve existing sessions; before={before:?} after={after:?}"
-    );
+    wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
     Ok(())
 }
 
