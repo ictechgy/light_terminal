@@ -163,6 +163,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "refresh-client" | "refresh" => Ok(0),
         "select-pane" | "selectp" => Ok(0),
         "select-layout" | "selectl" => Ok(0),
+        "set-hook" | "seth" => set_hook(rest),
         "set-option" | "set" | "setw" | "set-window-option" => Ok(0),
         "show-options"
         | "show"
@@ -977,6 +978,53 @@ fn resize_pane(args: &[String]) -> Result<i32> {
             client::resize(&target, info.rows, cols, None)?;
         }
         (None, None) => {}
+    }
+    Ok(0)
+}
+
+fn set_hook(args: &[String]) -> Result<i32> {
+    // Agent runtimes such as OMX install tmux client-resized hooks to keep a
+    // HUD pane at a fixed height:
+    //
+    //   tmux set-hook -t '#{session_id}' 'client-resized[id]' run-shell -b ...
+    //
+    // lterm has no tmux hook dispatcher yet.  Treat hook set/unset/list forms
+    // as accepted compatibility no-ops, while still validating option values
+    // that would otherwise swallow the hook name and hide malformed invocations.
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
+        if args[i] == "-t" {
+            value_for_option(args.get(i + 1).cloned(), "-t")?;
+            i += 2;
+            continue;
+        }
+        if let Some(value) = args[i].strip_prefix("-t=") {
+            value_for_option(Some(value.to_string()), "-t")?;
+            i += 1;
+            continue;
+        }
+        if args[i].starts_with("-t") && args[i].len() > 2 {
+            value_for_option(Some(args[i][2..].to_string()), "-t")?;
+            i += 1;
+            continue;
+        }
+        if let Some((_, value)) = short_cluster_flag_value(&args[i], 't', args, i) {
+            if let Some(value) = value {
+                value_for_option(Some(value), "-t")?;
+            } else {
+                value_for_option(args.get(i + 1).cloned(), "-t")?;
+            }
+            i += flag_arg_width(&args[i], args, i);
+            continue;
+        }
+        if args[i].starts_with('-') {
+            i += flag_arg_width(&args[i], args, i);
+        } else {
+            break;
+        }
     }
     Ok(0)
 }
@@ -2664,7 +2712,7 @@ fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> St
 fn command_support_tier(command: &str) -> &'static str {
     match command {
         "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-option"
-        | "set-window-option" | "show-environment" => "noop",
+        | "set-hook" | "set-window-option" | "show-environment" => "noop",
         "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
         | "list-commands" | "list-sessions" | "rename-session" | "send-keys" => "full",
         _ => "partial",
@@ -2711,6 +2759,7 @@ const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
     ("select-pane", Some("selectp"), &[]),
     ("send-keys", Some("send"), &[]),
     ("set-environment", Some("setenv"), &[]),
+    ("set-hook", Some("seth"), &[]),
     ("set-option", Some("set"), &[]),
     ("set-window-option", Some("setw"), &[]),
     ("show-environment", Some("showenv"), &[]),
@@ -2749,6 +2798,7 @@ fn command_usage(command: &str) -> &'static str {
         "select-pane" => "[-t target-pane]",
         "send-keys" => "[-l] [-t target-pane] [key ...]",
         "set-environment" => "[-t target-session] variable [value]",
+        "set-hook" => "[-agpRuw] [-t target-session] hook-name [command]",
         "set-option" => "[-t target-pane] option [value]",
         "set-window-option" => "[-t target-window] option [value]",
         "show-environment" => "[-t target-session] [variable]",
@@ -2944,6 +2994,41 @@ mod tests {
         assert_eq!(tmux_option_value(Some("focus-events")), "on");
         assert_eq!(tmux_option_value(Some("status")), "off");
         assert!(show_option_value_only(&args(["-gqv", "focus-events"])));
+    }
+
+    #[test]
+    fn set_hook_accepts_omx_client_resized_hook_forms() {
+        assert_eq!(
+            set_hook(&args([
+                "-t",
+                "#{session_id}",
+                "client-resized[867272301]",
+                "run-shell",
+                "-b",
+                "tmux resize-pane -t %1 -y 2",
+            ]))
+            .expect("set client-resized hook"),
+            0
+        );
+        assert_eq!(
+            set_hook(&args([
+                "-u",
+                "-t",
+                "#{session_id}",
+                "client-resized[867272301]",
+            ]))
+            .expect("unset client-resized hook"),
+            0
+        );
+        assert_eq!(
+            set_hook(&args(["-ut#{session_id}", "client-resized[867272301]",]))
+                .expect("clustered unset client-resized hook"),
+            0
+        );
+        assert!(
+            set_hook(&args(["-t"])).is_err(),
+            "missing -t value should not silently consume the hook name"
+        );
     }
 
     #[test]

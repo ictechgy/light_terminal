@@ -151,6 +151,8 @@ The manifest classifies `lterm tmux-compat list-commands` as
 `compatibility-stable`. Individual shim commands keep their behavior within the
 subset documented in the README and wiki, while unsupported tmux commands remain
 outside the 1.0 contract unless later added to the manifest.
+No-op compatibility commands, including `set-hook`, are stable only as accepted
+shim calls; lterm does not execute tmux hook dispatchers.
 
 ## Manifest-listed examples
 

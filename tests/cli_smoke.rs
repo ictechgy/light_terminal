@@ -7785,6 +7785,24 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
     for args in [
         vec!["tmux-compat", "set-environment", "LTERM_TEST_VAR", "1"],
         vec!["tmux-compat", "setenv", "LTERM_TEST_VAR", "1"],
+        vec![
+            "tmux-compat",
+            "set-hook",
+            "-t",
+            "#{session_id}",
+            "client-resized[867272301]",
+            "run-shell",
+            "-b",
+            "tmux resize-pane -t %1 -y 2",
+        ],
+        vec![
+            "tmux-compat",
+            "set-hook",
+            "-u",
+            "-t",
+            "#{session_id}",
+            "client-resized[867272301]",
+        ],
     ] {
         let status = env.cmd().args(args).status()?;
         assert!(status.success());
@@ -7820,6 +7838,7 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
         ("has-session", "has"),
         ("rename-session", "rename"),
         ("set-environment", "setenv"),
+        ("set-hook", "seth"),
         ("show-environment", "showenv"),
     ] {
         let expected = format!("cmd={command}:{alias}:");

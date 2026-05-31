@@ -406,11 +406,13 @@ lterm run -- codex exec "저장소를 요약해줘"
 - **조회** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Pane** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffer / popup** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
-- **호환용 no-op** — `select-pane`, `select-layout`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
+- **호환용 no-op** — `select-pane`, `select-layout`, `set-hook`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
 
 호환성 참고: lterm은 각 root session을 하나의 pseudo-window로 모델링합니다
 (`window_index=0`, `window_panes=1`). lterm은 client별 process/TTY metadata를
 노출하지 않기 때문에 `client_pid`와 `client_tty`는 빈 문자열로 확장됩니다.
+`set-hook`은 OMX `client-resized[...]` handler처럼 agent runtime이 쓰는 hook
+등록/해제 형태를 받아들이지만, lterm이 tmux hook dispatcher를 실행하지는 않습니다.
 Detached `split-window -d -t <target>`은 같은 daemon socket 안에서 기존 live lterm
 target이면 현재 pane이 아니어도 허용합니다. 이는 tmux의 cross-pane helper launch
 동작을 맞추기 위한 것이며, daemon은 요청 처리 전에 같은 OS 사용자 peer credential을
