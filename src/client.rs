@@ -2662,21 +2662,38 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
-            terminal_output_tracker.observe(&buf[..n]);
+            let output_effects = terminal_output_tracker.observe(&buf[..n]);
+            let alt_screen_active_after_output = alt_screen_state.active.load(Ordering::Relaxed);
             if let Err(err) = stdout.write_all(&buf[..n]) {
                 if err.kind() == ErrorKind::BrokenPipe {
                     break;
                 }
                 return Err(err).context("write stdout");
             }
-            if let Err(err) = stdout.flush() {
-                if err.kind() == ErrorKind::BrokenPipe {
-                    break;
-                }
-                return Err(err).context("flush stdout");
-            }
-            if status_enabled {
+            if status_enabled && output_effects.status_area_dirty && !alt_screen_active_after_output
+            {
+                // Some agent TUIs redraw their prompt/output with ED (`CSI J`) or reset
+                // DECSTBM (`CSI r`). Those sequences can erase the host-side status row
+                // or temporarily return the scroll region to the full cmux surface. Do
+                // the repair in the same output flush window instead of waiting for the
+                // idle heartbeat, which is visible as a bottom-row blink while typing.
                 status_dirty = true;
+                refresh_status(
+                    &mut status_bar,
+                    &mut stdout,
+                    &mut status_dirty,
+                    &mut last_status_refresh,
+                )?;
+            } else {
+                if let Err(err) = stdout.flush() {
+                    if err.kind() == ErrorKind::BrokenPipe {
+                        break;
+                    }
+                    return Err(err).context("flush stdout");
+                }
+                if status_enabled {
+                    status_dirty = true;
+                }
             }
         }
         if status_dirty && !prev_alt_screen_active {
@@ -3153,6 +3170,11 @@ struct TerminalOutputTracker {
     tail: Vec<u8>,
 }
 
+#[derive(Default)]
+struct TerminalOutputEffects {
+    status_area_dirty: bool,
+}
+
 impl TerminalOutputTracker {
     fn new(
         restore_state: Arc<KeyboardProtocolRestoreState>,
@@ -3165,8 +3187,9 @@ impl TerminalOutputTracker {
         }
     }
 
-    fn observe(&mut self, bytes: &[u8]) {
+    fn observe(&mut self, bytes: &[u8]) -> TerminalOutputEffects {
         const TAIL_LIMIT: usize = 64;
+        let mut effects = TerminalOutputEffects::default();
         let old_tail = std::mem::take(&mut self.tail);
         if !old_tail.is_empty() && !bytes.is_empty() {
             let prefix_len = bytes.len().min(TAIL_LIMIT);
@@ -3179,10 +3202,13 @@ impl TerminalOutputTracker {
                 &self.restore_state,
             );
             observe_alt_screen_sequences_after(&boundary, old_tail.len(), &self.alt_screen);
+            effects.status_area_dirty |=
+                observe_status_area_damage_sequences_after(&boundary, old_tail.len());
         }
 
         observe_keyboard_protocol_sequences(bytes, &self.restore_state);
         observe_alt_screen_sequences(bytes, &self.alt_screen);
+        effects.status_area_dirty |= observe_status_area_damage_sequences(bytes);
 
         if bytes.len() >= TAIL_LIMIT {
             self.tail
@@ -3193,11 +3219,55 @@ impl TerminalOutputTracker {
                 .extend_from_slice(&old_tail[old_tail.len() - old_keep..]);
             self.tail.extend_from_slice(bytes);
         }
+        effects
     }
 }
 
 fn observe_keyboard_protocol_sequences(bytes: &[u8], state: &KeyboardProtocolRestoreState) {
     observe_keyboard_protocol_sequences_after(bytes, 0, state);
+}
+
+fn observe_status_area_damage_sequences(bytes: &[u8]) -> bool {
+    observe_status_area_damage_sequences_after(bytes, 0)
+}
+
+fn observe_status_area_damage_sequences_after(bytes: &[u8], min_final_index: usize) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if min_final_index > 0 && i >= min_final_index {
+            break;
+        }
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b'c' {
+            if i + 1 >= min_final_index {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+
+        let scan_end = bytes.len().min(i + 64);
+        let mut j = i + 2;
+        while j < scan_end {
+            let byte = bytes[j];
+            if (0x40..=0x7e).contains(&byte) {
+                if j >= min_final_index && matches!(byte, b'J' | b'r') {
+                    return true;
+                }
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn observe_keyboard_protocol_sequences_after(
@@ -4719,6 +4789,54 @@ mod tests {
         tracker.observe(b"plain output");
         tracker.observe(b"\x1b[>1u");
         assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn terminal_output_tracker_marks_status_damage_for_screen_erases_and_scroll_resets() {
+        let state = Arc::new(KeyboardProtocolRestoreState::default());
+        let alt = Arc::new(AltScreenState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+
+        assert!(
+            !tracker
+                .observe(b"plain \x1b[31mred\x1b[0m")
+                .status_area_dirty,
+            "plain text and SGR should not force status redraw"
+        );
+        assert!(
+            tracker.observe(b"\x1b[J").status_area_dirty,
+            "ED from cursor to end can erase the host status row"
+        );
+        assert!(
+            tracker.observe(b"\x1b[2J").status_area_dirty,
+            "full-screen erase must force immediate status redraw"
+        );
+        assert!(
+            tracker.observe(b"\x1b[r").status_area_dirty,
+            "DECSTBM reset must force immediate status reservation repair"
+        );
+        assert!(
+            tracker.observe(b"\x1bc").status_area_dirty,
+            "RIS must force immediate status redraw"
+        );
+    }
+
+    #[test]
+    fn terminal_output_tracker_marks_status_damage_across_chunk_boundaries() {
+        let state = Arc::new(KeyboardProtocolRestoreState::default());
+        let alt = Arc::new(AltScreenState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+
+        assert!(!tracker.observe(b"prompt\x1b[").status_area_dirty);
+        assert!(
+            tracker.observe(b"2Jafter").status_area_dirty,
+            "split CSI ED should still trigger immediate status repair"
+        );
+        assert!(!tracker.observe(b"more\x1b").status_area_dirty);
+        assert!(
+            tracker.observe(b"cafter").status_area_dirty,
+            "split RIS should still trigger immediate status repair"
+        );
     }
 
     #[test]
