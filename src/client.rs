@@ -2704,40 +2704,15 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             };
             let output_effects = terminal_output_tracker.observe(&buf[..n]);
             let alt_screen_active_after_output = alt_screen_state.active.load(Ordering::Relaxed);
-            if let Err(err) = stdout.write_all(&buf[..n]) {
-                if err.kind() == ErrorKind::BrokenPipe {
-                    break;
-                }
-                return Err(err).context("write stdout");
-            }
-            if status_enabled && output_effects.status_area_dirty && !alt_screen_active_after_output
-            {
-                // Some agent TUIs redraw their prompt/output with ED (`CSI J`) or reset
-                // DECSTBM (`CSI r`). Those sequences can erase the host-side status row
-                // or temporarily return the scroll region to the full terminal surface.
-                // Mark the status dirty, but do not repaint in the same PTY-output
-                // window: interleaving a host-side cursor/SGR repair between an agent
-                // TUI's erase and subsequent redraw has repeatedly caused submitted
-                // prompt lines and color state to disappear. The read timeout/heartbeat
-                // paths below repaint after output goes quiet, while the forced heartbeat
-                // still bounds recovery during continuous output.
-                status_dirty = true;
-                if let Err(err) = stdout.flush() {
-                    if err.kind() == ErrorKind::BrokenPipe {
-                        break;
-                    }
-                    return Err(err).context("flush stdout");
-                }
-            } else {
-                if let Err(err) = stdout.flush() {
-                    if err.kind() == ErrorKind::BrokenPipe {
-                        break;
-                    }
-                    return Err(err).context("flush stdout");
-                }
-                if status_enabled {
-                    status_dirty = true;
-                }
+            if forward_pty_output_frame_or_detached(
+                &mut stdout,
+                &buf[..n],
+                output_effects,
+                status_enabled,
+                alt_screen_active_after_output,
+                &mut status_dirty,
+            )? {
+                break;
             }
         }
         if status_dirty
@@ -2882,6 +2857,45 @@ fn refresh_status_or_detached(
     }
 }
 
+fn forward_pty_output_frame_or_detached(
+    stdout: &mut impl Write,
+    bytes: &[u8],
+    output_effects: TerminalOutputEffects,
+    status_enabled: bool,
+    alt_screen_active: bool,
+    status_dirty: &mut bool,
+) -> Result<bool> {
+    if let Err(err) = stdout.write_all(bytes) {
+        if err.kind() == ErrorKind::BrokenPipe {
+            return Ok(true);
+        }
+        return Err(err).context("write stdout");
+    }
+
+    if status_enabled {
+        if output_effects.status_area_dirty && !alt_screen_active {
+            // Some agent TUIs redraw their prompt/output with ED (`CSI J`) or reset
+            // DECSTBM (`CSI r`). Those sequences can erase the host-side status row
+            // or temporarily return the scroll region to the full terminal surface.
+            // Mark the status dirty, but do not repaint in the same PTY-output
+            // window: interleaving a host-side cursor/SGR repair between an agent
+            // TUI's erase and subsequent redraw has repeatedly caused submitted
+            // prompt lines and color state to disappear. The read timeout/heartbeat
+            // paths repaint after output goes quiet, while the forced heartbeat still
+            // bounds recovery during continuous output.
+        }
+        *status_dirty = true;
+    }
+
+    if let Err(err) = stdout.flush() {
+        if err.kind() == ErrorKind::BrokenPipe {
+            return Ok(true);
+        }
+        return Err(err).context("flush stdout");
+    }
+    Ok(false)
+}
+
 fn anyhow_error_is_broken_pipe(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -2920,6 +2934,45 @@ fn status_bar_supported(show_status: bool) -> bool {
 
 fn status_bar_disabled_by_env() -> bool {
     env_flag_enabled("LTERM_NO_STATUS") || env_flag_disabled("LTERM_STATUS")
+}
+
+fn status_sgr_stack_supported() -> bool {
+    if env_flag_disabled("LTERM_STATUS_SGR_STACK") {
+        return false;
+    }
+    if env_flag_enabled("LTERM_STATUS_SGR_STACK") {
+        return true;
+    }
+
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if term.is_empty() || term == "dumb" {
+        return false;
+    }
+
+    let terminal_identity = [
+        std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        std::env::var("LC_TERMINAL").unwrap_or_default(),
+        std::env::var("TERMINAL_EMULATOR").unwrap_or_default(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+
+    term.contains("xterm")
+        || term.starts_with("tmux")
+        || term.starts_with("screen")
+        || term.contains("kitty")
+        || term.contains("wezterm")
+        || term.contains("alacritty")
+        || term.contains("ghostty")
+        || terminal_identity.contains("xterm")
+        || terminal_identity.contains("iterm")
+        || terminal_identity.contains("wezterm")
+        || terminal_identity.contains("kitty")
+        || terminal_identity.contains("alacritty")
+        || terminal_identity.contains("ghostty")
+        || terminal_identity.contains("termius")
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -3035,6 +3088,11 @@ struct StatusBar {
     /// 잔상을 지울 기회를 잃는다. 화면 밖 row 는 보관했다가 다시 visible 해지는
     /// redraw/restore 에서 clearing 한다.
     drawn_status_rows: Vec<u16>,
+    /// Whether status redraws may use xterm's SGR stack controls (`CSI # {` /
+    /// `CSI # }`) to preserve the PTY application's current rendition around
+    /// lterm's own `SGR 0` and theme writes. Detected once at attach start and
+    /// overridable with `LTERM_STATUS_SGR_STACK`.
+    preserve_sgr_stack: bool,
 }
 
 impl StatusBar {
@@ -3056,6 +3114,7 @@ impl StatusBar {
             pane_id,
             style,
             drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: status_sgr_stack_supported(),
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -3144,8 +3203,21 @@ impl StatusBar {
         // cursor position, but not every terminal restores rendition there; wrap
         // every host-side reset/theme write so an agent TUI keeps its foreground,
         // background, and truecolor state after lterm repaints the reserved row.
+        // Terminals that cannot safely handle this private CSI can disable it
+        // with LTERM_STATUS_SGR_STACK=0; unknown/dumb terminals skip it by
+        // default.
         let rows_to_clear = self.visible_previous_status_rows(rows);
-        let mut payload = String::from("\x1b7\x1b[#{");
+        let sgr_push = if self.preserve_sgr_stack {
+            "\x1b[#{"
+        } else {
+            ""
+        };
+        let sgr_pop = if self.preserve_sgr_stack {
+            "\x1b[#}"
+        } else {
+            ""
+        };
+        let mut payload = format!("\x1b7{sgr_push}");
         for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
@@ -3158,7 +3230,7 @@ impl StatusBar {
             "\x1b[2K"
         };
         payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K\x1b[#}}\x1b8"
+            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8"
         ));
         stdout
             .write_all(payload.as_bytes())
@@ -3173,11 +3245,21 @@ impl StatusBar {
         }
         let (_, rows) = terminal_size();
         let rows_to_clear = self.visible_previous_status_rows(rows);
-        let mut payload = String::from("\x1b7\x1b[#{\x1b[r");
+        let sgr_push = if self.preserve_sgr_stack {
+            "\x1b[#{"
+        } else {
+            ""
+        };
+        let sgr_pop = if self.preserve_sgr_stack {
+            "\x1b[#}"
+        } else {
+            ""
+        };
+        let mut payload = format!("\x1b7{sgr_push}\x1b[r");
         for previous_row in &rows_to_clear {
             payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
-        payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K\x1b[#}}\x1b8"));
+        payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K{sgr_pop}\x1b8"));
         stdout
             .write_all(payload.as_bytes())
             .context("restore terminal after lterm status bar")?;
@@ -3978,18 +4060,20 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome,
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme,
-        TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
-        compose_render_action, compose_sanitized_display_line, compose_should_commit,
-        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
-        handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        TerminalOutputEffects, TerminalOutputTracker, alt_screen_param_matches,
+        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, format_status_line,
+        forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due,
+        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
+        mobile_client_detected, mobile_transcript_capture_changed,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
         raw_attach_command_hint, read_attach_response_header, resolve_attach_mode,
-        resolve_status_style, should_mobile_transcript_auto, status_theme_protocol_error,
-        write_mobile_transcript_update,
+        resolve_status_style, should_mobile_transcript_auto, status_sgr_stack_supported,
+        status_theme_protocol_error, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read};
     use std::sync::Arc;
@@ -4523,6 +4607,7 @@ mod tests {
             pane_id: "%0".to_string(),
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
         };
         let mut output = Vec::new();
 
@@ -4553,6 +4638,7 @@ mod tests {
             pane_id: "%0".to_string(),
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
         };
         let mut output = Vec::new();
 
@@ -4597,6 +4683,7 @@ mod tests {
             pane_id: "%0".to_string(),
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
         };
         let mut output = Vec::new();
 
@@ -4631,6 +4718,7 @@ mod tests {
             pane_id: "%0".to_string(),
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
         };
         let mut output = Vec::new();
 
@@ -4646,6 +4734,130 @@ mod tests {
         assert!(
             payload.ends_with("\x1b[#}\x1b8"),
             "status redraw should pop SGR before restoring the application cursor: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_restore_preserves_application_sgr_state() {
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: vec![20],
+            preserve_sgr_stack: true,
+        };
+        let mut output = Vec::new();
+
+        status_bar.restore(&mut output).expect("restore status");
+
+        let payload = String::from_utf8(output).expect("restore payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b7\x1b[#{\x1b[r"),
+            "status restore should push SGR before host-side resets: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b[#}\x1b8"),
+            "status restore should pop SGR before restoring the application cursor: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_sgr_stack_support_is_gated_and_overridable() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::capture(&[
+            "TERM",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "TERMINAL_EMULATOR",
+            "LTERM_STATUS_SGR_STACK",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("TERM", "dumb");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("TERMINAL_EMULATOR");
+            std::env::remove_var("LTERM_STATUS_SGR_STACK");
+        }
+        assert!(
+            !status_sgr_stack_supported(),
+            "unknown/dumb terminals should not get xterm-private SGR stack by default"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("TERM", "xterm-256color");
+        }
+        assert!(
+            status_sgr_stack_supported(),
+            "common xterm-compatible terminals should preserve app SGR"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_STATUS_SGR_STACK", "0");
+        }
+        assert!(
+            !status_sgr_stack_supported(),
+            "explicit opt-out must disable private SGR stack sequences"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("TERM", "dumb");
+            std::env::set_var("LTERM_STATUS_SGR_STACK", "1");
+        }
+        assert!(
+            status_sgr_stack_supported(),
+            "explicit opt-in should be available for verified terminals"
+        );
+    }
+
+    #[test]
+    fn status_damage_output_defers_status_repaint_until_later_refresh() {
+        let mut output = Vec::new();
+        let mut status_dirty = false;
+        let agent_redraw = b"\x1b[2Jagent prompt redraw";
+
+        let detached = forward_pty_output_frame_or_detached(
+            &mut output,
+            agent_redraw,
+            TerminalOutputEffects {
+                status_area_dirty: true,
+            },
+            true,
+            false,
+            &mut status_dirty,
+        )
+        .expect("forward pty output");
+
+        assert!(!detached);
+        assert_eq!(
+            output, agent_redraw,
+            "status-damaging PTY output must be flushed without interleaving a host status repaint"
+        );
+        assert!(
+            status_dirty,
+            "status damage must be remembered for the heartbeat path"
+        );
+
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+        };
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("later explicit status refresh");
+        let delayed_payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            delayed_payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
+            "a later refresh should still repaint the dirty status row: {delayed_payload:?}"
         );
         status_bar.style = None;
     }
