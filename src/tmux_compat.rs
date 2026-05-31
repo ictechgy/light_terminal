@@ -491,6 +491,11 @@ fn rename_session(args: &[String]) -> Result<i32> {
 }
 
 fn split_window(args: &[String]) -> Result<i32> {
+    // tmux accepts layout/size/environment options such as `-l 3`
+    // before `-d`; these are placement hints for a real tmux pane, but
+    // they must still consume their values so detached helper panes stay
+    // detached instead of being mistaken for visible commands.
+    const VALUE_FLAGS: &[char] = &['e', 'l', 'p'];
     let mut direction = "right";
     let mut print = false;
     let mut format = "#{pane_id}".to_string();
@@ -534,31 +539,37 @@ fn split_window(args: &[String]) -> Result<i32> {
                 break;
             }
             flag if flag.starts_with('-') => {
-                if has_flag_in_arg(flag, 'h') {
+                if has_flag_in_arg_with_value_flags(flag, 'h', VALUE_FLAGS) {
                     direction = "right";
                 }
-                if has_flag_in_arg(flag, 'v') {
+                if has_flag_in_arg_with_value_flags(flag, 'v', VALUE_FLAGS) {
                     direction = "down";
                 }
-                if has_flag_in_arg(flag, 'd') {
+                if has_flag_in_arg_with_value_flags(flag, 'd', VALUE_FLAGS) {
                     detached = true;
                 }
-                if has_flag_in_arg(flag, 'P') {
+                if has_flag_in_arg_with_value_flags(flag, 'P', VALUE_FLAGS) {
                     print = true;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'F', args, i, VALUE_FLAGS)
+                {
                     format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
+                {
                     target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
                 }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'c', args, i) {
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'c', args, i, VALUE_FLAGS)
+                {
                     cwd = Some(value_for_option(
                         value.or_else(|| args.get(i + 1).cloned()),
                         "-c",
                     )?);
                 }
-                i += flag_arg_width(flag, args, i);
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
             }
             _ => {
                 command.extend_from_slice(&args[i..]);
@@ -566,13 +577,15 @@ fn split_window(args: &[String]) -> Result<i32> {
             }
         }
     }
-    if let Some(target) = target.as_deref() {
-        let target = sanitize::terminal_text(target);
-        bail!(
-            "tmux split-window -t {target} is not supported by lterm compat; \
-             refusing to create a session. Use -d for a detached lterm session \
-             or run `lterm tmux-compat list-commands` for supported commands."
-        );
+    if !detached {
+        if let Some(target) = target.as_deref() {
+            let target = sanitize::terminal_text(target);
+            bail!(
+                "tmux split-window -t {target} is not supported by lterm compat; \
+                 refusing to create a session. Use -d for a detached lterm session \
+                 or run `lterm tmux-compat list-commands` for supported commands."
+            );
+        }
     }
 
     let command = tmux_shell_command(&command)?;

@@ -5675,7 +5675,7 @@ fn tmux_compat_split_window_accepts_empty_format_value() -> TestResult {
 }
 
 #[test]
-fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> TestResult {
+fn tmux_compat_split_window_rejects_non_detached_target() -> TestResult {
     let env = TestEnv::new()?;
     let before = session_names_json(&env)?;
 
@@ -5684,7 +5684,6 @@ fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> Test
         .args([
             "tmux-compat",
             "split-window",
-            "-d",
             "-t",
             "some-target",
             "sh",
@@ -5703,6 +5702,71 @@ fn tmux_compat_split_window_target_is_rejected_before_session_creation() -> Test
         "split-window -t must not create a hidden session"
     );
     Ok(())
+}
+
+#[test]
+fn tmux_compat_split_window_detached_hud_options_do_not_open_cmux_split() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-detached-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-detached-hud-options.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             exit 97\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let marker = env.temp.path().join("split-detached-hud-marker.txt");
+    let cwd = env.temp.path().display().to_string();
+    let shell = command_path("sh")?.display().to_string();
+
+    let output = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-v",
+            "-l",
+            "3",
+            "-d",
+            "-t",
+            "%0",
+            "-c",
+            cwd.as_str(),
+            shell.as_str(),
+            "-lc",
+            "printf SPLIT_DETACHED_HUD_READY > \"$1\"; sleep 2",
+            "sh",
+            marker.to_str().ok_or("marker path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "detached HUD-style split-window should not be treated as a visible split: {output:?}"
+    );
+    assert!(
+        !cmux_log.exists(),
+        "detached split-window must not call cmux new-split/send; calls were: {}",
+        std::fs::read_to_string(&cmux_log).unwrap_or_default()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if matches!(
+            std::fs::read_to_string(&marker).as_deref(),
+            Ok("SPLIT_DETACHED_HUD_READY")
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("detached HUD-style split-window payload did not run".into())
 }
 
 #[test]
