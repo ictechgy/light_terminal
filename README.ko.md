@@ -414,7 +414,7 @@ lterm run -- codex exec "저장소를 요약해줘"
 Detached `split-window -d -t <target>`은 같은 daemon socket 안에서 기존 live lterm
 target이면 현재 pane이 아니어도 허용합니다. 이는 tmux의 cross-pane helper launch
 동작을 맞추기 위한 것이며, daemon은 요청 처리 전에 같은 OS 사용자 peer credential을
-검증합니다. detached helper는 target pane 안에 붙지 않고 별도 hidden lterm session으로
+검증합니다. detached helper는 target pane 안에 붙지 않고 별도 lterm session으로
 생성됩니다.
 `lterm tmux-compat list-commands --verbose`는 `command`, alias, support tier,
 usage를 tab-separated로 출력하고, `--json`은 machine-readable row를 출력합니다.
@@ -423,7 +423,7 @@ Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`
 shim에 도달했을 때 opt-in stderr diagnostic row를 출력합니다.
 tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니다.
 
-Status bar redraw는 일반적인 xterm/tmux/screen 계열 터미널에서 xterm SGR stack
+Status bar redraw는 인식된 terminal client에서 xterm SGR stack
 control을 사용해 실행 중인 TUI의 foreground/background color state를 빼앗지 않도록
 합니다. 터미널이 `CSI # {` / `CSI # }`를 눈에 보이게 잘못 처리하면
 `LTERM_STATUS_SGR_STACK=0`으로 끌 수 있고, 클라이언트가 해당 private CSI를 지원하거나

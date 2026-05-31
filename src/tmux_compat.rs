@@ -648,15 +648,15 @@ fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
     // Detached split-window is commonly used by agent HUD/status helpers with
     // `-t <session-name>`. A real tmux accepts an existing live session/window
     // target even when the command is issued from a different current pane. The
-    // lterm compat layer creates hidden helper sessions instead of visible panes,
-    // so this shim intentionally checks for existence rather than current-pane
-    // equality.
+    // lterm compat layer creates a separate helper session instead of a visible
+    // split inside the requested target pane, so this shim intentionally checks
+    // for existence rather than current-pane equality.
     //
     // Security boundary: lterm's daemon socket already enforces same-OS-user
     // peer credentials on every request. Within that same-owner socket boundary,
     // tmux compatibility follows tmux's model that a client able to name a live
-    // target can launch a detached helper for orchestration. The helper still
-    // runs as a separate lterm session and is not attached into the target pane.
+    // target can launch a detached helper for orchestration. The helper runs as
+    // a separate lterm session and is not attached into the target pane.
     client::info(target)
         .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
     Ok(())

@@ -2702,14 +2702,11 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
-            let output_effects = terminal_output_tracker.observe(&buf[..n]);
-            let alt_screen_active_after_output = alt_screen_state.active.load(Ordering::Relaxed);
+            terminal_output_tracker.observe(&buf[..n]);
             if forward_pty_output_frame_or_detached(
                 &mut stdout,
                 &buf[..n],
-                output_effects,
                 status_enabled,
-                alt_screen_active_after_output,
                 &mut status_dirty,
             )? {
                 break;
@@ -2860,9 +2857,7 @@ fn refresh_status_or_detached(
 fn forward_pty_output_frame_or_detached(
     stdout: &mut impl Write,
     bytes: &[u8],
-    output_effects: TerminalOutputEffects,
     status_enabled: bool,
-    alt_screen_active: bool,
     status_dirty: &mut bool,
 ) -> Result<bool> {
     if let Err(err) = stdout.write_all(bytes) {
@@ -2873,17 +2868,15 @@ fn forward_pty_output_frame_or_detached(
     }
 
     if status_enabled {
-        if output_effects.status_area_dirty && !alt_screen_active {
-            // Some agent TUIs redraw their prompt/output with ED (`CSI J`) or reset
-            // DECSTBM (`CSI r`). Those sequences can erase the host-side status row
-            // or temporarily return the scroll region to the full terminal surface.
-            // Mark the status dirty, but do not repaint in the same PTY-output
-            // window: interleaving a host-side cursor/SGR repair between an agent
-            // TUI's erase and subsequent redraw has repeatedly caused submitted
-            // prompt lines and color state to disappear. The read timeout/heartbeat
-            // paths repaint after output goes quiet, while the forced heartbeat still
-            // bounds recovery during continuous output.
-        }
+        // Mark the status dirty, but do not repaint in the same PTY-output
+        // window. This is especially important when agent TUIs emit ED (`CSI J`)
+        // or reset DECSTBM (`CSI r`): those sequences can erase the host-side
+        // status row or temporarily return the scroll region to the full terminal
+        // surface, and interleaving a host-side cursor/SGR repair between an
+        // agent TUI's erase and subsequent redraw has repeatedly caused submitted
+        // prompt lines and color state to disappear. The read timeout/heartbeat
+        // paths repaint after output goes quiet, while the forced heartbeat still
+        // bounds recovery during continuous output.
         *status_dirty = true;
     }
 
@@ -2959,20 +2952,14 @@ fn status_sgr_stack_supported() -> bool {
     .join(" ")
     .to_ascii_lowercase();
 
-    term.contains("xterm")
-        || term.starts_with("tmux")
-        || term.starts_with("screen")
-        || term.contains("kitty")
-        || term.contains("wezterm")
-        || term.contains("alacritty")
-        || term.contains("ghostty")
-        || terminal_identity.contains("xterm")
+    terminal_identity.contains("xterm")
         || terminal_identity.contains("iterm")
         || terminal_identity.contains("wezterm")
         || terminal_identity.contains("kitty")
         || terminal_identity.contains("alacritty")
         || terminal_identity.contains("ghostty")
         || terminal_identity.contains("termius")
+        || matches!(term.as_str(), "xterm-kitty" | "wezterm" | "xterm-ghostty")
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -4060,13 +4047,12 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome,
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme,
-        TerminalOutputEffects, TerminalOutputTracker, alt_screen_param_matches,
-        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, format_status_line,
+        TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
+        compose_render_action, compose_sanitized_display_line, compose_should_commit,
+        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due,
         keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
         mobile_client_detected, mobile_transcript_capture_changed,
@@ -4787,14 +4773,60 @@ mod tests {
             "unknown/dumb terminals should not get xterm-private SGR stack by default"
         );
 
-        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
-        unsafe {
-            std::env::set_var("TERM", "xterm-256color");
+        for generic_term in [
+            "xterm-256color",
+            "tmux-256color",
+            "screen-256color",
+            "ansi",
+            "vt100",
+        ] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::set_var("TERM", generic_term);
+                std::env::remove_var("TERM_PROGRAM");
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+            }
+            assert!(
+                !status_sgr_stack_supported(),
+                "generic TERM={generic_term} alone is too broad for private SGR stack auto-enable"
+            );
         }
-        assert!(
-            status_sgr_stack_supported(),
-            "common xterm-compatible terminals should preserve app SGR"
-        );
+
+        for identity in [
+            "iTerm.app",
+            "WezTerm",
+            "kitty",
+            "Alacritty",
+            "Ghostty",
+            "Termius",
+        ] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::set_var("TERM", "xterm-256color");
+                std::env::set_var("TERM_PROGRAM", identity);
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+            }
+            assert!(
+                status_sgr_stack_supported(),
+                "recognized terminal identity {identity} should preserve app SGR by default"
+            );
+        }
+
+        for verified_term in ["xterm-kitty", "wezterm", "xterm-ghostty"] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::set_var("TERM", verified_term);
+                std::env::remove_var("TERM_PROGRAM");
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+            }
+            assert!(
+                status_sgr_stack_supported(),
+                "specific TERM={verified_term} should preserve app SGR by default"
+            );
+        }
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
         unsafe {
@@ -4825,11 +4857,7 @@ mod tests {
         let detached = forward_pty_output_frame_or_detached(
             &mut output,
             agent_redraw,
-            TerminalOutputEffects {
-                status_area_dirty: true,
-            },
             true,
-            false,
             &mut status_dirty,
         )
         .expect("forward pty output");
