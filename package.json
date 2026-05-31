@@ -1,6 +1,6 @@
 {
   "name": "@ictechgy/lterm",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "Lightweight tmux-compatible terminal session daemon with cmux-friendly notifications.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/ictechgy/light_terminal#readme",
@@ -36,10 +36,10 @@
     "scripts/validate_npm_packages.mjs"
   ],
   "optionalDependencies": {
-    "lterm-darwin-arm64": "1.0.13",
-    "lterm-darwin-x64": "1.0.13",
-    "lterm-linux-arm64": "1.0.13",
-    "lterm-linux-x64": "1.0.13"
+    "lterm-darwin-arm64": "1.0.14",
+    "lterm-darwin-x64": "1.0.14",
+    "lterm-linux-arm64": "1.0.14",
+    "lterm-linux-x64": "1.0.14"
   },
   "engines": {
     "node": ">=16"
