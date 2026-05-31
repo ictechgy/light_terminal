@@ -255,6 +255,48 @@ fn session_names_json(env: &TestEnv) -> TestResult<BTreeSet<String>> {
         .collect())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRowJson {
+    name: String,
+    pane_id: String,
+    parent_pane_id: Option<String>,
+}
+
+fn session_rows_json(env: &TestEnv, all: bool) -> TestResult<Vec<SessionRowJson>> {
+    let mut cmd = env.cmd();
+    cmd.args(["sessions", "--json"]);
+    if all {
+        cmd.arg("--all");
+    }
+    let output = cmd.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    let mut rows = Vec::new();
+    for session in sessions {
+        rows.push(SessionRowJson {
+            name: session
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("session row missing name: {session:?}"))?
+                .to_string(),
+            pane_id: session
+                .get("pane_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("session row missing pane_id: {session:?}"))?
+                .to_string(),
+            parent_pane_id: session
+                .get("parent_pane_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        });
+    }
+    Ok(rows)
+}
+
+fn session_row_names(rows: &[SessionRowJson]) -> BTreeSet<String> {
+    rows.iter().map(|row| row.name.clone()).collect()
+}
+
 fn wait_for_session_names_eq(
     env: &TestEnv,
     expected: &BTreeSet<String>,
@@ -5914,6 +5956,8 @@ fn tmux_compat_split_window_detached_rejects_missing_target_without_side_effect(
 #[test]
 fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> TestResult {
     let env = TestEnv::new()?;
+    let marker = env.temp.path().join("split-detached-other-marker.txt");
+    let release = env.temp.path().join("split-detached-other-release.txt");
     for name in ["split-current", "split-other"] {
         let status = env
             .cmd()
@@ -5922,10 +5966,17 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
         assert!(status.success(), "{status:?}");
         wait_for_session_present(&env, name)?;
     }
-    let before = session_names_json(&env)?;
-    let marker = env.temp.path().join("split-detached-other-marker.txt");
-    let shell = command_path("sh")?.display().to_string();
 
+    let before = session_names_json(&env)?;
+    let before_all = session_rows_json(&env, true)?;
+    let before_all_names = session_row_names(&before_all);
+    let split_other_pane = before_all
+        .iter()
+        .find(|row| row.name == "split-other")
+        .map(|row| row.pane_id.clone())
+        .ok_or("split-other row should exist before detached helper")?;
+
+    let shell = command_path("sh")?.display().to_string();
     let output = env
         .cmd()
         .env("TMUX_PANE", "%0")
@@ -5940,9 +5991,10 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
             "split-other",
             shell.as_str(),
             "-lc",
-            "printf SPLIT_NON_CURRENT_TARGET_READY > \"$1\"",
+            "printf SPLIT_NON_CURRENT_TARGET_READY > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.05; done",
             "sh",
             marker.to_str().ok_or("marker path should be UTF-8")?,
+            release.to_str().ok_or("release path should be UTF-8")?,
         ])
         .output()?;
     assert!(
@@ -5950,25 +6002,50 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
         "detached split-window should accept an existing live target even when it is not current: {output:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let helper_pane = stdout.trim();
     assert!(
-        stdout.trim_start().starts_with('%'),
+        helper_pane.starts_with('%'),
         "detached split-window -P should print the helper pane id: {stdout:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline
-        && !matches!(
-            std::fs::read_to_string(&marker).as_deref(),
-            Ok("SPLIT_NON_CURRENT_TARGET_READY")
-        )
-    {
-        thread::sleep(Duration::from_millis(50));
-    }
-    let marker_contents = std::fs::read_to_string(&marker).unwrap_or_default();
+    let marker_contents = wait_for_file_contents(&marker)?;
     assert_eq!(
-        marker_contents, "SPLIT_NON_CURRENT_TARGET_READY",
+        marker_contents.trim(),
+        "SPLIT_NON_CURRENT_TARGET_READY",
         "accepted non-current target should execute payload"
     );
+    let running_all = session_rows_json(&env, true)?;
+    let running_all_names = session_row_names(&running_all);
+    let helper_names: Vec<_> = running_all_names.difference(&before_all_names).collect();
+    assert_eq!(
+        helper_names.len(),
+        1,
+        "accepted detached split-window should create exactly one helper while running; before={before_all_names:?} running={running_all_names:?}"
+    );
+    let helper_row = running_all
+        .iter()
+        .find(|row| row.name == *helper_names[0])
+        .ok_or_else(|| format!("helper row missing from all sessions: {running_all:?}"))?;
+    assert_eq!(
+        helper_row.pane_id, helper_pane,
+        "split-window -P should print the helper pane id, not the target pane"
+    );
+    assert_ne!(
+        helper_row.pane_id, split_other_pane,
+        "detached helper must be a separate lterm session, not the target pane"
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        running_all_names,
+        "detached helper invoked from outside an lterm parent is a separate visible root while running"
+    );
+    std::fs::write(&release, "release")?;
     wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
+    let final_all = session_rows_json(&env, true)?;
+    assert_eq!(
+        session_row_names(&final_all),
+        before_all_names,
+        "detached helper should be cleaned up after release"
+    );
     Ok(())
 }
 
