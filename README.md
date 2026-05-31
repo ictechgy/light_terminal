@@ -79,7 +79,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.12
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.13
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
