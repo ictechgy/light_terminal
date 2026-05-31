@@ -423,11 +423,13 @@ Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`
 shim에 도달했을 때 opt-in stderr diagnostic row를 출력합니다.
 tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니다.
 
-Status bar redraw는 인식된 terminal client에서 xterm SGR stack
-control을 사용해 실행 중인 TUI의 foreground/background color state를 빼앗지 않도록
-합니다. 터미널이 `CSI # {` / `CSI # }`를 눈에 보이게 잘못 처리하면
-`LTERM_STATUS_SGR_STACK=0`으로 끌 수 있고, 클라이언트가 해당 private CSI를 지원하거나
-안전하게 무시함을 확인했다면 `1`로 강제할 수 있습니다.
+Status bar redraw는 보수적으로 allowlist된 terminal client(예: xterm/iTerm2/WezTerm
+identity)에서만 xterm SGR stack control을 사용해 실행 중인 TUI의
+foreground/background color state를 빼앗지 않도록 합니다.
+`LTERM_STATUS_SGR_STACK=0`으로 `CSI # {` / `CSI # }`를 끌 수 있고, 클라이언트가
+해당 private CSI를 지원하거나 안전하게 무시함을 확인했다면 `1`로 강제할 수 있습니다.
+Kitty, Alacritty, Ghostty, Termius, generic `TERM=xterm-*` 값은 SGR-stack 동작이
+검증될 때까지 opt-in 경로로 둡니다.
 
 ## cmux 동작
 
