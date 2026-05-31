@@ -2952,14 +2952,14 @@ fn status_sgr_stack_supported() -> bool {
     .join(" ")
     .to_ascii_lowercase();
 
+    // `CSI # {` / `CSI # }` are xterm-private controls, not a generic
+    // xterm-compatible TERM capability. Auto-enable only for terminal identities
+    // we intentionally allowlist; leave Kitty/Alacritty/Ghostty/Termius and
+    // generic TERM=xterm-* on the explicit opt-in path until verified on device.
     terminal_identity.contains("xterm")
         || terminal_identity.contains("iterm")
         || terminal_identity.contains("wezterm")
-        || terminal_identity.contains("kitty")
-        || terminal_identity.contains("alacritty")
-        || terminal_identity.contains("ghostty")
-        || terminal_identity.contains("termius")
-        || matches!(term.as_str(), "xterm-kitty" | "wezterm" | "xterm-ghostty")
+        || matches!(term.as_str(), "xterm" | "wezterm")
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -3077,8 +3077,8 @@ struct StatusBar {
     drawn_status_rows: Vec<u16>,
     /// Whether status redraws may use xterm's SGR stack controls (`CSI # {` /
     /// `CSI # }`) to preserve the PTY application's current rendition around
-    /// lterm's own `SGR 0` and theme writes. Detected once at attach start and
-    /// overridable with `LTERM_STATUS_SGR_STACK`.
+    /// lterm's own `SGR 0` and theme writes. Detected conservatively once at
+    /// attach start and overridable with `LTERM_STATUS_SGR_STACK`.
     preserve_sgr_stack: bool,
 }
 
@@ -4750,6 +4750,58 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_redraw_and_restore_skip_sgr_stack_when_disabled() {
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: vec![20],
+            preserve_sgr_stack: false,
+        };
+        let mut output = Vec::new();
+
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw status without sgr stack");
+        let draw_payload = String::from_utf8(output.clone()).expect("draw payload should be utf8");
+        assert!(
+            !draw_payload.contains("\x1b[#{") && !draw_payload.contains("\x1b[#}"),
+            "status redraw must not emit private SGR stack controls when disabled: {draw_payload:?}"
+        );
+        assert!(
+            draw_payload.starts_with("\x1b7"),
+            "status redraw still saves the cursor without SGR stack: {draw_payload:?}"
+        );
+        assert!(
+            draw_payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
+            "status redraw still paints the status row when SGR stack is disabled: {draw_payload:?}"
+        );
+        assert!(
+            draw_payload.contains("\x1b[0m\x1b[K\x1b8"),
+            "status redraw still resets/clears and restores cursor when SGR stack is disabled: {draw_payload:?}"
+        );
+
+        output.clear();
+        status_bar
+            .restore(&mut output)
+            .expect("restore status without sgr stack");
+        let restore_payload = String::from_utf8(output).expect("restore payload should be utf8");
+        assert!(
+            !restore_payload.contains("\x1b[#{") && !restore_payload.contains("\x1b[#}"),
+            "status restore must not emit private SGR stack controls when disabled: {restore_payload:?}"
+        );
+        assert!(
+            restore_payload.starts_with("\x1b7\x1b[r"),
+            "status restore still resets scroll region after saving cursor: {restore_payload:?}"
+        );
+        assert!(
+            restore_payload.ends_with("\x1b[0m\x1b[2K\x1b8"),
+            "status restore still clears the active status row and restores cursor: {restore_payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
     fn status_bar_sgr_stack_support_is_gated_and_overridable() {
         let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
         let _env_guard = EnvGuard::capture(&[
@@ -4793,14 +4845,7 @@ mod tests {
             );
         }
 
-        for identity in [
-            "iTerm.app",
-            "WezTerm",
-            "kitty",
-            "Alacritty",
-            "Ghostty",
-            "Termius",
-        ] {
+        for identity in ["xterm", "iTerm.app", "WezTerm"] {
             // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
             unsafe {
                 std::env::set_var("TERM", "xterm-256color");
@@ -4814,7 +4859,35 @@ mod tests {
             );
         }
 
-        for verified_term in ["xterm-kitty", "wezterm", "xterm-ghostty"] {
+        for unverified_identity in ["kitty", "Alacritty", "Ghostty", "Termius"] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::set_var("TERM", "xterm-256color");
+                std::env::set_var("TERM_PROGRAM", unverified_identity);
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+            }
+            assert!(
+                !status_sgr_stack_supported(),
+                "unverified terminal identity {unverified_identity} must stay opt-in for private SGR stack"
+            );
+        }
+
+        for unverified_term in ["xterm-kitty", "xterm-ghostty"] {
+            // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+            unsafe {
+                std::env::set_var("TERM", unverified_term);
+                std::env::remove_var("TERM_PROGRAM");
+                std::env::remove_var("LC_TERMINAL");
+                std::env::remove_var("TERMINAL_EMULATOR");
+            }
+            assert!(
+                !status_sgr_stack_supported(),
+                "specific TERM={unverified_term} remains opt-in until SGR stack support is verified"
+            );
+        }
+
+        for verified_term in ["xterm", "wezterm"] {
             // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
             unsafe {
                 std::env::set_var("TERM", verified_term);

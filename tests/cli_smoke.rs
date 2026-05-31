@@ -3257,7 +3257,7 @@ fn open_and_attach_or_new_create_missing_session() -> TestResult {
                 "--",
                 "sh",
                 "-lc",
-                "echo READY; sleep 5",
+                "echo READY; sleep 30",
             ])
             .status()?;
         assert!(
@@ -3443,7 +3443,7 @@ fn start_and_new_short_name_list_aliases_work() -> TestResult {
         ("start", "shorty-start", "SHORTY_START"),
         ("new", "shorty-new", "SHORTY_NEW"),
     ] {
-        let script = format!("echo {marker}; sleep 2");
+        let script = format!("echo {marker}; sleep 10");
         let status = env
             .cmd()
             .args([command, "--detach", "-n", name, "--", "sh", "-lc", &script])

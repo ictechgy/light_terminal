@@ -431,7 +431,7 @@ the detached helper is created as a separate lterm session rather than being
 attached into the target pane.
 Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`, alias, support tier, and usage fields, or `--json` for machine-readable rows. Support tiers are `full`, `partial`, and `noop` within lterm's compatibility boundary. Set `LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when an unsupported tmux command reaches the shim.
 
-Status-bar redraws use xterm SGR stack controls on recognized terminal clients to avoid stealing the foreground/background color state of the running TUI. Set `LTERM_STATUS_SGR_STACK=0` if a terminal visibly mishandles `CSI # {` / `CSI # }`; set it to `1` to force the stack after verifying your client supports or safely ignores those private CSI sequences.
+Status-bar redraws use xterm SGR stack controls only on conservatively allowlisted terminal clients (for example xterm/iTerm2/WezTerm identities) to avoid stealing the foreground/background color state of the running TUI. Set `LTERM_STATUS_SGR_STACK=0` to disable `CSI # {` / `CSI # }`; set it to `1` to force the stack after verifying your client supports or safely ignores those private CSI sequences. Kitty, Alacritty, Ghostty, Termius, and generic `TERM=xterm-*` values stay opt-in until their SGR-stack behavior is verified.
 
 ## cmux behavior
 
