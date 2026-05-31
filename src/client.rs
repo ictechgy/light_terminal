@@ -2488,6 +2488,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut terminal_output_tracker = TerminalOutputTracker::new(
         _raw.keyboard_protocol_restore_state(),
         Arc::clone(&alt_screen_state),
+        status_scroll_bottom_for_terminal_rows(rows, status_enabled),
     );
     let running = Arc::new(AtomicBool::new(true));
 
@@ -2593,7 +2594,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
     let output_result = (|| -> Result<()> {
-        loop {
+        'output: loop {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
@@ -2603,27 +2604,37 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
             // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
             // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
-            if status_enabled && prev_alt_screen_active && !alt_screen_active {
-                refresh_status(
+            if status_enabled
+                && prev_alt_screen_active
+                && !alt_screen_active
+                && refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?;
+                )?
+            {
+                break;
             }
             prev_alt_screen_active = alt_screen_active;
 
             while resize_rx.try_recv().is_ok() {
+                let (_, current_rows) = terminal_size();
+                terminal_output_tracker.set_status_scroll_bottom(
+                    status_scroll_bottom_for_terminal_rows(current_rows, status_enabled),
+                );
                 // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
-                if !alt_screen_active {
-                    refresh_status(
+                if !alt_screen_active
+                    && refresh_status_or_detached(
                         &mut status_bar,
                         &mut stdout,
                         &mut status_dirty,
                         &mut last_status_refresh,
-                    )?;
+                    )?
+                {
+                    break 'output;
                 }
             }
             // heartbeat는 idle(STATUS_HEARTBEAT) + forced(STATUS_HEARTBEAT_FORCED) 두 경로를
@@ -2632,13 +2643,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             if status_enabled
                 && !alt_screen_active
                 && heartbeat_due(last_status_refresh.elapsed(), status_dirty)
-            {
-                refresh_status(
+                && refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?;
+                )?
+            {
+                break;
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -2650,13 +2662,16 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                             || err.kind() == ErrorKind::TimedOut) =>
                 {
                     // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
-                    if status_dirty && !alt_screen_active {
-                        refresh_status(
+                    if status_dirty
+                        && !alt_screen_active
+                        && refresh_status_or_detached(
                             &mut status_bar,
                             &mut stdout,
                             &mut status_dirty,
                             &mut last_status_refresh,
-                        )?;
+                        )?
+                    {
+                        break;
                     }
                     continue;
                 }
@@ -2678,12 +2693,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 // the repair in the same output flush window instead of waiting for the
                 // idle heartbeat, which is visible as a bottom-row blink while typing.
                 status_dirty = true;
-                refresh_status(
+                if refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?;
+                )? {
+                    break;
+                }
             } else {
                 if let Err(err) = stdout.flush() {
                     if err.kind() == ErrorKind::BrokenPipe {
@@ -2696,13 +2713,16 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 }
             }
         }
-        if status_dirty && !prev_alt_screen_active {
-            refresh_status(
+        if status_dirty
+            && !prev_alt_screen_active
+            && refresh_status_or_detached(
                 &mut status_bar,
                 &mut stdout,
                 &mut status_dirty,
                 &mut last_status_refresh,
-            )?;
+            )?
+        {
+            return Ok(());
         }
         Ok(())
     })();
@@ -2719,6 +2739,10 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
     } else {
         rows.max(1)
     }
+}
+
+fn status_scroll_bottom_for_terminal_rows(rows: u16, show_status: bool) -> Option<u16> {
+    (show_status && rows > 1).then_some(rows - 1)
 }
 
 /// `resize_thread` 한 tick 의 처리 결과. RPC 결과는 세 가지 의미상 분기로 나뉘는데,
@@ -2774,6 +2798,27 @@ fn refresh_status(
     *status_dirty = false;
     *last_status_refresh = Instant::now();
     Ok(())
+}
+
+fn refresh_status_or_detached(
+    status_bar: &mut StatusBar,
+    stdout: &mut std::io::Stdout,
+    status_dirty: &mut bool,
+    last_status_refresh: &mut Instant,
+) -> Result<bool> {
+    match refresh_status(status_bar, stdout, status_dirty, last_status_refresh) {
+        Ok(()) => Ok(false),
+        Err(err) if anyhow_error_is_broken_pipe(&err) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn anyhow_error_is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == ErrorKind::BrokenPipe)
+    })
 }
 
 /// heartbeat **timing/dirty 서브 게이트**만 평가한다. **호출자는 반드시 `status_enabled`
@@ -3167,6 +3212,7 @@ struct AltScreenState {
 struct TerminalOutputTracker {
     restore_state: Arc<KeyboardProtocolRestoreState>,
     alt_screen: Arc<AltScreenState>,
+    status_scroll_bottom: Option<u16>,
     tail: Vec<u8>,
 }
 
@@ -3179,12 +3225,18 @@ impl TerminalOutputTracker {
     fn new(
         restore_state: Arc<KeyboardProtocolRestoreState>,
         alt_screen: Arc<AltScreenState>,
+        status_scroll_bottom: Option<u16>,
     ) -> Self {
         Self {
             restore_state,
             alt_screen,
+            status_scroll_bottom,
             tail: Vec::new(),
         }
+    }
+
+    fn set_status_scroll_bottom(&mut self, status_scroll_bottom: Option<u16>) {
+        self.status_scroll_bottom = status_scroll_bottom;
     }
 
     fn observe(&mut self, bytes: &[u8]) -> TerminalOutputEffects {
@@ -3202,13 +3254,17 @@ impl TerminalOutputTracker {
                 &self.restore_state,
             );
             observe_alt_screen_sequences_after(&boundary, old_tail.len(), &self.alt_screen);
-            effects.status_area_dirty |=
-                observe_status_area_damage_sequences_after(&boundary, old_tail.len());
+            effects.status_area_dirty |= observe_status_area_damage_sequences_after(
+                &boundary,
+                old_tail.len(),
+                self.status_scroll_bottom,
+            );
         }
 
         observe_keyboard_protocol_sequences(bytes, &self.restore_state);
         observe_alt_screen_sequences(bytes, &self.alt_screen);
-        effects.status_area_dirty |= observe_status_area_damage_sequences(bytes);
+        effects.status_area_dirty |=
+            observe_status_area_damage_sequences(bytes, self.status_scroll_bottom);
 
         if bytes.len() >= TAIL_LIMIT {
             self.tail
@@ -3227,38 +3283,47 @@ fn observe_keyboard_protocol_sequences(bytes: &[u8], state: &KeyboardProtocolRes
     observe_keyboard_protocol_sequences_after(bytes, 0, state);
 }
 
-fn observe_status_area_damage_sequences(bytes: &[u8]) -> bool {
-    observe_status_area_damage_sequences_after(bytes, 0)
+fn observe_status_area_damage_sequences(bytes: &[u8], status_scroll_bottom: Option<u16>) -> bool {
+    observe_status_area_damage_sequences_after(bytes, 0, status_scroll_bottom)
 }
 
-fn observe_status_area_damage_sequences_after(bytes: &[u8], min_final_index: usize) -> bool {
+fn observe_status_area_damage_sequences_after(
+    bytes: &[u8],
+    min_final_index: usize,
+    status_scroll_bottom: Option<u16>,
+) -> bool {
     let mut i = 0;
-    while i + 1 < bytes.len() {
+    while i < bytes.len() {
         if min_final_index > 0 && i >= min_final_index {
             break;
         }
-        if bytes[i] != 0x1b {
-            i += 1;
-            continue;
-        }
-        if bytes[i + 1] == b'c' {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'c' {
             if i + 1 >= min_final_index {
                 return true;
             }
             i += 2;
             continue;
         }
-        if bytes[i + 1] != b'[' {
+
+        let params_start = if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i + 2
+        } else {
             i += 1;
             continue;
-        }
+        };
 
         let scan_end = bytes.len().min(i + 64);
-        let mut j = i + 2;
+        let mut j = params_start;
         while j < scan_end {
             let byte = bytes[j];
             if (0x40..=0x7e).contains(&byte) {
-                if j >= min_final_index && matches!(byte, b'J' | b'r') {
+                if j >= min_final_index
+                    && csi_sequence_can_damage_status_area(
+                        byte,
+                        &bytes[params_start..j],
+                        status_scroll_bottom,
+                    )
+                {
                     return true;
                 }
                 break;
@@ -3268,6 +3333,92 @@ fn observe_status_area_damage_sequences_after(bytes: &[u8], min_final_index: usi
         i += 1;
     }
     false
+}
+
+fn csi_sequence_can_damage_status_area(
+    final_byte: u8,
+    params: &[u8],
+    status_scroll_bottom: Option<u16>,
+) -> bool {
+    match final_byte {
+        // ED variants are conservative damage signals. Even `CSI 1J` can
+        // clear the host status row if the PTY first moves the cursor onto
+        // the bottom row; without full cursor tracking, repaint immediately.
+        b'J' => csi_first_numeric_param(params).is_none_or(|param| param <= 3),
+        // DECSTBM reset restores the scroll region to the full surface; that
+        // can let subsequent PTY output overwrite the host status row. Parameterized
+        // regions are damaging only when their bottom includes the reserved status
+        // row; the common PTY-owned `CSI 1;<body_rows>r` prompt redraw is benign.
+        b'r' => csi_decstbm_touches_status_area(params, status_scroll_bottom),
+        _ => false,
+    }
+}
+
+fn csi_first_numeric_param(params: &[u8]) -> Option<u16> {
+    if params.is_empty() {
+        return Some(0);
+    }
+    let mut value: u16 = 0;
+    let mut seen_digit = false;
+    for &byte in params {
+        match byte {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add(u16::from(byte - b'0'));
+            }
+            b';' => return Some(if seen_digit { value } else { 0 }),
+            _ => return None,
+        }
+    }
+    Some(if seen_digit { value } else { 0 })
+}
+
+fn csi_decstbm_touches_status_area(params: &[u8], status_scroll_bottom: Option<u16>) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    let Some(status_scroll_bottom) = status_scroll_bottom else {
+        return true;
+    };
+    let Some(params) = csi_numeric_params(params) else {
+        return true;
+    };
+    if params.is_empty() || params.iter().all(|param| param.unwrap_or(0) == 0) {
+        return true;
+    }
+    let Some(Some(bottom)) = params.get(1) else {
+        return true;
+    };
+    if *bottom == 0 {
+        return true;
+    }
+    *bottom > status_scroll_bottom
+}
+
+fn csi_numeric_params(params: &[u8]) -> Option<Vec<Option<u16>>> {
+    let mut out = Vec::new();
+    let mut seen_digit = false;
+    let mut current: u16 = 0;
+    for &byte in params {
+        match byte {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                current = current
+                    .saturating_mul(10)
+                    .saturating_add(u16::from(byte - b'0'));
+            }
+            b';' => {
+                out.push(seen_digit.then_some(current));
+                seen_digit = false;
+                current = 0;
+            }
+            _ => return None,
+        }
+    }
+    out.push(seen_digit.then_some(current));
+    Some(out)
 }
 
 fn observe_keyboard_protocol_sequences_after(
@@ -3743,11 +3894,11 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome,
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme,
-        TerminalOutputTracker, alt_screen_param_matches, attach_pty_rows, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence,
+        TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
+        compose_render_action, compose_sanitized_display_line, compose_should_commit,
+        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
         handle_resize_tick, heartbeat_due, keyboard_protocol_restore_bytes, likely_agent_session,
         matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
@@ -3756,7 +3907,7 @@ mod tests {
         resolve_status_style, should_mobile_transcript_auto, status_theme_protocol_error,
         write_mobile_transcript_update,
     };
-    use std::io::{BufReader, Cursor, Read};
+    use std::io::{BufReader, Cursor, ErrorKind, Read};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -4773,7 +4924,8 @@ mod tests {
     fn observes_keyboard_protocol_sequences_split_across_chunks_once() {
         let state = Arc::new(KeyboardProtocolRestoreState::default());
         let alt = Arc::new(AltScreenState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+        let mut tracker =
+            TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt), Some(23));
         tracker.observe(b"\x1b[>");
         tracker.observe(b"1u");
         tracker.observe(b"plain output");
@@ -4785,7 +4937,8 @@ mod tests {
     fn observes_whole_keyboard_protocol_sequences_once_after_tail() {
         let state = Arc::new(KeyboardProtocolRestoreState::default());
         let alt = Arc::new(AltScreenState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+        let mut tracker =
+            TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt), Some(23));
         tracker.observe(b"plain output");
         tracker.observe(b"\x1b[>1u");
         assert_eq!(state.kitty_push_depth.load(Ordering::Relaxed), 1);
@@ -4795,7 +4948,8 @@ mod tests {
     fn terminal_output_tracker_marks_status_damage_for_screen_erases_and_scroll_resets() {
         let state = Arc::new(KeyboardProtocolRestoreState::default());
         let alt = Arc::new(AltScreenState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+        let mut tracker =
+            TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt), Some(23));
 
         assert!(
             !tracker
@@ -4812,12 +4966,36 @@ mod tests {
             "full-screen erase must force immediate status redraw"
         );
         assert!(
+            tracker.observe(b"\x1b[3J").status_area_dirty,
+            "scrollback erase can still accompany a status-row clearing redraw"
+        );
+        assert!(
+            tracker.observe(b"\x1b[1J").status_area_dirty,
+            "erase start-to-cursor can touch the status row after cursor movement"
+        );
+        assert!(
             tracker.observe(b"\x1b[r").status_area_dirty,
             "DECSTBM reset must force immediate status reservation repair"
         );
         assert!(
+            !tracker.observe(b"\x1b[1;23r").status_area_dirty,
+            "body-only DECSTBM should not repaint on every prompt redraw"
+        );
+        assert!(
+            tracker.observe(b"\x1b[1;24r").status_area_dirty,
+            "full-height DECSTBM includes the reserved status row"
+        );
+        assert!(
             tracker.observe(b"\x1bc").status_area_dirty,
             "RIS must force immediate status redraw"
+        );
+        assert!(
+            tracker.observe(b"\x1b[?2J").status_area_dirty,
+            "private/selective ED should conservatively force immediate status redraw"
+        );
+        assert!(
+            !tracker.observe("śr".as_bytes()).status_area_dirty,
+            "UTF-8 continuation bytes must not be misread as raw C1 CSI"
         );
     }
 
@@ -4825,7 +5003,8 @@ mod tests {
     fn terminal_output_tracker_marks_status_damage_across_chunk_boundaries() {
         let state = Arc::new(KeyboardProtocolRestoreState::default());
         let alt = Arc::new(AltScreenState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt));
+        let mut tracker =
+            TerminalOutputTracker::new(Arc::clone(&state), Arc::clone(&alt), Some(23));
 
         assert!(!tracker.observe(b"prompt\x1b[").status_area_dirty);
         assert!(
@@ -4837,13 +5016,32 @@ mod tests {
             tracker.observe(b"cafter").status_area_dirty,
             "split RIS should still trigger immediate status repair"
         );
+        assert!(
+            !tracker.observe("moreś".as_bytes()).status_area_dirty,
+            "UTF-8 continuation bytes split near ASCII must not look like CSI"
+        );
+        assert!(
+            !tracker.observe(b"Jafter").status_area_dirty,
+            "plain ASCII after UTF-8 text is not a split raw CSI sequence"
+        );
+    }
+
+    #[test]
+    fn broken_pipe_detection_sees_context_wrapped_io_errors() {
+        let err =
+            anyhow::Error::new(std::io::Error::from(ErrorKind::BrokenPipe)).context("flush stdout");
+        assert!(anyhow_error_is_broken_pipe(&err));
+
+        let other =
+            anyhow::Error::new(std::io::Error::from(ErrorKind::ConnectionReset)).context("flush");
+        assert!(!anyhow_error_is_broken_pipe(&other));
     }
 
     #[test]
     fn alt_screen_tracker_observes_enter_and_exit() {
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         assert!(!state.active.load(Ordering::Relaxed));
         tracker.observe(b"plain\x1b[?1049hinside vim");
@@ -4858,7 +5056,7 @@ mod tests {
     fn alt_screen_tracker_handles_47_and_1047() {
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         tracker.observe(b"\x1b[?47h");
         assert!(state.active.load(Ordering::Relaxed));
@@ -4875,7 +5073,7 @@ mod tests {
     fn alt_screen_tracker_ignores_unrelated_private_modes() {
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         // ?25l (cursor hide), ?2004h (bracketed paste), ?1004h (focus events) → 무시
         tracker.observe(b"\x1b[?25l\x1b[?2004h\x1b[?1004h");
@@ -4893,7 +5091,7 @@ mod tests {
     fn alt_screen_tracker_handles_semicolon_grouped_params() {
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         // xterm 그룹 set: ?47;1049h → 1049 매치 → enter
         tracker.observe(b"\x1b[?47;1049h");
@@ -4912,7 +5110,7 @@ mod tests {
     fn alt_screen_sequence_split_across_chunks_observed_once() {
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         tracker.observe(b"prefix\x1b[?10");
         tracker.observe(b"49h");
@@ -4926,7 +5124,7 @@ mod tests {
         // 명시적 상한이 없으므로 i+64까지 스캔한다.
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         // ?25;47;1047;1049;1004;2004;1006h — i+3..j 사이가 32바이트 초과
         tracker.observe(b"\x1b[?25;47;1047;1049;1004;2004;1006h");
@@ -4951,7 +5149,7 @@ mod tests {
         // 후반(>32바이트) 영역에 떨어지는 케이스.
         let state = Arc::new(AltScreenState::default());
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
-        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state));
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
         tracker.observe(b"\x1b[?25;47;1047;1049;1004;2004;1");
         assert!(
