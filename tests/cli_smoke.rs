@@ -5895,8 +5895,7 @@ fn tmux_compat_split_window_detached_rejects_missing_target_without_side_effect(
 }
 
 #[test]
-fn tmux_compat_split_window_detached_rejects_non_current_target_without_side_effect() -> TestResult
-{
+fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> TestResult {
     let env = TestEnv::new()?;
     for name in ["split-current", "split-other"] {
         let status = env
@@ -5917,28 +5916,45 @@ fn tmux_compat_split_window_detached_rejects_non_current_target_without_side_eff
             "tmux-compat",
             "split-window",
             "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
             "-t",
             "split-other",
             shell.as_str(),
             "-lc",
-            "printf SHOULD_NOT_RUN > \"$1\"",
+            "printf SPLIT_NON_CURRENT_TARGET_READY > \"$1\"",
             "sh",
             marker.to_str().ok_or("marker path should be UTF-8")?,
         ])
         .output()?;
     assert!(
-        !output.status.success(),
-        "detached split-window must not silently ignore a non-current live target: {output:?}"
+        output.status.success(),
+        "detached split-window should accept an existing live target even when it is not current: {output:?}"
     );
-    assert_stderr_contains(&output, "only supports the current lterm pane target");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !marker.exists(),
-        "rejected non-current target must not execute payload"
+        stdout.trim_start().starts_with('%'),
+        "detached split-window -P should print the helper pane id: {stdout:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && !matches!(
+            std::fs::read_to_string(&marker).as_deref(),
+            Ok("SPLIT_NON_CURRENT_TARGET_READY")
+        )
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let marker_contents = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        marker_contents, "SPLIT_NON_CURRENT_TARGET_READY",
+        "accepted non-current target should execute payload"
     );
     let after = session_names_json(&env)?;
-    assert_eq!(
-        after, before,
-        "rejected non-current target must not create a hidden session"
+    assert!(
+        before.is_subset(&after),
+        "accepted detached split-window should preserve existing sessions; before={before:?} after={after:?}"
     );
     Ok(())
 }
@@ -8159,7 +8175,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .find(|line| line.starts_with("omx\t"))
         .ok_or("missing omx row")?;
     let fields: Vec<_> = omx.split('\t').collect();
-    assert_eq!(fields[3], "on", "{omx:?}");
+    assert_eq!(fields[3], "off", "{omx:?}");
     assert_eq!(fields[4], "missing", "{omx:?}");
     assert_eq!(fields[5], "-", "{omx:?}");
     assert_eq!(fields[6], "built-in", "{omx:?}");
@@ -8223,7 +8239,7 @@ fn agents_lists_builtin_profiles_and_path_availability() -> TestResult {
         .iter()
         .find(|row| row["profile"] == "omx")
         .ok_or("missing omx JSON row")?;
-    assert_eq!(omx["status_default"], true);
+    assert_eq!(omx["status_default"], false);
     assert_eq!(omx["available"], false);
     assert!(omx["path"].is_null());
 
@@ -9113,26 +9129,26 @@ fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
             String::from_utf8_lossy(&default_output)
         );
         assert!(
-            contains_subsequence(&default_output, &status_indicator),
-            "{alias} should keep the lterm status bar by default while status rendering is hardened: {:?}",
+            !contains_subsequence(&default_output, &status_indicator),
+            "{alias} should default to a raw full-terminal attach so the agent TUI owns color/input rendering: {:?}",
             String::from_utf8_lossy(&default_output)
         );
 
-        let no_status_output = run_agent_alias_on_pty_until_exit(
+        let status_output = run_agent_alias_on_pty_until_exit(
             &env,
             &path,
-            &[alias, "--no-status"],
-            &format!("{alias} explicit no status"),
+            &[alias, "--status"],
+            &format!("{alias} explicit status"),
         )?;
         assert!(
-            contains_subsequence(&no_status_output, b"AGENT_READY"),
-            "{alias} fake agent marker should be forwarded when --no-status is enabled: {:?}",
-            String::from_utf8_lossy(&no_status_output)
+            contains_subsequence(&status_output, b"AGENT_READY"),
+            "{alias} fake agent marker should be forwarded when --status is enabled: {:?}",
+            String::from_utf8_lossy(&status_output)
         );
         assert!(
-            !contains_subsequence(&no_status_output, &status_indicator),
-            "--no-status should still opt {alias} out of the lterm status bar: {:?}",
-            String::from_utf8_lossy(&no_status_output)
+            contains_subsequence(&status_output, &status_indicator),
+            "--status should still opt {alias} into the lterm status bar: {:?}",
+            String::from_utf8_lossy(&status_output)
         );
     }
 
