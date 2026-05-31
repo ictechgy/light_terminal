@@ -645,23 +645,16 @@ fn split_window(args: &[String]) -> Result<i32> {
 
 fn validate_detached_split_target(target: &str) -> Result<()> {
     let safe_target = sanitize::terminal_text(target);
-    let target_info = client::info(target)
+    // Detached split-window is commonly used by agent HUD/status helpers with
+    // `-t <session-name>`. A real tmux accepts an existing live session/window
+    // target even when the command is issued from a different current pane. The
+    // lterm compat layer creates hidden helper sessions instead of visible panes,
+    // so the important safety boundary is "the requested target exists"; strict
+    // "target must equal current pane" validation breaks legitimate OMX/OMC HUD
+    // launches and does not add meaningful protection because no visible split is
+    // created for detached helpers.
+    client::info(target)
         .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
-    let current_target = default_target();
-    let current_info = client::info(&current_target).with_context(|| {
-        format!(
-            "tmux split-window -d requires a current lterm pane target; default target {} was not found",
-            sanitize::terminal_text(&current_target)
-        )
-    })?;
-    if target_info.pane_id != current_info.pane_id {
-        bail!(
-            "tmux split-window -d -t only supports the current lterm pane target; \
-             requested {} but current pane is {}",
-            safe_target,
-            sanitize::terminal_text(&current_info.pane_id)
-        );
-    }
     Ok(())
 }
 

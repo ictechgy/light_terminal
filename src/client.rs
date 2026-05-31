@@ -2714,17 +2714,19 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             {
                 // Some agent TUIs redraw their prompt/output with ED (`CSI J`) or reset
                 // DECSTBM (`CSI r`). Those sequences can erase the host-side status row
-                // or temporarily return the scroll region to the full cmux surface. Do
-                // the repair in the same output flush window instead of waiting for the
-                // idle heartbeat, which is visible as a bottom-row blink while typing.
+                // or temporarily return the scroll region to the full terminal surface.
+                // Mark the status dirty, but do not repaint in the same PTY-output
+                // window: interleaving a host-side cursor/SGR repair between an agent
+                // TUI's erase and subsequent redraw has repeatedly caused submitted
+                // prompt lines and color state to disappear. The read timeout/heartbeat
+                // paths below repaint after output goes quiet, while the forced heartbeat
+                // still bounds recovery during continuous output.
                 status_dirty = true;
-                if refresh_status_or_detached(
-                    &mut status_bar,
-                    &mut stdout,
-                    &mut status_dirty,
-                    &mut last_status_refresh,
-                )? {
-                    break;
+                if let Err(err) = stdout.flush() {
+                    if err.kind() == ErrorKind::BrokenPipe {
+                        break;
+                    }
+                    return Err(err).context("flush stdout");
                 }
             } else {
                 if let Err(err) = stdout.flush() {
@@ -3138,8 +3140,12 @@ impl StatusBar {
         // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
         // 그러나 write! 매크로는 placeholder 마다 write_fmt 가 분할 syscall을 일으켜 SGR sequence
         // 중간이 다른 출력과 interleave 될 위험이 컸다 — buffered write 로 그 위험을 줄인다.
+        // CSI # { / CSI # } is xterm's SGR stack. DECSC/DECRC already saves
+        // cursor position, but not every terminal restores rendition there; wrap
+        // every host-side reset/theme write so an agent TUI keeps its foreground,
+        // background, and truecolor state after lterm repaints the reserved row.
         let rows_to_clear = self.visible_previous_status_rows(rows);
-        let mut payload = String::from("\x1b7");
+        let mut payload = String::from("\x1b7\x1b[#{");
         for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
@@ -3152,7 +3158,7 @@ impl StatusBar {
             "\x1b[2K"
         };
         payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K\x1b8"
+            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K\x1b[#}}\x1b8"
         ));
         stdout
             .write_all(payload.as_bytes())
@@ -3167,11 +3173,11 @@ impl StatusBar {
         }
         let (_, rows) = terminal_size();
         let rows_to_clear = self.visible_previous_status_rows(rows);
-        let mut payload = String::from("\x1b7\x1b[r");
+        let mut payload = String::from("\x1b7\x1b[#{\x1b[r");
         for previous_row in &rows_to_clear {
             payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
-        payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K\x1b8"));
+        payload.push_str(&format!("\x1b[{rows};1H\x1b[0m\x1b[2K\x1b[#}}\x1b8"));
         stdout
             .write_all(payload.as_bytes())
             .context("restore terminal after lterm status bar")?;
@@ -4612,8 +4618,34 @@ mod tests {
             "same-row heartbeat redraws should not clear the current row and visibly flicker: {payload:?}"
         );
         assert!(
-            payload.contains("\x1b[0m\x1b[K\x1b8"),
+            payload.contains("\x1b[0m\x1b[K\x1b[#}\x1b8"),
             "same-row redraws should still clear from the padded status text to line end, covering the intentionally unwritten final column without a full-row clear: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_redraw_preserves_application_sgr_state() {
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw status");
+
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b7\x1b[#{"),
+            "status redraw should push SGR before any host-side resets: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b[#}\x1b8"),
+            "status redraw should pop SGR before restoring the application cursor: {payload:?}"
         );
         status_bar.style = None;
     }
@@ -5041,7 +5073,7 @@ mod tests {
         );
         assert!(
             tracker.observe(b"\x1b[2J").status_area_dirty,
-            "full-screen erase must force immediate status redraw"
+            "full-screen erase must mark the status row dirty"
         );
         assert!(
             tracker.observe(b"\x1b[3J").status_area_dirty,
@@ -5053,7 +5085,7 @@ mod tests {
         );
         assert!(
             tracker.observe(b"\x1b[r").status_area_dirty,
-            "DECSTBM reset must force immediate status reservation repair"
+            "DECSTBM reset must mark status reservation dirty"
         );
         assert!(
             !tracker.observe(b"\x1b[1;23r").status_area_dirty,
@@ -5065,11 +5097,11 @@ mod tests {
         );
         assert!(
             tracker.observe(b"\x1bc").status_area_dirty,
-            "RIS must force immediate status redraw"
+            "RIS must mark the status row dirty"
         );
         assert!(
             tracker.observe(b"\x1b[?2J").status_area_dirty,
-            "private/selective ED should conservatively force immediate status redraw"
+            "private/selective ED should conservatively mark the status row dirty"
         );
         assert!(
             !tracker.observe("śr".as_bytes()).status_area_dirty,
@@ -5087,12 +5119,12 @@ mod tests {
         assert!(!tracker.observe(b"prompt\x1b[").status_area_dirty);
         assert!(
             tracker.observe(b"2Jafter").status_area_dirty,
-            "split CSI ED should still trigger immediate status repair"
+            "split CSI ED should still mark the status row dirty"
         );
         assert!(!tracker.observe(b"more\x1b").status_area_dirty);
         assert!(
             tracker.observe(b"cafter").status_area_dirty,
-            "split RIS should still trigger immediate status repair"
+            "split RIS should still mark the status row dirty"
         );
         assert!(
             !tracker.observe("moreś".as_bytes()).status_area_dirty,
