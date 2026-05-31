@@ -3588,6 +3588,67 @@ fn rename_existing_session_updates_targets() -> TestResult {
 }
 
 #[test]
+#[cfg(unix)]
+fn attached_status_line_tracks_external_rename() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = "STATUS_RENAME_READY";
+    let create = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            "status-rename-old",
+            "--",
+            "sh",
+            "-lc",
+            &format!("echo {marker}; sleep 60"),
+        ])
+        .status()?;
+    assert!(create.success());
+    env.capture_until("status-rename-old", marker)?;
+
+    let (mut master, slave) = open_pty_pair()?;
+    set_pty_window_size(&slave, 24, 100)?;
+    let stdin = Stdio::from(slave.try_clone()?);
+    let stdout = Stdio::from(slave.try_clone()?);
+    let stderr = Stdio::from(slave.try_clone()?);
+    let mut attach = ChildCleanup::new(
+        env.cmd()
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .args(["resume", "status-rename-old", "--raw"])
+            .spawn()?,
+    );
+    drop(slave);
+
+    read_until_marker_bytes(
+        &mut master,
+        b"lterm  status-rename-old",
+        Duration::from_secs(5),
+    )?;
+
+    let rename = env
+        .cmd()
+        .args(["rename", "status-rename-old", "status-rename-new"])
+        .output()?;
+    assert!(rename.status.success(), "{rename:?}");
+
+    read_until_marker_bytes(
+        &mut master,
+        b"lterm  status-rename-new",
+        Duration::from_secs(6),
+    )?;
+
+    attach.kill_and_wait()?;
+    let close = env.cmd().args(["close", "status-rename-new"]).status()?;
+    assert!(close.success());
+    wait_for_session_absent(&env, "status-rename-new")?;
+    Ok(())
+}
+
+#[test]
 fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
     let env = TestEnv::new()?;
     for name in ["rename-keep", "rename-taken"] {

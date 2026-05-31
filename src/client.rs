@@ -55,6 +55,13 @@ const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_secs(2);
 /// Attach output idle wakeup. This bounds status-bar redraw latency without the
 /// previous 30ms hot poll; heartbeat logic still owns the actual redraw cadence.
 const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+/// Poll live session metadata while attached so host-side status text follows
+/// external `lterm rename` calls without mixing metadata frames into the raw
+/// PTY stream. The poll runs on a side RPC thread; the attach output loop only
+/// consumes best-effort updates from a bounded channel.
+const STATUS_METADATA_POLL: Duration = Duration::from_millis(500);
+const STATUS_METADATA_RPC_TIMEOUT: Duration = Duration::from_millis(250);
+const STATUS_METADATA_CHANNEL_LIMIT: usize = 4;
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
@@ -2583,6 +2590,9 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let status_style = status_enabled
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
+    let status_metadata = status_info
+        .as_ref()
+        .map(|info| spawn_status_metadata_thread(info.pane_id.clone(), Arc::clone(&running)));
     if status_enabled {
         reader
             .get_ref()
@@ -2593,12 +2603,27 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut status_dirty = false;
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
+    let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
     let output_result = (|| -> Result<()> {
         'output: loop {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
+
+            if apply_pending_status_metadata(status_metadata_rx, &mut status_bar) {
+                status_dirty = true;
+                if !alt_screen_active
+                    && refresh_status_or_detached(
+                        &mut status_bar,
+                        &mut stdout,
+                        &mut status_dirty,
+                        &mut last_status_refresh,
+                    )?
+                {
+                    break;
+                }
+            }
 
             // alt-screen 종료 즉시 refresh: alt buffer로 흘러갔던 status는 폐기되었으므로
             // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
@@ -2730,6 +2755,9 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     running.store(false, Ordering::SeqCst);
     let _ = input_thread.join();
     let _ = resize_thread.join();
+    if let Some((_, status_metadata_thread)) = status_metadata {
+        let _ = status_metadata_thread.join();
+    }
     output_result
 }
 
@@ -2743,6 +2771,45 @@ fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
 
 fn status_scroll_bottom_for_terminal_rows(rows: u16, show_status: bool) -> Option<u16> {
     (show_status && rows > 1).then_some(rows - 1)
+}
+
+fn spawn_status_metadata_thread(
+    target: String,
+    running: Arc<AtomicBool>,
+) -> (mpsc::Receiver<SessionInfo>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel(STATUS_METADATA_CHANNEL_LIMIT);
+    let handle = thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            thread::sleep(STATUS_METADATA_POLL);
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            let result: Result<SessionInfo> = rpc_with_read_timeout(
+                &Request::Info {
+                    target: target.clone(),
+                },
+                Some(STATUS_METADATA_RPC_TIMEOUT),
+            );
+            if let Ok(info) = result {
+                let _ = tx.try_send(info);
+            }
+        }
+    });
+    (rx, handle)
+}
+
+fn apply_pending_status_metadata(
+    rx: Option<&mpsc::Receiver<SessionInfo>>,
+    status_bar: &mut StatusBar,
+) -> bool {
+    let Some(rx) = rx else {
+        return false;
+    };
+    let mut changed = false;
+    while let Ok(info) = rx.try_recv() {
+        changed |= status_bar.update_info(&info);
+    }
+    changed
 }
 
 /// `resize_thread` 한 tick 의 처리 결과. RPC 결과는 세 가지 의미상 분기로 나뉘는데,
@@ -3017,6 +3084,17 @@ impl StatusBar {
         let (_, rows) = terminal_size();
         self.reserve_terminal_area(stdout, rows)?;
         self.draw(stdout)
+    }
+
+    fn update_info(&mut self, info: &SessionInfo) -> bool {
+        let session_name = sanitize::terminal_text(&info.name);
+        let pane_id = sanitize::terminal_text(&info.pane_id);
+        if self.session_name == session_name && self.pane_id == pane_id {
+            return false;
+        }
+        self.session_name = session_name;
+        self.pane_id = pane_id;
+        true
     }
 
     fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
