@@ -8,6 +8,12 @@ use std::collections::HashMap;
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const PROTOCOL_VERSION: u32 = 3;
+pub const CMUX_CONTEXT_ENV: &[&str] = &[
+    "CMUX_WORKSPACE_ID",
+    "CMUX_SURFACE_ID",
+    "CMUX_WINDOW_ID",
+    "CMUX_SOCKET_PATH",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

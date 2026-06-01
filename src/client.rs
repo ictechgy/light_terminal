@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
-    DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo,
-    StatusTheme, WaitContainsResult, WaitExitResult,
+    CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response,
+    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -298,13 +298,6 @@ const TERMINAL_CAPABILITY_ENV: &[&str] = &[
     "FORCE_COLOR",
     "CLICOLOR",
     "CLICOLOR_FORCE",
-];
-
-const CMUX_CONTEXT_ENV: &[&str] = &[
-    "CMUX_WORKSPACE_ID",
-    "CMUX_SURFACE_ID",
-    "CMUX_WINDOW_ID",
-    "CMUX_SOCKET_PATH",
 ];
 
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {

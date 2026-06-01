@@ -1,6 +1,6 @@
 use crate::paths;
 use crate::protocol::{
-    DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
+    CMUX_CONTEXT_ENV, DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
     WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
@@ -3028,10 +3028,7 @@ fn is_private_multiplexer_env_key(key: &str, allow_cmux_context: bool) -> bool {
 }
 
 fn is_allowed_child_cmux_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "CMUX_WORKSPACE_ID" | "CMUX_SURFACE_ID" | "CMUX_WINDOW_ID" | "CMUX_SOCKET_PATH"
-    )
+    CMUX_CONTEXT_ENV.contains(&key)
 }
 
 fn normalize_target(target: &str) -> String {

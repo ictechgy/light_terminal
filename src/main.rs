@@ -78,6 +78,7 @@ enum Commands {
         /// Working directory for the session command.
         #[arg(short = 'c', long)]
         cwd: Option<String>,
+        /// Legacy compatibility spelling; `run` is tmux-compatible unless `--no-tmux` is set.
         #[arg(long, hide = true)]
         tmux: bool,
         /// Disable the lterm tmux compatibility shim for this run session (enabled by default).
