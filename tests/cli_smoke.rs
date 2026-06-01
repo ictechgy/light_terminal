@@ -8208,6 +8208,37 @@ fn run_defaults_to_lterm_tmux_shim() -> TestResult {
 }
 
 #[test]
+fn run_exports_session_identity_env_to_child_process() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--no-tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'SESSION:%s\\nPANE:%s\\n' \"$LTERM_SESSION\" \"$LTERM_PANE\"",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let session = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SESSION:"))
+        .ok_or_else(|| format!("run output missing session identity: {stdout:?}"))?;
+    let pane = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("PANE:"))
+        .ok_or_else(|| format!("run output missing pane identity: {stdout:?}"))?;
+    assert!(!session.trim().is_empty(), "{stdout:?}");
+    assert!(pane.starts_with('%'), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn run_hidden_tmux_flag_keeps_default_shim() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
