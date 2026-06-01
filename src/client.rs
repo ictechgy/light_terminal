@@ -63,6 +63,7 @@ const STATUS_METADATA_POLL: Duration = Duration::from_millis(500);
 const STATUS_METADATA_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 const STATUS_METADATA_CHANNEL_LIMIT: usize = 4;
 const NESTED_AGENT_POLL: Duration = Duration::from_millis(500);
+const NESTED_AGENT_DETECTION_CHANNEL_LIMIT: usize = 4;
 const NESTED_AGENT_STABLE_POLLS: u8 = 2;
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
@@ -1588,11 +1589,7 @@ fn known_agent_name_from_command(command: &str) -> bool {
     if known_agent_command_executable_token(executable) {
         return true;
     }
-    known_agent_wrapper_executable_token(executable)
-        && parts
-            .iter()
-            .skip(executable_index + 1)
-            .any(|part| known_agent_command_script_token(part))
+    known_agent_wrapper_command_contains_agent_payload(&parts, executable_index)
 }
 
 fn effective_command_executable_index(parts: &[String]) -> Option<usize> {
@@ -1646,11 +1643,75 @@ fn known_agent_command_executable_token(token: &str) -> bool {
     known_agent_name(command_token_stem(token))
 }
 
-fn known_agent_wrapper_executable_token(token: &str) -> bool {
-    matches!(
-        command_token_stem(token),
-        "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "deno"
-    )
+fn known_agent_wrapper_command_contains_agent_payload(
+    parts: &[String],
+    executable_index: usize,
+) -> bool {
+    let executable = command_token_stem(&parts[executable_index]);
+    let mut payload_start = executable_index + 1;
+    match executable {
+        "node" | "deno" => {}
+        "npx" | "bunx" => {
+            payload_start = skip_wrapper_options(parts, payload_start);
+        }
+        "npm" => {
+            let Some(after_subcommand) =
+                package_manager_execution_payload_start(parts, payload_start, &["exec", "x"])
+            else {
+                return false;
+            };
+            payload_start = after_subcommand;
+        }
+        "pnpm" | "yarn" => {
+            let Some(after_subcommand) =
+                package_manager_execution_payload_start(parts, payload_start, &["dlx", "exec"])
+            else {
+                return false;
+            };
+            payload_start = after_subcommand;
+        }
+        "bun" => {
+            let Some(after_subcommand) =
+                package_manager_execution_payload_start(parts, payload_start, &["x", "dlx"])
+            else {
+                return false;
+            };
+            payload_start = after_subcommand;
+        }
+        _ => return false,
+    }
+
+    parts
+        .iter()
+        .skip(payload_start)
+        .any(|part| known_agent_command_script_token(part))
+}
+
+fn package_manager_execution_payload_start(
+    parts: &[String],
+    mut index: usize,
+    execution_subcommands: &[&str],
+) -> Option<usize> {
+    index = skip_wrapper_options(parts, index);
+    let subcommand = parts.get(index)?;
+    if execution_subcommands.contains(&subcommand.as_str()) {
+        Some(skip_wrapper_options(parts, index + 1))
+    } else {
+        None
+    }
+}
+
+fn skip_wrapper_options(parts: &[String], mut index: usize) -> usize {
+    while let Some(token) = parts.get(index) {
+        if token == "--" {
+            return index + 1;
+        }
+        if !token.starts_with('-') {
+            return index;
+        }
+        index += 1;
+    }
+    index
 }
 
 fn known_agent_command_script_token(token: &str) -> bool {
@@ -2665,38 +2726,27 @@ enum NestedAgentTransition {
     Resume,
 }
 
+type NestedAgentPresence = std::result::Result<bool, String>;
+
 struct NestedAgentDetector {
-    target: String,
-    enabled: bool,
-    last_poll: Instant,
     positive_polls: u8,
     negative_polls: u8,
     suppressed: bool,
 }
 
 impl NestedAgentDetector {
-    fn new(target: &str, enabled: bool) -> Self {
+    fn new() -> Self {
         Self {
-            target: target.to_string(),
-            enabled,
-            // Poll immediately after attach starts so long-running nested agents
-            // do not need to wait for a full interval before the debounce begins.
-            last_poll: Instant::now() - NESTED_AGENT_POLL,
             positive_polls: 0,
             negative_polls: 0,
             suppressed: false,
         }
     }
 
-    fn poll(&mut self) -> Option<NestedAgentTransition> {
-        if !self.enabled || self.last_poll.elapsed() < NESTED_AGENT_POLL {
-            return None;
-        }
-        self.last_poll = Instant::now();
-        self.apply_presence_poll(nested_known_agent_present(&self.target))
-    }
-
-    fn apply_presence_poll(&mut self, present: Result<bool>) -> Option<NestedAgentTransition> {
+    fn apply_presence_poll(
+        &mut self,
+        present: NestedAgentPresence,
+    ) -> Option<NestedAgentTransition> {
         let present = match present {
             Ok(present) => present,
             Err(_) => {
@@ -2727,6 +2777,17 @@ impl NestedAgentDetector {
             }
         }
         None
+    }
+
+    fn retry_transition(&mut self, transition: NestedAgentTransition) {
+        match transition {
+            NestedAgentTransition::Suspend => {
+                self.suppressed = false;
+            }
+            NestedAgentTransition::Resume => {
+                self.suppressed = true;
+            }
+        }
     }
 }
 
@@ -2931,6 +2992,8 @@ pub fn attach_with_presence(
             Arc::clone(&status_metadata_enabled),
         )
     });
+    let nested_detection = nested_monitor_enabled
+        .then(|| spawn_nested_agent_detection_thread(target.to_string(), Arc::clone(&running)));
     if status_enabled {
         reader
             .get_ref()
@@ -2942,7 +3005,8 @@ pub fn attach_with_presence(
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
-    let mut nested_detector = NestedAgentDetector::new(target, nested_monitor_enabled);
+    let nested_detection_rx = nested_detection.as_ref().map(|(rx, _)| rx);
+    let mut nested_detector = NestedAgentDetector::new();
     let output_result = (|| -> Result<()> {
         'output: loop {
             if !running.load(Ordering::SeqCst) {
@@ -2950,38 +3014,46 @@ pub fn attach_with_presence(
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
 
-            if let Some(transition) = nested_detector.poll() {
-                let transition_result = match transition {
-                    NestedAgentTransition::Suspend => suspend_status_row(
-                        target,
-                        subscriber_id,
-                        &row_runtime,
-                        &mut status_bar,
-                        &mut stdout,
-                        &mut terminal_output_tracker,
-                        &status_metadata_enabled,
-                        &mut status_dirty,
-                        &mut last_status_refresh,
-                    )?,
-                    NestedAgentTransition::Resume => resume_status_row(
-                        target,
-                        subscriber_id,
-                        &row_runtime,
-                        &mut status_bar,
-                        &mut stdout,
-                        &mut terminal_output_tracker,
-                        &status_metadata_enabled,
-                        &mut status_dirty,
-                        &mut last_status_refresh,
-                    )?,
-                };
-                if transition_result == StatusTransitionResult::Detached {
-                    break;
+            if let Some(rx) = nested_detection_rx {
+                while let Ok(presence) = rx.try_recv() {
+                    if let Some(transition) = nested_detector.apply_presence_poll(presence) {
+                        let transition_result = match transition {
+                            NestedAgentTransition::Suspend => suspend_status_row(
+                                target,
+                                subscriber_id,
+                                &row_runtime,
+                                &mut status_bar,
+                                &mut stdout,
+                                &mut terminal_output_tracker,
+                                &status_metadata_enabled,
+                                &mut status_dirty,
+                                &mut last_status_refresh,
+                            )?,
+                            NestedAgentTransition::Resume => resume_status_row(
+                                target,
+                                subscriber_id,
+                                &row_runtime,
+                                &mut status_bar,
+                                &mut stdout,
+                                &mut terminal_output_tracker,
+                                &status_metadata_enabled,
+                                &mut status_dirty,
+                                &mut last_status_refresh,
+                            )?,
+                        };
+                        match transition_result {
+                            StatusTransitionResult::Applied => {}
+                            StatusTransitionResult::Ignored => {
+                                nested_detector.retry_transition(transition);
+                            }
+                            StatusTransitionResult::Detached => break 'output,
+                        }
+                    }
                 }
             }
 
-            if row_runtime.can_draw_status()
-                && apply_pending_status_metadata(status_metadata_rx, &mut status_bar)
+            if apply_pending_status_metadata(status_metadata_rx, &mut status_bar)
+                && row_runtime.can_draw_status()
             {
                 status_dirty = true;
                 if !alt_screen_active
@@ -3105,6 +3177,9 @@ pub fn attach_with_presence(
     if let Some((_, status_metadata_thread)) = status_metadata {
         let _ = status_metadata_thread.join();
     }
+    if let Some((_, nested_detection_thread)) = nested_detection {
+        let _ = nested_detection_thread.join();
+    }
     output_result
 }
 
@@ -3144,6 +3219,21 @@ fn spawn_status_metadata_thread(
             if let Ok(info) = result {
                 let _ = tx.try_send(info);
             }
+        }
+    });
+    (rx, handle)
+}
+
+fn spawn_nested_agent_detection_thread(
+    target: String,
+    running: Arc<AtomicBool>,
+) -> (mpsc::Receiver<NestedAgentPresence>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel(NESTED_AGENT_DETECTION_CHANNEL_LIMIT);
+    let handle = thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            let result = nested_known_agent_present(&target).map_err(|err| format!("{err:#}"));
+            let _ = tx.try_send(result);
+            thread::sleep(NESTED_AGENT_POLL);
         }
     });
     (rx, handle)
@@ -5170,6 +5260,10 @@ mod tests {
         ]));
         assert!(nested_known_agent_present_in_processes(&[
             sample_process("/bin/zsh -l", 0),
+            sample_process("npm exec -- @openai/codex", 1),
+        ]));
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
             sample_process(
                 "node /Users/me/.npm/_npx/x/node_modules/@anthropic-ai/claude-code/cli.js",
                 1
@@ -5182,11 +5276,25 @@ mod tests {
             ]),
             "generic node wrappers should not suspend the row"
         );
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("npm install @openai/codex", 1),
+            ]),
+            "package-manager install operations are not agent execution"
+        );
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("npm view @anthropic-ai/claude-code", 1),
+            ]),
+            "package-manager metadata queries are not agent execution"
+        );
     }
 
     #[test]
     fn nested_agent_detector_restores_after_detection_errors_when_suppressed() {
-        let mut detector = NestedAgentDetector::new("%0", true);
+        let mut detector = NestedAgentDetector::new();
         assert_eq!(detector.apply_presence_poll(Ok(true)), None);
         assert_eq!(
             detector.apply_presence_poll(Ok(true)),
@@ -5195,11 +5303,11 @@ mod tests {
         assert!(detector.suppressed);
 
         assert_eq!(
-            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            detector.apply_presence_poll(Err("process tree unavailable".to_string())),
             None
         );
         assert_eq!(
-            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            detector.apply_presence_poll(Err("process tree unavailable".to_string())),
             Some(NestedAgentTransition::Resume)
         );
         assert!(!detector.suppressed);
@@ -5207,16 +5315,46 @@ mod tests {
 
     #[test]
     fn nested_agent_detector_errors_do_not_create_positive_debounce() {
-        let mut detector = NestedAgentDetector::new("%0", true);
+        let mut detector = NestedAgentDetector::new();
         assert_eq!(detector.apply_presence_poll(Ok(true)), None);
         assert_eq!(
-            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            detector.apply_presence_poll(Err("process tree unavailable".to_string())),
             None
         );
         assert_eq!(detector.apply_presence_poll(Ok(true)), None);
         assert_eq!(
             detector.apply_presence_poll(Ok(true)),
             Some(NestedAgentTransition::Suspend)
+        );
+    }
+
+    #[test]
+    fn nested_agent_detector_retries_ignored_transitions() {
+        let mut detector = NestedAgentDetector::new();
+        assert_eq!(detector.apply_presence_poll(Ok(true)), None);
+        let transition = detector
+            .apply_presence_poll(Ok(true))
+            .expect("stable positive poll suspends");
+        assert_eq!(transition, NestedAgentTransition::Suspend);
+        detector.retry_transition(transition);
+        assert!(!detector.suppressed);
+        assert_eq!(
+            detector.apply_presence_poll(Ok(true)),
+            Some(NestedAgentTransition::Suspend),
+            "ignored suspend transition remains retryable"
+        );
+
+        assert_eq!(detector.apply_presence_poll(Ok(false)), None);
+        let transition = detector
+            .apply_presence_poll(Ok(false))
+            .expect("stable negative poll resumes");
+        assert_eq!(transition, NestedAgentTransition::Resume);
+        detector.retry_transition(transition);
+        assert!(detector.suppressed);
+        assert_eq!(
+            detector.apply_presence_poll(Ok(false)),
+            Some(NestedAgentTransition::Resume),
+            "ignored resume transition remains retryable"
         );
     }
 
