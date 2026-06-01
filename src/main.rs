@@ -16,6 +16,7 @@ use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell as CompletionOutputShell, generate};
 use client::{
     AttachMode, AttachPolicyOptions, AttachStdinEof, ComposeOptions, MobileTranscriptOptions,
+    StatusPresencePolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -606,7 +607,11 @@ fn run() -> Result<()> {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())
             } else {
-                client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
+                client::attach_with_presence(
+                    &info.pane_id,
+                    status_presence_from_no_status(no_status),
+                    AttachStdinEof::KeepAttached,
+                )
             }
         }
         Commands::Run {
@@ -627,7 +632,11 @@ fn run() -> Result<()> {
             let command = normalize_command(command)?.context("run requires a command")?;
             let info =
                 client::new_session(name, Some(command), cwd, HashMap::new(), status_theme, tmux)?;
-            client::attach(&info.pane_id, !no_status, AttachStdinEof::KeepAttached)
+            client::attach_with_presence(
+                &info.pane_id,
+                status_presence_from_no_status(no_status),
+                AttachStdinEof::KeepAttached,
+            )
         }
         Commands::Resume {
             target,
@@ -648,7 +657,7 @@ fn run() -> Result<()> {
             };
             client::attach_info_with_policy(
                 &info,
-                !no_status,
+                status_presence_from_no_status(no_status),
                 AttachStdinEof::Detach,
                 attach_policy,
             )
@@ -679,7 +688,7 @@ fn run() -> Result<()> {
             };
             client::attach_info_with_policy(
                 &info,
-                !no_status,
+                status_presence_from_no_status(no_status),
                 AttachStdinEof::Detach,
                 attach_policy,
             )
@@ -1818,6 +1827,14 @@ fn attach_policy_options(
     })
 }
 
+fn status_presence_from_no_status(no_status: bool) -> StatusPresencePolicy {
+    if no_status {
+        StatusPresencePolicy::RowOff
+    } else {
+        StatusPresencePolicy::RowAuto
+    }
+}
+
 fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -2056,6 +2073,7 @@ impl AgentLaunchOptions {
         self.detach
     }
 
+    #[cfg(test)]
     fn show_status(&self, default: bool) -> bool {
         if self.status {
             true
@@ -2063,6 +2081,18 @@ impl AgentLaunchOptions {
             false
         } else {
             default
+        }
+    }
+
+    fn status_presence(&self, default: bool) -> StatusPresencePolicy {
+        if self.no_status {
+            StatusPresencePolicy::RowOff
+        } else if self.status {
+            StatusPresencePolicy::ForceRow
+        } else if default {
+            StatusPresencePolicy::RowAuto
+        } else {
+            StatusPresencePolicy::RowOff
         }
     }
 
@@ -2500,7 +2530,7 @@ fn run_agent_profile(
                 }
                 return client::attach_info_with_policy(
                     &info,
-                    launch.show_status(profile.show_status),
+                    launch.status_presence(profile.show_status),
                     AttachStdinEof::KeepAttached,
                     attach_policy
                         .clone()
@@ -3257,18 +3287,37 @@ mod tests {
         let default = AgentLaunchOptions::default();
         assert!(default.show_status(true));
         assert!(!default.show_status(false));
+        assert_eq!(
+            default.status_presence(true),
+            StatusPresencePolicy::RowAuto,
+            "custom/default-on profiles should use auto row presence"
+        );
+        assert_eq!(
+            default.status_presence(false),
+            StatusPresencePolicy::RowOff,
+            "built-in/default-off profiles should stay full-height"
+        );
 
         let status = AgentLaunchOptions {
             status: true,
             ..AgentLaunchOptions::default()
         };
         assert!(status.show_status(false));
+        assert_eq!(
+            status.status_presence(false),
+            StatusPresencePolicy::ForceRow,
+            "agent --status is a force-row request subject to the client safety gate"
+        );
 
         let no_status = AgentLaunchOptions {
             no_status: true,
             ..AgentLaunchOptions::default()
         };
         assert!(!no_status.show_status(true));
+        assert_eq!(
+            no_status.status_presence(true),
+            StatusPresencePolicy::RowOff
+        );
     }
 
     #[test]

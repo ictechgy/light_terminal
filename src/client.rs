@@ -22,9 +22,9 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,8 @@ const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const STATUS_METADATA_POLL: Duration = Duration::from_millis(500);
 const STATUS_METADATA_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 const STATUS_METADATA_CHANNEL_LIMIT: usize = 4;
+const NESTED_AGENT_POLL: Duration = Duration::from_millis(500);
+const NESTED_AGENT_STABLE_POLLS: u8 = 2;
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
@@ -1471,6 +1473,42 @@ pub struct AttachPolicyOptions {
     pub transcript: MobileTranscriptOptions,
 }
 
+/// Raw-attach row-presence policy. This is intentionally separate from
+/// `AttachMode`: attach mode chooses the transport surface (raw vs mobile
+/// transcript), while this policy only controls whether the raw attach path may
+/// reserve a host-side status row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPresencePolicy {
+    /// Start with the row on, but allow best-effort suspension when a nested
+    /// known agent is detected. Used by ordinary shell sessions and custom
+    /// agent profiles.
+    RowAuto,
+    /// Keep the raw attach surface full-height. Used by built-in agent profiles
+    /// and explicit `--no-status`.
+    RowOff,
+    /// Request the row even for a direct agent launcher. The global
+    /// env/TTY/geometry gate still wins for safety.
+    ForceRow,
+}
+
+impl StatusPresencePolicy {
+    fn requests_row(self) -> bool {
+        matches!(self, Self::RowAuto | Self::ForceRow)
+    }
+
+    fn allows_nested_suspend(self) -> bool {
+        matches!(self, Self::RowAuto)
+    }
+
+    pub fn from_legacy_show_status(show_status: bool) -> Self {
+        if show_status {
+            Self::RowAuto
+        } else {
+            Self::RowOff
+        }
+    }
+}
+
 pub fn compose(target: &str, options: ComposeOptions) -> Result<()> {
     let tail_start = compose_tail_start(options.tail)?;
     if options.once {
@@ -1537,11 +1575,49 @@ fn known_agent_name_from_session(name: &str) -> bool {
 }
 
 fn known_agent_name_from_command(command: &str) -> bool {
-    let first = shlex::split(command)
-        .and_then(|parts| parts.into_iter().next())
-        .unwrap_or_else(|| command.split_whitespace().next().unwrap_or("").to_string());
-    let basename = first.rsplit('/').next().unwrap_or(&first);
-    known_agent_name(basename)
+    let parts = shlex::split(command).unwrap_or_else(|| {
+        command
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect()
+    });
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    known_agent_command_executable_token(first)
+        || parts
+            .iter()
+            .skip(1)
+            .any(|part| known_agent_command_script_token(part))
+}
+
+fn known_agent_command_executable_token(token: &str) -> bool {
+    if token.starts_with('-') || token.contains('=') {
+        return false;
+    }
+    known_agent_name(command_token_stem(token))
+}
+
+fn known_agent_command_script_token(token: &str) -> bool {
+    if token.starts_with('-') || token.contains('=') {
+        return false;
+    }
+    let stem = command_token_stem(token);
+    if known_agent_name(stem) {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    lower.contains("claude-code") || lower.contains("@openai/codex")
+}
+
+fn command_token_stem(token: &str) -> &str {
+    let basename = token.rsplit('/').next().unwrap_or(token);
+    basename
+        .strip_suffix(".js")
+        .or_else(|| basename.strip_suffix(".mjs"))
+        .or_else(|| basename.strip_suffix(".cjs"))
+        .or_else(|| basename.strip_suffix(".sh"))
+        .unwrap_or(basename)
 }
 
 fn known_agent_name(name: &str) -> bool {
@@ -1568,9 +1644,20 @@ fn known_agent_name(name: &str) -> bool {
     )
 }
 
+fn nested_known_agent_present(target: &str) -> Result<bool> {
+    let processes = process_tree(Some(target), true)?;
+    Ok(nested_known_agent_present_in_processes(&processes))
+}
+
+fn nested_known_agent_present_in_processes(processes: &[ProcessInfo]) -> bool {
+    processes
+        .iter()
+        .any(|process| known_agent_name_from_command(&process.command))
+}
+
 pub fn attach_info_with_policy(
     info: &SessionInfo,
-    show_status: bool,
+    presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
     options: AttachPolicyOptions,
 ) -> Result<()> {
@@ -1584,8 +1671,46 @@ pub fn attach_info_with_policy(
     } else if options.transcript.read_only {
         bail!("--read-only requires mobile transcript mode");
     } else {
-        attach(&info.pane_id, show_status, stdin_eof)
+        maybe_emit_agent_title_cue(info, presence_policy)?;
+        attach_with_presence(&info.pane_id, presence_policy, stdin_eof)
     }
+}
+
+fn maybe_emit_agent_title_cue(
+    info: &SessionInfo,
+    presence_policy: StatusPresencePolicy,
+) -> Result<()> {
+    if presence_policy.requests_row()
+        || !likely_agent_session(info)
+        || !std::io::stdout().is_terminal()
+    {
+        return Ok(());
+    }
+    let session = sanitize::terminal_text(&info.name);
+    let pane = sanitize::terminal_text(&info.pane_id);
+    let agent = info
+        .agent_name
+        .as_deref()
+        .map(sanitize::terminal_text)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "agent".to_string());
+    let mut stdout = std::io::stdout();
+    write_lterm_title_cue(&mut stdout, &session, &pane, &agent)?;
+    stdout.flush().context("flush lterm terminal title cue")?;
+    Ok(())
+}
+
+fn write_lterm_title_cue(
+    stdout: &mut impl Write,
+    session: &str,
+    pane: &str,
+    agent: &str,
+) -> Result<()> {
+    let session = sanitize::terminal_text(session);
+    let pane = sanitize::terminal_text(pane);
+    let agent = sanitize::terminal_text(agent);
+    let title = format!("lterm · {session} · {pane} · {agent}");
+    write!(stdout, "\x1b]0;{title}\x07").context("emit lterm terminal title cue")
 }
 
 const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -2421,10 +2546,134 @@ fn read_attach_response_header(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPresenceState {
+    Disabled,
+    Active,
+    Suspended,
+    Transitioning,
+}
+
+#[derive(Debug)]
+struct StatusPresenceRuntime {
+    state: StatusPresenceState,
+}
+
+#[derive(Clone, Debug)]
+struct StatusPresenceRuntimeHandle {
+    inner: Arc<Mutex<StatusPresenceRuntime>>,
+}
+
+impl StatusPresenceRuntimeHandle {
+    fn new(active: bool) -> Self {
+        let state = if active {
+            StatusPresenceState::Active
+        } else {
+            StatusPresenceState::Disabled
+        };
+        Self {
+            inner: Arc::new(Mutex::new(StatusPresenceRuntime { state })),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .state
+            == StatusPresenceState::Active
+    }
+
+    fn can_draw_status(&self) -> bool {
+        self.is_active()
+    }
+
+    fn pty_rows_for(&self, rows: u16) -> u16 {
+        let guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        attach_pty_rows(rows, guard.state == StatusPresenceState::Active)
+    }
+
+    fn status_scroll_bottom_for(&self, rows: u16) -> Option<u16> {
+        let guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        status_scroll_bottom_for_terminal_rows(rows, guard.state == StatusPresenceState::Active)
+    }
+
+    fn with_locked<R>(&self, f: impl FnOnce(&mut StatusPresenceRuntime) -> R) -> R {
+        let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        f(&mut guard)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedAgentTransition {
+    Suspend,
+    Resume,
+}
+
+struct NestedAgentDetector {
+    target: String,
+    enabled: bool,
+    last_poll: Instant,
+    positive_polls: u8,
+    negative_polls: u8,
+    suppressed: bool,
+}
+
+impl NestedAgentDetector {
+    fn new(target: &str, enabled: bool) -> Self {
+        Self {
+            target: target.to_string(),
+            enabled,
+            // Poll immediately after attach starts so long-running nested agents
+            // do not need to wait for a full interval before the debounce begins.
+            last_poll: Instant::now() - NESTED_AGENT_POLL,
+            positive_polls: 0,
+            negative_polls: 0,
+            suppressed: false,
+        }
+    }
+
+    fn poll(&mut self) -> Option<NestedAgentTransition> {
+        if !self.enabled || self.last_poll.elapsed() < NESTED_AGENT_POLL {
+            return None;
+        }
+        self.last_poll = Instant::now();
+        let present = nested_known_agent_present(&self.target).ok()?;
+        if present {
+            self.positive_polls = self.positive_polls.saturating_add(1);
+            self.negative_polls = 0;
+            if !self.suppressed && self.positive_polls >= NESTED_AGENT_STABLE_POLLS {
+                self.suppressed = true;
+                return Some(NestedAgentTransition::Suspend);
+            }
+        } else {
+            self.negative_polls = self.negative_polls.saturating_add(1);
+            self.positive_polls = 0;
+            if self.suppressed && self.negative_polls >= NESTED_AGENT_STABLE_POLLS {
+                self.suppressed = false;
+                return Some(NestedAgentTransition::Resume);
+            }
+        }
+        None
+    }
+}
+
 pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
+    attach_with_presence(
+        target,
+        StatusPresencePolicy::from_legacy_show_status(show_status),
+        stdin_eof,
+    )
+}
+
+pub fn attach_with_presence(
+    target: &str,
+    presence_policy: StatusPresencePolicy,
+    stdin_eof: AttachStdinEof,
+) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
-    let status_enabled = status_bar_supported(show_status);
+    let status_enabled = status_bar_supported(presence_policy.requests_row());
     // status bar 는 SessionInfo 의 메타데이터 (이름/명령 등) 가 필요하므로 켜졌을 때만
     // info() 를 호출한다. PR #14 의 client-side first-attach guard 가 사라졌으므로
     // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
@@ -2434,8 +2683,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     } else {
         None
     };
+    let nested_monitor_enabled = status_enabled
+        && presence_policy.allows_nested_suspend()
+        && status_info
+            .as_ref()
+            .is_some_and(|info| info.agent_name.is_none());
+    let row_runtime = StatusPresenceRuntimeHandle::new(status_enabled);
     let (cols, rows) = terminal_size();
-    let pty_rows = attach_pty_rows(rows, status_enabled);
+    let pty_rows = row_runtime.pty_rows_for(rows);
 
     let path = paths::socket_path()?;
     let mut stream = UnixStream::connect(&path).with_context(|| daemon_connect_context(&path))?;
@@ -2495,7 +2750,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut terminal_output_tracker = TerminalOutputTracker::new(
         _raw.keyboard_protocol_restore_state(),
         Arc::clone(&alt_screen_state),
-        status_scroll_bottom_for_terminal_rows(rows, status_enabled),
+        row_runtime.status_scroll_bottom_for(rows),
     );
     let running = Arc::new(AtomicBool::new(true));
 
@@ -2540,6 +2795,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
 
     let resize_running = Arc::clone(&running);
     let resize_target = target.to_string();
+    let resize_row_runtime = row_runtime.clone();
     let (resize_tx, resize_rx) = mpsc::sync_channel(1);
     let resize_thread = thread::spawn(move || {
         let mut last = terminal_size();
@@ -2554,12 +2810,17 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             // 는 이 client 의 per-client geometry 만 갱신한 뒤 모든 attach 의 min 으로
             // PTY 를 재계산하므로, 더 이상 client-side 에서 "다른 attach 가 있는가" 를
             // 판단할 필요가 없다 (PR #14 단기 가드 폐기).
-            let resize_result = resize(
-                &resize_target,
-                attach_pty_rows(current.1, status_enabled),
-                current.0,
-                Some(subscriber_id),
-            );
+            let resize_result = resize_row_runtime.with_locked(|runtime| {
+                if runtime.state == StatusPresenceState::Transitioning {
+                    return Ok(());
+                }
+                resize(
+                    &resize_target,
+                    attach_pty_rows(current.1, runtime.state == StatusPresenceState::Active),
+                    current.0,
+                    Some(subscriber_id),
+                )
+            });
             match handle_resize_tick(resize_result) {
                 ResizeTickOutcome::Advance => {
                     // 우리 화면 cols/rows 가 변했으므로 status row 는 새 폭으로 다시
@@ -2590,9 +2851,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let status_style = status_enabled
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
-    let status_metadata = status_info
-        .as_ref()
-        .map(|info| spawn_status_metadata_thread(info.pane_id.clone(), Arc::clone(&running)));
+    let status_metadata_enabled = Arc::new(AtomicBool::new(status_enabled));
+    let status_metadata = status_info.as_ref().map(|info| {
+        spawn_status_metadata_thread(
+            info.pane_id.clone(),
+            Arc::clone(&running),
+            Arc::clone(&status_metadata_enabled),
+        )
+    });
     if status_enabled {
         reader
             .get_ref()
@@ -2604,6 +2870,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
+    let mut nested_detector = NestedAgentDetector::new(target, nested_monitor_enabled);
     let output_result = (|| -> Result<()> {
         'output: loop {
             if !running.load(Ordering::SeqCst) {
@@ -2611,7 +2878,39 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
 
-            if apply_pending_status_metadata(status_metadata_rx, &mut status_bar) {
+            if let Some(transition) = nested_detector.poll() {
+                let transition_result = match transition {
+                    NestedAgentTransition::Suspend => suspend_status_row(
+                        target,
+                        subscriber_id,
+                        &row_runtime,
+                        &mut status_bar,
+                        &mut stdout,
+                        &mut terminal_output_tracker,
+                        &status_metadata_enabled,
+                        &mut status_dirty,
+                        &mut last_status_refresh,
+                    )?,
+                    NestedAgentTransition::Resume => resume_status_row(
+                        target,
+                        subscriber_id,
+                        &row_runtime,
+                        &mut status_bar,
+                        &mut stdout,
+                        &mut terminal_output_tracker,
+                        &status_metadata_enabled,
+                        &mut status_dirty,
+                        &mut last_status_refresh,
+                    )?,
+                };
+                if transition_result == StatusTransitionResult::Detached {
+                    break;
+                }
+            }
+
+            if row_runtime.can_draw_status()
+                && apply_pending_status_metadata(status_metadata_rx, &mut status_bar)
+            {
                 status_dirty = true;
                 if !alt_screen_active
                     && refresh_status_or_detached(
@@ -2629,7 +2928,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
             // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
             // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
-            if status_enabled
+            if row_runtime.can_draw_status()
                 && prev_alt_screen_active
                 && !alt_screen_active
                 && refresh_status_or_detached(
@@ -2645,13 +2944,13 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
 
             while resize_rx.try_recv().is_ok() {
                 let (_, current_rows) = terminal_size();
-                terminal_output_tracker.set_status_scroll_bottom(
-                    status_scroll_bottom_for_terminal_rows(current_rows, status_enabled),
-                );
+                terminal_output_tracker
+                    .set_status_scroll_bottom(row_runtime.status_scroll_bottom_for(current_rows));
                 // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
-                if !alt_screen_active
+                if row_runtime.can_draw_status()
+                    && !alt_screen_active
                     && refresh_status_or_detached(
                         &mut status_bar,
                         &mut stdout,
@@ -2665,7 +2964,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             // heartbeat는 idle(STATUS_HEARTBEAT) + forced(STATUS_HEARTBEAT_FORCED) 두 경로를
             // 모두 가진다. busy PTY 출력 중에도 forced 경로로 self-heal이 발화한다.
             // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
-            if status_enabled
+            if row_runtime.can_draw_status()
                 && !alt_screen_active
                 && heartbeat_due(last_status_refresh.elapsed(), status_dirty)
                 && refresh_status_or_detached(
@@ -2688,6 +2987,7 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
                 {
                     // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                     if status_dirty
+                        && row_runtime.can_draw_status()
                         && !alt_screen_active
                         && refresh_status_or_detached(
                             &mut status_bar,
@@ -2706,13 +3006,14 @@ pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Res
             if forward_pty_output_frame_or_detached(
                 &mut stdout,
                 &buf[..n],
-                status_enabled,
+                row_runtime.can_draw_status(),
                 &mut status_dirty,
             )? {
                 break;
             }
         }
         if status_dirty
+            && row_runtime.can_draw_status()
             && !prev_alt_screen_active
             && refresh_status_or_detached(
                 &mut status_bar,
@@ -2750,6 +3051,7 @@ fn status_scroll_bottom_for_terminal_rows(rows: u16, show_status: bool) -> Optio
 fn spawn_status_metadata_thread(
     target: String,
     running: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
 ) -> (mpsc::Receiver<SessionInfo>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(STATUS_METADATA_CHANNEL_LIMIT);
     let handle = thread::spawn(move || {
@@ -2757,6 +3059,9 @@ fn spawn_status_metadata_thread(
             thread::sleep(STATUS_METADATA_POLL);
             if !running.load(Ordering::SeqCst) {
                 break;
+            }
+            if !enabled.load(Ordering::SeqCst) {
+                continue;
             }
             let result: Result<SessionInfo> = rpc_with_read_timeout(
                 &Request::Info {
@@ -2852,6 +3157,139 @@ fn refresh_status_or_detached(
         Err(err) if anyhow_error_is_broken_pipe(&err) => Ok(true),
         Err(err) => Err(err),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTransitionResult {
+    Applied,
+    Ignored,
+    Detached,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn suspend_status_row(
+    target: &str,
+    subscriber_id: u64,
+    row_runtime: &StatusPresenceRuntimeHandle,
+    status_bar: &mut StatusBar,
+    stdout: &mut std::io::Stdout,
+    terminal_output_tracker: &mut TerminalOutputTracker,
+    metadata_enabled: &AtomicBool,
+    status_dirty: &mut bool,
+    last_status_refresh: &mut Instant,
+) -> Result<StatusTransitionResult> {
+    row_runtime.with_locked(|runtime| -> Result<StatusTransitionResult> {
+        if runtime.state != StatusPresenceState::Active {
+            return Ok(StatusTransitionResult::Ignored);
+        }
+        runtime.state = StatusPresenceState::Transitioning;
+        metadata_enabled.store(false, Ordering::SeqCst);
+
+        if let Err(err) = status_bar.restore(stdout) {
+            runtime.state = StatusPresenceState::Active;
+            metadata_enabled.store(true, Ordering::SeqCst);
+            if anyhow_error_is_broken_pipe(&err) {
+                return Ok(StatusTransitionResult::Detached);
+            }
+            return Err(err);
+        }
+
+        let (cols, rows) = terminal_size();
+        match handle_resize_tick(resize(target, rows.max(1), cols, Some(subscriber_id))) {
+            ResizeTickOutcome::Advance => {
+                status_bar.style = None;
+                terminal_output_tracker.set_status_scroll_bottom(None);
+                runtime.state = StatusPresenceState::Suspended;
+                *status_dirty = false;
+                *last_status_refresh = Instant::now();
+                write_lterm_title_cue(
+                    stdout,
+                    &status_bar.session_name,
+                    &status_bar.pane_id,
+                    "nested agent",
+                )?;
+                stdout.flush().context("flush status suspend")?;
+                Ok(StatusTransitionResult::Applied)
+            }
+            ResizeTickOutcome::Retry => {
+                runtime.state = StatusPresenceState::Active;
+                metadata_enabled.store(true, Ordering::SeqCst);
+                *status_dirty = true;
+                Ok(StatusTransitionResult::Ignored)
+            }
+            ResizeTickOutcome::StaleSubscriberId => {
+                runtime.state = StatusPresenceState::Disabled;
+                Ok(StatusTransitionResult::Detached)
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_status_row(
+    target: &str,
+    subscriber_id: u64,
+    row_runtime: &StatusPresenceRuntimeHandle,
+    status_bar: &mut StatusBar,
+    stdout: &mut std::io::Stdout,
+    terminal_output_tracker: &mut TerminalOutputTracker,
+    metadata_enabled: &AtomicBool,
+    status_dirty: &mut bool,
+    last_status_refresh: &mut Instant,
+) -> Result<StatusTransitionResult> {
+    row_runtime.with_locked(|runtime| -> Result<StatusTransitionResult> {
+        if runtime.state != StatusPresenceState::Suspended {
+            return Ok(StatusTransitionResult::Ignored);
+        }
+        runtime.state = StatusPresenceState::Transitioning;
+        let info = match info(target) {
+            Ok(info) => info,
+            Err(_) => {
+                runtime.state = StatusPresenceState::Suspended;
+                metadata_enabled.store(false, Ordering::SeqCst);
+                return Ok(StatusTransitionResult::Ignored);
+            }
+        };
+        let (cols, rows) = terminal_size();
+        let body_rows = attach_pty_rows(rows, true);
+        match handle_resize_tick(resize(target, body_rows, cols, Some(subscriber_id))) {
+            ResizeTickOutcome::Advance => {
+                terminal_output_tracker
+                    .set_status_scroll_bottom(status_scroll_bottom_for_terminal_rows(rows, true));
+                status_bar.update_info(&info);
+                status_bar.style = Some(resolve_status_style(info.status_theme));
+                match refresh_status_or_detached(
+                    status_bar,
+                    stdout,
+                    status_dirty,
+                    last_status_refresh,
+                ) {
+                    Ok(true) => {
+                        runtime.state = StatusPresenceState::Disabled;
+                        return Ok(StatusTransitionResult::Detached);
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        runtime.state = StatusPresenceState::Suspended;
+                        metadata_enabled.store(false, Ordering::SeqCst);
+                        return Err(err);
+                    }
+                }
+                metadata_enabled.store(true, Ordering::SeqCst);
+                runtime.state = StatusPresenceState::Active;
+                Ok(StatusTransitionResult::Applied)
+            }
+            ResizeTickOutcome::Retry => {
+                runtime.state = StatusPresenceState::Suspended;
+                metadata_enabled.store(false, Ordering::SeqCst);
+                Ok(StatusTransitionResult::Ignored)
+            }
+            ResizeTickOutcome::StaleSubscriberId => {
+                runtime.state = StatusPresenceState::Disabled;
+                Ok(StatusTransitionResult::Detached)
+            }
+        }
+    })
 }
 
 fn forward_pty_output_frame_or_detached(
@@ -4045,9 +4483,10 @@ mod tests {
     use super::{
         ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
-        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ResizeTickOutcome,
-        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar, StatusStyle, StatusTheme,
-        TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ProcessInfo,
+        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar,
+        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
+        StatusTheme, TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
         attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
         compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
         compose_render_action, compose_sanitized_display_line, compose_should_commit,
@@ -4056,10 +4495,11 @@ mod tests {
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due,
         keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
         mobile_client_detected, mobile_transcript_capture_changed,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
-        raw_attach_command_hint, read_attach_response_header, resolve_attach_mode,
-        resolve_status_style, should_mobile_transcript_auto, status_sgr_stack_supported,
-        status_theme_protocol_error, write_mobile_transcript_update,
+        nested_known_agent_present_in_processes, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_style, raw_attach_command_hint,
+        read_attach_response_header, resolve_attach_mode, resolve_status_style,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read};
     use std::sync::Arc;
@@ -4542,6 +4982,104 @@ mod tests {
         assert_eq!(attach_pty_rows(24, true), 23);
         assert_eq!(attach_pty_rows(1, true), 1);
         assert_eq!(attach_pty_rows(24, false), 24);
+    }
+
+    #[test]
+    fn status_presence_policy_keeps_transport_separate_from_row_intent() {
+        assert!(StatusPresencePolicy::RowAuto.requests_row());
+        assert!(StatusPresencePolicy::RowAuto.allows_nested_suspend());
+        assert!(!StatusPresencePolicy::RowOff.requests_row());
+        assert!(!StatusPresencePolicy::RowOff.allows_nested_suspend());
+        assert!(StatusPresencePolicy::ForceRow.requests_row());
+        assert!(!StatusPresencePolicy::ForceRow.allows_nested_suspend());
+        assert_eq!(
+            StatusPresencePolicy::from_legacy_show_status(true),
+            StatusPresencePolicy::RowAuto
+        );
+        assert_eq!(
+            StatusPresencePolicy::from_legacy_show_status(false),
+            StatusPresencePolicy::RowOff
+        );
+    }
+
+    #[test]
+    fn row_presence_runtime_controls_resize_geometry() {
+        let handle = StatusPresenceRuntimeHandle::new(true);
+        assert_eq!(handle.pty_rows_for(24), 23);
+        assert_eq!(handle.status_scroll_bottom_for(24), Some(23));
+
+        handle.with_locked(|runtime| runtime.state = StatusPresenceState::Suspended);
+        assert_eq!(handle.pty_rows_for(24), 24);
+        assert_eq!(handle.status_scroll_bottom_for(24), None);
+
+        handle.with_locked(|runtime| runtime.state = StatusPresenceState::Transitioning);
+        assert_eq!(
+            handle.pty_rows_for(24),
+            24,
+            "transitioning state must not reuse stale row-active geometry"
+        );
+
+        let disabled = StatusPresenceRuntimeHandle::new(false);
+        assert_eq!(disabled.pty_rows_for(24), 24);
+        assert_eq!(disabled.status_scroll_bottom_for(24), None);
+    }
+
+    fn sample_process(command: &str, depth: usize) -> ProcessInfo {
+        ProcessInfo {
+            session: "main".to_string(),
+            pane_id: "%0".to_string(),
+            depth,
+            pid: (100 + depth) as u32,
+            ppid: 1,
+            process_group_id: Some(100),
+            orphan: false,
+            stat: "S".to_string(),
+            cpu_percent: 0.0,
+            mem_percent: 0.0,
+            rss_kib: 0,
+            elapsed: "00:00".to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn nested_agent_classifier_matches_known_agent_descendants() {
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process("/usr/local/bin/codex --model gpt", 1),
+        ]));
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process("omx --madmax --xhigh", 1),
+        ]));
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("/usr/bin/vim README.md", 1),
+            ]),
+            "non-agent full-screen tools are not part of this best-effort classifier"
+        );
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process(
+                "node /Users/me/.nvm/versions/node/v22/lib/node_modules/oh-my-codex/dist/cli/omx.js",
+                1
+            ),
+        ]));
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process(
+                "node /Users/me/.npm/_npx/x/node_modules/@anthropic-ai/claude-code/cli.js",
+                1
+            ),
+        ]));
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("node /tmp/not-an-agent.js", 1),
+            ]),
+            "generic node wrappers should not suspend the row"
+        );
     }
 
     #[test]
