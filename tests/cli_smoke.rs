@@ -849,6 +849,35 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
+fn session_identity_env_is_exported_to_child_process() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "identity-env",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'SESSION:%s\\nPANE:%s\\n' \"$LTERM_SESSION\" \"$LTERM_PANE\"; sleep 2",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane = stdout
+        .lines()
+        .find_map(|line| line.split('\t').nth(1))
+        .ok_or_else(|| format!("detached output missing pane field: {stdout:?}"))?;
+
+    let captured = env.capture_until("identity-env", &format!("PANE:{pane}"))?;
+    assert!(captured.contains("SESSION:identity-env"), "{captured:?}");
+    assert!(captured.contains(&format!("PANE:{pane}")), "{captured:?}");
+    Ok(())
+}
+
+#[test]
 fn capture_alias_captures_output() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -2028,6 +2057,31 @@ fn install_completions_sanitizes_error_paths() -> TestResult {
     assert!(
         stderr.contains("bad]0;owned"),
         "stderr should retain readable sanitized path text: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_completions_requires_supported_shell_when_undetected() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    std::fs::create_dir_all(&home)?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .env("SHELL", "/bin/sh")
+        .arg("install-completions")
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not detect a supported completion shell"),
+        "stderr should explain unsupported shell detection: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{001b}') && !stderr.contains('\u{0007}'),
+        "unsupported shell detection errors must be terminal-safe: {stderr:?}"
     );
     Ok(())
 }

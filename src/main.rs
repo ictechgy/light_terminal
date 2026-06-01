@@ -1028,7 +1028,7 @@ fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> 
     println!("path\t{}", terminal_path(&path));
     let next = completion_activation_hint(shell, &dir);
     println!("next\t{}", sanitize::terminal_text(&next));
-    println!("note\tOpen a new shell, or source the completion file if your shell supports it.");
+    println!("note\tOpen a new shell, or follow the activation hint above.");
     Ok(())
 }
 
