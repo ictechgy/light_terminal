@@ -8603,6 +8603,35 @@ fn mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions() -> Test
 }
 
 #[test]
+fn agent_mobile_status_request_stays_on_transcript_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("codex"),
+        "#!/bin/sh\nprintf 'READY\\n'\nsleep 5\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .args(["codex", "--mobile", "--status"])
+        .output()?;
+    let _cleanup = SessionCleanup::new(&env, "codex-lterm");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("lterm mobile transcript"), "{stdout:?}");
+    assert!(stdout.contains("READY"), "{stdout:?}");
+    assert!(
+        !stdout.contains("lterm  codex-lterm"),
+        "--mobile --status must not create a raw status row: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn mobile_auto_transcript_prints_sanitized_capture() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -9216,7 +9245,7 @@ fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
     for binary in ["omx", "omc"] {
         write_executable(
             &fake_bin.join(binary),
-            "#!/bin/sh\nprintf 'AGENT_READY\\n'\n",
+            "#!/bin/sh\nprintf 'AGENT_READY\\n'\nsleep 1\n",
         )?;
     }
     let old_path = std::env::var("PATH").unwrap_or_default();

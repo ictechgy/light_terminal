@@ -74,6 +74,20 @@ forces the raw path; `--mobile` / `LTERM_ATTACH_MODE=mobile` forces the
 transcript path. CLI flags (`--raw`, `--mobile`, `--attach-mode`) are explicit
 user intent and take precedence over `LTERM_ATTACH_MODE`.
 
+Raw attach row presence is separate from attach transport. Ordinary raw sessions
+default to a client-side bottom status row; built-in agent launchers default to
+row-off full-height raw attach and may emit a terminal-title cue as the non-row
+presence indicator. The row can be disabled globally with `LTERM_NO_STATUS=1` or
+`LTERM_STATUS=0`; those env gates also beat explicit agent `--status` requests
+for safety. `--status` is scoped to agent launchers in the current CLI and
+requests a raw status row only when the final transport is raw. Mobile transcript
+ignores row-presence policy because it is not a raw-row renderer. For row-on
+shell sessions, lterm may best-effort suspend the row when a stable known-agent
+descendant is detected through the local process tree, then restore it when the
+agent exits. Ambiguous or unavailable process detection must fail safe by keeping
+the row. This host-side row management does not sanitize, filter, or rewrite
+attached PTY bytes.
+
 Compose target resolution uses the same session-or-pane target model as
 `lterm logs`. The display sub-surface captures the last `--tail` sanitized
 scrollback lines (default: 80) from that target; it does not expose independent
