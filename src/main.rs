@@ -27,6 +27,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const CMUX_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "lterm",
@@ -2839,10 +2841,9 @@ fn notify_with_fallback(
         if let Some(subtitle) = subtitle {
             cmd.arg("--subtitle").arg(subtitle);
         }
-        if matches!(fallback, NotificationFallback::Stderr) {
-            cmd.stdout(std::process::Stdio::null());
-        }
-        if cmd.status().is_ok_and(|s| s.success()) {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if run_cmux_notify_with_timeout(&mut cmd, CMUX_NOTIFY_TIMEOUT) {
             return Ok(());
         }
     }
@@ -2871,6 +2872,27 @@ fn notify_with_fallback(
         }
     }
     Ok(())
+}
+
+fn run_cmux_notify_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 fn add_cmux_notification_context_args(cmd: &mut Command) {

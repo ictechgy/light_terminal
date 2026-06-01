@@ -1567,6 +1567,39 @@ fn watch_json_notify_without_cmux_keeps_stdout_machine_readable() -> TestResult 
 }
 
 #[test]
+fn notify_falls_back_when_cmux_notify_hangs() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(&fake_bin.join("cmux"), "#!/bin/sh\n/bin/sleep 10\nexit 0\n")?;
+
+    let started = Instant::now();
+    let mut notify = env.cmd();
+    notify.env("PATH", &fake_bin);
+    let output = notify
+        .args([
+            "notify",
+            "--title",
+            "Task complete",
+            "--body",
+            "All checks passed",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "notify should not wait for a hung cmux helper: elapsed={:?}; output={output:?}",
+        started.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\u{1b}]777;notify;Task complete;All checks passed\u{7}"),
+        "hung cmux should fall back to OSC 777 on stdout: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn logs_supports_inclusive_end_range() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
