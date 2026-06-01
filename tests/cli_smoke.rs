@@ -2005,6 +2005,34 @@ fn install_completions_writes_user_files_without_starting_daemon() -> TestResult
 }
 
 #[test]
+fn install_completions_sanitizes_error_paths() -> TestResult {
+    let env = TestEnv::new()?;
+    let bad_dir = env.temp.path().join("bad\u{001b}]0;owned\u{0007}");
+    std::fs::write(&bad_dir, "not a directory")?;
+
+    let output = env
+        .cmd()
+        .args(["install-completions", "--shell", "zsh", "--dir"])
+        .arg(&bad_dir)
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('\u{001b}') && !stderr.contains('\u{0007}'),
+        "install-completions errors must be terminal-safe: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("create completion directory"),
+        "stderr should preserve useful error context: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("bad]0;owned"),
+        "stderr should retain readable sanitized path text: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> TestResult {
     let env = TestEnv::new()?;
 

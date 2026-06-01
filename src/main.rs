@@ -1004,6 +1004,10 @@ fn completion_bytes(shell: CompletionShell) -> Vec<u8> {
     bytes
 }
 
+fn terminal_path(path: &Path) -> String {
+    sanitize::terminal_text(&path.display().to_string())
+}
+
 fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> Result<()> {
     let shell = match shell {
         Some(shell) => shell,
@@ -1014,17 +1018,14 @@ fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> 
         None => default_completion_dir(shell)?,
     };
     std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create completion directory {}", dir.display()))?;
+        .with_context(|| format!("create completion directory {}", terminal_path(&dir)))?;
     let path = dir.join(completion_file_name(shell));
     std::fs::write(&path, completion_bytes(shell))
-        .with_context(|| format!("write completion file {}", path.display()))?;
+        .with_context(|| format!("write completion file {}", terminal_path(&path)))?;
 
     println!("lterm completions installed");
     println!("shell\t{}", completion_shell_name(shell));
-    println!(
-        "path\t{}",
-        sanitize::terminal_text(&path.display().to_string())
-    );
+    println!("path\t{}", terminal_path(&path));
     let next = completion_activation_hint(shell, &dir);
     println!("next\t{}", sanitize::terminal_text(&next));
     println!("note\tOpen a new shell, or source the completion file if your shell supports it.");

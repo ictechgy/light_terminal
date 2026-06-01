@@ -1798,7 +1798,7 @@ fn maybe_emit_agent_presence_cue(
 ) -> Result<()> {
     if presence_policy.requests_row()
         || !likely_agent_session(info)
-        || env_flag_disabled("LTERM_AGENT_CUE")
+        || !agent_presence_cue_enabled()
         || !std::io::stdout().is_terminal()
     {
         return Ok(());
@@ -1818,6 +1818,10 @@ fn maybe_emit_agent_presence_cue(
     }
     stdout.flush().context("flush lterm terminal title cue")?;
     Ok(())
+}
+
+fn agent_presence_cue_enabled() -> bool {
+    !env_flag_disabled("LTERM_AGENT_CUE")
 }
 
 fn write_lterm_title_cue(
@@ -4673,12 +4677,13 @@ mod tests {
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
         STATUS_HEARTBEAT_FORCED, StatusBar, StatusPresencePolicy, StatusPresenceRuntimeHandle,
         StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
-        alt_screen_param_matches, anyhow_error_is_broken_pipe, attach_pty_rows,
-        compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
-        compose_render_action, compose_sanitized_display_line, compose_should_commit,
-        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook, format_status_line,
+        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
+        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due,
         keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
         mobile_client_detected, mobile_transcript_capture_changed,
@@ -5191,38 +5196,94 @@ mod tests {
 
     #[test]
     fn agent_presence_cue_is_sanitized_and_explains_hidden_row() {
-        let mut output = Vec::new();
-        write_lterm_title_cue(
-            &mut output,
-            "repo\x1b]0;bad\x07",
-            "%0\nnext",
-            "codex\tagent",
-        )
-        .expect("title cue");
+        let mut title = Vec::new();
+        write_lterm_title_cue(&mut title, "repo\x1b]0;bad\x07", "%0\nnext", "codex\tagent")
+            .expect("title cue");
+        let title = String::from_utf8(title).expect("title cue is utf8");
+
+        assert!(title.starts_with("\x1b]0;"), "{title:?}");
+        assert!(title.ends_with('\x07'), "{title:?}");
+        assert_eq!(
+            title.matches('\x1b').count(),
+            1,
+            "title may only contain its OSC introducer, not user-controlled ESC: {title:?}"
+        );
+        assert_eq!(
+            title.matches('\x07').count(),
+            1,
+            "title may only contain its OSC terminator, not user-controlled BEL: {title:?}"
+        );
+        let title_inner = title
+            .strip_prefix("\x1b]0;")
+            .and_then(|value| value.strip_suffix('\x07'))
+            .expect("title wrapper");
+        assert!(
+            title_inner.contains("lterm · repo]0;bad · %0next · codexagent"),
+            "title cue should retain readable sanitized text: {title:?}"
+        );
+        assert!(
+            !title_inner.contains('\x1b') && !title_inner.contains('\x07'),
+            "title payload must not include user-controlled terminal controls: {title:?}"
+        );
+
+        let mut banner = Vec::new();
         write_lterm_agent_presence_banner(
-            &mut output,
+            &mut banner,
             "repo\x1b]0;bad\x07",
             "%0\nnext",
             "codex\tagent",
         )
         .expect("banner cue");
-        let output = String::from_utf8(output).expect("cue is utf8");
+        let banner = String::from_utf8(banner).expect("banner cue is utf8");
 
         assert!(
-            output.contains("lterm · repo]0;bad · %0next · codexagent"),
-            "title cue should retain readable sanitized text: {output:?}"
+            banner.contains("[lterm] repo]0;bad %0next · codexagent"),
+            "banner should show lterm/session/pane/agent identity: {banner:?}"
         );
         assert!(
-            output.contains("[lterm] repo]0;bad %0next · codexagent"),
-            "banner should show lterm/session/pane/agent identity: {output:?}"
+            banner.contains("status row hidden for agent TUI; use --status to show it"),
+            "banner should explain why no bottom row is visible: {banner:?}"
         );
         assert!(
-            output.contains("status row hidden for agent TUI; use --status to show it"),
-            "banner should explain why no bottom row is visible: {output:?}"
+            !banner.contains('\x1b') && !banner.contains('\x07'),
+            "banner must not include terminal controls: {banner:?}"
+        );
+    }
+
+    #[test]
+    fn agent_presence_cue_env_flags_split_title_and_banner_controls() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env_guard = EnvGuard::capture(&["LTERM_AGENT_CUE", "LTERM_AGENT_BANNER"]);
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation in tests.
+        unsafe {
+            std::env::remove_var("LTERM_AGENT_CUE");
+            std::env::remove_var("LTERM_AGENT_BANNER");
+        }
+        assert!(agent_presence_cue_enabled());
+        assert!(agent_presence_banner_enabled());
+
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation in tests.
+        unsafe {
+            std::env::set_var("LTERM_AGENT_BANNER", "0");
+        }
+        assert!(
+            agent_presence_cue_enabled(),
+            "banner opt-out must keep the terminal-title cue enabled"
+        );
+        assert!(!agent_presence_banner_enabled());
+
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation in tests.
+        unsafe {
+            std::env::set_var("LTERM_AGENT_CUE", "0");
+            std::env::remove_var("LTERM_AGENT_BANNER");
+        }
+        assert!(
+            !agent_presence_cue_enabled(),
+            "outer cue gate suppresses the full cue path"
         );
         assert!(
-            !output.contains('\x1b') || output.starts_with("\x1b]0;"),
-            "cue must not include user-controlled terminal controls: {output:?}"
+            agent_presence_banner_enabled(),
+            "banner helper remains independently controlled by LTERM_AGENT_BANNER"
         );
     }
 
