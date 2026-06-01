@@ -79,7 +79,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.14
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.15
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
@@ -501,7 +501,7 @@ executable or `lterm` on `PATH`. Do not set it from untrusted environment data.
 
 **Popup commands.** `tmux-compat display-popup` runs the requested command through the user's shell to preserve tmux-like behavior. **Do not pass untrusted popup commands.**
 
-**Build reproducibility.** Use the committed lockfile for release builds: `cargo build --release --locked`. The current lockfile pins `serde_json 1.0.149` and its registry dependency `zmij 1.0.21`; both are resolved by Cargo from the lockfile, not vendored locally. Verify the dependency set with `cargo tree --locked -p serde_json`.
+**Build reproducibility.** Use the committed lockfile for release builds: `cargo build --release --locked`. The current lockfile pins `serde_json 1.0.159` and its registry dependency `zmij 1.0.21`; both are resolved by Cargo from the lockfile, not vendored locally. Verify the dependency set with `cargo tree --locked -p serde_json`.
 
 ## Current limitations
 

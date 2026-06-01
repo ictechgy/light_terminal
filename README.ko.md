@@ -76,7 +76,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.14
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.15
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
@@ -500,7 +500,7 @@ override로 인정합니다. 유효하지 않은 값은 무시하고 현재 exec
 
 **Popup 명령.** `tmux-compat display-popup`은 tmux와 비슷한 동작을 위해 요청된 명령을 사용자 shell로 실행합니다. **신뢰할 수 없는 popup 명령을 전달하지 마세요.**
 
-**빌드 재현성.** 릴리스 빌드는 커밋된 lockfile을 사용하세요: `cargo build --release --locked`. 현재 lockfile은 `serde_json 1.0.149`와 registry dependency인 `zmij 1.0.21`을 고정합니다. 둘 다 Cargo가 lockfile에 따라 resolve하는 crate이며, 로컬에 vendor된 crate가 아닙니다. `cargo tree --locked -p serde_json`으로 의존성 집합을 확인할 수 있습니다.
+**빌드 재현성.** 릴리스 빌드는 커밋된 lockfile을 사용하세요: `cargo build --release --locked`. 현재 lockfile은 `serde_json 1.0.159`와 registry dependency인 `zmij 1.0.21`을 고정합니다. 둘 다 Cargo가 lockfile에 따라 resolve하는 crate이며, 로컬에 vendor된 crate가 아닙니다. `cargo tree --locked -p serde_json`으로 의존성 집합을 확인할 수 있습니다.
 
 ## 현재 제한 사항
 
