@@ -140,6 +140,7 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | `stable` shim path text | none | `sanitized-output-only` |
 | `lterm env` | none | `stable` | `stable` shell exports; `--shell fish` emits fish syntax for `source`; quote style is not a stable visual API | none | `sanitized-output-only` |
+| `lterm install-completions` | none | `best-effort` | `best-effort` user-local completion file install summary and activation hint; does not start the daemon | none | `sanitized-output-only` |
 | `lterm completions` | none | `best-effort` | `best-effort` shell completion scripts for `bash`, `zsh`, and `fish`; generated output follows clap-complete behavior and does not start the daemon | none | `sanitized-output-only` |
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |

@@ -153,7 +153,8 @@ lterm -a api
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
 | Collect a redacted local diagnostic bundle | `lterm diagnose --bundle` | None |
 | Preview local setup steps | `lterm init --shell zsh` | None |
-| Generate shell completions | `mkdir -p ~/.zfunc && lterm completions zsh > ~/.zfunc/_lterm` | None |
+| Install shell completions | `lterm install-completions --shell zsh` | None |
+| Generate shell completions | `lterm completions zsh` | None |
 | Run the background daemon explicitly | `lterm daemon` | None |
 | Stop the daemon and all sessions | `lterm shutdown` | None |
 
@@ -165,6 +166,7 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 | Inspect available agent profiles | `lterm agents --json` | PATH availability probe at command runtime |
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
+| Install shell completions | `lterm install-completions --shell bash\|zsh\|fish` | Writes a user-local completion file and prints any activation hint; it does not start the daemon |
 | Generate shell completions | `lterm completions bash\|zsh\|fish` | Prints completion scripts only; it does not inspect sessions or start the daemon |
 | Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
@@ -192,7 +194,9 @@ This table is the product CLI surface for humans and agents. `lterm tmux-compat 
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The JSON form also includes optional `agent_name` metadata for sessions launched through an agent profile; non-agent sessions omit that field. The compatibility names `lterm list` and `lterm ls` keep the same text output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. To force the older raw full-terminal resume, use `lterm resume --raw --no-status api` (or compatibility name `lterm attach --raw --no-status api`) or set `LTERM_ATTACH_MODE=raw`; add `LTERM_NO_STATUS=1` or `LTERM_STATUS=0` when only the status line conflicts with the client.
 
-Row presence is separate from attach mode. `--attach-mode=auto` still chooses the raw-vs-mobile transcript transport only. On the raw attach path, ordinary sessions keep the row by default, while built-in agent launchers default to a full-height row-off surface and emit a terminal-title cue when the terminal supports it. When a row-on shell session later appears to run a known agent command as a child process, lterm may best-effort suspend the row and restore full PTY height until that agent exits; ambiguous process detection fails safe by keeping the row. The global `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` status kill-switches still win over CLI status requests.
+Row presence is separate from attach mode. `--attach-mode=auto` still chooses the raw-vs-mobile transcript transport only. On the raw attach path, ordinary sessions keep the row by default, while built-in agent launchers default to a full-height row-off surface and emit a terminal-title cue plus a one-shot `[lterm] <session> <pane>` banner before attach when the terminal supports it. Set `LTERM_AGENT_CUE=0` (or `LTERM_AGENT_BANNER=0`) to suppress that banner/title cue. When a row-on shell session later appears to run a known agent command as a child process, lterm may best-effort suspend the row and restore full PTY height until that agent exits; ambiguous process detection fails safe by keeping the row. The global `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` status kill-switches still win over CLI status requests.
+
+Every lterm session also exports `LTERM_SESSION` and `LTERM_PANE` inside the child process. If you prefer a shell-prompt badge such as `[lterm:api:%0]`, add those variables to your shell prompt; `lterm init --shell zsh|bash|fish` prints this reminder along with the shim and completion setup steps.
 
 `lterm resume` / `lterm open` use `--attach-mode=auto` (or `LTERM_ATTACH_MODE=auto`) by default. Accepted attach-mode values are `auto`, `raw`, and `mobile` (`mobile` means the normal-screen transcript view). Desktop clients still get the raw PTY attach path. Auto mobile detection is conservative best effort: `LTERM_MOBILE=1` or a Termius terminal identity marks the client as mobile, and the target must look like an agent session through persisted `LTERM_AGENT` metadata, a built-in `*-lterm` agent session name, or a known agent command basename. Scripts that need deterministic behavior should use explicit flags or env: `--raw` / `LTERM_ATTACH_MODE=raw` for the old raw path, or `--mobile` / `LTERM_ATTACH_MODE=mobile` for the transcript path. CLI flags take precedence over the environment. `--tail`, `--refresh`, and `--read-only` tune the transcript view.
 

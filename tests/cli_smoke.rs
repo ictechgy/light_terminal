@@ -1849,6 +1849,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "install-shim",
         "env",
         "completions",
+        "install-completions",
         "diagnose",
         "trace",
         "trace-replay",
@@ -1937,6 +1938,68 @@ fn completions_generate_shell_scripts_without_starting_daemon() -> TestResult {
         report.get("daemon_reachable").and_then(|v| v.as_bool()),
         Some(false),
         "completion generation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_completions_writes_user_files_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let xdg_data = env.temp.path().join("xdg-data");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&xdg_data)?;
+
+    let zsh = env
+        .cmd()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("SHELL", "/bin/zsh")
+        .arg("install-completions")
+        .output()?;
+    assert!(zsh.status.success(), "{zsh:?}");
+    assert!(zsh.stderr.is_empty(), "{zsh:?}");
+    let zsh_stdout = String::from_utf8_lossy(&zsh.stdout);
+    let zsh_file = home.join(".zfunc/_lterm");
+    assert!(zsh_file.is_file(), "missing zsh completion file");
+    let zsh_script = std::fs::read_to_string(&zsh_file)?;
+    assert!(zsh_script.contains("#compdef lterm"), "{zsh_script}");
+    assert!(zsh_stdout.contains("shell\tzsh"), "{zsh_stdout}");
+    assert!(
+        zsh_stdout.contains("fpath=(") && zsh_stdout.contains("compinit"),
+        "zsh install output should include activation hint:\n{zsh_stdout}"
+    );
+
+    let bash = env
+        .cmd()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .args(["install-completions", "--shell", "bash"])
+        .output()?;
+    assert!(bash.status.success(), "{bash:?}");
+    let bash_file = xdg_data.join("bash-completion/completions/lterm");
+    assert!(bash_file.is_file(), "missing bash completion file");
+    let bash_script = std::fs::read_to_string(&bash_file)?;
+    assert!(bash_script.contains("complete -F _lterm"), "{bash_script}");
+
+    let fish = env
+        .cmd()
+        .env("HOME", &home)
+        .args(["install-completions", "--shell", "fish"])
+        .output()?;
+    assert!(fish.status.success(), "{fish:?}");
+    let fish_file = home.join(".config/fish/completions/lterm.fish");
+    assert!(fish_file.is_file(), "missing fish completion file");
+    let fish_script = std::fs::read_to_string(&fish_file)?;
+    assert!(fish_script.contains("complete -c lterm"), "{fish_script}");
+
+    let doctor = env.cmd().args(["doctor", "--json"]).output()?;
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    assert_eq!(
+        report.get("daemon_reachable").and_then(|v| v.as_bool()),
+        Some(false),
+        "completion installation must not auto-start the daemon: {report:?}"
     );
     Ok(())
 }
@@ -2628,6 +2691,8 @@ fn init_prints_setup_preview_without_modifying_files() -> TestResult {
         "step\t1\tlterm doctor --json",
         "step\t2\tlterm install-shim",
         "step\t3\teval \"$(lterm env)\"",
+        "step\t4\tlterm install-completions --shell zsh",
+        "indicator\tLTERM_SESSION/LTERM_PANE",
         "Copy the enable command",
     ] {
         assert!(
@@ -2654,6 +2719,7 @@ fn init_prints_fish_source_preview() -> TestResult {
         "shell\tfish",
         "step\t2\tlterm install-shim",
         "step\t3\tlterm env --shell fish | source",
+        "step\t4\tlterm install-completions --shell fish",
     ] {
         assert!(
             stdout.contains(expected),

@@ -148,7 +148,8 @@ lterm -a api
 | 데몬과 shim 상태 진단 | `lterm doctor --json` | `status` |
 | redacted 로컬 진단 bundle 수집 | `lterm diagnose --bundle` | 없음 |
 | 로컬 설정 단계 미리 보기 | `lterm init --shell zsh` | 없음 |
-| shell completion 생성 | `mkdir -p ~/.zfunc && lterm completions zsh > ~/.zfunc/_lterm` | 없음 |
+| shell completion 설치 | `lterm install-completions --shell zsh` | 없음 |
+| shell completion 생성 | `lterm completions zsh` | 없음 |
 | 백그라운드 데몬 명시 실행 | `lterm daemon` | 없음 |
 | 데몬과 모든 세션 종료 | `lterm shutdown` | 없음 |
 
@@ -160,6 +161,7 @@ lterm -a api
 | 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 `PATH` 사용 가능 여부 확인 |
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
 | tmux 호환 shell export 출력 | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
+| shell completion 설치 | `lterm install-completions --shell bash\|zsh\|fish` | 사용자 로컬 completion 파일을 쓰고 필요한 활성화 hint를 출력하며 daemon은 시작하지 않음 |
 | shell completion 생성 | `lterm completions bash\|zsh\|fish` | completion script만 출력하며 session을 조회하거나 daemon을 시작하지 않음 |
 | cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 터미널 제어 문자를 제거하고 Unicode text는 보존 |
 | 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 전달 |
@@ -188,7 +190,9 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. JSON 출력에는 agent profile로 띄운 세션에 한해 `agent_name` metadata가 추가되고, 일반 세션에는 이 field가 생략됩니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 text 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 status bar를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 강제하려면 `lterm resume --raw --no-status api`(호환 이름: `lterm attach --raw --no-status api`)를 쓰거나 `LTERM_ATTACH_MODE=raw`를 설정하세요. 단순히 status line만 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` 또는 같은 의미의 `LTERM_STATUS=0`을 함께 사용하면 됩니다.
 
-row status 존재 여부는 attach mode와 별도입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher는 full-height row-off surface를 기본값으로 사용하며 terminal이 지원하면 terminal title cue를 emit합니다. row-on shell 세션 안에서 나중에 알려진 agent command가 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
+row status 존재 여부는 attach mode와 별도입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher는 full-height row-off surface를 기본값으로 사용하며 terminal이 지원하면 attach 직전에 terminal title cue와 one-shot `[lterm] <session> <pane>` banner를 표시합니다. 이 cue/banner를 끄려면 `LTERM_AGENT_CUE=0`(또는 `LTERM_AGENT_BANNER=0`)을 설정하세요. row-on shell 세션 안에서 나중에 알려진 agent command가 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
+
+모든 lterm 세션의 child process에는 `LTERM_SESSION`과 `LTERM_PANE`도 export됩니다. `[lterm:api:%0]` 같은 shell prompt badge를 선호한다면 이 변수를 prompt에 추가하세요. `lterm init --shell zsh|bash|fish`는 shim/completion 단계와 함께 이 reminder를 출력합니다.
 
 `lterm resume` / `lterm open`의 기본 attach 정책은 `--attach-mode=auto`(또는 `LTERM_ATTACH_MODE=auto`)입니다. attach mode 값은 `auto`, `raw`, `mobile` 세 가지이고, 여기서 `mobile`은 일반 화면(normal screen)의 transcript view를 뜻합니다. 데스크톱에서는 기존처럼 raw PTY attach를 사용합니다. 자동 모바일 감지는 보수적인 best-effort 동작입니다. `LTERM_MOBILE=1` 또는 Termius 터미널 식별값이 있으면 모바일 클라이언트로 보고, 대상 세션은 persisted `LTERM_AGENT` metadata, 내장 agent의 `*-lterm` 세션 이름, 또는 알려진 agent command basename 중 하나에 맞아야 agent 세션으로 봅니다. 스크립트처럼 결과가 반드시 예측 가능해야 하는 경우에는 명시적으로 지정하세요. 기존 raw 경로를 강제로 쓰려면 `--raw` 또는 `LTERM_ATTACH_MODE=raw`, transcript를 강제로 쓰려면 `--mobile` 또는 `LTERM_ATTACH_MODE=mobile`을 사용합니다. CLI flag가 환경 변수보다 우선합니다. transcript의 표시 범위와 갱신 주기는 `--tail`, `--refresh`, `--read-only`로 조정할 수 있습니다.
 

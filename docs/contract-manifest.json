@@ -551,6 +551,20 @@
       "stability_scope": "Generates bash, zsh, and fish shell completion scripts from the current clap command surface. The command must not start the daemon; exact completion script bytes are delegated to clap-complete and are not a stable visual contract."
     },
     {
+      "command": "lterm install-completions",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke install_completions_writes_user_files_without_starting_daemon"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Writes a user-local bash, zsh, or fish completion file and prints a sanitized activation hint. The command must not start the daemon; completion script bytes are delegated to clap-complete and user shell discovery is best-effort."
+    },
+    {
       "command": "lterm notify",
       "aliases": [],
       "text_output_stability": "best-effort",

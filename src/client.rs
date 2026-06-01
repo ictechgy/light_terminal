@@ -1787,17 +1787,18 @@ pub fn attach_info_with_policy(
     } else if options.transcript.read_only {
         bail!("--read-only requires mobile transcript mode");
     } else {
-        maybe_emit_agent_title_cue(info, presence_policy)?;
+        maybe_emit_agent_presence_cue(info, presence_policy)?;
         attach_with_presence(&info.pane_id, presence_policy, stdin_eof)
     }
 }
 
-fn maybe_emit_agent_title_cue(
+fn maybe_emit_agent_presence_cue(
     info: &SessionInfo,
     presence_policy: StatusPresencePolicy,
 ) -> Result<()> {
     if presence_policy.requests_row()
         || !likely_agent_session(info)
+        || env_flag_disabled("LTERM_AGENT_CUE")
         || !std::io::stdout().is_terminal()
     {
         return Ok(());
@@ -1812,6 +1813,9 @@ fn maybe_emit_agent_title_cue(
         .unwrap_or_else(|| "agent".to_string());
     let mut stdout = std::io::stdout();
     write_lterm_title_cue(&mut stdout, &session, &pane, &agent)?;
+    if agent_presence_banner_enabled() {
+        write_lterm_agent_presence_banner(&mut stdout, &session, &pane, &agent)?;
+    }
     stdout.flush().context("flush lterm terminal title cue")?;
     Ok(())
 }
@@ -1827,6 +1831,26 @@ fn write_lterm_title_cue(
     let agent = sanitize::terminal_text(agent);
     let title = format!("lterm · {session} · {pane} · {agent}");
     write!(stdout, "\x1b]0;{title}\x07").context("emit lterm terminal title cue")
+}
+
+fn agent_presence_banner_enabled() -> bool {
+    !env_flag_disabled("LTERM_AGENT_BANNER")
+}
+
+fn write_lterm_agent_presence_banner(
+    stdout: &mut impl Write,
+    session: &str,
+    pane: &str,
+    agent: &str,
+) -> Result<()> {
+    let session = sanitize::terminal_text(session);
+    let pane = sanitize::terminal_text(pane);
+    let agent = sanitize::terminal_text(agent);
+    writeln!(
+        stdout,
+        "\r[lterm] {session} {pane} · {agent} (status row hidden for agent TUI; use --status to show it)"
+    )
+    .context("emit lterm agent presence banner")
 }
 
 const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -4662,7 +4686,7 @@ mod tests {
         panic_terminal_cleanup_bytes, parse_status_style, raw_attach_command_hint,
         read_attach_response_header, resolve_attach_mode, resolve_status_style,
         should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        write_mobile_transcript_update,
+        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read};
     use std::sync::Arc;
@@ -5162,6 +5186,43 @@ mod tests {
         assert_eq!(
             StatusPresencePolicy::from_legacy_show_status(false),
             StatusPresencePolicy::RowOff
+        );
+    }
+
+    #[test]
+    fn agent_presence_cue_is_sanitized_and_explains_hidden_row() {
+        let mut output = Vec::new();
+        write_lterm_title_cue(
+            &mut output,
+            "repo\x1b]0;bad\x07",
+            "%0\nnext",
+            "codex\tagent",
+        )
+        .expect("title cue");
+        write_lterm_agent_presence_banner(
+            &mut output,
+            "repo\x1b]0;bad\x07",
+            "%0\nnext",
+            "codex\tagent",
+        )
+        .expect("banner cue");
+        let output = String::from_utf8(output).expect("cue is utf8");
+
+        assert!(
+            output.contains("lterm · repo]0;bad · %0next · codexagent"),
+            "title cue should retain readable sanitized text: {output:?}"
+        );
+        assert!(
+            output.contains("[lterm] repo]0;bad %0next · codexagent"),
+            "banner should show lterm/session/pane/agent identity: {output:?}"
+        );
+        assert!(
+            output.contains("status row hidden for agent TUI; use --status to show it"),
+            "banner should explain why no bottom row is visible: {output:?}"
+        );
+        assert!(
+            !output.contains('\x1b') || output.starts_with("\x1b]0;"),
+            "cue must not include user-controlled terminal controls: {output:?}"
         );
     }
 
