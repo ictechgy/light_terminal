@@ -579,7 +579,9 @@
       "json_output_stability": "none",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke install_completions_writes_user_files_without_starting_daemon"
+        "cargo test --test cli_smoke install_completions_writes_user_files_without_starting_daemon",
+        "cargo test --test cli_smoke install_completions_sanitizes_error_paths",
+        "cargo test --test cli_smoke install_completions_requires_supported_shell_when_undetected"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "best-effort",

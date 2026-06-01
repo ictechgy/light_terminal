@@ -1850,9 +1850,9 @@ fn write_lterm_agent_presence_banner(
     let session = sanitize::terminal_text(session);
     let pane = sanitize::terminal_text(pane);
     let agent = sanitize::terminal_text(agent);
-    writeln!(
+    write!(
         stdout,
-        "\r[lterm] {session} {pane} · {agent} (status row hidden for agent TUI; use --status to show it)"
+        "\r[lterm] {session} {pane} · {agent} (status row hidden for agent TUI; use --status to show it)\r\n"
     )
     .context("emit lterm agent presence banner")
 }
@@ -5243,6 +5243,10 @@ mod tests {
         assert!(
             banner.contains("status row hidden for agent TUI; use --status to show it"),
             "banner should explain why no bottom row is visible: {banner:?}"
+        );
+        assert!(
+            banner.ends_with("\r\n"),
+            "banner should return the cursor to the left margin before raw attach: {banner:?}"
         );
         assert!(
             !banner.contains('\x1b') && !banner.contains('\x07'),
