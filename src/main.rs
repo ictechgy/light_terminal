@@ -1068,9 +1068,20 @@ fn default_completion_dir(shell: CompletionShell) -> Result<PathBuf> {
         CompletionShell::Zsh => Ok(home_dir()
             .context("HOME is not set; pass --dir to choose a zsh completion directory")?
             .join(".zfunc")),
-        CompletionShell::Fish => Ok(home_dir()
-            .context("HOME is not set; pass --dir to choose a fish completion directory")?
-            .join(".config/fish/completions")),
+        CompletionShell::Fish => {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    home_dir()
+                        .map(|home| home.join(".config"))
+                        .unwrap_or_default()
+                });
+            if config_home.as_os_str().is_empty() {
+                bail!("HOME is not set; pass --dir to choose a fish completion directory");
+            }
+            Ok(config_home.join("fish/completions"))
+        }
     }
 }
 

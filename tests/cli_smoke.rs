@@ -1975,8 +1975,10 @@ fn completions_generate_shell_scripts_without_starting_daemon() -> TestResult {
 fn install_completions_writes_user_files_without_starting_daemon() -> TestResult {
     let env = TestEnv::new()?;
     let home = env.temp.path().join("home");
+    let xdg_config = env.temp.path().join("xdg-config");
     let xdg_data = env.temp.path().join("xdg-data");
     std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&xdg_config)?;
     std::fs::create_dir_all(&xdg_data)?;
 
     let zsh = env
@@ -2014,10 +2016,11 @@ fn install_completions_writes_user_files_without_starting_daemon() -> TestResult
     let fish = env
         .cmd()
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
         .args(["install-completions", "--shell", "fish"])
         .output()?;
     assert!(fish.status.success(), "{fish:?}");
-    let fish_file = home.join(".config/fish/completions/lterm.fish");
+    let fish_file = xdg_config.join("fish/completions/lterm.fish");
     assert!(fish_file.is_file(), "missing fish completion file");
     let fish_script = std::fs::read_to_string(&fish_file)?;
     assert!(fish_script.contains("complete -c lterm"), "{fish_script}");
