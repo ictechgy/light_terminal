@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -365,6 +365,15 @@ enum Commands {
         /// Shell completion format to generate.
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+    /// Install shell completions into the current user's completion directory.
+    InstallCompletions {
+        /// Shell completion format to install; detected from SHELL when omitted.
+        #[arg(long, value_enum)]
+        shell: Option<CompletionShell>,
+        /// Directory to write the completion file into.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
     },
     /// Print a no-touch setup preview for enabling lterm locally.
     Init {
@@ -874,6 +883,7 @@ fn run() -> Result<()> {
             tmux_compat::print_env_exports(shell.unwrap_or(ShellKind::Posix).into())
         }
         Commands::Completions { shell } => print_completions(shell),
+        Commands::InstallCompletions { shell, dir } => install_completions(shell, dir),
         Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
@@ -978,11 +988,141 @@ impl From<CompletionShell> for CompletionOutputShell {
 }
 
 fn print_completions(shell: CompletionShell) -> Result<()> {
+    let bytes = completion_bytes(shell);
+    std::io::stdout()
+        .write_all(&bytes)
+        .context("write lterm completion script")?;
+    Ok(())
+}
+
+fn completion_bytes(shell: CompletionShell) -> Vec<u8> {
     let mut command = Cli::command();
     let binary_name = command.get_name().to_string();
     let generator: CompletionOutputShell = shell.into();
-    generate(generator, &mut command, binary_name, &mut std::io::stdout());
+    let mut bytes = Vec::new();
+    generate(generator, &mut command, binary_name, &mut bytes);
+    bytes
+}
+
+fn terminal_path(path: &Path) -> String {
+    sanitize::terminal_text(&path.display().to_string())
+}
+
+fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> Result<()> {
+    let shell = match shell {
+        Some(shell) => shell,
+        None => detect_completion_shell()?,
+    };
+    let dir = match dir {
+        Some(dir) => dir,
+        None => default_completion_dir(shell)?,
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create completion directory {}", terminal_path(&dir)))?;
+    let path = dir.join(completion_file_name(shell));
+    std::fs::write(&path, completion_bytes(shell))
+        .with_context(|| format!("write completion file {}", terminal_path(&path)))?;
+
+    println!("lterm completions installed");
+    println!("shell\t{}", completion_shell_name(shell));
+    println!("path\t{}", terminal_path(&path));
+    let next = completion_activation_hint(shell, &dir);
+    println!("next\t{}", sanitize::terminal_text(&next));
+    println!("note\tOpen a new shell, or follow the activation hint above.");
     Ok(())
+}
+
+fn detect_completion_shell() -> Result<CompletionShell> {
+    completion_shell_from_shell_kind(detect_init_shell()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not detect a supported completion shell from SHELL; pass --shell bash|zsh|fish"
+        )
+    })
+}
+
+fn completion_shell_from_shell_kind(shell: ShellKind) -> Option<CompletionShell> {
+    match shell {
+        ShellKind::Bash => Some(CompletionShell::Bash),
+        ShellKind::Zsh => Some(CompletionShell::Zsh),
+        ShellKind::Fish => Some(CompletionShell::Fish),
+        ShellKind::Posix => None,
+    }
+}
+
+fn default_completion_dir(shell: CompletionShell) -> Result<PathBuf> {
+    match shell {
+        CompletionShell::Bash => {
+            let data_home = std::env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    home_dir()
+                        .map(|home| home.join(".local/share"))
+                        .unwrap_or_default()
+                });
+            if data_home.as_os_str().is_empty() {
+                bail!("HOME is not set; pass --dir to choose a bash completion directory");
+            }
+            Ok(data_home.join("bash-completion/completions"))
+        }
+        CompletionShell::Zsh => Ok(home_dir()
+            .context("HOME is not set; pass --dir to choose a zsh completion directory")?
+            .join(".zfunc")),
+        CompletionShell::Fish => {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    home_dir()
+                        .map(|home| home.join(".config"))
+                        .unwrap_or_default()
+                });
+            if config_home.as_os_str().is_empty() {
+                bail!("HOME is not set; pass --dir to choose a fish completion directory");
+            }
+            Ok(config_home.join("fish/completions"))
+        }
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+fn completion_file_name(shell: CompletionShell) -> &'static str {
+    match shell {
+        CompletionShell::Bash => "lterm",
+        CompletionShell::Zsh => "_lterm",
+        CompletionShell::Fish => "lterm.fish",
+    }
+}
+
+fn completion_shell_name(shell: CompletionShell) -> &'static str {
+    match shell {
+        CompletionShell::Bash => "bash",
+        CompletionShell::Zsh => "zsh",
+        CompletionShell::Fish => "fish",
+    }
+}
+
+fn completion_activation_hint(shell: CompletionShell, dir: &Path) -> String {
+    match shell {
+        CompletionShell::Bash => {
+            "Ensure bash-completion is loaded; user completions are usually auto-discovered from this directory."
+                .to_string()
+        }
+        CompletionShell::Zsh => {
+            let dir = tmux_compat::quote(&dir.display().to_string());
+            format!(
+                "Add to ~/.zshrc if needed: fpath=({dir} $fpath); autoload -Uz compinit; compinit"
+            )
+        }
+        CompletionShell::Fish => {
+            "Fish auto-loads this file; run `exec fish` or open a new fish shell.".to_string()
+        }
+    }
 }
 
 fn detect_init_shell() -> ShellKind {
@@ -1014,6 +1154,15 @@ fn print_init_preview(shell: ShellKind) -> Result<()> {
     println!("step\t1\tlterm doctor --json");
     println!("step\t2\tlterm install-shim");
     println!("step\t3\t{enable_command}");
+    if let Some(completion_shell) = completion_shell_from_shell_kind(shell) {
+        println!(
+            "step\t4\tlterm install-completions --shell {}",
+            completion_shell_name(completion_shell)
+        );
+    }
+    println!(
+        "indicator\tLTERM_SESSION/LTERM_PANE are exported inside lterm sessions; add them to your shell prompt for a visible [lterm] badge if you want one."
+    );
     println!("note\tCopy the enable command into a trusted shell startup file only after review.");
     println!("note\tRun lterm doctor --json again after changing PATH to verify shim_dir_in_path.");
     Ok(())

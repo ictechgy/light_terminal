@@ -30,7 +30,8 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke keeps_session_and_captures_output",
-        "cargo test --test cli_smoke new_attaches_by_default"
+        "cargo test --test cli_smoke new_attaches_by_default",
+        "cargo test --test cli_smoke session_identity_env_is_exported_to_child_process"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -53,7 +54,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Top-level text stability is conservative for the mixed attach/detach command; the detached-summary-row surface is stable, while the attached raw-pty-stream has no stable sanitized text contract."
+      "stability_scope": "Top-level text stability is conservative for the mixed attach/detach command; the detached-summary-row surface is stable, while the attached raw-pty-stream has no stable sanitized text contract. Every spawned child process receives LTERM_SESSION and LTERM_PANE identity variables for in-session prompt badges and environment-aware tooling."
     },
     {
       "command": "lterm run",
@@ -63,7 +64,8 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke run_defaults_to_lterm_tmux_shim",
-        "cargo test --test cli_smoke run_no_tmux_does_not_inject_lterm_tmux_shim"
+        "cargo test --test cli_smoke run_no_tmux_does_not_inject_lterm_tmux_shim",
+        "cargo test --test cli_smoke run_exports_session_identity_env_to_child_process"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -78,7 +80,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Run is an attached command surface: the raw-pty-stream sub-surface is transparent and intentionally has no stable sanitized text or JSON contract."
+      "stability_scope": "Run is an attached command surface: the raw-pty-stream sub-surface is transparent and intentionally has no stable sanitized text or JSON contract. Every spawned child process receives LTERM_SESSION and LTERM_PANE identity variables for in-session prompt badges and environment-aware tooling."
     },
     {
       "command": "lterm resume",
@@ -97,7 +99,9 @@
         "cargo test --bin lterm attach_commands_parse_mobile_policy_flags",
         "cargo test --bin lterm mobile_auto_requires_both_mobile_client_and_likely_agent",
         "cargo test --test cli_smoke mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions",
-        "cargo test --test cli_smoke mobile_auto_transcript_does_not_perturb_raw_attach_geometry"
+        "cargo test --test cli_smoke mobile_auto_transcript_does_not_perturb_raw_attach_geometry",
+        "cargo test --bin lterm agent_presence_cue_is_sanitized_and_explains_hidden_row",
+        "cargo test --bin lterm agent_presence_cue_env_flags_split_title_and_banner_controls"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
@@ -126,9 +130,17 @@
           "text_output_stability": "best-effort",
           "json_output_stability": "none",
           "schema_path": null
+        },
+        {
+          "name": "agent-presence-cue",
+          "classification": "best-effort",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
         }
       ],
-      "stability_scope": "Resume/attach is a mixed surface: raw-pty-stream is transparent; local-status-bar is a client-side decoration; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy."
+      "stability_scope": "Resume/attach is a mixed surface: raw-pty-stream is transparent; local-status-bar is a client-side decoration; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
     },
     {
       "command": "lterm open",
@@ -143,7 +155,9 @@
         "cargo test --bin lterm attach_commands_parse_mobile_policy_flags",
         "cargo test --bin lterm mobile_auto_requires_both_mobile_client_and_likely_agent",
         "cargo test --test cli_smoke mobile_auto_attach_uses_normal_screen_transcript_for_agent_sessions",
-        "cargo test --test cli_smoke mobile_auto_transcript_does_not_perturb_raw_attach_geometry"
+        "cargo test --test cli_smoke mobile_auto_transcript_does_not_perturb_raw_attach_geometry",
+        "cargo test --bin lterm agent_presence_cue_is_sanitized_and_explains_hidden_row",
+        "cargo test --bin lterm agent_presence_cue_env_flags_split_title_and_banner_controls"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
@@ -172,9 +186,17 @@
           "text_output_stability": "best-effort",
           "json_output_stability": "none",
           "schema_path": null
+        },
+        {
+          "name": "agent-presence-cue",
+          "classification": "best-effort",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
         }
       ],
-      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy."
+      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
     },
     {
       "command": "lterm sessions",
@@ -551,6 +573,22 @@
       "stability_scope": "Generates bash, zsh, and fish shell completion scripts from the current clap command surface. The command must not start the daemon; exact completion script bytes are delegated to clap-complete and are not a stable visual contract."
     },
     {
+      "command": "lterm install-completions",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke install_completions_writes_user_files_without_starting_daemon",
+        "cargo test --test cli_smoke install_completions_sanitizes_error_paths",
+        "cargo test --test cli_smoke install_completions_requires_supported_shell_when_undetected"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Writes a user-local bash, zsh, or fish completion file and prints a sanitized activation hint. The command must not start the daemon; completion script bytes are delegated to clap-complete and user shell discovery is best-effort."
+    },
+    {
       "command": "lterm notify",
       "aliases": [],
       "text_output_stability": "best-effort",
@@ -642,7 +680,9 @@
         "cargo test --test cli_smoke generic_agent_profile_forwards_args_and_tmux_environment",
         "cargo test --test cli_smoke named_agent_alias_uses_profile_environment",
         "cargo test --bin lterm agent_launch_options_parse_attach_policy_controls",
-        "cargo test --test cli_smoke agent_launcher_persists_agent_name_metadata"
+        "cargo test --test cli_smoke agent_launcher_persists_agent_name_metadata",
+        "cargo test --bin lterm agent_presence_cue_is_sanitized_and_explains_hidden_row",
+        "cargo test --bin lterm agent_presence_cue_env_flags_split_title_and_banner_controls"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "best-effort",
@@ -671,9 +711,17 @@
           "text_output_stability": "best-effort",
           "json_output_stability": "none",
           "schema_path": null
+        },
+        {
+          "name": "agent-presence-cue",
+          "classification": "best-effort",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
         }
       ],
-      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy."
+      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach when the launcher uses the default row-off full-height TUI surface; LTERM_AGENT_CUE disables both cue forms and LTERM_AGENT_BANNER disables only the inline banner. Agent-spawned child processes also receive LTERM_SESSION and LTERM_PANE identity variables; this is covered by the generic agent profile environment test."
     },
     {
       "command": "lterm tmux-compat list-commands",

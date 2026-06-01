@@ -849,6 +849,35 @@ fn keeps_session_and_captures_output() -> TestResult {
 }
 
 #[test]
+fn session_identity_env_is_exported_to_child_process() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "identity-env",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'SESSION:%s\\nPANE:%s\\n' \"$LTERM_SESSION\" \"$LTERM_PANE\"; sleep 2",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pane = stdout
+        .lines()
+        .find_map(|line| line.split('\t').nth(1))
+        .ok_or_else(|| format!("detached output missing pane field: {stdout:?}"))?;
+
+    let captured = env.capture_until("identity-env", &format!("PANE:{pane}"))?;
+    assert!(captured.contains("SESSION:identity-env"), "{captured:?}");
+    assert!(captured.contains(&format!("PANE:{pane}")), "{captured:?}");
+    Ok(())
+}
+
+#[test]
 fn capture_alias_captures_output() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
@@ -1849,6 +1878,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "install-shim",
         "env",
         "completions",
+        "install-completions",
         "diagnose",
         "trace",
         "trace-replay",
@@ -1937,6 +1967,124 @@ fn completions_generate_shell_scripts_without_starting_daemon() -> TestResult {
         report.get("daemon_reachable").and_then(|v| v.as_bool()),
         Some(false),
         "completion generation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_completions_writes_user_files_without_starting_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let xdg_config = env.temp.path().join("xdg-config");
+    let xdg_data = env.temp.path().join("xdg-data");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&xdg_config)?;
+    std::fs::create_dir_all(&xdg_data)?;
+
+    let zsh = env
+        .cmd()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("SHELL", "/bin/zsh")
+        .arg("install-completions")
+        .output()?;
+    assert!(zsh.status.success(), "{zsh:?}");
+    assert!(zsh.stderr.is_empty(), "{zsh:?}");
+    let zsh_stdout = String::from_utf8_lossy(&zsh.stdout);
+    let zsh_file = home.join(".zfunc/_lterm");
+    assert!(zsh_file.is_file(), "missing zsh completion file");
+    let zsh_script = std::fs::read_to_string(&zsh_file)?;
+    assert!(zsh_script.contains("#compdef lterm"), "{zsh_script}");
+    assert!(zsh_stdout.contains("shell\tzsh"), "{zsh_stdout}");
+    assert!(
+        zsh_stdout.contains("fpath=(") && zsh_stdout.contains("compinit"),
+        "zsh install output should include activation hint:\n{zsh_stdout}"
+    );
+
+    let bash = env
+        .cmd()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .args(["install-completions", "--shell", "bash"])
+        .output()?;
+    assert!(bash.status.success(), "{bash:?}");
+    let bash_file = xdg_data.join("bash-completion/completions/lterm");
+    assert!(bash_file.is_file(), "missing bash completion file");
+    let bash_script = std::fs::read_to_string(&bash_file)?;
+    assert!(bash_script.contains("complete -F _lterm"), "{bash_script}");
+
+    let fish = env
+        .cmd()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .args(["install-completions", "--shell", "fish"])
+        .output()?;
+    assert!(fish.status.success(), "{fish:?}");
+    let fish_file = xdg_config.join("fish/completions/lterm.fish");
+    assert!(fish_file.is_file(), "missing fish completion file");
+    let fish_script = std::fs::read_to_string(&fish_file)?;
+    assert!(fish_script.contains("complete -c lterm"), "{fish_script}");
+
+    let doctor = env.cmd().args(["doctor", "--json"]).output()?;
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+    assert_eq!(
+        report.get("daemon_reachable").and_then(|v| v.as_bool()),
+        Some(false),
+        "completion installation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_completions_sanitizes_error_paths() -> TestResult {
+    let env = TestEnv::new()?;
+    let bad_dir = env.temp.path().join("bad\u{001b}]0;owned\u{0007}");
+    std::fs::write(&bad_dir, "not a directory")?;
+
+    let output = env
+        .cmd()
+        .args(["install-completions", "--shell", "zsh", "--dir"])
+        .arg(&bad_dir)
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('\u{001b}') && !stderr.contains('\u{0007}'),
+        "install-completions errors must be terminal-safe: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("create completion directory"),
+        "stderr should preserve useful error context: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("bad]0;owned"),
+        "stderr should retain readable sanitized path text: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_completions_requires_supported_shell_when_undetected() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    std::fs::create_dir_all(&home)?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .env("SHELL", "/bin/sh")
+        .arg("install-completions")
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not detect a supported completion shell"),
+        "stderr should explain unsupported shell detection: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\u{001b}') && !stderr.contains('\u{0007}'),
+        "unsupported shell detection errors must be terminal-safe: {stderr:?}"
     );
     Ok(())
 }
@@ -2628,6 +2776,8 @@ fn init_prints_setup_preview_without_modifying_files() -> TestResult {
         "step\t1\tlterm doctor --json",
         "step\t2\tlterm install-shim",
         "step\t3\teval \"$(lterm env)\"",
+        "step\t4\tlterm install-completions --shell zsh",
+        "indicator\tLTERM_SESSION/LTERM_PANE",
         "Copy the enable command",
     ] {
         assert!(
@@ -2654,6 +2804,7 @@ fn init_prints_fish_source_preview() -> TestResult {
         "shell\tfish",
         "step\t2\tlterm install-shim",
         "step\t3\tlterm env --shell fish | source",
+        "step\t4\tlterm install-completions --shell fish",
     ] {
         assert!(
             stdout.contains(expected),
@@ -8056,6 +8207,37 @@ fn run_defaults_to_lterm_tmux_shim() -> TestResult {
         stdout.contains(&shim_tmux),
         "run should inject the lterm tmux shim by default: {stdout:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn run_exports_session_identity_env_to_child_process() -> TestResult {
+    let env = TestEnv::new()?;
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--no-tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'SESSION:%s\\nPANE:%s\\n' \"$LTERM_SESSION\" \"$LTERM_PANE\"",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let session = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SESSION:"))
+        .ok_or_else(|| format!("run output missing session identity: {stdout:?}"))?;
+    let pane = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("PANE:"))
+        .ok_or_else(|| format!("run output missing pane identity: {stdout:?}"))?;
+    assert!(!session.trim().is_empty(), "{stdout:?}");
+    assert!(pane.starts_with('%'), "{stdout:?}");
     Ok(())
 }
 

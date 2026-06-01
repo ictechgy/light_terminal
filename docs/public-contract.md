@@ -76,17 +76,26 @@ user intent and take precedence over `LTERM_ATTACH_MODE`.
 
 Raw attach row presence is separate from attach transport. Ordinary raw sessions
 default to a client-side bottom status row; built-in agent launchers default to
-row-off full-height raw attach and may emit a terminal-title cue as the non-row
-presence indicator. The row can be disabled globally with `LTERM_NO_STATUS=1` or
-`LTERM_STATUS=0`; those env gates also beat explicit agent `--status` requests
-for safety. `--status` is scoped to agent launchers in the current CLI and
-requests a raw status row only when the final transport is raw. Mobile transcript
-ignores row-presence policy because it is not a raw-row renderer. For row-on
-shell sessions, lterm may best-effort suspend the row when a stable known-agent
-descendant is detected through the local process tree, then restore it when the
-agent exits. Ambiguous or unavailable process detection must fail safe by keeping
-the row. This host-side row management does not sanitize, filter, or rewrite
-attached PTY bytes.
+row-off full-height raw attach and may emit a terminal-title cue plus a one-shot
+`[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use
+--status to show it)` banner as the non-row presence indicator before raw attach.
+`LTERM_AGENT_CUE=0` disables both cue forms; `LTERM_AGENT_BANNER=0` disables only
+the inline banner while keeping the terminal-title cue. User-controlled fields in
+these host-side cue surfaces are sanitized before printing, but the subsequent
+attached PTY stream remains raw-transparent. The row can be disabled globally
+with `LTERM_NO_STATUS=1` or `LTERM_STATUS=0`; those env gates also beat explicit
+agent `--status` requests for safety. `--status` is scoped to agent launchers in
+the current CLI and requests a raw status row only when the final transport is
+raw. Mobile transcript ignores row-presence policy because it is not a raw-row
+renderer. For row-on shell sessions, lterm may best-effort suspend the row when a
+stable known-agent descendant is detected through the local process tree, then
+restore it when the agent exits. Ambiguous or unavailable process detection must
+fail safe by keeping the row. This host-side row management does not sanitize,
+filter, or rewrite attached PTY bytes.
+
+Every spawned session child receives `LTERM_SESSION` and `LTERM_PANE` as stable
+in-session identity variables for prompt badges and lightweight environment-aware
+tooling.
 
 Compose target resolution uses the same session-or-pane target model as
 `lterm logs`. The display sub-surface captures the last `--tail` sanitized
@@ -113,8 +122,8 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm start` | `lterm new` | `stable` | `best-effort` at command level; `stable` for the `--detach` summary row; attached stream is raw | none | `raw-transparent` when attached |
 | `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
-| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
-| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
@@ -140,11 +149,12 @@ or raw output stream.
 | --- | --- | --- | --- | --- | --- |
 | `lterm install-shim` | none | `stable` | `stable` shim path text | none | `sanitized-output-only` |
 | `lterm env` | none | `stable` | `stable` shell exports; `--shell fish` emits fish syntax for `source`; quote style is not a stable visual API | none | `sanitized-output-only` |
+| `lterm install-completions` | none | `best-effort` | `best-effort` user-local completion file install summary and activation hint; does not start the daemon | none | `sanitized-output-only` |
 | `lterm completions` | none | `best-effort` | `best-effort` shell completion scripts for `bash`, `zsh`, and `fish`; generated output follows clap-complete behavior and does not start the daemon | none | `sanitized-output-only` |
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |
 | `lterm agents` | none | `stable` | `stable` agent profile availability report | `stable` | `sanitized-output-only` |
-| `lterm agent` | `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls; raw attached agent PTY stream and external agent CLI behavior are outside the lterm sanitized-output contract; mobile transcript is sanitized capture UI | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm agent` | `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` | `best-effort` | `best-effort` launcher controls and pre-attach presence cue; raw attached agent PTY stream and external agent CLI behavior are outside the lterm sanitized-output contract; mobile transcript is sanitized capture UI | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm tmux-compat list-commands` | none | `compatibility-stable` | `stable` tmux shim command list | `stable` | `sanitized-output-only` |
 
 `lterm sessions --json` and the embedded `session` object in `lterm wait/watch
