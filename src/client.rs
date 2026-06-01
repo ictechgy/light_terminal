@@ -1581,14 +1581,62 @@ fn known_agent_name_from_command(command: &str) -> bool {
             .map(ToString::to_string)
             .collect()
     });
-    let Some(first) = parts.first() else {
+    let Some(executable_index) = effective_command_executable_index(&parts) else {
         return false;
     };
-    known_agent_command_executable_token(first)
-        || parts
+    let executable = &parts[executable_index];
+    if known_agent_command_executable_token(executable) {
+        return true;
+    }
+    known_agent_wrapper_executable_token(executable)
+        && parts
             .iter()
-            .skip(1)
+            .skip(executable_index + 1)
             .any(|part| known_agent_command_script_token(part))
+}
+
+fn effective_command_executable_index(parts: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < parts.len() {
+        while parts
+            .get(index)
+            .is_some_and(|token| env_assignment_token(token))
+        {
+            index += 1;
+        }
+
+        let token = parts.get(index)?;
+        if command_token_stem(token) != "env" {
+            return Some(index);
+        }
+
+        index += 1;
+        while let Some(token) = parts.get(index) {
+            if token == "--" {
+                index += 1;
+                break;
+            }
+            if env_assignment_token(token) {
+                index += 1;
+                continue;
+            }
+            if token.starts_with('-') {
+                let option_takes_value =
+                    matches!(token.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-S");
+                index += 1;
+                if option_takes_value {
+                    index += 1;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn env_assignment_token(token: &str) -> bool {
+    !token.starts_with('-') && token.contains('=')
 }
 
 fn known_agent_command_executable_token(token: &str) -> bool {
@@ -1596,6 +1644,13 @@ fn known_agent_command_executable_token(token: &str) -> bool {
         return false;
     }
     known_agent_name(command_token_stem(token))
+}
+
+fn known_agent_wrapper_executable_token(token: &str) -> bool {
+    matches!(
+        command_token_stem(token),
+        "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "deno"
+    )
 }
 
 fn known_agent_command_script_token(token: &str) -> bool {
@@ -2638,7 +2693,24 @@ impl NestedAgentDetector {
             return None;
         }
         self.last_poll = Instant::now();
-        let present = nested_known_agent_present(&self.target).ok()?;
+        self.apply_presence_poll(nested_known_agent_present(&self.target))
+    }
+
+    fn apply_presence_poll(&mut self, present: Result<bool>) -> Option<NestedAgentTransition> {
+        let present = match present {
+            Ok(present) => present,
+            Err(_) => {
+                self.positive_polls = 0;
+                if self.suppressed {
+                    self.negative_polls = self.negative_polls.saturating_add(1);
+                    if self.negative_polls >= NESTED_AGENT_STABLE_POLLS {
+                        self.suppressed = false;
+                        return Some(NestedAgentTransition::Resume);
+                    }
+                }
+                return None;
+            }
+        };
         if present {
             self.positive_polls = self.positive_polls.saturating_add(1);
             self.negative_polls = 0;
@@ -4483,11 +4555,12 @@ mod tests {
     use super::{
         ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
-        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, ProcessInfo,
-        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, TerminalOutputTracker, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, NestedAgentDetector,
+        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
+        STATUS_HEARTBEAT_FORCED, StatusBar, StatusPresencePolicy, StatusPresenceRuntimeHandle,
+        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
+        alt_screen_param_matches, anyhow_error_is_broken_pipe, attach_pty_rows,
+        compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
         compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
         compose_render_action, compose_sanitized_display_line, compose_should_commit,
         compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
@@ -5059,12 +5132,41 @@ mod tests {
             ]),
             "non-agent full-screen tools are not part of this best-effort classifier"
         );
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("/usr/bin/vim codex", 1),
+            ]),
+            "ordinary command arguments must not look like agent launchers"
+        );
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("tail -f /tmp/@openai/codex.log", 1),
+            ]),
+            "scoped package names in ordinary filenames must not suspend the row"
+        );
+        assert!(
+            !nested_known_agent_present_in_processes(&[
+                sample_process("/bin/zsh -l", 0),
+                sample_process("less claude", 1),
+            ]),
+            "known agent words are only meaningful as executables or wrapper payloads"
+        );
         assert!(nested_known_agent_present_in_processes(&[
             sample_process("/bin/zsh -l", 0),
             sample_process(
                 "node /Users/me/.nvm/versions/node/v22/lib/node_modules/oh-my-codex/dist/cli/omx.js",
                 1
             ),
+        ]));
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process("/usr/bin/env node /opt/homebrew/bin/codex.js", 1),
+        ]));
+        assert!(nested_known_agent_present_in_processes(&[
+            sample_process("/bin/zsh -l", 0),
+            sample_process("npx -y @openai/codex", 1),
         ]));
         assert!(nested_known_agent_present_in_processes(&[
             sample_process("/bin/zsh -l", 0),
@@ -5079,6 +5181,42 @@ mod tests {
                 sample_process("node /tmp/not-an-agent.js", 1),
             ]),
             "generic node wrappers should not suspend the row"
+        );
+    }
+
+    #[test]
+    fn nested_agent_detector_restores_after_detection_errors_when_suppressed() {
+        let mut detector = NestedAgentDetector::new("%0", true);
+        assert_eq!(detector.apply_presence_poll(Ok(true)), None);
+        assert_eq!(
+            detector.apply_presence_poll(Ok(true)),
+            Some(NestedAgentTransition::Suspend)
+        );
+        assert!(detector.suppressed);
+
+        assert_eq!(
+            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            None
+        );
+        assert_eq!(
+            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            Some(NestedAgentTransition::Resume)
+        );
+        assert!(!detector.suppressed);
+    }
+
+    #[test]
+    fn nested_agent_detector_errors_do_not_create_positive_debounce() {
+        let mut detector = NestedAgentDetector::new("%0", true);
+        assert_eq!(detector.apply_presence_poll(Ok(true)), None);
+        assert_eq!(
+            detector.apply_presence_poll(Err(anyhow::anyhow!("process tree unavailable"))),
+            None
+        );
+        assert_eq!(detector.apply_presence_poll(Ok(true)), None);
+        assert_eq!(
+            detector.apply_presence_poll(Ok(true)),
+            Some(NestedAgentTransition::Suspend)
         );
     }
 
