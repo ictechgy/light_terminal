@@ -201,3 +201,210 @@ fn require_absolute_env_path(name: &str, path: &Path) -> Result<()> {
 pub(crate) fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        APP_DIR_NAME, data_dir, ensure_private_dir, runtime_dir, socket_path,
+        validate_socket_parent,
+    };
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::Path;
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: paths tests hold crate::TEST_ENV_LOCK while mutating process env.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    fn reset_path_env() -> EnvGuard {
+        let guard = EnvGuard::capture(&[
+            "LTERM_RUNTIME_DIR",
+            "LTERM_DATA_DIR",
+            "LTERM_SOCKET",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "HOME",
+        ]);
+        // SAFETY: caller holds crate::TEST_ENV_LOCK and EnvGuard restores values.
+        unsafe {
+            for name in [
+                "LTERM_RUNTIME_DIR",
+                "LTERM_DATA_DIR",
+                "LTERM_SOCKET",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+                "HOME",
+            ] {
+                std::env::remove_var(name);
+            }
+        }
+        guard
+    }
+
+    #[test]
+    fn runtime_dir_rejects_relative_lterm_runtime_dir() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_RUNTIME_DIR", "relative-runtime");
+        }
+
+        let err = runtime_dir().expect_err("relative runtime dir must fail");
+        assert!(
+            err.to_string()
+                .contains("LTERM_RUNTIME_DIR must be an absolute path"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn data_dir_rejects_relative_lterm_data_dir() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", "relative-data");
+        }
+
+        let err = data_dir().expect_err("relative data dir must fail");
+        assert!(
+            err.to_string()
+                .contains("LTERM_DATA_DIR must be an absolute path"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn runtime_dir_uses_xdg_runtime_dir_child_and_preserves_private_base() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let xdg = tempfile::tempdir().expect("temp xdg runtime dir");
+        fs::set_permissions(xdg.path(), fs::Permissions::from_mode(0o700))
+            .expect("private xdg dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", xdg.path());
+        }
+
+        let path = runtime_dir().expect("runtime dir under xdg");
+        assert_eq!(path, xdg.path().join(APP_DIR_NAME));
+        let mode = fs::symlink_metadata(&path)
+            .expect("created runtime child")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "runtime child must be private");
+    }
+
+    #[test]
+    fn socket_path_rejects_relative_lterm_socket() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_SOCKET", "relative.sock");
+        }
+
+        let err = socket_path().expect_err("relative socket override must fail");
+        assert!(
+            err.to_string()
+                .contains("LTERM_SOCKET must be an absolute path"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_socket_parent_rejects_empty_and_parentless_paths() {
+        let err = validate_socket_parent(Path::new("")).expect_err("empty socket path must fail");
+        assert!(
+            err.to_string().contains("LTERM_SOCKET cannot be empty"),
+            "unexpected empty-path error: {err:#}"
+        );
+
+        let err = validate_socket_parent(Path::new("lterm.sock"))
+            .expect_err("parentless socket path must fail");
+        assert!(
+            err.to_string()
+                .contains("LTERM_SOCKET must include a parent directory"),
+            "unexpected parentless-path error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_symlink_leaf() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let dir = tempfile::tempdir().expect("temp socket dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("private socket dir");
+        let target = dir.path().join("target.sock");
+        fs::write(&target, b"not a socket").expect("target file");
+        let link = dir.path().join("lterm.sock");
+        symlink(&target, &link).expect("socket leaf symlink");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_SOCKET", &link);
+        }
+
+        let err = socket_path().expect_err("symlink socket leaf must fail");
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_private_dir_tightens_world_accessible_existing_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
+            .expect("world-readable dir");
+
+        ensure_private_dir(dir.path()).expect("tighten existing private dir");
+        let mode = fs::symlink_metadata(dir.path())
+            .expect("tightened dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "group/world bits must be cleared");
+    }
+
+    #[test]
+    fn user_private_socket_parent_refuses_world_accessible_override_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
+            .expect("world-readable dir");
+
+        let err = validate_socket_parent(&dir.path().join("lterm.sock"))
+            .expect_err("user override parent must already be private");
+        assert!(
+            err.to_string().contains("must be private"),
+            "unexpected error: {err:#}"
+        );
+    }
+}

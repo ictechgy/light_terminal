@@ -452,7 +452,27 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SEND_DATA_BYTES, Request, SessionInfo};
+    use super::{MAX_SEND_DATA_BYTES, Request, SessionInfo, StatusTheme};
+
+    #[test]
+    fn status_theme_parse_aliases_and_round_trips_canonical_names() {
+        for (input, theme, canonical) in [
+            (" blue ", StatusTheme::Blue, "blue"),
+            ("GREEN", StatusTheme::Green, "green"),
+            ("purple", StatusTheme::Magenta, "magenta"),
+            ("yellow", StatusTheme::Amber, "amber"),
+            ("grey", StatusTheme::Gray, "gray"),
+            ("minimal", StatusTheme::Plain, "plain"),
+            ("red", StatusTheme::Red, "red"),
+            ("cyan", StatusTheme::Cyan, "cyan"),
+        ] {
+            assert_eq!(StatusTheme::parse(input), Some(theme), "{input:?}");
+            assert_eq!(theme.as_str(), canonical, "{input:?}");
+        }
+        assert_eq!(StatusTheme::parse("unknown"), None);
+        assert!(StatusTheme::allowed_values().contains("purple"));
+        assert!(StatusTheme::allowed_values().contains("minimal"));
+    }
 
     #[test]
     fn session_info_accepts_pre_process_metadata_json() {
