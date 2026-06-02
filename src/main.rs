@@ -2970,6 +2970,34 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    struct EnvGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                values: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn expand_attach_short_flag_rewrites_only_first_exact_dash_a() {
         assert_eq!(
@@ -2992,6 +3020,79 @@ mod tests {
             expand_attach_short_flag(os_args(&["lterm"])),
             os_args(&["lterm"])
         );
+    }
+
+    #[test]
+    fn completion_helpers_resolve_shell_dirs_names_and_hints() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = EnvGuard::capture(&["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "SHELL"]);
+
+        unsafe {
+            std::env::set_var("HOME", "/tmp/lterm-home");
+            std::env::set_var("XDG_DATA_HOME", "/tmp/lterm-data");
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/lterm-config");
+            std::env::set_var("SHELL", "/usr/local/bin/fish");
+        }
+        assert!(matches!(
+            detect_completion_shell().expect("fish shell"),
+            CompletionShell::Fish
+        ));
+        assert!(completion_shell_from_shell_kind(ShellKind::Posix).is_none());
+        assert_eq!(completion_file_name(CompletionShell::Bash), "lterm");
+        assert_eq!(completion_file_name(CompletionShell::Zsh), "_lterm");
+        assert_eq!(completion_file_name(CompletionShell::Fish), "lterm.fish");
+        assert_eq!(completion_shell_name(CompletionShell::Bash), "bash");
+        assert_eq!(completion_shell_name(CompletionShell::Zsh), "zsh");
+        assert_eq!(completion_shell_name(CompletionShell::Fish), "fish");
+        assert!(
+            completion_activation_hint(CompletionShell::Bash, Path::new("/unused"))
+                .contains("auto-discovered")
+        );
+        assert!(
+            completion_activation_hint(CompletionShell::Zsh, Path::new("/tmp/zfunc dir"))
+                .contains("fpath=")
+        );
+        assert!(
+            completion_activation_hint(CompletionShell::Fish, Path::new("/unused"))
+                .contains("auto-loads")
+        );
+
+        assert_eq!(
+            default_completion_dir(CompletionShell::Bash).expect("bash dir"),
+            PathBuf::from("/tmp/lterm-data/bash-completion/completions")
+        );
+        assert_eq!(
+            default_completion_dir(CompletionShell::Fish).expect("fish dir"),
+            PathBuf::from("/tmp/lterm-config/fish/completions")
+        );
+        assert_eq!(
+            default_completion_dir(CompletionShell::Zsh).expect("zsh dir"),
+            PathBuf::from("/tmp/lterm-home/.zfunc")
+        );
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        assert_eq!(
+            default_completion_dir(CompletionShell::Bash).expect("bash home fallback"),
+            PathBuf::from("/tmp/lterm-home/.local/share/bash-completion/completions")
+        );
+        assert_eq!(
+            default_completion_dir(CompletionShell::Fish).expect("fish home fallback"),
+            PathBuf::from("/tmp/lterm-home/.config/fish/completions")
+        );
+
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("SHELL", "/bin/unknown-shell");
+        }
+        assert!(detect_completion_shell().is_err());
+        assert!(default_completion_dir(CompletionShell::Bash).is_err());
+        assert!(default_completion_dir(CompletionShell::Zsh).is_err());
+        assert!(default_completion_dir(CompletionShell::Fish).is_err());
     }
 
     #[test]
@@ -3025,6 +3126,73 @@ mod tests {
                 parse_wait_duration_arg(value).is_err(),
                 "{value:?} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn trace_max_bytes_parser_accepts_positive_integer() {
+        assert_eq!(parse_trace_max_bytes_arg("1").expect("one byte"), 1);
+        assert_eq!(
+            parse_trace_max_bytes_arg(" 1048576 ").expect("trimmed positive integer"),
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn trace_max_bytes_parser_rejects_empty_zero_negative_and_non_numeric() {
+        for value in ["", "0", "-1", "1.5", "ten"] {
+            assert!(
+                parse_trace_max_bytes_arg(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_tail_parser_rejects_empty_zero_negative_and_non_numeric() {
+        assert_eq!(parse_wait_tail_arg(" 42 ").expect("valid tail"), 42);
+        for value in ["", "0", "-1", "1.5", "ten"] {
+            assert!(
+                parse_wait_tail_arg(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_tail_parser_rejects_value_above_i32_max() {
+        assert_eq!(
+            parse_compose_tail_arg("120").expect("valid compose tail"),
+            120
+        );
+        let too_large = ((i32::MAX as u64) + 1).to_string();
+        let err = parse_compose_tail_arg(&too_large).expect_err("compose tail cap");
+        assert!(
+            err.contains("exceeds supported scrollback range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_host_validation_rejects_empty_dash_and_control_chars() {
+        for host in ["", "-proxy", "example.com\nnext", "bad\u{7f}host"] {
+            assert!(
+                validate_ssh_host(host).is_err(),
+                "{host:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_host_validation_accepts_common_hosts() {
+        for host in [
+            "example.com",
+            "user@example.com",
+            "192.0.2.10",
+            "[2001:db8::1]",
+            "host-name.local",
+        ] {
+            validate_ssh_host(host).unwrap_or_else(|err| panic!("{host:?}: {err:#}"));
         }
     }
 

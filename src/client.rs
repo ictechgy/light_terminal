@@ -1172,45 +1172,77 @@ fn validate_trace_start_event(
 }
 
 fn print_trace_summary_text(summary: &TraceFileSummary) {
-    print_trace_summary_string("path", Some(&summary.path));
-    print_trace_summary_string("format", summary.format.as_deref());
-    print_trace_summary_string("schema_version", summary.schema_version.as_deref());
-    print_trace_summary_string("trace_id", summary.trace_id.as_deref());
-    print_trace_summary_string("producer", summary.producer.as_deref());
-    print_trace_summary_string("client_version", summary.client_version.as_deref());
-    print_trace_summary_u64("client_protocol_version", summary.client_protocol_version);
-    print_trace_summary_string("target", summary.target.as_deref());
-    print_trace_summary_u64("created_at_unix_ms", summary.created_at_unix_ms);
-    print_trace_summary_u64("duration_ms", summary.duration_ms);
-    print_trace_summary_u64("max_bytes", summary.max_bytes);
-    print_trace_summary_u64("rows", summary.rows);
-    print_trace_summary_u64("cols", summary.cols);
-    print_trace_summary_string("raw_stream_policy", summary.raw_stream_policy.as_deref());
-    println!("event_count\t{}", summary.event_count);
-    println!("output_chunks\t{}", summary.output_chunks);
-    println!("output_bytes\t{}", summary.output_bytes);
-    print_trace_summary_u64("first_output_elapsed_ms", summary.first_output_elapsed_ms);
-    print_trace_summary_u64("last_output_elapsed_ms", summary.last_output_elapsed_ms);
-    print_trace_summary_u64("end_elapsed_ms", summary.end_elapsed_ms);
-    print_trace_summary_string("end_reason", summary.end_reason.as_deref());
-    print_trace_summary_u64("end_bytes_recorded", summary.end_bytes_recorded);
-    print_trace_summary_u64("end_chunks_recorded", summary.end_chunks_recorded);
-    println!("unknown_events\t{}", summary.unknown_events);
+    print!("{}", trace_summary_text(summary));
 }
 
-fn print_trace_summary_string(key: &str, value: Option<&str>) {
-    println!(
-        "{}\t{}",
-        key,
-        sanitize::terminal_text(value.unwrap_or("unknown"))
+fn trace_summary_text(summary: &TraceFileSummary) -> String {
+    let mut out = String::new();
+    push_trace_summary_string(&mut out, "path", Some(&summary.path));
+    push_trace_summary_string(&mut out, "format", summary.format.as_deref());
+    push_trace_summary_string(
+        &mut out,
+        "schema_version",
+        summary.schema_version.as_deref(),
     );
+    push_trace_summary_string(&mut out, "trace_id", summary.trace_id.as_deref());
+    push_trace_summary_string(&mut out, "producer", summary.producer.as_deref());
+    push_trace_summary_string(
+        &mut out,
+        "client_version",
+        summary.client_version.as_deref(),
+    );
+    push_trace_summary_u64(
+        &mut out,
+        "client_protocol_version",
+        summary.client_protocol_version,
+    );
+    push_trace_summary_string(&mut out, "target", summary.target.as_deref());
+    push_trace_summary_u64(&mut out, "created_at_unix_ms", summary.created_at_unix_ms);
+    push_trace_summary_u64(&mut out, "duration_ms", summary.duration_ms);
+    push_trace_summary_u64(&mut out, "max_bytes", summary.max_bytes);
+    push_trace_summary_u64(&mut out, "rows", summary.rows);
+    push_trace_summary_u64(&mut out, "cols", summary.cols);
+    push_trace_summary_string(
+        &mut out,
+        "raw_stream_policy",
+        summary.raw_stream_policy.as_deref(),
+    );
+    push_trace_summary_u64(&mut out, "event_count", Some(summary.event_count));
+    push_trace_summary_u64(&mut out, "output_chunks", Some(summary.output_chunks));
+    push_trace_summary_u64(&mut out, "output_bytes", Some(summary.output_bytes));
+    push_trace_summary_u64(
+        &mut out,
+        "first_output_elapsed_ms",
+        summary.first_output_elapsed_ms,
+    );
+    push_trace_summary_u64(
+        &mut out,
+        "last_output_elapsed_ms",
+        summary.last_output_elapsed_ms,
+    );
+    push_trace_summary_u64(&mut out, "end_elapsed_ms", summary.end_elapsed_ms);
+    push_trace_summary_string(&mut out, "end_reason", summary.end_reason.as_deref());
+    push_trace_summary_u64(&mut out, "end_bytes_recorded", summary.end_bytes_recorded);
+    push_trace_summary_u64(&mut out, "end_chunks_recorded", summary.end_chunks_recorded);
+    push_trace_summary_u64(&mut out, "unknown_events", Some(summary.unknown_events));
+    out
 }
 
-fn print_trace_summary_u64(key: &str, value: Option<u64>) {
+fn push_trace_summary_string(out: &mut String, key: &str, value: Option<&str>) {
+    out.push_str(key);
+    out.push('\t');
+    out.push_str(&sanitize::terminal_text(value.unwrap_or("unknown")));
+    out.push('\n');
+}
+
+fn push_trace_summary_u64(out: &mut String, key: &str, value: Option<u64>) {
+    out.push_str(key);
+    out.push('\t');
     match value {
-        Some(value) => println!("{key}\t{value}"),
-        None => println!("{key}\tunknown"),
+        Some(value) => out.push_str(&value.to_string()),
+        None => out.push_str("unknown"),
     }
+    out.push('\n');
 }
 
 fn required_trace_str<'a>(
@@ -4666,27 +4698,31 @@ mod tests {
     use super::{
         ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
-        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, NestedAgentDetector,
-        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, StatusBar, StatusPresencePolicy, StatusPresenceRuntimeHandle,
-        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
-        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
-        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, format_status_line,
-        forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due,
-        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
-        mobile_client_detected, mobile_transcript_capture_changed,
+        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
+        MAX_TRACE_JSONL_LINE_BYTES, NestedAgentDetector, NestedAgentTransition, ProcessInfo,
+        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar,
+        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
+        StatusTheme, TerminalOutputTracker, agent_presence_banner_enabled,
+        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
+        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
+        compose_render_action, compose_sanitized_display_line, compose_should_commit,
+        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
+        current_unix_ms, cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
+        ensure_trace_force_target_private, format_status_line,
+        forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
+        hex_encode, hex_encoded_len, keyboard_protocol_restore_bytes, likely_agent_session,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
         nested_known_agent_present_in_processes, observe_keyboard_protocol_sequences,
         panic_terminal_cleanup_bytes, parse_status_style, raw_attach_command_hint,
-        read_attach_response_header, resolve_attach_mode, resolve_status_style,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
+        read_attach_response_header, read_trace_jsonl_line, resolve_attach_mode,
+        resolve_status_style, should_mobile_transcript_auto, status_sgr_stack_supported,
+        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
+        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
+        write_lterm_title_cue, write_mobile_transcript_update,
     };
-    use std::io::{BufReader, Cursor, ErrorKind, Read};
+    use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -5477,6 +5513,562 @@ mod tests {
         );
     }
 
+    fn trace_start_event() -> serde_json::Value {
+        serde_json::json!({
+            "type": "start",
+            "schema_version": "1.0",
+            "format": "lterm-trace-jsonl",
+            "duration_ms": 100_u64
+        })
+    }
+
+    fn trace_output_event(
+        chunk_index: serde_json::Value,
+        elapsed_ms: serde_json::Value,
+        bytes_hex: serde_json::Value,
+        len: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "output",
+            "direction": "stdout",
+            "chunk_index": chunk_index,
+            "elapsed_ms": elapsed_ms,
+            "bytes_hex": bytes_hex,
+            "len": len
+        })
+    }
+
+    fn trace_end_event(
+        chunks_recorded: serde_json::Value,
+        bytes_recorded: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "end",
+            "chunks_recorded": chunks_recorded,
+            "bytes_recorded": bytes_recorded
+        })
+    }
+
+    fn trace_file(events: &[serde_json::Value]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("trace tempfile");
+        for event in events {
+            writeln!(file, "{event}").expect("write trace event");
+        }
+        file.flush().expect("flush trace tempfile");
+        file
+    }
+
+    fn trace_replay_error_contains(events: &[serde_json::Value], timing: bool, needle: &str) {
+        let file = trace_file(events);
+        let err = validate_trace_replay(file.path(), timing).expect_err("trace should be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(needle),
+            "expected {needle:?} in error, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_accepts_valid_minimal_trace() {
+        let file = trace_file(&[
+            trace_start_event(),
+            trace_output_event(0_u64.into(), 7_u64.into(), "6869".into(), 2_u64.into()),
+            trace_end_event(1_u64.into(), 2_u64.into()),
+        ]);
+
+        let plan = validate_trace_replay(file.path(), false).expect("valid trace");
+        assert_eq!(plan.total_bytes, 2);
+        assert_eq!(plan.chunks.len(), 1);
+        assert_eq!(plan.chunks[0].line_number, 2);
+        assert_eq!(plan.chunks[0].elapsed_ms, 7);
+        assert_eq!(plan.chunks[0].bytes, b"hi");
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_missing_start() {
+        trace_replay_error_contains(
+            &[trace_end_event(0_u64.into(), 0_u64.into())],
+            false,
+            "end before start",
+        );
+        trace_replay_error_contains(&[], false, "missing a start event");
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_output_before_start() {
+        trace_replay_error_contains(
+            &[
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "output before start",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_duplicate_start() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_start_event(),
+                trace_end_event(0_u64.into(), 0_u64.into()),
+            ],
+            false,
+            "duplicate start event",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_output_after_end() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_end_event(0_u64.into(), 0_u64.into()),
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+            ],
+            false,
+            "output after end",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_chunk_index_gap() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(1_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "has chunk_index 1 but expected 0",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_non_monotonic_elapsed_ms() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 20_u64.into(), "00".into(), 1_u64.into()),
+                trace_output_event(1_u64.into(), 10_u64.into(), "01".into(), 1_u64.into()),
+                trace_end_event(2_u64.into(), 2_u64.into()),
+            ],
+            false,
+            "non-monotonic elapsed_ms",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_len_hex_mismatch() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "6869".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "has len 1 but bytes_hex decodes to 2 bytes",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_non_hex_bytes() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "zz".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "non-hex digit",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_timing_delay_cap() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 60_001_u64.into(), "00".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            true,
+            "exceeds safety cap",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_end_count_mismatch() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                trace_end_event(2_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "records 2 chunks but replay saw 1",
+        );
+
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                trace_end_event(1_u64.into(), 2_u64.into()),
+            ],
+            false,
+            "records 2 bytes but replay saw 1",
+        );
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_schema_and_type_edges() {
+        trace_replay_error_contains(
+            &[
+                serde_json::json!({
+                    "type": "start",
+                    "schema_version": "2.0",
+                    "format": "lterm-trace-jsonl",
+                    "duration_ms": 100_u64
+                }),
+                trace_end_event(0_u64.into(), 0_u64.into()),
+            ],
+            false,
+            "unsupported trace schema_version",
+        );
+        trace_replay_error_contains(
+            &[
+                serde_json::json!({
+                    "type": "start",
+                    "schema_version": "1.0",
+                    "format": 7,
+                    "duration_ms": 100_u64
+                }),
+                trace_end_event(0_u64.into(), 0_u64.into()),
+            ],
+            false,
+            "non-string field format",
+        );
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                serde_json::json!({
+                    "type": "output",
+                    "direction": "stderr",
+                    "chunk_index": 0_u64,
+                    "elapsed_ms": 0_u64,
+                    "bytes_hex": "00",
+                    "len": 1_u64
+                }),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "unsupported output direction",
+        );
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                serde_json::json!({
+                    "type": "metadata",
+                    "value": "ignored"
+                }),
+                trace_end_event(0_u64.into(), 0_u64.into()),
+            ],
+            false,
+            "unsupported event type",
+        );
+        trace_replay_error_contains(&[trace_start_event()], false, "missing an end event");
+    }
+
+    #[test]
+    fn validate_trace_replay_rejects_non_u64_optional_counts() {
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                serde_json::json!({
+                    "type": "output",
+                    "direction": "stdout",
+                    "chunk_index": "zero",
+                    "elapsed_ms": 0_u64,
+                    "bytes_hex": "00",
+                    "len": 1_u64
+                }),
+                trace_end_event(1_u64.into(), 1_u64.into()),
+            ],
+            false,
+            "non-u64 field chunk_index",
+        );
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                serde_json::json!({
+                    "type": "end",
+                    "chunks_recorded": "one",
+                    "bytes_recorded": 1_u64
+                }),
+            ],
+            false,
+            "non-u64 field chunks_recorded",
+        );
+        trace_replay_error_contains(
+            &[
+                trace_start_event(),
+                trace_output_event(0_u64.into(), 0_u64.into(), "00".into(), 1_u64.into()),
+                serde_json::json!({
+                    "type": "end",
+                    "chunks_recorded": 1_u64,
+                    "bytes_recorded": "one"
+                }),
+            ],
+            false,
+            "non-u64 field bytes_recorded",
+        );
+    }
+
+    #[test]
+    fn trace_file_summary_collects_metadata_and_counts_unknowns() {
+        let file = trace_file(&[
+            serde_json::json!({
+                "type": "start",
+                "schema_version": "1.0",
+                "format": "lterm-trace-jsonl",
+                "trace_id": "trace-1",
+                "producer": "lterm",
+                "client_version": "1.2.3",
+                "client_protocol_version": 3_u64,
+                "target": "main",
+                "created_at_unix_ms": 123_u64,
+                "duration_ms": 250_u64,
+                "max_bytes": 4096_u64,
+                "rows": 24_u64,
+                "cols": 80_u64,
+                "raw_stream_policy": "raw-transparent"
+            }),
+            trace_output_event(0_u64.into(), 5_u64.into(), "6869".into(), 2_u64.into()),
+            serde_json::json!({
+                "type": "output",
+                "direction": "stdout",
+                "elapsed_ms": 7_u64,
+                "bytes_hex": "21"
+            }),
+            trace_end_event(2_u64.into(), 3_u64.into()),
+            trace_start_event(),
+            serde_json::json!({"type": "end"}),
+            serde_json::json!({"type": "metadata"}),
+            serde_json::json!({"type": "output", "bytes_hex": "zz", "len": 1_u64}),
+        ]);
+        let mut raw = std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .expect("append malformed trace line");
+        writeln!(raw, "not-json").expect("malformed line");
+        writeln!(raw).expect("blank line");
+        raw.flush().expect("flush trace file");
+
+        let summary = trace_file_summary(file.path()).expect("trace summary");
+        assert_eq!(summary.format.as_deref(), Some("lterm-trace-jsonl"));
+        assert_eq!(summary.schema_version.as_deref(), Some("1.0"));
+        assert_eq!(summary.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(summary.producer.as_deref(), Some("lterm"));
+        assert_eq!(summary.client_version.as_deref(), Some("1.2.3"));
+        assert_eq!(summary.client_protocol_version, Some(3));
+        assert_eq!(summary.target.as_deref(), Some("main"));
+        assert_eq!(summary.created_at_unix_ms, Some(123));
+        assert_eq!(summary.duration_ms, Some(250));
+        assert_eq!(summary.max_bytes, Some(4096));
+        assert_eq!(summary.rows, Some(24));
+        assert_eq!(summary.cols, Some(80));
+        assert_eq!(
+            summary.raw_stream_policy.as_deref(),
+            Some("raw-transparent")
+        );
+        assert_eq!(summary.event_count, 9);
+        assert_eq!(summary.output_chunks, 2);
+        assert_eq!(summary.output_bytes, 3);
+        assert_eq!(summary.first_output_elapsed_ms, Some(5));
+        assert_eq!(summary.last_output_elapsed_ms, Some(7));
+        assert_eq!(summary.end_chunks_recorded, Some(2));
+        assert_eq!(summary.end_bytes_recorded, Some(3));
+        assert_eq!(summary.unknown_events, 5);
+    }
+
+    #[test]
+    fn read_trace_jsonl_line_handles_crlf_final_line_and_rejects_bad_input() {
+        let path = std::path::Path::new("trace.fixture");
+        let mut reader = BufReader::new(Cursor::new(b"one\r\ntwo".to_vec()));
+        let mut line_number = 0_usize;
+        assert_eq!(
+            read_trace_jsonl_line(&mut reader, &mut line_number, path)
+                .expect("first line")
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(line_number, 1);
+        assert_eq!(
+            read_trace_jsonl_line(&mut reader, &mut line_number, path)
+                .expect("final line")
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(line_number, 2);
+        assert!(
+            read_trace_jsonl_line(&mut reader, &mut line_number, path)
+                .expect("eof")
+                .is_none()
+        );
+
+        let mut invalid_utf8 = BufReader::new(Cursor::new(vec![0xff, b'\n']));
+        let err = read_trace_jsonl_line(&mut invalid_utf8, &mut 0, path)
+            .expect_err("invalid UTF-8 should fail");
+        assert!(
+            format!("{err:#}").contains("not valid UTF-8"),
+            "unexpected UTF-8 error: {err:#}"
+        );
+
+        let mut oversized = BufReader::new(Cursor::new(vec![b'x'; MAX_TRACE_JSONL_LINE_BYTES + 1]));
+        let err = read_trace_jsonl_line(&mut oversized, &mut 0, path)
+            .expect_err("oversized line should fail");
+        assert!(
+            format!("{err:#}").contains("maximum JSONL line length"),
+            "unexpected line cap error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn trace_summary_text_and_open_context_cover_human_output_paths() {
+        let summary = super::TraceFileSummary {
+            path: "/tmp/trace\u{1b}[31m.jsonl".to_string(),
+            format: Some("lterm-trace-jsonl".to_string()),
+            schema_version: Some("1.0".to_string()),
+            trace_id: Some("trace-id".to_string()),
+            producer: Some("lterm".to_string()),
+            client_version: Some("1.0.0".to_string()),
+            client_protocol_version: Some(3),
+            target: Some("main".to_string()),
+            created_at_unix_ms: Some(123),
+            duration_ms: Some(250),
+            max_bytes: Some(4096),
+            rows: Some(24),
+            cols: Some(80),
+            raw_stream_policy: Some("raw-transparent".to_string()),
+            event_count: 3,
+            output_chunks: 1,
+            output_bytes: 2,
+            first_output_elapsed_ms: Some(5),
+            last_output_elapsed_ms: Some(5),
+            end_elapsed_ms: Some(7),
+            end_reason: Some("duration".to_string()),
+            end_bytes_recorded: Some(2),
+            end_chunks_recorded: Some(1),
+            unknown_events: 0,
+        };
+        let rendered = trace_summary_text(&summary);
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "summary text must sanitize terminal controls: {rendered:?}"
+        );
+        assert!(rendered.contains("path\t/tmp/trace[31m.jsonl\n"));
+        assert!(rendered.contains("format\tlterm-trace-jsonl\n"));
+        assert!(rendered.contains("client_protocol_version\t3\n"));
+        assert!(rendered.contains("event_count\t3\n"));
+        assert!(rendered.contains("end_reason\tduration\n"));
+        assert!(rendered.contains("unknown_events\t0\n"));
+
+        let unknowns = super::TraceFileSummary {
+            path: "unknowns".to_string(),
+            ..super::TraceFileSummary::default()
+        };
+        let unknown_rendered = trace_summary_text(&unknowns);
+        assert!(unknown_rendered.contains("path\tunknowns\n"));
+        assert!(unknown_rendered.contains("format\tunknown\n"));
+        assert!(unknown_rendered.contains("client_protocol_version\tunknown\n"));
+        assert!(unknown_rendered.contains("event_count\t0\n"));
+
+        assert!(
+            trace_output_open_context(std::path::Path::new("trace.jsonl"), false)
+                .contains("pass --force")
+        );
+        assert!(
+            trace_output_open_context(std::path::Path::new("trace.jsonl"), true)
+                .contains("truncate")
+        );
+    }
+
+    #[test]
+    fn trace_hex_helpers_cover_encoding_decoding_and_validation_edges() {
+        assert!(current_unix_ms().is_some());
+        assert_eq!(hex_encode(b"\x00\x0f\x10\xff"), "000f10ff");
+        assert_eq!(hex_encoded_len("6869").expect("hex len"), 2);
+        assert_eq!(hex_decode("4869").expect("uppercase hex"), b"Hi");
+        assert!(
+            hex_encoded_len("abc")
+                .unwrap_err()
+                .to_string()
+                .contains("odd length")
+        );
+        assert!(
+            hex_encoded_len("zz")
+                .unwrap_err()
+                .to_string()
+                .contains("non-hex")
+        );
+        assert!(
+            hex_decode("0")
+                .unwrap_err()
+                .to_string()
+                .contains("odd length")
+        );
+        assert!(
+            hex_decode("0g")
+                .unwrap_err()
+                .to_string()
+                .contains("non-hex")
+        );
+    }
+
+    #[test]
+    fn ensure_trace_force_target_private_rejects_unsafe_targets() {
+        let dir = tempfile::tempdir().expect("trace tempdir");
+
+        let target = dir.path().join("target.trace");
+        std::fs::write(&target, b"trace").expect("target file");
+        let link = dir.path().join("link.trace");
+        symlink(&target, &link).expect("trace symlink");
+        let err = ensure_trace_force_target_private(&link).expect_err("symlink reject");
+        assert!(
+            err.to_string().contains("refusing to overwrite symlink"),
+            "unexpected symlink error: {err:#}"
+        );
+
+        let err = ensure_trace_force_target_private(dir.path()).expect_err("directory reject");
+        assert!(
+            err.to_string().contains("refusing to overwrite non-file"),
+            "unexpected directory error: {err:#}"
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("world-readable trace file");
+        let err = ensure_trace_force_target_private(&target).expect_err("public file reject");
+        assert!(
+            err.to_string().contains("permissions 644"),
+            "unexpected public-file error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_trace_force_target_private_allows_missing_or_private_file() {
+        let dir = tempfile::tempdir().expect("trace tempdir");
+        let missing = dir.path().join("missing.trace");
+        ensure_trace_force_target_private(&missing).expect("missing target is safe for create");
+
+        let private = dir.path().join("private.trace");
+        std::fs::write(&private, b"trace").expect("private trace file");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600))
+            .expect("private trace permissions");
+        ensure_trace_force_target_private(&private).expect("private regular file is safe");
+    }
+
     #[test]
     fn attach_header_reader_preserves_buffered_pty_tail() {
         let mut reader =
@@ -5517,6 +6109,18 @@ mod tests {
         let header = read_attach_response_header(&mut reader).expect("header at cap boundary");
         assert_eq!(header.len(), ATTACH_RESPONSE_HEADER_LIMIT);
         assert_eq!(header.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn attach_header_reader_rejects_eof_before_header() {
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+
+        let err = read_attach_response_header(&mut reader).expect_err("empty attach header");
+        assert!(
+            err.to_string()
+                .contains("daemon closed attach before header"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

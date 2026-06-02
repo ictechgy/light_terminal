@@ -176,6 +176,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_capture_handles_escape_edge_states_without_leaking_payloads() {
+        assert_eq!(terminal_capture(b"A\x1b(B"), "A");
+        assert_eq!(terminal_capture(b"A\x1b[31\x18B"), "AB");
+        assert_eq!(terminal_capture(b"A\x1b]title\x1bXsecret\x07B"), "AB");
+        assert_eq!(terminal_capture(b"A\x90secret\x1b\\B"), "AB");
+    }
+
+    #[test]
+    fn terminal_capture_replaces_incomplete_or_invalid_utf8() {
+        assert_eq!(terminal_capture(&[b'A', 0xe2]), "A�");
+        assert_eq!(terminal_capture(&[b'A', 0xf5, b'B']), "A�B");
+    }
+
+    #[test]
     fn terminal_capture_fuzz_lite_seed_corpus_has_no_escape_controls() {
         let corpus: &[(&str, &[u8], &str, &[&str])] = &[
             (
