@@ -76,9 +76,10 @@ user intent and take precedence over `LTERM_ATTACH_MODE`.
 
 Raw attach row presence is separate from attach transport. Ordinary raw sessions
 default to a client-side bottom status row; built-in agent launchers default to
-row-off full-height raw attach and may emit a terminal-title cue plus a one-shot
-`[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use
---status to show it)` banner as the non-row presence indicator before raw attach.
+row-off full-height raw attach and may emit a compact terminal-title cue
+(`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> ·
+<agent> (status row hidden for agent TUI; use --status to show it)` banner as the
+non-row presence indicator before raw attach.
 `LTERM_AGENT_CUE=0` disables both cue forms; `LTERM_AGENT_BANNER=0` disables only
 the inline banner while keeping the terminal-title cue. User-controlled fields in
 these host-side cue surfaces are sanitized before printing, but the subsequent
@@ -150,7 +151,7 @@ or raw output stream.
 | `lterm install-shim` | none | `stable` | `stable` shim path text | none | `sanitized-output-only` |
 | `lterm env` | none | `stable` | `stable` shell exports; `--shell fish` emits fish syntax for `source`; quote style is not a stable visual API | none | `sanitized-output-only` |
 | `lterm install-completions` | none | `best-effort` | `best-effort` user-local completion file install summary and activation hint; does not start the daemon | none | `sanitized-output-only` |
-| `lterm install-ai-statusline` | none | `best-effort` | `best-effort` supported AI CLI statusline install summary; backs up mutated settings and reports unsupported CLIs as skipped | none | `sanitized-output-only` |
+| `lterm install-ai-statusline` | none | `best-effort` | `best-effort` supported AI CLI statusline install summary; backs up mutated settings and reports unsupported custom statusline surfaces with an explanatory note | none | `sanitized-output-only` |
 | `lterm completions` | none | `best-effort` | `best-effort` shell completion scripts for `bash`, `zsh`, and `fish`; generated output follows clap-complete behavior and does not start the daemon | none | `sanitized-output-only` |
 | `lterm notify` | none | `best-effort` | `best-effort` cmux notification attempt plus sanitized OSC fallback | none | `sanitized-output-only` |
 | `lterm ssh` | none | `explicit-raw-unsafe` | none | none | `raw-transparent` |

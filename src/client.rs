@@ -1858,7 +1858,7 @@ fn write_lterm_title_cue(
     let session = sanitize::terminal_text(session);
     let pane = sanitize::terminal_text(pane);
     let agent = sanitize::terminal_text(agent);
-    let title = format!("lterm · {session} · {pane} · {agent}");
+    let title = format!("lt:{session}:{pane} · {agent}");
     write!(stdout, "\x1b]0;{title}\x07").context("emit lterm terminal title cue")
 }
 
@@ -5247,7 +5247,7 @@ mod tests {
             .and_then(|value| value.strip_suffix('\x07'))
             .expect("title wrapper");
         assert!(
-            title_inner.contains("lterm · repo]0;bad · %0next · codexagent"),
+            title_inner.contains("lt:repo]0;bad:%0next · codexagent"),
             "title cue should retain readable sanitized text: {title:?}"
         );
         assert!(
