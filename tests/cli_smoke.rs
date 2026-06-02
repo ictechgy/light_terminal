@@ -2214,6 +2214,90 @@ fn install_ai_statusline_does_not_overwrite_custom_claude_statusline() -> TestRe
 }
 
 #[test]
+fn install_ai_statusline_does_not_substring_match_omc_like_commands() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    let settings_path = claude.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/bin/custom-omc-hud.mjs --theme compact"
+  }
+}
+"#,
+    )?;
+    let before = std::fs::read_to_string(&settings_path)?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tskipped"),
+        "OMC-like custom Claude statusline should be skipped, not migrated by substring:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&settings_path)?,
+        "OMC-like custom Claude settings must not be overwritten"
+    );
+    assert!(
+        !claude.join("hud/lterm-omc-hud.mjs").exists(),
+        "skipped OMC-like custom statusline should not create unused wrapper files"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_ai_statusline_does_not_treat_custom_lterm_like_command_as_installed() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    let settings_path = claude.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/bin/custom-lterm-omc-hud.mjs"
+  }
+}
+"#,
+    )?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tskipped"),
+        "custom lterm-like Claude statusline should be skipped, not treated as installed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("provider\tclaude\talready-installed"),
+        "substring lterm-like command must not be accepted as already installed:\n{stdout}"
+    );
+    assert!(
+        !claude.join("hud/lterm-omc-hud.mjs").exists(),
+        "skipped lterm-like custom statusline should not create unused wrapper files"
+    );
+    Ok(())
+}
+
+#[test]
 fn install_completions_sanitizes_error_paths() -> TestResult {
     let env = TestEnv::new()?;
     let bad_dir = env.temp.path().join("bad\u{001b}]0;owned\u{0007}");

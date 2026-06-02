@@ -1041,6 +1041,7 @@ fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> 
 }
 
 const LTERM_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/lterm-omc-hud.mjs";
+const OMC_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/omc-hud.mjs";
 const LTERM_CLAUDE_STATUSLINE_WRAPPER: &str = r#"#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -1245,11 +1246,11 @@ fn set_claude_statusline_command(settings: &mut serde_json::Value) {
 }
 
 fn is_lterm_claude_statusline_command(command: &str) -> bool {
-    command.contains("lterm-omc-hud.mjs")
+    command.trim() == LTERM_CLAUDE_STATUSLINE_COMMAND
 }
 
 fn is_omc_statusline_command(command: &str) -> bool {
-    command.contains("omc-hud.mjs")
+    command.trim() == OMC_CLAUDE_STATUSLINE_COMMAND
 }
 
 fn write_executable_script(path: &Path, contents: &str) -> Result<()> {

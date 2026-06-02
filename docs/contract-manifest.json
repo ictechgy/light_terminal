@@ -596,7 +596,9 @@
       "schema_path": null,
       "tests": [
         "cargo test --test cli_smoke install_ai_statusline_writes_claude_wrapper_and_settings",
-        "cargo test --test cli_smoke install_ai_statusline_does_not_overwrite_custom_claude_statusline"
+        "cargo test --test cli_smoke install_ai_statusline_does_not_overwrite_custom_claude_statusline",
+        "cargo test --test cli_smoke install_ai_statusline_does_not_substring_match_omc_like_commands",
+        "cargo test --test cli_smoke install_ai_statusline_does_not_treat_custom_lterm_like_command_as_installed"
       ],
       "docs_owner": "README.md",
       "classification": "best-effort",
