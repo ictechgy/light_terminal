@@ -589,6 +589,21 @@
       "stability_scope": "Writes a user-local bash, zsh, or fish completion file and prints a sanitized activation hint. The command must not start the daemon; completion script bytes are delegated to clap-complete and user shell discovery is best-effort."
     },
     {
+      "command": "lterm install-ai-statusline",
+      "aliases": [],
+      "text_output_stability": "best-effort",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --test cli_smoke install_ai_statusline_writes_claude_wrapper_and_settings",
+        "cargo test --test cli_smoke install_ai_statusline_does_not_overwrite_custom_claude_statusline"
+      ],
+      "docs_owner": "README.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Installs supported AI CLI statusline integrations that render LTERM_SESSION/LTERM_PANE identity inside the AI CLI's own HUD. Current writes are limited to Claude/OMC command statusline configuration with backup and idempotency safeguards; unsupported CLIs are reported as skipped."
+    },
+    {
       "command": "lterm notify",
       "aliases": [],
       "text_output_stability": "best-effort",
