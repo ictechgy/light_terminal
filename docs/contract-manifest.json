@@ -140,7 +140,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Resume/attach is a mixed surface: raw-pty-stream is transparent; local-status-bar is a client-side decoration; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
+      "stability_scope": "Resume/attach is a mixed surface: raw-pty-stream is transparent; local-status-bar is a client-side decoration; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
     },
     {
       "command": "lterm open",
@@ -196,7 +196,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
+      "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus sanitized one-shot banner emitted before raw attach for row-off agent sessions; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
     },
     {
       "command": "lterm sessions",
@@ -738,7 +738,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort terminal-title cue plus sanitized one-shot banner emitted before raw attach when the launcher uses the default row-off full-height TUI surface; LTERM_AGENT_CUE disables both cue forms and LTERM_AGENT_BANNER disables only the inline banner. Agent-spawned child processes also receive LTERM_SESSION and LTERM_PANE identity variables; this is covered by the generic agent profile environment test."
+      "stability_scope": "Agent launchers are mixed surfaces: raw-pty-stream is transparent once raw-attached; launcher-control covers local profile/session setup and persists optional agent metadata; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus sanitized one-shot banner emitted before raw attach when the launcher uses the default row-off full-height TUI surface; LTERM_AGENT_CUE disables both cue forms and LTERM_AGENT_BANNER disables only the inline banner. Agent-spawned child processes also receive LTERM_SESSION and LTERM_PANE identity variables; this is covered by the generic agent profile environment test."
     },
     {
       "command": "lterm tmux-compat list-commands",

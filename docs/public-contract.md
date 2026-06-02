@@ -76,9 +76,10 @@ user intent and take precedence over `LTERM_ATTACH_MODE`.
 
 Raw attach row presence is separate from attach transport. Ordinary raw sessions
 default to a client-side bottom status row; built-in agent launchers default to
-row-off full-height raw attach and may emit a terminal-title cue plus a one-shot
-`[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use
---status to show it)` banner as the non-row presence indicator before raw attach.
+row-off full-height raw attach and may emit a compact terminal-title cue
+(`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> ·
+<agent> (status row hidden for agent TUI; use --status to show it)` banner as the
+non-row presence indicator before raw attach.
 `LTERM_AGENT_CUE=0` disables both cue forms; `LTERM_AGENT_BANNER=0` disables only
 the inline banner while keeping the terminal-title cue. User-controlled fields in
 these host-side cue surfaces are sanitized before printing, but the subsequent
