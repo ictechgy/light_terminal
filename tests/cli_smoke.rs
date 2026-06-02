@@ -1912,6 +1912,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
         "env",
         "completions",
         "install-completions",
+        "install-ai-statusline",
         "diagnose",
         "trace",
         "trace-replay",
@@ -1950,6 +1951,7 @@ fn help_exposes_utility_command_surface() -> TestResult {
     for expected in [
         "tmux compatibility",
         "setup preview",
+        "statusline integrations",
         "sanitized output",
         "cmux-friendly notification",
         "remote host",
@@ -2065,6 +2067,232 @@ fn install_completions_writes_user_files_without_starting_daemon() -> TestResult
         report.get("daemon_reachable").and_then(|v| v.as_bool()),
         Some(false),
         "completion installation must not auto-start the daemon: {report:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    let hud = claude.join("hud");
+    std::fs::create_dir_all(&hud)?;
+    std::fs::write(
+        claude.join("settings.json"),
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/.claude/hud/omc-hud.mjs",
+    "padding": "keep"
+  },
+  "theme": "dark"
+}
+"#,
+    )?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tinstalled"),
+        "Claude statusline should be installed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("provider\tcodex\tskipped"),
+        "Codex should be reported as unsupported for custom command statuslines:\n{stdout}"
+    );
+
+    let wrapper = hud.join("lterm-omc-hud.mjs");
+    assert!(wrapper.is_file(), "missing lterm Claude HUD wrapper");
+    let wrapper_script = std::fs::read_to_string(&wrapper)?;
+    assert!(
+        wrapper_script.contains("LTERM_SESSION") && wrapper_script.contains("omc-hud.mjs"),
+        "wrapper should prepend lterm env and delegate to OMC HUD:\n{wrapper_script}"
+    );
+    #[cfg(unix)]
+    assert_ne!(
+        std::fs::metadata(&wrapper)?.permissions().mode() & 0o111,
+        0,
+        "wrapper should be executable"
+    );
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(claude.join("settings.json"))?)?;
+    assert_eq!(
+        settings
+            .get("statusLine")
+            .and_then(|status_line| status_line.get("command"))
+            .and_then(serde_json::Value::as_str),
+        Some("node $HOME/.claude/hud/lterm-omc-hud.mjs"),
+        "Claude settings should point to the lterm wrapper: {settings:?}"
+    );
+    assert_eq!(
+        settings.get("theme").and_then(serde_json::Value::as_str),
+        Some("dark"),
+        "unrelated Claude settings should be preserved: {settings:?}"
+    );
+    assert_eq!(
+        settings
+            .get("statusLine")
+            .and_then(|status_line| status_line.get("padding"))
+            .and_then(serde_json::Value::as_str),
+        Some("keep"),
+        "unrelated Claude statusLine settings should be preserved: {settings:?}"
+    );
+    let backups: Vec<_> = std::fs::read_dir(&claude)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("settings.json.bak.lterm-statusline."))
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "expected one settings backup: {backups:?}"
+    );
+
+    let again = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(again.status.success(), "{again:?}");
+    let again_stdout = String::from_utf8_lossy(&again.stdout);
+    assert!(
+        again_stdout.contains("provider\tclaude\talready-installed"),
+        "second install should be idempotent:\n{again_stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_ai_statusline_does_not_overwrite_custom_claude_statusline() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    let settings_path = claude.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/bin/my-statusline.mjs"
+  }
+}
+"#,
+    )?;
+    let before = std::fs::read_to_string(&settings_path)?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tskipped"),
+        "custom Claude statusline should be skipped:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&settings_path)?,
+        "custom Claude settings must not be overwritten"
+    );
+    assert!(
+        !claude.join("hud/lterm-omc-hud.mjs").exists(),
+        "skipped custom statusline should not create unused wrapper files"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_ai_statusline_does_not_substring_match_omc_like_commands() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    let settings_path = claude.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/bin/custom-omc-hud.mjs --theme compact"
+  }
+}
+"#,
+    )?;
+    let before = std::fs::read_to_string(&settings_path)?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tskipped"),
+        "OMC-like custom Claude statusline should be skipped, not migrated by substring:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&settings_path)?,
+        "OMC-like custom Claude settings must not be overwritten"
+    );
+    assert!(
+        !claude.join("hud/lterm-omc-hud.mjs").exists(),
+        "skipped OMC-like custom statusline should not create unused wrapper files"
+    );
+    Ok(())
+}
+
+#[test]
+fn install_ai_statusline_does_not_treat_custom_lterm_like_command_as_installed() -> TestResult {
+    let env = TestEnv::new()?;
+    let home = env.temp.path().join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude)?;
+    let settings_path = claude.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{
+  "statusLine": {
+    "type": "command",
+    "command": "node $HOME/bin/custom-lterm-omc-hud.mjs"
+  }
+}
+"#,
+    )?;
+
+    let output = env
+        .cmd()
+        .env("HOME", &home)
+        .arg("install-ai-statusline")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("provider\tclaude\tskipped"),
+        "custom lterm-like Claude statusline should be skipped, not treated as installed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("provider\tclaude\talready-installed"),
+        "substring lterm-like command must not be accepted as already installed:\n{stdout}"
+    );
+    assert!(
+        !claude.join("hud/lterm-omc-hud.mjs").exists(),
+        "skipped lterm-like custom statusline should not create unused wrapper files"
     );
     Ok(())
 }
@@ -2810,6 +3038,7 @@ fn init_prints_setup_preview_without_modifying_files() -> TestResult {
         "step\t2\tlterm install-shim",
         "step\t3\teval \"$(lterm env)\"",
         "step\t4\tlterm install-completions --shell zsh",
+        "step\t5\tlterm install-ai-statusline",
         "indicator\tLTERM_SESSION/LTERM_PANE",
         "Copy the enable command",
     ] {
@@ -2838,6 +3067,7 @@ fn init_prints_fish_source_preview() -> TestResult {
         "step\t2\tlterm install-shim",
         "step\t3\tlterm env --shell fish | source",
         "step\t4\tlterm install-completions --shell fish",
+        "step\t5\tlterm install-ai-statusline",
     ] {
         assert!(
             stdout.contains(expected),

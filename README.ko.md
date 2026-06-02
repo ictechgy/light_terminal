@@ -101,6 +101,8 @@ lterm env
 eval "$(lterm env)"
 # fish:
 lterm env --shell fish | source
+# 선택: 지원되는 AI CLI statusline/HUD badge를 설치합니다.
+lterm install-ai-statusline
 ```
 
 ## 빠른 시작
@@ -148,6 +150,7 @@ lterm -a api
 | 데몬과 shim 상태 진단 | `lterm doctor --json` | `status` |
 | redacted 로컬 진단 bundle 수집 | `lterm diagnose --bundle` | 없음 |
 | 로컬 설정 단계 미리 보기 | `lterm init --shell zsh` | 없음 |
+| 지원되는 AI CLI statusline badge 설치 | `lterm install-ai-statusline` | 없음 |
 | shell completion 설치 | `lterm install-completions --shell zsh` | 없음 |
 | shell completion 생성 | `lterm completions zsh` | 없음 |
 | 백그라운드 데몬 명시 실행 | `lterm daemon` | 없음 |
@@ -162,6 +165,7 @@ lterm -a api
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
 | tmux 호환 shell export 출력 | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
 | shell completion 설치 | `lterm install-completions --shell bash\|zsh\|fish` | 사용자 로컬 completion 파일을 쓰고 필요한 활성화 hint를 출력하며 daemon은 시작하지 않음 |
+| AI CLI statusline badge 설치 | `lterm install-ai-statusline` | `LTERM_SESSION` / `LTERM_PANE`를 쓰는 지원 statusline 통합을 설치함; 현재 Claude/OMC는 idempotent하게 쓰고, Codex는 TUI status line이 고정 built-in 항목만 노출하므로 skipped로 보고함 |
 | shell completion 생성 | `lterm completions bash\|zsh\|fish` | completion script만 출력하며 session을 조회하거나 daemon을 시작하지 않음 |
 | cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 터미널 제어 문자를 제거하고 Unicode text는 보존 |
 | 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 전달 |
@@ -190,9 +194,9 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 `lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. JSON 출력에는 agent profile로 띄운 세션에 한해 `agent_name` metadata가 추가되고, 일반 세션에는 이 field가 생략됩니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 text 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 status bar를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 강제하려면 `lterm resume --raw --no-status api`(호환 이름: `lterm attach --raw --no-status api`)를 쓰거나 `LTERM_ATTACH_MODE=raw`를 설정하세요. 단순히 status line만 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` 또는 같은 의미의 `LTERM_STATUS=0`을 함께 사용하면 됩니다.
 
-row status 존재 여부는 attach mode와 별도입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher는 full-height row-off surface를 기본값으로 사용하며 terminal이 지원하면 attach 직전에 terminal title cue와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 나중에 알려진 agent command가 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
+row status 존재 여부는 attach mode와 별도입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher 및 나중에 알려진 agent 세션에 붙는 `resume` / `open`은 full-height row-off surface를 기본값으로 사용합니다. 직접 agent launcher를 실행할 때는 terminal이 지원하면 attach 직전에 terminal title cue와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 나중에 알려진 agent command가 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
 
-모든 lterm 세션의 child process에는 `LTERM_SESSION`과 `LTERM_PANE`도 export됩니다. `[lterm:api:%0]` 같은 shell prompt badge를 선호한다면 이 변수를 prompt에 추가하세요. `lterm init --shell zsh|bash|fish`는 shim/completion 단계와 함께 이 reminder를 출력합니다.
+모든 lterm 세션의 child process에는 `LTERM_SESSION`과 `LTERM_PANE`도 export됩니다. `[lterm:api:%0]` 같은 shell prompt badge를 선호한다면 이 변수를 prompt에 추가하세요. `lterm init --shell zsh|bash|fish`는 shim/completion/AI statusline 단계와 함께 이 reminder를 출력합니다. 자체 statusline/HUD를 제공하는 AI CLI는 lterm의 host-side bottom row에 의존하지 말고 같은 변수를 읽어 그 statusline 안에 badge를 표시하는 편이 좋습니다. 그래야 full-screen agent TUI와 모바일 SSH renderer를 덜 방해합니다. `lterm install-ai-statusline`을 실행하면 지원되는 command 기반 통합을 설치합니다. 현재는 Claude/OMC HUD wrapper를 만들어 `lt:<session>:<pane>`를 앞에 붙이고, `~/.claude/settings.json`은 변경 전 backup합니다. Codex는 TUI가 custom statusline command를 받기 전까지 자동 삽입 대상이 아니라 skipped로 보고됩니다.
 
 `lterm resume` / `lterm open`의 기본 attach 정책은 `--attach-mode=auto`(또는 `LTERM_ATTACH_MODE=auto`)입니다. attach mode 값은 `auto`, `raw`, `mobile` 세 가지이고, 여기서 `mobile`은 일반 화면(normal screen)의 transcript view를 뜻합니다. 데스크톱에서는 기존처럼 raw PTY attach를 사용합니다. 자동 모바일 감지는 보수적인 best-effort 동작입니다. `LTERM_MOBILE=1` 또는 Termius 터미널 식별값이 있으면 모바일 클라이언트로 보고, 대상 세션은 persisted `LTERM_AGENT` metadata, 내장 agent의 `*-lterm` 세션 이름, 또는 알려진 agent command basename 중 하나에 맞아야 agent 세션으로 봅니다. 스크립트처럼 결과가 반드시 예측 가능해야 하는 경우에는 명시적으로 지정하세요. 기존 raw 경로를 강제로 쓰려면 `--raw` 또는 `LTERM_ATTACH_MODE=raw`, transcript를 강제로 쓰려면 `--mobile` 또는 `LTERM_ATTACH_MODE=mobile`을 사용합니다. CLI flag가 환경 변수보다 우선합니다. transcript의 표시 범위와 갱신 주기는 `--tail`, `--refresh`, `--read-only`로 조정할 수 있습니다.
 
@@ -349,7 +353,7 @@ lterm codex --mobile --tail 200 --refresh 1s --read-only
 lterm agy --status -- -p "lterm status를 유지해줘"
 ```
 
-Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
+Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. 이후 해당 agent 세션을 `lterm resume` 또는 `lterm open`으로 다시 붙을 때도 같은 row-off 기본값을 유지합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 직접 agent launch의 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
 launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`, `--attach-mode`, `--raw`, `--mobile`, `--tail`, `--refresh`, `--read-only`)입니다. 이 옵션들은 `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.

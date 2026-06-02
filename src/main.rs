@@ -22,9 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const CMUX_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -378,6 +380,8 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
     },
+    /// Install supported AI CLI statusline integrations for lterm session badges.
+    InstallAiStatusline,
     /// Print a no-touch setup preview for enabling lterm locally.
     Init {
         /// Shell syntax to show in the preview; detected from SHELL when omitted.
@@ -669,7 +673,7 @@ fn run() -> Result<()> {
             };
             client::attach_info_with_policy(
                 &info,
-                status_presence_from_no_status(no_status),
+                status_presence_for_existing_attach(no_status, &info),
                 AttachStdinEof::Detach,
                 attach_policy,
             )
@@ -700,7 +704,7 @@ fn run() -> Result<()> {
             };
             client::attach_info_with_policy(
                 &info,
-                status_presence_from_no_status(no_status),
+                status_presence_for_existing_attach(no_status, &info),
                 AttachStdinEof::Detach,
                 attach_policy,
             )
@@ -887,6 +891,7 @@ fn run() -> Result<()> {
         }
         Commands::Completions { shell } => print_completions(shell),
         Commands::InstallCompletions { shell, dir } => install_completions(shell, dir),
+        Commands::InstallAiStatusline => install_ai_statusline(),
         Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
@@ -1035,6 +1040,258 @@ fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> 
     Ok(())
 }
 
+const LTERM_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/lterm-omc-hud.mjs";
+const OMC_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/omc-hud.mjs";
+const LTERM_CLAUDE_STATUSLINE_WRAPPER: &str = r#"#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+function cleanPart(value, fallback, limit) {
+  const cleaned = String(value || "")
+    .replace(/[\u0000-\u001f\u007f\u001b]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (cleaned || fallback).slice(0, limit);
+}
+
+function ltermBadge() {
+  const session = process.env.LTERM_SESSION;
+  const pane = process.env.LTERM_PANE;
+  if (!session && !pane) return "";
+  return `lt:${cleanPart(session, "?", 24)}:${cleanPart(pane, "?", 10)}`;
+}
+
+const input = readFileSync(0);
+const original = join(homedir(), ".claude", "hud", "omc-hud.mjs");
+const badge = ltermBadge();
+
+if (!existsSync(original)) {
+  if (badge) process.stdout.write(badge);
+  process.exit(0);
+}
+
+const result = spawnSync(process.execPath, [original], {
+  input,
+  encoding: "utf8",
+  env: { ...process.env, LTERM_OMC_HUD_WRAPPER_ACTIVE: "1" },
+  maxBuffer: 1024 * 1024,
+});
+
+if (result.error) {
+  if (badge) process.stdout.write(badge);
+  process.exit(0);
+}
+
+const base = (result.stdout || "").trim();
+const line = badge && base ? `${badge} · ${base}` : (badge || base);
+if (line) process.stdout.write(line);
+if (result.status && result.status !== 0) process.exit(result.status);
+"#;
+
+fn install_ai_statusline() -> Result<()> {
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+
+    println!("lterm ai statusline install");
+    install_claude_statusline(&home)?;
+    println!(
+        "provider\tcodex\tskipped\t{}",
+        sanitize::terminal_text(
+            "current Codex TUI exposes fixed built-in status_line items, not custom command items; lterm still exports LTERM_SESSION/LTERM_PANE for future support."
+        )
+    );
+    println!(
+        "next\t{}",
+        sanitize::terminal_text("Restart supported AI CLIs inside lterm after installing.")
+    );
+    Ok(())
+}
+
+fn install_claude_statusline(home: &Path) -> Result<()> {
+    let claude_dir = home.join(".claude");
+    let hud_dir = claude_dir.join("hud");
+    let wrapper_path = hud_dir.join("lterm-omc-hud.mjs");
+    let settings_path = claude_dir.join("settings.json");
+
+    let existing_settings = match std::fs::read_to_string(&settings_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read Claude settings {}", terminal_path(&settings_path))
+            });
+        }
+    };
+    let mut settings = parse_claude_settings(existing_settings.as_deref(), &settings_path)?;
+    let existing_command = settings
+        .get("statusLine")
+        .and_then(|status_line| status_line.get("command"))
+        .and_then(serde_json::Value::as_str);
+    let status_line_exists = settings.get("statusLine").is_some();
+
+    if let Some(command) = existing_command {
+        if !is_lterm_claude_statusline_command(command)
+            && status_line_exists
+            && !is_omc_statusline_command(command)
+        {
+            println!(
+                "provider\tclaude\tskipped\t{}",
+                sanitize::terminal_text(
+                    "custom statusLine.command exists; not overwriting automatically"
+                )
+            );
+            println!("file\t{}", terminal_path(&settings_path));
+            return Ok(());
+        }
+    } else if status_line_exists {
+        println!(
+            "provider\tclaude\tskipped\t{}",
+            sanitize::terminal_text("non-command statusLine exists; not overwriting automatically")
+        );
+        println!("file\t{}", terminal_path(&settings_path));
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&hud_dir)
+        .with_context(|| format!("create Claude HUD directory {}", terminal_path(&hud_dir)))?;
+    write_executable_script(&wrapper_path, LTERM_CLAUDE_STATUSLINE_WRAPPER).with_context(|| {
+        format!(
+            "write Claude lterm HUD wrapper {}",
+            terminal_path(&wrapper_path)
+        )
+    })?;
+
+    let already_installed = existing_command.is_some_and(is_lterm_claude_statusline_command);
+    if already_installed {
+        println!("provider\tclaude\talready-installed");
+        println!("file\t{}", terminal_path(&wrapper_path));
+        println!("file\t{}", terminal_path(&settings_path));
+        return Ok(());
+    }
+
+    set_claude_statusline_command(&mut settings);
+    let backup = if settings_path.exists() {
+        let backup = next_settings_backup_path(&settings_path)?;
+        std::fs::copy(&settings_path, &backup).with_context(|| {
+            format!(
+                "backup Claude settings {} to {}",
+                terminal_path(&settings_path),
+                terminal_path(&backup)
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    std::fs::create_dir_all(&claude_dir).with_context(|| {
+        format!(
+            "create Claude config directory {}",
+            terminal_path(&claude_dir)
+        )
+    })?;
+    let rendered = serde_json::to_string_pretty(&settings).context("serialize Claude settings")?;
+    std::fs::write(&settings_path, format!("{rendered}\n"))
+        .with_context(|| format!("write Claude settings {}", terminal_path(&settings_path)))?;
+
+    println!("provider\tclaude\tinstalled");
+    println!("file\t{}", terminal_path(&wrapper_path));
+    println!("file\t{}", terminal_path(&settings_path));
+    if let Some(backup) = backup {
+        println!("backup\t{}", terminal_path(&backup));
+    }
+    Ok(())
+}
+
+fn parse_claude_settings(
+    contents: Option<&str>,
+    settings_path: &Path,
+) -> Result<serde_json::Value> {
+    let Some(contents) = contents else {
+        return Ok(serde_json::json!({}));
+    };
+    let settings: serde_json::Value = serde_json::from_str(contents)
+        .with_context(|| format!("parse Claude settings {}", terminal_path(settings_path)))?;
+    if !settings.is_object() {
+        bail!(
+            "Claude settings {} must be a JSON object",
+            terminal_path(settings_path)
+        );
+    }
+    Ok(settings)
+}
+
+fn set_claude_statusline_command(settings: &mut serde_json::Value) {
+    let object = settings
+        .as_object_mut()
+        .expect("Claude settings object was validated before statusline mutation");
+    let status_line = object
+        .entry("statusLine")
+        .or_insert_with(|| serde_json::json!({}));
+    if !status_line.is_object() {
+        *status_line = serde_json::json!({});
+    }
+    let status_line = status_line
+        .as_object_mut()
+        .expect("statusLine object was initialized before mutation");
+    status_line.insert(
+        "type".to_string(),
+        serde_json::Value::String("command".to_string()),
+    );
+    status_line.insert(
+        "command".to_string(),
+        serde_json::Value::String(LTERM_CLAUDE_STATUSLINE_COMMAND.to_string()),
+    );
+}
+
+fn is_lterm_claude_statusline_command(command: &str) -> bool {
+    command.trim() == LTERM_CLAUDE_STATUSLINE_COMMAND
+}
+
+fn is_omc_statusline_command(command: &str) -> bool {
+    command.trim() == OMC_CLAUDE_STATUSLINE_COMMAND
+}
+
+fn write_executable_script(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn next_settings_backup_path(settings_path: &Path) -> Result<PathBuf> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = settings_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    for suffix in 0..1000 {
+        let candidate = if suffix == 0 {
+            parent.join(format!("{file_name}.bak.lterm-statusline.{seconds}"))
+        } else {
+            parent.join(format!(
+                "{file_name}.bak.lterm-statusline.{seconds}.{suffix}"
+            ))
+        };
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not allocate a Claude settings backup name near {}",
+        terminal_path(settings_path)
+    )
+}
+
 fn detect_completion_shell() -> Result<CompletionShell> {
     completion_shell_from_shell_kind(detect_init_shell()).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1163,8 +1420,9 @@ fn print_init_preview(shell: ShellKind) -> Result<()> {
             completion_shell_name(completion_shell)
         );
     }
+    println!("step\t5\tlterm install-ai-statusline");
     println!(
-        "indicator\tLTERM_SESSION/LTERM_PANE are exported inside lterm sessions; add them to your shell prompt for a visible [lterm] badge if you want one."
+        "indicator\tLTERM_SESSION/LTERM_PANE are exported inside lterm sessions; install supported AI CLI statusline integrations or add them to your shell prompt for a visible [lterm] badge."
     );
     println!("note\tCopy the enable command into a trusted shell startup file only after review.");
     println!("note\tRun lterm doctor --json again after changing PATH to verify shim_dir_in_path.");
@@ -1981,6 +2239,17 @@ fn attach_policy_options(
 
 fn status_presence_from_no_status(no_status: bool) -> StatusPresencePolicy {
     if no_status {
+        StatusPresencePolicy::RowOff
+    } else {
+        StatusPresencePolicy::RowAuto
+    }
+}
+
+fn status_presence_for_existing_attach(
+    no_status: bool,
+    info: &protocol::SessionInfo,
+) -> StatusPresencePolicy {
+    if no_status || client::likely_agent_session(info) {
         StatusPresencePolicy::RowOff
     } else {
         StatusPresencePolicy::RowAuto
@@ -2970,6 +3239,32 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    fn sample_status_session_info(
+        name: &str,
+        command: &str,
+        agent_name: Option<&str>,
+    ) -> protocol::SessionInfo {
+        protocol::SessionInfo {
+            id: "id".into(),
+            name: name.into(),
+            pane_id: "%7".into(),
+            command: command.into(),
+            cwd: "/tmp".into(),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            parent_pane_id: None,
+            parent_session_id: None,
+            attached_clients: 0,
+            process_id: None,
+            process_group_id: None,
+            status_theme: None,
+            agent_name: agent_name.map(str::to_string),
+        }
+    }
+
     struct EnvGuard {
         values: Vec<(&'static str, Option<OsString>)>,
     }
@@ -3657,6 +3952,34 @@ mod tests {
         assert_eq!(
             no_status.status_presence(true),
             StatusPresencePolicy::RowOff
+        );
+    }
+
+    #[test]
+    fn existing_agent_attach_defaults_to_row_off() {
+        let shell = sample_status_session_info("api", "/bin/zsh -l", None);
+        assert_eq!(
+            status_presence_for_existing_attach(false, &shell),
+            StatusPresencePolicy::RowAuto
+        );
+        assert_eq!(
+            status_presence_for_existing_attach(true, &shell),
+            StatusPresencePolicy::RowOff
+        );
+
+        let built_in_agent =
+            sample_status_session_info("omx-lterm", "/opt/homebrew/bin/omx", Some("omx"));
+        assert_eq!(
+            status_presence_for_existing_attach(false, &built_in_agent),
+            StatusPresencePolicy::RowOff,
+            "reattaching an agent session should not redraw lterm's host status row"
+        );
+
+        let fallback_agent = sample_status_session_info("codex-lterm", "codex", None);
+        assert_eq!(
+            status_presence_for_existing_attach(false, &fallback_agent),
+            StatusPresencePolicy::RowOff,
+            "agent-like names/commands should also avoid host-row leaks"
         );
     }
 
