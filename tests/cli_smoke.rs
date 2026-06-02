@@ -2077,7 +2077,9 @@ fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
     let home = env.temp.path().join("home");
     let claude = home.join(".claude");
     let hud = claude.join("hud");
+    let codex = home.join(".codex");
     std::fs::create_dir_all(&hud)?;
+    std::fs::create_dir_all(&codex)?;
     std::fs::write(
         claude.join("settings.json"),
         r#"{
@@ -2090,6 +2092,13 @@ fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
 }
 "#,
     )?;
+    let original_codex_config = r#"[tui]
+status_line = ["model-with-reasoning", "git-branch"]
+
+[notice]
+hide_rate_limit_model_nudge = true
+"#;
+    std::fs::write(codex.join("config.toml"), original_codex_config)?;
 
     let output = env
         .cmd()
@@ -2105,7 +2114,11 @@ fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
     );
     assert!(
         stdout.contains("provider\tcodex\tskipped"),
-        "Codex should be reported as unsupported for custom command statuslines:\n{stdout}"
+        "Codex statusline should be reported as unsupported:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Codex status_line cannot render custom LTERM_SESSION/LTERM_PANE"),
+        "Codex custom LTERM_SESSION limitation should be explicit:\n{stdout}"
     );
 
     let wrapper = hud.join("lterm-omc-hud.mjs");
@@ -2155,6 +2168,21 @@ fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
         1,
         "expected one settings backup: {backups:?}"
     );
+    let codex_config = std::fs::read_to_string(codex.join("config.toml"))?;
+    assert_eq!(
+        codex_config, original_codex_config,
+        "Codex config should not be mutated for unsupported custom lterm statusline items"
+    );
+    let codex_backups: Vec<_> = std::fs::read_dir(&codex)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("config.toml.bak.lterm-statusline."))
+        .collect();
+    assert_eq!(
+        codex_backups.len(),
+        0,
+        "unsupported Codex integration should not create backups: {codex_backups:?}"
+    );
 
     let again = env
         .cmd()
@@ -2166,6 +2194,10 @@ fn install_ai_statusline_writes_claude_wrapper_and_settings() -> TestResult {
     assert!(
         again_stdout.contains("provider\tclaude\talready-installed"),
         "second install should be idempotent:\n{again_stdout}"
+    );
+    assert!(
+        again_stdout.contains("provider\tcodex\tskipped"),
+        "second install should keep reporting Codex as unsupported:\n{again_stdout}"
     );
     Ok(())
 }
@@ -7405,6 +7437,7 @@ fn interactive_does_not_change_attached_clients_or_geometry(
     );
 
     let (mut master, slave) = open_pty_pair()?;
+    set_pty_window_size(&slave, 24, 80)?;
     let stdin = Stdio::from(slave.try_clone()?);
     let stdout = Stdio::from(slave.try_clone()?);
     let mut compose = ChildCleanup::new(
@@ -7416,22 +7449,23 @@ fn interactive_does_not_change_attached_clients_or_geometry(
             .spawn()?,
     );
     drop(slave);
-    thread::sleep(Duration::from_millis(200));
+    read_until_marker_bytes(&mut master, b"> ", Duration::from_secs(5))?;
     master.write_all(b"\x1b")?;
     master.flush()?;
-
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut exited = false;
     while Instant::now() < deadline {
         if let Some(status) = compose.child_mut()?.try_wait()? {
-            assert!(status.success(), "interactive compose failed: {status:?}");
+            assert!(
+                status.success(),
+                "interactive compose exited unsuccessfully after local Esc: {status}"
+            );
             exited = true;
             break;
         }
         thread::sleep(Duration::from_millis(25));
     }
     assert!(exited, "interactive compose did not exit after local Esc");
-    compose.kill_and_wait()?;
 
     let after = read_session_json(&env, name)?;
     assert_eq!(

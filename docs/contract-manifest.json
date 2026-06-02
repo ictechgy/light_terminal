@@ -603,7 +603,7 @@
       "docs_owner": "README.md",
       "classification": "best-effort",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Installs supported AI CLI statusline integrations that render LTERM_SESSION/LTERM_PANE identity inside the AI CLI's own HUD. Current writes are limited to Claude/OMC command statusline configuration with backup and idempotency safeguards; unsupported CLIs are reported as skipped."
+      "stability_scope": "Installs supported AI CLI statusline integrations with backup and idempotency safeguards. Claude/OMC command statusline configuration renders LTERM_SESSION/LTERM_PANE identity inside the AI CLI's own HUD. Codex config is left untouched and reported as skipped because current Codex status_line items are built-in only, and thread-id is Codex-internal rather than an lterm session identifier."
     },
     {
       "command": "lterm notify",

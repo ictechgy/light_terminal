@@ -1042,6 +1042,7 @@ fn install_completions(shell: Option<CompletionShell>, dir: Option<PathBuf>) -> 
 
 const LTERM_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/lterm-omc-hud.mjs";
 const OMC_CLAUDE_STATUSLINE_COMMAND: &str = "node $HOME/.claude/hud/omc-hud.mjs";
+const CODEX_STATUSLINE_UNSUPPORTED_NOTE: &str = "Codex status_line cannot render custom LTERM_SESSION/LTERM_PANE values yet; lterm does not install Codex's thread-id because it is Codex-internal and not an lterm session identifier.";
 const LTERM_CLAUDE_STATUSLINE_WRAPPER: &str = r#"#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -1095,17 +1096,20 @@ fn install_ai_statusline() -> Result<()> {
 
     println!("lterm ai statusline install");
     install_claude_statusline(&home)?;
-    println!(
-        "provider\tcodex\tskipped\t{}",
-        sanitize::terminal_text(
-            "current Codex TUI exposes fixed built-in status_line items, not custom command items; lterm still exports LTERM_SESSION/LTERM_PANE for future support."
-        )
-    );
+    report_codex_statusline_unsupported();
     println!(
         "next\t{}",
         sanitize::terminal_text("Restart supported AI CLIs inside lterm after installing.")
     );
     Ok(())
+}
+
+fn report_codex_statusline_unsupported() {
+    println!("provider\tcodex\tskipped");
+    println!(
+        "note\t{}",
+        sanitize::terminal_text(CODEX_STATUSLINE_UNSUPPORTED_NOTE)
+    );
 }
 
 fn install_claude_statusline(home: &Path) -> Result<()> {
