@@ -12,8 +12,17 @@ artifact.
 - Reviewer:
 - Date / timezone:
 - Host OS and architecture:
-- Rust toolchain:
+- Rust binary path (`command -v rustc`):
+- Cargo binary path (`command -v cargo`):
+- Rust toolchain (`rustc -vV`):
+- Cargo version (`cargo --version`):
+- rustfmt version (`rustfmt --version`):
+- Clippy version (`cargo clippy -V`):
 - Node version:
+- npm package/platform graph provenance:
+  - Root `package.json` version:
+  - Platform package versions:
+  - Source commit used for platform binaries:
 
 ## Required gate
 
@@ -31,7 +40,7 @@ Evidence:
 - `cargo clippy --locked --all-targets -- -D warnings`:
 - `cargo test --locked -- --test-threads=1`:
 - `cargo build --release --locked`:
-- `scripts/release-preflight.sh --require-audit`:
+- `scripts/release-preflight.sh --require-audit` (include toolchain diagnostic output):
 
 ## Contract gate
 
@@ -60,10 +69,12 @@ scripts/dependency-minor-dry-run.sh
 Evidence:
 
 - `cargo audit` result:
+- Audit tool version/path:
 - Deferred advisories, if any:
 - Dependency dry-run diff summary:
 - Dependency updates applied in this release:
 - Dependency updates deferred and owner:
+- npm/platform package provenance:
 
 ## Manual release soak
 

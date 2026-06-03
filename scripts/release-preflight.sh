@@ -67,6 +67,31 @@ fi
 step() { printf '\n==> %s\n' "$*"; }
 run() { step "$*"; "$@"; }
 
+run_toolchain_probe() {
+  local label="$1"
+  shift
+  printf '+ %s\n' "$label"
+  local status=0
+  "$@" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    cat >&2 <<EOF
+error: toolchain diagnostic failed: $label (exit $status)
+hint: verify the installed toolchain, or prefer a rustup toolchain first, for example:
+  PATH="\$HOME/.cargo/bin:\$PATH" scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+EOF
+    exit 67
+  fi
+}
+
+print_toolchain_diagnostics() {
+  step "Toolchain diagnostics"
+  run_toolchain_probe "rustc -vV" rustc -vV
+  run_toolchain_probe "rustfmt --version" rustfmt --version
+  run_toolchain_probe "cargo clippy -V" cargo clippy -V
+  run_toolchain_probe "cargo --version" cargo --version
+  run_toolchain_probe "node --version" node --version
+}
+
 cargo_package_version() {
   python3 - <<'PY'
 from pathlib import Path
@@ -99,6 +124,8 @@ path = Path(sys.argv[1])
 print(json.loads(path.read_text(encoding="utf-8"))["version"])
 PY
 }
+
+print_toolchain_diagnostics
 
 step "Validate release metadata versions"
 cargo_version=$(cargo_package_version)

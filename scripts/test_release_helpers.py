@@ -55,9 +55,31 @@ def file_hash(path: Path) -> str:
 
 
 class HelperScriptTests(unittest.TestCase):
-    def make_stub_dir(self, log_path: Path, *, include_node: bool = True, include_cargo_audit: bool = True) -> Path:
+    def make_stub_dir(
+        self,
+        log_path: Path,
+        *,
+        include_node: bool = True,
+        include_cargo_audit: bool = True,
+    ) -> Path:
         stub_dir = log_path.parent / "bin"
         stub_dir.mkdir(exist_ok=True)
+        for tool in ("rustc", "rustfmt"):
+            write_executable(
+                stub_dir / tool,
+                f"""
+                #!/bin/bash
+                set -euo pipefail
+                printf '{tool}' >> "$LTERM_HELPER_TEST_LOG"
+                printf '\\t%s' "$@" >> "$LTERM_HELPER_TEST_LOG"
+                printf '\\n' >> "$LTERM_HELPER_TEST_LOG"
+                if [[ "${{LTERM_FAIL_TOOL:-}}" == {tool!r} ]]; then
+                  echo '{tool}: simulated toolchain failure' >&2
+                  exit 70
+                fi
+                echo '{tool} fixture-version'
+                """,
+            )
         write_executable(
             stub_dir / "cargo",
             r"""
@@ -66,6 +88,14 @@ class HelperScriptTests(unittest.TestCase):
             printf 'cargo' >> "$LTERM_HELPER_TEST_LOG"
             printf '\t%s' "$@" >> "$LTERM_HELPER_TEST_LOG"
             printf '\n' >> "$LTERM_HELPER_TEST_LOG"
+            if [[ "${LTERM_FAIL_TOOL:-}" == "cargo" ]]; then
+              echo 'cargo: simulated toolchain failure' >&2
+              exit 70
+            fi
+            if [[ "${1:-}" == "--version" || ("${1:-}" == "clippy" && "${2:-}" == "-V") ]]; then
+              echo "cargo fixture-version"
+              exit 0
+            fi
             if [[ "${1:-}" == "build" ]]; then
               target="${CARGO_TARGET_DIR:-target}"
               mkdir -p "$target/debug" "$target/release"
@@ -112,12 +142,24 @@ class HelperScriptTests(unittest.TestCase):
                 printf 'node' >> "$LTERM_HELPER_TEST_LOG"
                 printf '\\t%s' "$@" >> "$LTERM_HELPER_TEST_LOG"
                 printf '\\n' >> "$LTERM_HELPER_TEST_LOG"
+                if [[ "${{LTERM_FAIL_TOOL:-}}" == "node" ]]; then
+                  echo 'node: simulated toolchain failure' >&2
+                  exit 70
+                fi
+                if [[ "${{1:-}}" == "--version" ]]; then
+                  echo 'vfixture'
+                  exit 0
+                fi
                 if [[ "${{1:-}}" == "-e" ]]; then
                   exec {REAL_PYTHON!r} - "$3" <<'PY'
 import json
 import sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
 PY
+                fi
+                if [[ "${{1:-}}" == "--version" ]]; then
+                  echo "v22.0.0-stub"
+                  exit 0
                 fi
                 if [[ "${{1:-}}" == "scripts/validate_npm_packages.mjs" ]]; then
                   exit 0
@@ -161,6 +203,7 @@ PY
         *,
         include_node: bool = True,
         include_cargo_audit: bool = True,
+        failing_tool: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         log_path = fixture.parent / "commands.log"
         stub_dir = self.make_stub_dir(log_path, include_node=include_node, include_cargo_audit=include_cargo_audit)
@@ -172,6 +215,8 @@ PY
                 "CARGO_TARGET_DIR": str(fixture / "target"),
             }
         )
+        if failing_tool is not None:
+            env["LTERM_FAIL_TOOL"] = failing_tool
         proc = run_checked(["/bin/bash", "scripts/release-preflight.sh", *args], fixture, env)
         return proc, log_path.read_text(encoding="utf-8") if log_path.exists() else ""
 
@@ -181,8 +226,13 @@ PY
             proc, log = self.run_release_preflight(fixture, ["--contract-only"], include_cargo_audit=False)
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             self.assertIn("cargo\tbuild\t--locked\n", log)
+            self.assertLess(log.index("rustc\t-vV"), log.index("cargo\tbuild\t--locked"))
+            self.assertLess(log.index("rustfmt\t--version"), log.index("cargo\tbuild\t--locked"))
+            self.assertLess(log.index("cargo\tclippy\t-V"), log.index("cargo\tbuild\t--locked"))
+            self.assertLess(log.index("cargo\t--version"), log.index("cargo\tbuild\t--locked"))
+            self.assertLess(log.index("node\t--version"), log.index("cargo\tbuild\t--locked"))
             self.assertNotIn("cargo\tfmt", log)
-            self.assertNotIn("cargo\tclippy", log)
+            self.assertNotIn("cargo\tclippy\t--locked", log)
             self.assertNotIn("cargo\ttest\t--locked\t--test\tupgrade_matrix", log)
             self.assertNotIn("cargo\taudit", log)
             self.assertIn("python3\tscripts/validate_contract_manifest.py\tdocs/contract-manifest.json", log)
@@ -217,6 +267,39 @@ PY
             self.assertEqual(proc.returncode, 66, proc.stderr + proc.stdout)
             self.assertIn("cargo-audit required but not found", proc.stderr)
 
+    def test_release_preflight_toolchain_failure_is_actionable_before_cargo_checks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lterm-release-preflight-test-") as tmp:
+            fixture = self.make_release_fixture(Path(tmp))
+            log_path = fixture.parent / "commands.log"
+            stub_dir = self.make_stub_dir(log_path)
+            write_executable(
+                stub_dir / "rustc",
+                """
+                #!/bin/bash
+                set -euo pipefail
+                printf 'rustc' >> "$LTERM_HELPER_TEST_LOG"
+                printf '\\t%s' "$@" >> "$LTERM_HELPER_TEST_LOG"
+                printf '\\n' >> "$LTERM_HELPER_TEST_LOG"
+                echo 'dyld: Library not loaded: libLLVM.dylib' >&2
+                exit 42
+                """,
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{stub_dir}{os.pathsep}{os.defpath}",
+                    "LTERM_HELPER_TEST_LOG": str(log_path),
+                    "CARGO_TARGET_DIR": str(fixture / "target"),
+                }
+            )
+            proc = run_checked(["/bin/bash", "scripts/release-preflight.sh", "--contract-only"], fixture, env)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertEqual(proc.returncode, 67, proc.stderr + proc.stdout)
+            self.assertIn("toolchain diagnostic failed: rustc -vV", proc.stderr)
+            self.assertIn('PATH="$HOME/.cargo/bin:$PATH"', proc.stderr)
+            self.assertIn("rustc\t-vV", log)
+            self.assertNotIn("cargo\tbuild", log)
+
     def test_release_preflight_version_mismatches_exit_65(self) -> None:
         mismatch_cases = [
             ("package.json", lambda fixture: (fixture / "package.json").write_text(json.dumps({"version": "9.9.9"}))),
@@ -249,8 +332,8 @@ PY
             fixture = self.make_release_fixture(Path(tmp))
             (fixture / "package.json").write_text(json.dumps({"version": "9.9.9"}), encoding="utf-8")
             proc, log = self.run_release_preflight(fixture, ["--contract-only"], include_node=False)
-            self.assertEqual(proc.returncode, 65, proc.stderr + proc.stdout)
-            self.assertIn("Cargo.toml version", proc.stderr)
+            self.assertEqual(proc.returncode, 67, proc.stderr + proc.stdout)
+            self.assertIn("toolchain diagnostic failed: node --version", proc.stderr)
             self.assertNotIn("cargo\tbuild", log)
 
     def make_dependency_fixture(self, root: Path) -> Path:

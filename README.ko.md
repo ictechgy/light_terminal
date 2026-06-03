@@ -527,6 +527,15 @@ cargo test
 cargo build --locked
 ```
 
+시스템 패키지 매니저로 설치한 Rust toolchain이 Cargo 시작 전에 실패한다면
+(예: Homebrew `libLLVM.dylib` loader error), release gate 실행 전 rustup
+toolchain을 PATH 앞에 두는 것을 권장합니다.
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" rustc -vV
+PATH="$HOME/.cargo/bin:$PATH" cargo --version
+```
+
 수동 테스트에는 격리된 runtime directory 사용을 권장합니다.
 
 ```bash
@@ -539,14 +548,14 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 릴리스/계약 preflight 헬퍼:
 
 ```bash
-scripts/release-preflight.sh --contract-only
-scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+PATH="$HOME/.cargo/bin:$PATH" scripts/release-preflight.sh --contract-only
+PATH="$HOME/.cargo/bin:$PATH" scripts/release-preflight.sh --allow-occupied-skip --skip-audit
 scripts/dependency-minor-dry-run.sh
 ```
 
 `scripts/release-preflight.sh`의 `--run-soak`은 manual release-gate soak
-profile에서만 사용하세요. Tagging 또는 publishing 전에 release, audit,
-contract, dependency, soak evidence를 남길 때는
+profile에서만 사용하세요. Tagging 또는 publishing 전에 release, toolchain
+provenance, audit, contract, dependency, soak evidence를 남길 때는
 [`docs/release-evidence-template.md`](docs/release-evidence-template.md)를
 사용하세요.
 
