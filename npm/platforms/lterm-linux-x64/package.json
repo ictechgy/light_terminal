@@ -1,6 +1,6 @@
 {
   "name": "lterm-linux-x64",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "Native lterm binary for Linux x64.",
   "license": "MIT OR Apache-2.0",
   "repository": {
