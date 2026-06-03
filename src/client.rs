@@ -55,6 +55,11 @@ const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_secs(2);
 /// Attach output idle wakeup. This bounds status-bar redraw latency without the
 /// previous 30ms hot poll; heartbeat logic still owns the actual redraw cadence.
 const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+/// Row-off agent sessions cannot safely use the host status row, and Codex-like
+/// TUIs may overwrite the one-shot terminal title during startup. Re-emit the
+/// sanitized title only after the PTY has been idle for a short while so the cue
+/// remains available without consuming a row or touching SGR color state.
+const AGENT_TITLE_REFRESH: Duration = Duration::from_secs(2);
 /// Poll live session metadata while attached so host-side status text follows
 /// external `lterm rename` calls without mixing metadata frames into the raw
 /// PTY stream. The poll runs on a side RPC thread; the attach output loop only
@@ -1812,21 +1817,63 @@ pub fn attach_info_with_policy(
     } else if options.transcript.read_only {
         bail!("--read-only requires mobile transcript mode");
     } else {
-        maybe_emit_agent_presence_cue(info, presence_policy)?;
-        attach_with_presence(&info.pane_id, presence_policy, stdin_eof)
+        let agent_presence_cue = agent_presence_cue_for_info(info, presence_policy);
+        if let Some(cue) = agent_presence_cue.as_ref() {
+            cue.emit_initial(&mut std::io::stdout())?;
+        }
+        attach_with_presence_and_cue(
+            &info.pane_id,
+            presence_policy,
+            stdin_eof,
+            agent_presence_cue,
+        )
     }
 }
 
-fn maybe_emit_agent_presence_cue(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentPresenceCue {
+    session: String,
+    pane: String,
+    agent: String,
+}
+
+impl AgentPresenceCue {
+    fn emit_initial(&self, stdout: &mut impl Write) -> Result<()> {
+        self.write_title(stdout)?;
+        if agent_presence_banner_enabled() {
+            self.write_banner(stdout)?;
+        }
+        stdout.flush().context("flush lterm agent presence cue")?;
+        Ok(())
+    }
+
+    fn refresh_title(&self, stdout: &mut impl Write) -> Result<()> {
+        self.write_title(stdout)?;
+        stdout
+            .flush()
+            .context("flush lterm terminal title refresh")?;
+        Ok(())
+    }
+
+    fn write_title(&self, stdout: &mut impl Write) -> Result<()> {
+        write_lterm_title_cue(stdout, &self.session, &self.pane, &self.agent)
+    }
+
+    fn write_banner(&self, stdout: &mut impl Write) -> Result<()> {
+        write_lterm_agent_presence_banner(stdout, &self.session, &self.pane, &self.agent)
+    }
+}
+
+fn agent_presence_cue_for_info(
     info: &SessionInfo,
     presence_policy: StatusPresencePolicy,
-) -> Result<()> {
+) -> Option<AgentPresenceCue> {
     if presence_policy.requests_row()
         || !likely_agent_session(info)
         || !agent_presence_cue_enabled()
         || !std::io::stdout().is_terminal()
     {
-        return Ok(());
+        return None;
     }
     let session = sanitize::terminal_text(&info.name);
     let pane = sanitize::terminal_text(&info.pane_id);
@@ -1836,13 +1883,11 @@ fn maybe_emit_agent_presence_cue(
         .map(sanitize::terminal_text)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "agent".to_string());
-    let mut stdout = std::io::stdout();
-    write_lterm_title_cue(&mut stdout, &session, &pane, &agent)?;
-    if agent_presence_banner_enabled() {
-        write_lterm_agent_presence_banner(&mut stdout, &session, &pane, &agent)?;
-    }
-    stdout.flush().context("flush lterm terminal title cue")?;
-    Ok(())
+    Some(AgentPresenceCue {
+        session,
+        pane,
+        agent,
+    })
 }
 
 fn agent_presence_cue_enabled() -> bool {
@@ -1880,6 +1925,40 @@ fn write_lterm_agent_presence_banner(
         "\r[lterm] {session} {pane} · {agent} (status row hidden for agent TUI; use --status to show it)\r\n"
     )
     .context("emit lterm agent presence banner")
+}
+
+struct AgentTitleCueRuntime {
+    cue: AgentPresenceCue,
+    last_refresh: Instant,
+    last_pty_output: Option<Instant>,
+}
+
+impl AgentTitleCueRuntime {
+    fn new(cue: AgentPresenceCue) -> Self {
+        Self {
+            cue,
+            last_refresh: Instant::now(),
+            last_pty_output: None,
+        }
+    }
+
+    fn observe_pty_output(&mut self) {
+        self.last_pty_output = Some(Instant::now());
+    }
+
+    fn refresh_due(&self) -> bool {
+        self.last_pty_output.is_some_and(|last_pty_output| {
+            last_pty_output.elapsed() >= AGENT_TITLE_REFRESH
+                && self.last_refresh.elapsed() >= AGENT_TITLE_REFRESH
+        })
+    }
+
+    fn refresh_title(&mut self, stdout: &mut impl Write) -> Result<()> {
+        self.cue.refresh_title(stdout)?;
+        self.last_refresh = Instant::now();
+        self.last_pty_output = None;
+        Ok(())
+    }
 }
 
 const COMPOSE_MIN_REFRESH: Duration = Duration::from_millis(50);
@@ -2857,9 +2936,20 @@ pub fn attach_with_presence(
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
 ) -> Result<()> {
+    attach_with_presence_and_cue(target, presence_policy, stdin_eof, None)
+}
+
+fn attach_with_presence_and_cue(
+    target: &str,
+    presence_policy: StatusPresencePolicy,
+    stdin_eof: AttachStdinEof,
+    agent_presence_cue: Option<AgentPresenceCue>,
+) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
     let status_enabled = status_bar_supported(presence_policy.requests_row());
+    let mut title_cue_runtime = agent_presence_cue.map(AgentTitleCueRuntime::new);
+    let idle_wakeup_enabled = status_enabled || title_cue_runtime.is_some();
     // status bar 는 SessionInfo 의 메타데이터 (이름/명령 등) 가 필요하므로 켜졌을 때만
     // info() 를 호출한다. PR #14 의 client-side first-attach guard 가 사라졌으므로
     // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
@@ -3047,10 +3137,15 @@ pub fn attach_with_presence(
     });
     let nested_detection = nested_monitor_enabled
         .then(|| spawn_nested_agent_detection_thread(target.to_string(), Arc::clone(&running)));
-    if status_enabled {
+    if idle_wakeup_enabled {
+        let output_idle_timeout = if status_enabled {
+            ATTACH_OUTPUT_IDLE_TIMEOUT
+        } else {
+            AGENT_TITLE_REFRESH
+        };
         reader
             .get_ref()
-            .set_read_timeout(Some(ATTACH_OUTPUT_IDLE_TIMEOUT))
+            .set_read_timeout(Some(output_idle_timeout))
             .context("set attach output read timeout")?;
     }
     let mut buf = [0_u8; 8192];
@@ -3178,7 +3273,7 @@ pub fn attach_with_presence(
                 Ok(n) => n,
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                 Err(err)
-                    if status_enabled
+                    if idle_wakeup_enabled
                         && (err.kind() == ErrorKind::WouldBlock
                             || err.kind() == ErrorKind::TimedOut) =>
                 {
@@ -3195,11 +3290,23 @@ pub fn attach_with_presence(
                     {
                         break;
                     }
+                    if let Some(title_cue) = title_cue_runtime.as_mut()
+                        && title_cue.refresh_due()
+                    {
+                        match title_cue.refresh_title(&mut stdout) {
+                            Ok(()) => {}
+                            Err(err) if anyhow_error_is_broken_pipe(&err) => break,
+                            Err(err) => return Err(err),
+                        }
+                    }
                     continue;
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
             terminal_output_tracker.observe(&buf[..n]);
+            if let Some(title_cue) = title_cue_runtime.as_mut() {
+                title_cue.observe_pty_output();
+            }
             if forward_pty_output_frame_or_detached(
                 &mut stdout,
                 &buf[..n],
@@ -4696,7 +4803,8 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT, ATTACH_RESPONSE_HEADER_LIMIT, AltScreenState,
+        AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
+        ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, NestedAgentDetector, NestedAgentTransition, ProcessInfo,
@@ -4725,7 +4833,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn compose_commit_bytes_match_input_enter_semantics() {
@@ -5317,6 +5425,59 @@ mod tests {
         assert!(
             agent_presence_banner_enabled(),
             "banner helper remains independently controlled by LTERM_AGENT_BANNER"
+        );
+    }
+
+    #[test]
+    fn agent_title_cue_runtime_refreshes_title_without_inline_banner() {
+        let mut runtime = AgentTitleCueRuntime::new(AgentPresenceCue {
+            session: "repo".to_string(),
+            pane: "%0".to_string(),
+            agent: "codex".to_string(),
+        });
+        assert!(
+            !runtime.refresh_due(),
+            "new runtime should not immediately re-emit the title cue"
+        );
+
+        runtime.last_refresh = Instant::now() - AGENT_TITLE_REFRESH - Duration::from_millis(1);
+        assert!(
+            !runtime.refresh_due(),
+            "title refresh should wait until the attached PTY has produced output"
+        );
+        runtime.observe_pty_output();
+        assert!(
+            !runtime.refresh_due(),
+            "fresh PTY output should reset the idle interval"
+        );
+        runtime.last_refresh = Instant::now() - AGENT_TITLE_REFRESH - Duration::from_millis(1);
+        runtime.last_pty_output =
+            Some(Instant::now() - AGENT_TITLE_REFRESH + Duration::from_millis(1));
+        assert!(
+            !runtime.refresh_due(),
+            "title refresh should wait for a full idle interval after the latest PTY output"
+        );
+        runtime.last_pty_output =
+            Some(Instant::now() - AGENT_TITLE_REFRESH - Duration::from_millis(1));
+        assert!(runtime.refresh_due());
+
+        let mut output = Vec::new();
+        runtime
+            .refresh_title(&mut output)
+            .expect("refresh title cue");
+        let output = String::from_utf8(output).expect("title cue is utf8");
+        assert_eq!(output, "\x1b]0;lt:repo:%0 · codex\x07");
+        assert!(
+            !output.contains("[lterm]"),
+            "periodic refresh must not inject an inline row/banner into the raw TUI surface"
+        );
+        assert!(
+            runtime.last_pty_output.is_none(),
+            "successful refresh should disarm until the TUI writes again"
+        );
+        assert!(
+            !runtime.refresh_due(),
+            "successful refresh should reset the interval"
         );
     }
 

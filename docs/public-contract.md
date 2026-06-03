@@ -79,7 +79,9 @@ default to a client-side bottom status row; built-in agent launchers default to
 row-off full-height raw attach and may emit a compact terminal-title cue
 (`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> ·
 <agent> (status row hidden for agent TUI; use --status to show it)` banner as the
-non-row presence indicator before raw attach.
+non-row presence indicator before raw attach. While the row remains hidden, lterm
+refreshes only the terminal-title cue after idle gaps so Codex-like TUIs can own
+the screen without permanently erasing the lterm identity.
 `LTERM_AGENT_CUE=0` disables both cue forms; `LTERM_AGENT_BANNER=0` disables only
 the inline banner while keeping the terminal-title cue. User-controlled fields in
 these host-side cue surfaces are sanitized before printing, but the subsequent
