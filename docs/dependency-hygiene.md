@@ -37,6 +37,9 @@ before deciding whether to apply it in the real checkout.
 
 `scripts/release-preflight.sh` runs the normal build/test/contract gates and will
 run `cargo audit` automatically when `cargo-audit` is installed. Use
-`--require-audit` for release evidence when an audit result is mandatory. Record
-the audit result, dependency dry-run diff, and any deferred advisory decision in
+`--require-audit` for release evidence when an audit result is mandatory. The
+preflight prints Rust, Cargo, rustfmt, Clippy, and Node diagnostics before the
+expensive gates so release evidence can identify the exact toolchain used.
+Record the toolchain provenance, audit result, dependency dry-run diff, npm
+package graph provenance, and any deferred advisory decision in
 `docs/release-evidence-template.md`.

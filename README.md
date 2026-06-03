@@ -528,6 +528,15 @@ cargo test
 cargo build --locked
 ```
 
+If a system package-manager Rust toolchain fails before Cargo starts (for
+example a Homebrew `libLLVM.dylib` loader error), prefer the rustup toolchain in
+your shell before running release gates:
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" rustc -vV
+PATH="$HOME/.cargo/bin:$PATH" cargo --version
+```
+
 Use isolated runtime directories for manual testing:
 
 ```bash
@@ -540,16 +549,16 @@ LTERM_RUNTIME_DIR="$TMP/run" LTERM_DATA_DIR="$TMP/data" cargo run -- shutdown
 Release/contract preflight helpers:
 
 ```bash
-scripts/release-preflight.sh --contract-only
-scripts/release-preflight.sh --allow-occupied-skip --skip-audit
+PATH="$HOME/.cargo/bin:$PATH" scripts/release-preflight.sh --contract-only
+PATH="$HOME/.cargo/bin:$PATH" scripts/release-preflight.sh --allow-occupied-skip --skip-audit
 scripts/dependency-minor-dry-run.sh
 ```
 
 Use `--run-soak` on `scripts/release-preflight.sh` only for the manual
 release-gate soak profile. Use
 [`docs/release-evidence-template.md`](docs/release-evidence-template.md) to
-capture release, audit, contract, dependency, and soak evidence before tagging or
-publishing.
+capture release, toolchain provenance, audit, contract, dependency, and soak
+evidence before tagging or publishing.
 
 ## License
 
