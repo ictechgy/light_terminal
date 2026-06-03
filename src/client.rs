@@ -5174,8 +5174,13 @@ mod tests {
             rendered,
             format!("{MOBILE_TRANSCRIPT_SGR_RESET}safe red done\n")
         );
-        let rendered_without_local_resets = rendered.replace(MOBILE_TRANSCRIPT_SGR_RESET, "");
-        assert!(!rendered_without_local_resets.contains('\x1b'));
+        let sanitized_payload = rendered
+            .strip_prefix(MOBILE_TRANSCRIPT_SGR_RESET)
+            .expect("transcript update should start with exactly one local SGR reset");
+        assert!(
+            !sanitized_payload.contains('\x1b'),
+            "sanitized transcript payload must not leak reset-only or other escapes: {rendered:?}"
+        );
         assert!(!rendered.contains("secret"));
         assert_eq!(previous, "safe red done\n");
 

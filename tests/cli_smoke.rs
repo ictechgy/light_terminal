@@ -9139,7 +9139,12 @@ fn mobile_auto_transcript_prints_sanitized_capture() -> TestResult {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("VISIBLE RED DONE"), "{stdout:?}");
-    let stdout_without_local_resets = stdout.replace("\x1b[0m", "");
+    assert_eq!(
+        stdout.matches("\x1b[0m").count(),
+        2,
+        "mobile transcript should emit exactly one local reset for the banner and one for the transcript update; reset-only payload escapes must stay sanitized: {stdout:?}"
+    );
+    let stdout_without_local_resets = stdout.replacen("\x1b[0m", "", 2);
     assert!(
         !stdout_without_local_resets.contains('\x1b') && !stdout.contains("secret"),
         "mobile transcript must not print active escape/control payloads: {stdout:?}"
