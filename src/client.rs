@@ -1930,7 +1930,7 @@ fn write_lterm_agent_presence_banner(
 struct AgentTitleCueRuntime {
     cue: AgentPresenceCue,
     last_refresh: Instant,
-    saw_pty_output: bool,
+    last_pty_output: Option<Instant>,
 }
 
 impl AgentTitleCueRuntime {
@@ -1938,24 +1938,25 @@ impl AgentTitleCueRuntime {
         Self {
             cue,
             last_refresh: Instant::now(),
-            saw_pty_output: false,
+            last_pty_output: None,
         }
     }
 
     fn observe_pty_output(&mut self) {
-        if !self.saw_pty_output {
-            self.saw_pty_output = true;
-            self.last_refresh = Instant::now();
-        }
+        self.last_pty_output = Some(Instant::now());
     }
 
     fn refresh_due(&self) -> bool {
-        self.saw_pty_output && self.last_refresh.elapsed() >= AGENT_TITLE_REFRESH
+        self.last_pty_output.is_some_and(|last_pty_output| {
+            last_pty_output.elapsed() >= AGENT_TITLE_REFRESH
+                && self.last_refresh.elapsed() >= AGENT_TITLE_REFRESH
+        })
     }
 
     fn refresh_title(&mut self, stdout: &mut impl Write) -> Result<()> {
         self.cue.refresh_title(stdout)?;
         self.last_refresh = Instant::now();
+        self.last_pty_output = None;
         Ok(())
     }
 }
@@ -3137,9 +3138,14 @@ fn attach_with_presence_and_cue(
     let nested_detection = nested_monitor_enabled
         .then(|| spawn_nested_agent_detection_thread(target.to_string(), Arc::clone(&running)));
     if idle_wakeup_enabled {
+        let output_idle_timeout = if status_enabled {
+            ATTACH_OUTPUT_IDLE_TIMEOUT
+        } else {
+            AGENT_TITLE_REFRESH
+        };
         reader
             .get_ref()
-            .set_read_timeout(Some(ATTACH_OUTPUT_IDLE_TIMEOUT))
+            .set_read_timeout(Some(output_idle_timeout))
             .context("set attach output read timeout")?;
     }
     let mut buf = [0_u8; 8192];
@@ -5440,7 +5446,19 @@ mod tests {
             "title refresh should wait until the attached PTY has produced output"
         );
         runtime.observe_pty_output();
+        assert!(
+            !runtime.refresh_due(),
+            "fresh PTY output should reset the idle interval"
+        );
         runtime.last_refresh = Instant::now() - AGENT_TITLE_REFRESH - Duration::from_millis(1);
+        runtime.last_pty_output =
+            Some(Instant::now() - AGENT_TITLE_REFRESH + Duration::from_millis(1));
+        assert!(
+            !runtime.refresh_due(),
+            "title refresh should wait for a full idle interval after the latest PTY output"
+        );
+        runtime.last_pty_output =
+            Some(Instant::now() - AGENT_TITLE_REFRESH - Duration::from_millis(1));
         assert!(runtime.refresh_due());
 
         let mut output = Vec::new();
@@ -5452,6 +5470,10 @@ mod tests {
         assert!(
             !output.contains("[lterm]"),
             "periodic refresh must not inject an inline row/banner into the raw TUI surface"
+        );
+        assert!(
+            runtime.last_pty_output.is_none(),
+            "successful refresh should disarm until the TUI writes again"
         );
         assert!(
             !runtime.refresh_due(),
