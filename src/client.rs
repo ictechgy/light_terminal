@@ -7161,6 +7161,59 @@ mod tests {
     }
 
     #[test]
+    fn normal_attach_cleanup_keeps_raw_recovery_minimal_and_ordered() {
+        const ALT_SCREEN_EXIT_1049: &[u8] = b"\x1b[?1049l";
+        const SCROLL_REGION_RESET: &[u8] = b"\x1b[r";
+        const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+        const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
+        const SGR_RESET: &[u8] = b"\x1b[0m";
+
+        let bytes = normal_attach_terminal_cleanup_bytes(false);
+        assert!(
+            !bytes.windows(b"\x1b]52;".len()).any(|w| w == b"\x1b]52;"),
+            "normal raw attach cleanup must not introduce clipboard-capable OSC controls"
+        );
+        assert!(
+            !bytes
+                .windows(ALT_SCREEN_EXIT_1049.len())
+                .any(|w| w == ALT_SCREEN_EXIT_1049),
+            "normal cleanup without observed alt-screen must stay on the main screen"
+        );
+
+        let pos_scroll = bytes
+            .windows(SCROLL_REGION_RESET.len())
+            .position(|w| w == SCROLL_REGION_RESET)
+            .expect("scroll-region reset in normal cleanup");
+        let pos_cursor = bytes
+            .windows(CURSOR_SHOW.len())
+            .position(|w| w == CURSOR_SHOW)
+            .expect("cursor show in normal cleanup");
+        let pos_bracketed_paste = bytes
+            .windows(BRACKETED_PASTE_DISABLE.len())
+            .position(|w| w == BRACKETED_PASTE_DISABLE)
+            .expect("bracketed paste disable in normal cleanup");
+        let pos_sgr_reset = bytes
+            .windows(SGR_RESET.len())
+            .rposition(|w| w == SGR_RESET)
+            .expect("final SGR reset in normal cleanup");
+
+        assert!(
+            pos_scroll < pos_cursor
+                && pos_cursor < pos_bracketed_paste
+                && pos_bracketed_paste < pos_sgr_reset,
+            "normal cleanup order should be scroll reset -> cursor show -> bracketed paste off -> final local SGR reset: {bytes:?}"
+        );
+        assert_eq!(
+            bytes
+                .windows(SGR_RESET.len())
+                .filter(|w| *w == SGR_RESET)
+                .count(),
+            1,
+            "normal cleanup should emit exactly one host-local SGR reset"
+        );
+    }
+
+    #[test]
     fn ensure_panic_terminal_cleanup_hook_is_idempotent() {
         // OnceLock 으로 보호되어 다회 호출이 안전해야 한다
         ensure_panic_terminal_cleanup_hook();
