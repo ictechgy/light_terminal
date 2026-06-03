@@ -9139,8 +9139,9 @@ fn mobile_auto_transcript_prints_sanitized_capture() -> TestResult {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("VISIBLE RED DONE"), "{stdout:?}");
+    let stdout_without_local_resets = stdout.replace("\x1b[0m", "");
     assert!(
-        !stdout.contains('\x1b') && !stdout.contains("secret"),
+        !stdout_without_local_resets.contains('\x1b') && !stdout.contains("secret"),
         "mobile transcript must not print active escape/control payloads: {stdout:?}"
     );
     Ok(())

@@ -4117,6 +4117,43 @@ mod tests {
     }
 
     #[test]
+    fn leader_exit_finalize_marks_not_alive_and_removes_indexes() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("leader-exit-finalize");
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert(session.name(), Arc::clone(&session));
+            sessions
+                .by_pane
+                .insert(session.pane_id.clone(), Arc::clone(&session));
+            sessions
+                .by_id
+                .insert(session.id.clone(), Arc::clone(&session));
+        }
+
+        super::finalize_session(&state, &session, super::SessionFinalizeReason::LeaderExited);
+
+        assert!(
+            !session.alive.load(Ordering::SeqCst),
+            "leader-exit finalization must clear user-visible alive state"
+        );
+        assert!(
+            session.cleanup_complete.load(Ordering::SeqCst),
+            "leader-exit finalization must publish cleanup completion"
+        );
+        assert!(
+            !session.unreaped_cleanup_started.load(Ordering::SeqCst),
+            "leader-exit finalization should not run explicit terminate cleanup"
+        );
+        let sessions = super::lock(&state.sessions);
+        assert!(!sessions.by_name.contains_key(&session.name()));
+        assert!(!sessions.by_pane.contains_key(&session.pane_id));
+        assert!(!sessions.by_id.contains_key(&session.id));
+    }
+
+    #[test]
     fn concurrent_finalize_waits_for_single_cleanup_completion() {
         use std::sync::Barrier;
 

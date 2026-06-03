@@ -65,11 +65,17 @@ normal-screen transcript view). Desktop clients keep the raw attach path. Auto
 mobile detection is conservative best effort: `LTERM_MOBILE=1` or a Termius
 terminal identity marks the client as mobile, and the target must look like an
 agent session via persisted `LTERM_AGENT` metadata, a built-in `*-lterm` agent
-session name, or a known agent command basename. Scripts that need deterministic
-behavior should use explicit flags/env. The transcript surface is non-attached:
-it displays sanitized capture output, sends input through the existing `input` /
-`send` path, does not enter alternate screen, does not increment attached-client
-counts, and does not resize PTY geometry. `--raw` / `LTERM_ATTACH_MODE=raw`
+session name, or a known agent command basename. Termius connections that expose
+only generic SSH variables such as `SSH_TTY` and `TERM=xterm-256color` stay on
+the raw path unless the user explicitly opts into mobile transcript mode.
+Scripts that need deterministic behavior should use explicit flags/env. The
+transcript surface is non-attached: it displays sanitized capture output, sends
+input through the existing `input` / `send` path, does not enter alternate
+screen, does not increment attached-client counts, and does not resize PTY
+geometry. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
+lterm-owned text so stale host terminal colors do not leak into sanitized
+scrollback; that reset is not captured PTY payload and does not relax capture
+sanitization. `--raw` / `LTERM_ATTACH_MODE=raw`
 forces the raw path; `--mobile` / `LTERM_ATTACH_MODE=mobile` forces the
 transcript path. CLI flags (`--raw`, `--mobile`, `--attach-mode`) are explicit
 user intent and take precedence over `LTERM_ATTACH_MODE`.

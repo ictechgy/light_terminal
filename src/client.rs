@@ -70,6 +70,11 @@ const STATUS_METADATA_CHANNEL_LIMIT: usize = 4;
 const NESTED_AGENT_POLL: Duration = Duration::from_millis(500);
 const NESTED_AGENT_DETECTION_CHANNEL_LIMIT: usize = 4;
 const NESTED_AGENT_STABLE_POLLS: u8 = 2;
+/// Mobile transcript writes sanitized text, but the containing terminal may
+/// still be in a colored SGR state left by a previous raw TUI attach. Emit a
+/// narrow local reset before transcript UI text so sanitized output does not
+/// inherit stale foreground/background colors.
+const MOBILE_TRANSCRIPT_SGR_RESET: &str = "\x1b[0m";
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
@@ -2150,7 +2155,7 @@ pub fn mobile_transcript(target: &str, options: MobileTranscriptOptions) -> Resu
         let info = info(target)?;
         writeln!(
             stdout,
-            "lterm mobile transcript · target={} · pane={} · raw attach: {}",
+            "{MOBILE_TRANSCRIPT_SGR_RESET}lterm mobile transcript · target={} · pane={} · raw attach: {}",
             sanitize::terminal_text(&info.name),
             sanitize::terminal_text(&info.pane_id),
             raw_attach_command_hint(&info.name)?
@@ -2234,8 +2239,7 @@ fn run_interactive_mobile_transcript(
         }
     });
     let mut stdout = std::io::stdout();
-    write!(stdout, "> ").context("write mobile prompt")?;
-    stdout.flush().context("flush mobile prompt")?;
+    write_mobile_transcript_prompt(&mut stdout)?;
     loop {
         match input_rx.recv_timeout(refresh) {
             Ok(Ok(Some(input))) => {
@@ -2248,8 +2252,12 @@ fn run_interactive_mobile_transcript(
                         write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
                     }
                     "/raw" => {
-                        writeln!(stdout, "raw attach: {}", raw_attach_command_hint(target)?)
-                            .context("write raw attach hint")?;
+                        writeln!(
+                            stdout,
+                            "{MOBILE_TRANSCRIPT_SGR_RESET}raw attach: {}",
+                            raw_attach_command_hint(target)?
+                        )
+                        .context("write raw attach hint")?;
                     }
                     _ => {
                         send(target, compose_commit_bytes(input, options.append_enter))?;
@@ -2257,8 +2265,8 @@ fn run_interactive_mobile_transcript(
                         write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
                     }
                 }
-                write!(stdout, "\n> ").context("redraw mobile prompt")?;
-                stdout.flush().context("flush mobile prompt")?;
+                writeln!(stdout).context("separate mobile prompt")?;
+                write_mobile_transcript_prompt(&mut stdout)?;
             }
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(err)) => bail!("read mobile transcript input: {err}"),
@@ -2267,8 +2275,8 @@ fn run_interactive_mobile_transcript(
                 if mobile_transcript_capture_changed(&last_capture, &capture) {
                     writeln!(stdout).context("separate mobile prompt from transcript update")?;
                     write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
-                    write!(stdout, "\n> ").context("redraw mobile prompt")?;
-                    stdout.flush().context("flush mobile prompt")?;
+                    writeln!(stdout).context("separate mobile prompt")?;
+                    write_mobile_transcript_prompt(&mut stdout)?;
                 }
                 if !info(target)?.alive {
                     return Ok(());
@@ -2277,6 +2285,12 @@ fn run_interactive_mobile_transcript(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
+}
+
+fn write_mobile_transcript_prompt(stdout: &mut impl Write) -> Result<()> {
+    write!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}> ").context("write mobile prompt")?;
+    stdout.flush().context("flush mobile prompt")?;
+    Ok(())
 }
 
 fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
@@ -2306,6 +2320,7 @@ fn write_mobile_transcript_update(
     if next == *previous {
         return Ok(false);
     }
+    write!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}").context("reset mobile transcript style")?;
     if previous.is_empty() {
         write!(stdout, "{next}").context("write mobile transcript")?;
     } else if let Some(suffix) = mobile_transcript_incremental_suffix(previous, &next) {
@@ -3015,15 +3030,15 @@ fn attach_with_presence_and_cue(
         .set_read_timeout(None)
         .context("clear attach stream read timeout")?;
 
-    // RawModeGuard 먼저 → AttachActiveGuard 가 raw mode가 실제 세팅된 이후에만 활성.
-    // Drop 역순: status_bar → _attach_active(flag false) → _raw(raw mode 복원).
-    // 정상 종료 시 hook이 raw mode 복원 *후* 에 fire 되어 escape sequence를 emit
-    // 하는 의미 없는 window를 제거한다.
-    let _raw = RawModeGuard::enter()?;
-    let _attach_active = AttachActiveGuard::enter();
+    // RawAttachTerminalGuards owns raw-mode restoration and host-side cleanup
+    // ordering: attach_active drops first, then the guard drops RawModeGuard,
+    // then its HostTerminalCleanupGuard field emits host stdout cleanup. The
+    // child PTY stream is never used for this cleanup.
     let alt_screen_state = Arc::new(AltScreenState::default());
+    let terminal_guards = RawAttachTerminalGuards::enter(Arc::clone(&alt_screen_state))?;
+    let _attach_active = AttachActiveGuard::enter();
     let mut terminal_output_tracker = TerminalOutputTracker::new(
-        _raw.keyboard_protocol_restore_state(),
+        terminal_guards.keyboard_protocol_restore_state(),
         Arc::clone(&alt_screen_state),
         row_runtime.status_scroll_bottom_for(rows),
     );
@@ -4530,6 +4545,39 @@ struct RawModeGuard {
     keyboard_protocol_restore_state: Arc<KeyboardProtocolRestoreState>,
 }
 
+struct RawAttachTerminalGuards {
+    raw: Option<RawModeGuard>,
+    _cleanup: HostTerminalCleanupGuard,
+}
+
+impl RawAttachTerminalGuards {
+    fn enter(alt_screen_state: Arc<AltScreenState>) -> Result<Self> {
+        let mut cleanup = HostTerminalCleanupGuard::new(alt_screen_state);
+        let raw = RawModeGuard::enter()?;
+        cleanup.arm(raw.active());
+        Ok(Self {
+            raw: Some(raw),
+            _cleanup: cleanup,
+        })
+    }
+
+    fn keyboard_protocol_restore_state(&self) -> Arc<KeyboardProtocolRestoreState> {
+        self.raw
+            .as_ref()
+            .expect("raw attach terminal guards must hold raw mode until drop")
+            .keyboard_protocol_restore_state()
+    }
+}
+
+impl Drop for RawAttachTerminalGuards {
+    fn drop(&mut self) {
+        // Explicitly drop RawModeGuard first so raw mode and tracked keyboard
+        // protocol state are restored before HostTerminalCleanupGuard emits
+        // scroll/cursor/SGR cleanup on the host stdout.
+        drop(self.raw.take());
+    }
+}
+
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         let active = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -4540,6 +4588,10 @@ impl RawModeGuard {
             active,
             keyboard_protocol_restore_state: Arc::new(KeyboardProtocolRestoreState::default()),
         })
+    }
+
+    fn active(&self) -> bool {
+        self.active
     }
 
     fn keyboard_protocol_restore_state(&self) -> Arc<KeyboardProtocolRestoreState> {
@@ -4554,6 +4606,53 @@ impl Drop for RawModeGuard {
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
+}
+
+struct HostTerminalCleanupGuard {
+    active: bool,
+    alt_screen_state: Arc<AltScreenState>,
+}
+
+impl HostTerminalCleanupGuard {
+    fn new(alt_screen_state: Arc<AltScreenState>) -> Self {
+        Self {
+            active: false,
+            alt_screen_state,
+        }
+    }
+
+    fn arm(&mut self, raw_mode_active: bool) {
+        self.active = raw_mode_active && std::io::stdout().is_terminal();
+    }
+}
+
+impl Drop for HostTerminalCleanupGuard {
+    fn drop(&mut self) {
+        if self.active {
+            emit_normal_attach_terminal_cleanup(
+                self.alt_screen_state.active.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+fn emit_normal_attach_terminal_cleanup(alt_screen_active: bool) {
+    let bytes = normal_attach_terminal_cleanup_bytes(alt_screen_active);
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(&bytes);
+    let _ = stdout.flush();
+}
+
+fn normal_attach_terminal_cleanup_bytes(alt_screen_active: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if alt_screen_active {
+        // Leave alt-screen only when the raw stream actually entered it during
+        // this attach. Normal exits should not blindly force an alt-buffer
+        // switch for ordinary shell sessions.
+        bytes.extend_from_slice(b"\x1b[?1049l\x1b[?47l\x1b[?1047l");
+    }
+    bytes.extend_from_slice(b"\x1b[r\x1b[?25h\x1b[?2004l\x1b[0m\r\n");
+    bytes
 }
 
 fn restore_keyboard_protocols(state: &KeyboardProtocolRestoreState) {
@@ -4801,27 +4900,27 @@ mod tests {
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
-        MAX_TRACE_JSONL_LINE_BYTES, NestedAgentDetector, NestedAgentTransition, ProcessInfo,
-        ResizeTickOutcome, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, StatusBar,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, TerminalOutputTracker, agent_presence_banner_enabled,
-        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        attach_pty_rows, compose_commit_bytes, compose_display_line, compose_is_local_exit_key,
-        compose_pop_grapheme, compose_prompt_line, compose_push_paste, compose_refresh_interval,
-        compose_render_action, compose_sanitized_display_line, compose_should_commit,
-        compose_tail_start, compose_terminal_enter_sequence, compose_terminal_leave_sequence,
-        current_unix_ms, cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, format_status_line,
+        MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
+        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
+        STATUS_HEARTBEAT_FORCED, StatusBar, StatusPresencePolicy, StatusPresenceRuntimeHandle,
+        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
+        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
+        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, keyboard_protocol_restore_bytes, likely_agent_session,
         matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
-        nested_known_agent_present_in_processes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_style, raw_attach_command_hint,
-        read_attach_response_header, read_trace_jsonl_line, resolve_attach_mode,
-        resolve_status_style, should_mobile_transcript_auto, status_sgr_stack_supported,
-        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
-        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
-        write_lterm_title_cue, write_mobile_transcript_update,
+        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
+        resolve_attach_mode, resolve_status_style, should_mobile_transcript_auto,
+        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
+        trace_output_open_context, trace_summary_text, validate_trace_replay,
+        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -5023,7 +5122,10 @@ mod tests {
         let mut previous = String::new();
         let mut out = Vec::new();
         assert!(write_mobile_transcript_update(&mut previous, "one\n", &mut out).unwrap());
-        assert_eq!(String::from_utf8(out.clone()).unwrap(), "one\n");
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}one\n")
+        );
         assert_eq!(previous, "one\n");
 
         out.clear();
@@ -5031,7 +5133,10 @@ mod tests {
             write_mobile_transcript_update(&mut previous, "one\ntwo\n", &mut out).unwrap(),
             "longer capture should write only the suffix"
         );
-        assert_eq!(String::from_utf8(out.clone()).unwrap(), "two\n");
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}two\n")
+        );
 
         out.clear();
         assert!(!write_mobile_transcript_update(&mut previous, "one\ntwo\n", &mut out).unwrap());
@@ -5040,6 +5145,10 @@ mod tests {
         out.clear();
         assert!(write_mobile_transcript_update(&mut previous, "fresh\n", &mut out).unwrap());
         let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.starts_with(MOBILE_TRANSCRIPT_SGR_RESET),
+            "transcript refresh must reset stale terminal colors before local UI text: {rendered:?}"
+        );
         assert!(rendered.contains("--- lterm transcript refresh ---"));
         assert!(rendered.ends_with("fresh\n"));
         assert!(
@@ -5061,8 +5170,12 @@ mod tests {
             .unwrap()
         );
         let rendered = String::from_utf8(out.clone()).unwrap();
-        assert_eq!(rendered, "safe red done\n");
-        assert!(!rendered.contains('\x1b'));
+        assert_eq!(
+            rendered,
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}safe red done\n")
+        );
+        let rendered_without_local_resets = rendered.replace(MOBILE_TRANSCRIPT_SGR_RESET, "");
+        assert!(!rendered_without_local_resets.contains('\x1b'));
         assert!(!rendered.contains("secret"));
         assert_eq!(previous, "safe red done\n");
 
@@ -5072,7 +5185,10 @@ mod tests {
             write_mobile_transcript_update(&mut previous, "two\nthree\nfour\n", &mut out).unwrap(),
             "tail-window rollover should append only unseen complete-line suffix"
         );
-        assert_eq!(String::from_utf8(out.clone()).unwrap(), "four\n");
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}four\n")
+        );
         assert_eq!(previous, "two\nthree\nfour\n");
 
         previous = "alpha\nrepeat\nrepeat\n".to_string();
@@ -5082,7 +5198,10 @@ mod tests {
                 .unwrap(),
             "tail-window rollover should prefer the longest repeated-line overlap"
         );
-        assert_eq!(String::from_utf8(out).unwrap(), "omega\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}omega\n")
+        );
         assert_eq!(previous, "repeat\nrepeat\nomega\n");
     }
 
@@ -6969,6 +7088,49 @@ mod tests {
         assert!(bytes.windows(4).any(|w| w == b"\x1b[<u"));
         assert!(bytes.windows(5).any(|w| w == b"\x1b[=0u"));
         assert!(bytes.windows(8).any(|w| w == b"\x1b[?2004l"));
+    }
+
+    #[test]
+    fn normal_attach_cleanup_skips_alt_screen_exit_when_not_observed() {
+        let bytes = normal_attach_terminal_cleanup_bytes(false);
+        assert!(
+            !bytes
+                .windows(b"\x1b[?1049l".len())
+                .any(|w| w == b"\x1b[?1049l"),
+            "normal cleanup must not unconditionally leave alt-screen"
+        );
+        assert!(
+            !bytes.windows(b"\x1b[?47l".len()).any(|w| w == b"\x1b[?47l"),
+            "normal cleanup must not emit legacy alt-screen exit unless observed"
+        );
+        assert!(bytes.starts_with(b"\x1b[r"));
+        assert!(bytes.windows(6).any(|w| w == b"\x1b[?25h"));
+        assert!(bytes.windows(8).any(|w| w == b"\x1b[?2004l"));
+        assert!(bytes.ends_with(b"\x1b[0m\r\n"));
+    }
+
+    #[test]
+    fn normal_attach_cleanup_exits_alt_screen_only_when_observed() {
+        let bytes = normal_attach_terminal_cleanup_bytes(true);
+        let pos_alt = bytes
+            .windows(b"\x1b[?1049l".len())
+            .position(|w| w == b"\x1b[?1049l")
+            .expect("conditional alt-screen exit");
+        let pos_scroll = bytes
+            .windows(b"\x1b[r".len())
+            .position(|w| w == b"\x1b[r")
+            .expect("scroll reset in normal cleanup");
+        assert!(
+            pos_alt < pos_scroll,
+            "conditional alt-screen exit must happen before scroll reset"
+        );
+        assert!(bytes.windows(b"\x1b[?47l".len()).any(|w| w == b"\x1b[?47l"));
+        assert!(
+            bytes
+                .windows(b"\x1b[?1047l".len())
+                .any(|w| w == b"\x1b[?1047l")
+        );
+        assert!(bytes.ends_with(b"\x1b[0m\r\n"));
     }
 
     #[test]
