@@ -5957,7 +5957,8 @@ mod tests {
     }
 
     fn trace_file(events: &[serde_json::Value]) -> tempfile::NamedTempFile {
-        let mut file = tempfile::NamedTempFile::new().expect("trace tempfile");
+        let cwd = std::env::current_dir().expect("trace tempfile cwd");
+        let mut file = tempfile::NamedTempFile::new_in(cwd).expect("trace tempfile");
         for event in events {
             writeln!(file, "{event}").expect("write trace event");
         }

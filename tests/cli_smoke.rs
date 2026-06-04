@@ -1399,7 +1399,7 @@ fn watch_contains_notify_invokes_cmux_with_sanitized_message() -> TestResult {
 }
 
 #[test]
-fn watch_notify_targets_cmux_context_when_available() -> TestResult {
+fn notify_targets_cmux_context_when_available() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("bin");
     std::fs::create_dir(&fake_bin)?;
@@ -1413,37 +1413,20 @@ fn watch_notify_targets_cmux_context_when_available() -> TestResult {
     )?;
     let path = path_with_prepended(&fake_bin)?;
 
-    let status = env
-        .cmd()
-        .args([
-            "new",
-            "--detach",
-            "--name",
-            "watch-notify-context",
-            "--",
-            "sh",
-            "-lc",
-            "sleep 0.2; exit 0",
-        ])
-        .status()?;
-    assert!(status.success());
-    let _cleanup = SessionCleanup::new(&env, "watch-notify-context");
-
-    let mut watch = env.cmd();
-    watch
+    let mut notify = env.cmd();
+    notify
         .env("PATH", path)
         .env("CMUX_WORKSPACE_ID", "workspace:2")
         .env("CMUX_WINDOW_ID", "window:1")
         .env("CMUX_SURFACE_ID", "surface:7")
         .env("CMUX_PANE_ID", "pane:ignored");
-    let output = watch
+    let output = notify
         .args([
-            "watch",
-            "watch-notify-context",
-            "--exit",
-            "--timeout",
-            "5s",
-            "--notify",
+            "notify",
+            "--title",
+            "context-test",
+            "--body",
+            "context-body",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
@@ -1461,7 +1444,7 @@ fn watch_notify_targets_cmux_context_when_available() -> TestResult {
 }
 
 #[test]
-fn watch_notify_ignores_unsafe_cmux_context_refs() -> TestResult {
+fn notify_ignores_unsafe_cmux_context_refs() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("bin");
     std::fs::create_dir(&fake_bin)?;
@@ -1475,22 +1458,6 @@ fn watch_notify_ignores_unsafe_cmux_context_refs() -> TestResult {
     )?;
     let path = path_with_prepended(&fake_bin)?;
 
-    let status = env
-        .cmd()
-        .args([
-            "new",
-            "--detach",
-            "--name",
-            "watch-notify-context-filter",
-            "--",
-            "sh",
-            "-lc",
-            "sleep 0.2; exit 0",
-        ])
-        .status()?;
-    assert!(status.success());
-    let _cleanup = SessionCleanup::new(&env, "watch-notify-context-filter");
-
     let output = env
         .cmd()
         .env("PATH", path)
@@ -1498,12 +1465,11 @@ fn watch_notify_ignores_unsafe_cmux_context_refs() -> TestResult {
         .env("CMUX_WINDOW_ID", "window:1")
         .env("CMUX_SURFACE_ID", "surface:bad/value")
         .args([
-            "watch",
-            "watch-notify-context-filter",
-            "--exit",
-            "--timeout",
-            "5s",
-            "--notify",
+            "notify",
+            "--title",
+            "context-filter-test",
+            "--body",
+            "context-filter-body",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
@@ -6151,6 +6117,65 @@ fn prompt_time_visible_split_semantics_are_not_globally_hidden() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_kill_pane_closes_visible_cmux_split_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-visible-kill.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:source\",\"workspace_ref\":\"workspace:1\",\"window_ref\":\"window:main\"}}}}'; exit 0 ;;\n\
+               new-split) printf '%s\\n' 'OK surface:visible workspace:1 window:main'; exit 0 ;;\n\
+               send) exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let shell = command_path("sh")?.display().to_string();
+
+    let split = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-vPF",
+            "#{pane_id}",
+            shell.as_str(),
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(split.status.success(), "{split:?}");
+    let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    assert!(pane.starts_with('%'), "expected pane id, got {pane:?}");
+
+    let kill = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["tmux-compat", "kill-pane", "-t", pane.as_str()])
+        .output()?;
+    assert!(kill.status.success(), "{kill:?}");
+
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "close-surface --surface surface:visible --workspace workspace:1 --window window:main"
+        }),
+        "kill-pane should close the visible cmux split surface: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_stops_option_parsing_at_command() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
@@ -6899,6 +6924,31 @@ fn tmux_compat_supports_omc_default_split_flow() -> TestResult {
             .all(|line| line.split('\t').count() == 3),
         "HUD helper output must stay tab-parseable: {panes_stdout:?}"
     );
+
+    let panes_from_worker_target = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-panes",
+            "-t",
+            worker_pane.as_str(),
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()?;
+    assert!(
+        panes_from_worker_target.status.success(),
+        "{panes_from_worker_target:?}"
+    );
+    let worker_target_stdout = String::from_utf8_lossy(&panes_from_worker_target.stdout);
+    for expected_pane in [leader_pane, worker_pane.as_str()] {
+        assert!(
+            worker_target_stdout
+                .lines()
+                .any(|line| line == expected_pane),
+            "list-panes -t <pane> should return the whole synthetic window so HUD dedupe can see sibling panes; missing {expected_pane}: {worker_target_stdout:?}"
+        );
+    }
 
     let kill = env
         .cmd()
