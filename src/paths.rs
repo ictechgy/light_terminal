@@ -120,8 +120,22 @@ fn active_socket_marker_path() -> Result<PathBuf> {
     Ok(data_dir()?.join(ACTIVE_SOCKET_MARKER))
 }
 
+fn default_active_socket_marker_path() -> Result<Option<PathBuf>> {
+    if env::var_os("LTERM_DATA_DIR").is_some() {
+        return Ok(Some(active_socket_marker_path()?));
+    }
+    let Some(home) = env::var_os("HOME") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(home).join(".local/share").join(APP_DIR_NAME);
+    ensure_private_dir(&path)?;
+    Ok(Some(path.join(ACTIVE_SOCKET_MARKER)))
+}
+
 fn recorded_default_socket_path() -> Result<Option<PathBuf>> {
-    let marker = active_socket_marker_path()?;
+    let Some(marker) = default_active_socket_marker_path()? else {
+        return Ok(None);
+    };
     let text = match fs::read_to_string(&marker) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -474,6 +488,48 @@ mod tests {
             socket_path().expect("socket path from marker"),
             first,
             "default clients should rejoin the active daemon even if TMPDIR changes"
+        );
+    }
+
+    #[test]
+    fn socket_path_without_home_skips_default_marker_and_uses_tmp_runtime() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+        }
+
+        let path = socket_path().expect("HOME-less default socket path should still work");
+        assert!(
+            path.starts_with(tmp.path()),
+            "HOME-less default should fall back to temp runtime, got {path:?}"
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lterm.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_data_dir_errors_remain_strict_for_default_marker_lookup() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+            std::env::set_var("LTERM_DATA_DIR", "relative-data");
+        }
+
+        let err = socket_path().expect_err("explicit invalid data dir must not be ignored");
+        assert!(
+            err.to_string()
+                .contains("LTERM_DATA_DIR must be an absolute path"),
+            "unexpected error: {err:#}"
         );
     }
 
