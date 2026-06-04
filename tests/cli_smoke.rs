@@ -6713,6 +6713,38 @@ fn tmux_compat_run_shell_background_delay_defers_execution() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_run_shell_rejects_overflowing_delay_without_panic() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("run-shell-overflow-marker.txt");
+    let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let shell_command = format!("printf RUNSHELL_OVERFLOW_SHOULD_NOT_RUN > {marker_arg}");
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "run-shell",
+            "-b",
+            "-d",
+            "18446744073709551616",
+            shell_command.as_str(),
+        ])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "overflowing run-shell delay should fail before spawning: {output:?}"
+    );
+    assert_stderr_contains(
+        &output,
+        "tmux run-shell -d delay must be a finite non-negative duration",
+    );
+    assert!(
+        !marker.exists(),
+        "overflowing run-shell delay must not spawn the command"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_detached_e_applies_environment_and_cluster_values() -> TestResult {
     let env = TestEnv::new()?;
     let parent_status = env

@@ -440,7 +440,7 @@ fn window_row_for_target(target: &str) -> Result<SessionInfo> {
 fn window_pane_rows_for_target(target: &str) -> Result<Vec<SessionInfo>> {
     let root = window_row_for_target(target)?;
     let mut panes = vec![root.clone()];
-    let mut seen = HashSet::from([root.pane_id.clone()]);
+    let mut seen = HashSet::from([root.id.clone()]);
     let rows = client::list_sessions()?;
     let mut pending = vec![root.id.clone()];
     while let Some(parent_id) = pending.pop() {
@@ -450,7 +450,7 @@ fn window_pane_rows_for_target(target: &str) -> Result<Vec<SessionInfo>> {
                 .as_deref()
                 .is_some_and(|id| id == parent_id)
         }) {
-            if seen.insert(child.pane_id.clone()) {
+            if seen.insert(child.id.clone()) {
                 pending.push(child.id.clone());
                 panes.push(child.clone());
             }
@@ -1282,10 +1282,9 @@ fn parse_run_shell_delay(value: &str) -> Result<Duration> {
     let seconds: f64 = value
         .parse()
         .with_context(|| format!("tmux run-shell -d delay must be seconds: {value}"))?;
-    if !seconds.is_finite() || seconds < 0.0 || seconds > u64::MAX as f64 {
-        bail!("tmux run-shell -d delay must be a finite non-negative duration: {value}");
-    }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        anyhow!("tmux run-shell -d delay must be a finite non-negative duration: {value}")
+    })
 }
 
 fn run_shell_command(command: String, background: bool, delay: Duration) -> Result<i32> {
@@ -1295,6 +1294,8 @@ fn run_shell_command(command: String, background: bool, delay: Duration) -> Resu
         if delay.is_zero() {
             shell.arg("-c").arg(command);
         } else {
+            // Keep the caller-provided delay and command out of the wrapper's
+            // shell source so they cannot inject commands before the exec.
             shell
                 .arg("-c")
                 .arg(
