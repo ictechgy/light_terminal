@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-- **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이되, 기능 범위를 더 작게 좁힌 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
+- **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이지만, 기능 범위를 더 작게 좁힌 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
 - **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속합니다. shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` 같은 내장 단축 명령을 사용할 수 있습니다. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — 1.0 명령/출력 호환성 경계를 문서화한 alpha MVP입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스, escape-sequence sanitizer, 완전한 tmux 대체품 모두 아닙니다.**
