@@ -91,6 +91,12 @@ pub fn serve_forever() -> Result<()> {
     let listener = bind_private_socket(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", socket.display()))?;
+    if let Err(err) = paths::record_default_socket_path(&socket) {
+        eprintln!(
+            "failed to record active lterm socket {}: {err:#}",
+            socket.display()
+        );
+    }
     eprintln!("lterm daemon listening on {}", socket.display());
 
     // 데몬 시작 시각. SystemTime이 UNIX_EPOCH 이전이면 None을 그대로 들고 가서
