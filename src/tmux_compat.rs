@@ -502,15 +502,10 @@ fn kill_session(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
-    let before = client::info(target).ok();
-    let cmux_surface = before
-        .as_ref()
-        .and_then(|info| stored_cmux_surface_for_pane(&info.pane_id).transpose())
-        .transpose()?;
+    let before = client::info(target)?;
+    let cmux_surface = stored_cmux_surface_for_pane(&before.pane_id)?;
     client::kill(target)?;
-    if let Some(info) = before {
-        forget_pane(&info.pane_id)?;
-    }
+    forget_pane_best_effort(&before.pane_id);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
     }
@@ -533,7 +528,7 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
     client::kill(kill_target)?;
 
     for pane in panes_before {
-        forget_pane(&pane.pane_id)?;
+        forget_pane_best_effort(&pane.pane_id);
     }
     for surface in &cmux_surfaces {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
@@ -2383,6 +2378,16 @@ fn forget_pane(pane_id: &str) -> Result<()> {
         store.panes.remove(pane_id);
         Ok(())
     })
+}
+
+fn forget_pane_best_effort(pane_id: &str) {
+    if let Err(err) = forget_pane(pane_id) {
+        eprintln!(
+            "warning: tmux compat store cleanup failed for {}: {}",
+            sanitize::terminal_text(pane_id),
+            sanitize::terminal_text(&err.to_string())
+        );
+    }
 }
 
 fn now_unix_secs() -> u64 {
