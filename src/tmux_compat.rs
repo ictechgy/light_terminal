@@ -503,7 +503,7 @@ fn kill_session(args: &[String]) -> Result<i32> {
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let before = client::info(target)?;
-    let cmux_surface = stored_cmux_surface_for_pane(&before.pane_id)?;
+    let cmux_surface = stored_cmux_surface_for_pane_best_effort(&before.pane_id);
     client::kill(target)?;
     forget_pane_best_effort(&before.pane_id);
     if let Some(surface) = cmux_surface.as_ref() {
@@ -513,19 +513,32 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
 }
 
 fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
-    let panes_before = window_pane_rows_for_target(target)?;
-    let kill_target = panes_before
-        .first()
-        .map(|pane| pane.name.as_str())
-        .unwrap_or(target);
+    let (kill_target, panes_before) = match window_pane_rows_for_target(target) {
+        Ok(panes_before) => {
+            let kill_target = panes_before
+                .first()
+                .map(|pane| pane.name.clone())
+                .unwrap_or_else(|| target.to_string());
+            (kill_target, panes_before)
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: tmux compat pane enumeration failed for {}: {}",
+                sanitize::terminal_text(target),
+                sanitize::terminal_text(&err.to_string())
+            );
+            let fallback = client::info(target).ok().into_iter().collect();
+            (target.to_string(), fallback)
+        }
+    };
     let mut cmux_surfaces = HashSet::new();
     for pane in &panes_before {
-        if let Some(surface) = stored_cmux_surface_for_pane(&pane.pane_id)? {
+        if let Some(surface) = stored_cmux_surface_for_pane_best_effort(&pane.pane_id) {
             cmux_surfaces.insert(surface);
         }
     }
 
-    client::kill(kill_target)?;
+    client::kill(&kill_target)?;
 
     for pane in panes_before {
         forget_pane_best_effort(&pane.pane_id);
@@ -2371,6 +2384,20 @@ fn stored_cmux_surface_for_pane(pane_id: &str) -> Result<Option<CmuxSurfaceConte
             })
         }))
     })
+}
+
+fn stored_cmux_surface_for_pane_best_effort(pane_id: &str) -> Option<CmuxSurfaceContext> {
+    match stored_cmux_surface_for_pane(pane_id) {
+        Ok(surface) => surface,
+        Err(err) => {
+            eprintln!(
+                "warning: tmux compat store lookup failed for {}: {}",
+                sanitize::terminal_text(pane_id),
+                sanitize::terminal_text(&err.to_string())
+            );
+            None
+        }
+    }
 }
 
 fn forget_pane(pane_id: &str) -> Result<()> {
