@@ -3864,8 +3864,12 @@ mod tests {
         // `true` 는 즉시 종료되지만 PTY 마스터/슬레이브 fd 는 살아 있어 Session 구조에
         // 필요한 trait object 들을 채울 수 있다. process_id 는 보장되지 않으므로 None
         // 으로 두어도 본 단위테스트가 사용하는 어떤 경로도 process_id 에 의존하지 않는다.
-        let mut cmd = CommandBuilder::new("true");
-        cmd.cwd(std::env::temp_dir());
+        let true_path = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("absolute true for test session");
+        let mut cmd = CommandBuilder::new(true_path);
+        cmd.cwd(std::env::current_dir().expect("test session cwd"));
         let child = pair
             .slave
             .spawn_command(cmd)
