@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-- **무엇** — tmux 같은 영속 터미널 세션 데몬을 더 작게 만든 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
+- **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이되, 기능 범위를 더 작게 좁힌 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
 - **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속합니다. shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` 같은 내장 단축 명령을 사용할 수 있습니다. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — 1.0 명령/출력 호환성 경계를 문서화한 alpha MVP입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스, escape-sequence sanitizer, 완전한 tmux 대체품 모두 아닙니다.**
@@ -20,7 +20,7 @@
 ## 왜 tmux 대신 lterm인가요?
 
 풍부한 pane/window/layout 관리를 원하면 tmux가 맞습니다. `lterm`은 AI
-agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
+agent가 보통 필요로 하는 더 작은 기능 범위에 집중합니다.
 
 - **Agent-first persistence** — named PTY session이 detached client와 무관하게
   계속 실행되므로, 모든 workflow가 full tmux server를 직접 관리할 필요가
@@ -44,7 +44,7 @@ agent가 보통 필요로 하는 더 작은 표면에 집중합니다.
 
 1. **tmux와 비슷한 세션 지속성과 원격 접속** — 세션은 백그라운드 데몬에서 실행되며, 이름이나 pane id로 attach/detach할 수 있습니다. 원격 호스트에 `lterm`이 설치되어 있다면 `lterm ssh`로 접속할 수 있습니다.
 2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, tmux shim은 가능한 경우 worker pane을 cmux native split으로 엽니다.
-3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 가짜 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
+3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 tmux를 흉내 내는 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
 
 cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux native pane으로 매핑하는 tmux shim 모델을 문서화하고 있습니다.
 
@@ -188,13 +188,15 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 보호하는 범위이며, 신뢰된 title/body 내부의 Unicode bidi/format/zero-width
 문자를 normalize하지 않습니다.
 
-호환 이름은 앞에 flag 형태로 표시된 경우를 제외하면 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
+호환 이름은 flag 형태로 표시된 경우(`-a`)를 제외하면 모두 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
 
-이 표는 사람과 agent가 직접 쓰는 제품 CLI 표면입니다. `lterm tmux-compat ...`는 이미 tmux 명령을 사용하는 스크립트를 위한 별도 shim namespace이며, 모든 제품 명령에 tmux 호환 이름이 있는 것은 아닙니다. 런타임에 지원되는 shim subset은 `lterm tmux-compat list-commands`로 확인하세요.
+이 표는 사람과 agent가 직접 쓰는 제품 CLI 명령 모음입니다. `lterm tmux-compat ...`는 이미 tmux 명령을 사용하는 스크립트를 위한 별도 shim namespace이며, 모든 제품 명령에 tmux 호환 이름이 있는 것은 아닙니다. 런타임에 지원되는 shim subset은 `lterm tmux-compat list-commands`로 확인하세요.
 
-`lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. JSON 출력에는 agent profile로 띄운 세션에 한해 `agent_name` metadata가 추가되고, 일반 세션에는 이 field가 생략됩니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 text 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 status bar를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 강제하려면 `lterm resume --raw --no-status api`(호환 이름: `lterm attach --raw --no-status api`)를 쓰거나 `LTERM_ATTACH_MODE=raw`를 설정하세요. 단순히 status line만 충돌하는 클라이언트에서는 `LTERM_NO_STATUS=1` 또는 같은 의미의 `LTERM_STATUS=0`을 함께 사용하면 됩니다.
+`lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. JSON 출력에는 agent profile로 띄운 세션에 한해 `agent_name` metadata가 추가되고, 일반 세션에는 이 field가 생략됩니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 text 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 status bar를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 강제하려면 `lterm resume --raw --no-status api`(호환 이름: `lterm attach --raw --no-status api`)를 쓰거나 `LTERM_ATTACH_MODE=raw`를 설정하세요. status line만 충돌하는 클라이언트라면 `LTERM_NO_STATUS=1`(또는 같은 의미의 `LTERM_STATUS=0`)만 설정해도 됩니다.
 
-row status 존재 여부는 attach mode와 별도입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher 및 나중에 알려진 agent 세션에 붙는 `resume` / `open`은 full-height row-off surface를 기본값으로 사용합니다. 직접 agent launcher를 실행할 때는 terminal이 지원하면 attach 직전에 compact terminal-title cue(`lt:<session>:<pane> · <agent>`)와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 나중에 알려진 agent command가 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
+row status 표시 여부는 attach mode와는 별개입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher와 이미 agent 세션으로 식별된 세션에 다시 붙는 `resume` / `open`은 full-height row-off 화면을 기본값으로 사용합니다.
+
+직접 agent launcher를 실행할 때는 terminal이 지원하면 attach 직전에 compact terminal-title cue(`lt:<session>:<pane> · <agent>`)와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 알려진 agent command가 나중에 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
 
 모든 lterm 세션의 child process에는 `LTERM_SESSION`과 `LTERM_PANE`도 export됩니다. `[lterm:api:%0]` 같은 shell prompt badge를 선호한다면 이 변수를 prompt에 추가하세요. `lterm init --shell zsh|bash|fish`는 shim/completion/AI statusline 단계와 함께 이 reminder를 출력합니다. 자체 statusline/HUD를 제공하는 AI CLI는 lterm의 host-side bottom row에 의존하지 말고 같은 변수를 읽어 그 statusline 안에 badge를 표시하는 편이 좋습니다. 그래야 full-screen agent TUI와 모바일 SSH renderer를 덜 방해합니다. `lterm install-ai-statusline`을 실행하면 지원 통합을 설치합니다. 현재는 Claude/OMC HUD wrapper를 만들어 `lt:<session>:<pane>`를 앞에 붙이고, `~/.claude/settings.json`은 변경 전 backup합니다. Codex는 `~/.codex/config.toml`을 건드리지 않고 skipped로 보고합니다. 현재 Codex status_line item은 built-in만 가능하고, `thread-id`는 Codex 내부 식별자라 lterm 세션 식별자로 쓰기에 부적절하기 때문입니다.
 
@@ -281,7 +283,7 @@ lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다루기 쉽게 하기 위한 표면입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다룰 수 있게 해 주는 명령 집합입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
 
 자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
 Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
@@ -355,7 +357,7 @@ lterm agy --status -- -p "lterm status를 유지해줘"
 
 Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. 이후 해당 agent 세션을 `lterm resume` 또는 `lterm open`으로 다시 붙을 때도 같은 row-off 기본값을 유지합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 직접 agent launch의 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
-Agent launcher는 host/application 색상 정책도 agent child와 분리합니다. 클라이언트나 오래 살아 있는 daemon의 ambient `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`는 `LTERM_AGENT` metadata가 있는 세션으로 전달하지 않습니다. 모바일 SSH renderer나 host status 설정이 full-screen agent TUI를 의도치 않게 monochrome 출력으로 고정할 수 있기 때문입니다. 일반 non-agent 세션(`lterm start` / `lterm new` / `lterm run`)은 이 변수들을 계속 child process에 보존하며, lterm 자체 status style도 `NO_COLOR`를 계속 존중합니다.
+Agent launcher는 색상 관련 환경 변수도 host 쪽과 agent child 쪽을 분리해 다룹니다. lterm은 클라이언트나 장기 실행 daemon에 설정된 `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`를 `LTERM_AGENT` metadata가 있는 세션으로는 전달하지 않습니다. 모바일 SSH renderer나 host status 설정이 full-screen agent TUI를 의도치 않게 monochrome 출력으로 고정할 수 있기 때문입니다. 일반 non-agent 세션(`lterm start` / `lterm new` / `lterm run`)은 이 변수들을 계속 child process에 보존하며, lterm 자체 status style도 `NO_COLOR`를 계속 존중합니다.
 
 launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`, `--attach-mode`, `--raw`, `--mobile`, `--tail`, `--refresh`, `--read-only`)입니다. 이 옵션들은 `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.

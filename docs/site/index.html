@@ -515,7 +515,7 @@
               <tr data-lang="en"><td>Notify on completion</td><td><code>lterm watch api --exit --notify</code></td><td>none</td></tr>
               <tr data-lang="ko"><td>완료 시 알림</td><td><code>lterm watch api --exit --notify</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Launch an agent profile</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
-              <tr data-lang="ko"><td>에이전트 프로파일 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
+              <tr data-lang="ko"><td>agent profile 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
               <tr data-lang="en"><td>Diagnose local state</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="ko"><td>로컬 상태 진단</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
             </tbody>
@@ -542,6 +542,10 @@
           <div class="callout">
             <p data-lang="en"><strong>Reports are sanitized.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, diagnostics, and notification fallback paths strip terminal controls while preserving valid UTF-8 text.</p>
             <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
+          </div>
+          <div class="callout">
+            <p data-lang="en"><strong>Agent TUI colors stay independent.</strong> Agent launchers do not forward ambient <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, or <code>CLICOLOR_FORCE</code> from the client or daemon, while ordinary sessions preserve those variables.</p>
+            <p data-lang="ko"><strong>Agent TUI 색상은 분리해 다룹니다.</strong> agent launcher는 클라이언트나 daemon의 ambient <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, <code>CLICOLOR_FORCE</code>를 agent child에 전달하지 않고, 일반 세션은 이 변수들을 그대로 보존합니다.</p>
           </div>
         </div>
       </div>
