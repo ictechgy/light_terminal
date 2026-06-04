@@ -502,10 +502,18 @@ fn kill_session(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
-    let before = client::info(target)?;
-    let cmux_surface = stored_cmux_surface_for_pane_best_effort(&before.pane_id);
+    let before = client::info(target).ok();
+    let pane_id = before
+        .as_ref()
+        .map(|info| info.pane_id.clone())
+        .or_else(|| target.strip_prefix('%').map(|digits| format!("%{digits}")));
+    let cmux_surface = pane_id
+        .as_deref()
+        .and_then(stored_cmux_surface_for_pane_best_effort);
     client::kill(target)?;
-    forget_pane_best_effort(&before.pane_id);
+    if let Some(pane_id) = pane_id.as_deref() {
+        forget_pane_best_effort(pane_id);
+    }
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
     }
