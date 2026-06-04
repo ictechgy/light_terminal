@@ -221,6 +221,8 @@ fn strip_global_flags(raw_args: Vec<String>) -> Result<Vec<String>> {
 
 fn new_session(args: &[String]) -> Result<i32> {
     let mut detached = false;
+    let mut print = false;
+    let mut format = "#{pane_id}".to_string();
     let mut name = None;
     let mut cwd = None;
     let mut command = Vec::new();
@@ -230,6 +232,14 @@ fn new_session(args: &[String]) -> Result<i32> {
             "-d" => {
                 detached = true;
                 i += 1;
+            }
+            "-P" => {
+                print = true;
+                i += 1;
+            }
+            "-F" => {
+                format = value_for_option(args.get(i + 1).cloned(), "-F")?;
+                i += 2;
             }
             "-s" => {
                 name = Some(value_for_option(args.get(i + 1).cloned(), "-s")?);
@@ -243,7 +253,18 @@ fn new_session(args: &[String]) -> Result<i32> {
                 command.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            flag if flag.starts_with('-') => i += flag_arg_width(flag, args, i),
+            flag if flag.starts_with('-') => {
+                if has_flag_in_arg(flag, 'd') {
+                    detached = true;
+                }
+                if has_flag_in_arg(flag, 'P') {
+                    print = true;
+                }
+                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
+                    format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
+                }
+                i += flag_arg_width(flag, args, i);
+            }
             _ => {
                 command.extend_from_slice(&args[i..]);
                 break;
@@ -253,6 +274,9 @@ fn new_session(args: &[String]) -> Result<i32> {
     let command = tmux_shell_command(&command)?;
     let info = client::new_session(name, command, cwd, HashMap::new(), None, true)?;
     remember_pane(&info, None)?;
+    if print {
+        println!("{}", expand_format(&format, &info));
+    }
     if detached {
         Ok(0)
     } else {
@@ -263,19 +287,21 @@ fn new_session(args: &[String]) -> Result<i32> {
 
 fn attach_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
-    client::attach(&target, true, AttachStdinEof::Detach)?;
+    let target = normalize_tmux_target(&target)?;
+    client::attach(target.as_ref(), true, AttachStdinEof::Detach)?;
     Ok(0)
 }
 
 fn has_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
-    match client::info(&target) {
+    let target = normalize_tmux_target(&target)?;
+    match client::info(target.as_ref()) {
         Ok(_) => Ok(0),
         Err(info_err) => match client::list_sessions() {
             Ok(sessions)
                 if !sessions
                     .iter()
-                    .any(|info| target_matches_info(&target, info)) =>
+                    .any(|info| target_matches_info(target.as_ref(), info)) =>
             {
                 Ok(1)
             }
@@ -304,6 +330,10 @@ fn list_sessions(args: &[String]) -> Result<i32> {
 }
 
 fn list_windows(args: &[String]) -> Result<i32> {
+    // Observational compatibility only: lterm exposes a single synthetic
+    // tmux-style window row per root session so status/HUD tools can query
+    // dimensions. This is not an ownership model and must not be used as a
+    // basis for window cleanup commands such as kill-window.
     reject_filter(args)?;
     let format =
         parse_format(args).unwrap_or_else(|| "#{window_index}: #{window_name}".to_string());
@@ -466,7 +496,8 @@ fn pane_number(pane_id: &str) -> Option<usize> {
 
 fn kill_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
-    client::kill(&target)?;
+    let target = normalize_tmux_target(&target)?;
+    client::kill(target.as_ref())?;
     Ok(0)
 }
 
@@ -672,6 +703,7 @@ fn split_window(args: &[String]) -> Result<i32> {
         }
     }
     if let Some(target) = target.as_deref() {
+        reject_unsupported_tmux_window_target(target)?;
         if detached {
             ensure_detached_split_target_exists(target)?;
         } else {
@@ -843,7 +875,8 @@ fn display_message(args: &[String]) -> Result<i32> {
 fn capture_pane(args: &[String]) -> Result<i32> {
     let parsed = parse_capture_pane_args(args)?;
     let target = parsed.target.unwrap_or_else(default_target);
-    let text = client::capture_range(&target, parsed.start, parsed.end)?;
+    let target = normalize_tmux_target(&target)?;
+    let text = client::capture_range(target.as_ref(), parsed.start, parsed.end)?;
     if parsed.print {
         print!("{text}");
         if !text.ends_with('\n') {
@@ -973,9 +1006,10 @@ fn send_keys(args: &[String]) -> Result<i32> {
         }
     }
     let target = target.unwrap_or_else(default_target);
+    let target = normalize_tmux_target(&target)?;
     let bytes = keys_to_bytes(&keys, literal);
     let bytes = repeated_send_payload(&bytes, repeat)?;
-    client::send(&target, bytes)?;
+    client::send(target.as_ref(), bytes)?;
     Ok(0)
 }
 
@@ -1010,12 +1044,14 @@ fn parse_send_keys_repeat(value: Option<String>) -> Result<usize> {
 
 fn kill_pane(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
-    client::kill(&target)?;
+    let target = normalize_tmux_target(&target)?;
+    client::kill(target.as_ref())?;
     Ok(0)
 }
 
 fn resize_pane(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
+    let target = normalize_tmux_target(&target)?;
     let mut rows = None;
     let mut cols = None;
     let mut i = 0;
@@ -1049,14 +1085,14 @@ fn resize_pane(args: &[String]) -> Result<i32> {
     // server 는 per-client geometry 추적을 거치지 않고 즉시 master.resize 한다
     // (PR #15 legacy 경로).
     match (rows, cols) {
-        (Some(rows), Some(cols)) => client::resize(&target, rows, cols, None)?,
+        (Some(rows), Some(cols)) => client::resize(target.as_ref(), rows, cols, None)?,
         (Some(rows), None) => {
-            let info = client::info(&target)?;
-            client::resize(&target, rows, info.cols, None)?;
+            let info = client::info(target.as_ref())?;
+            client::resize(target.as_ref(), rows, info.cols, None)?;
         }
         (None, Some(cols)) => {
-            let info = client::info(&target)?;
-            client::resize(&target, info.rows, cols, None)?;
+            let info = client::info(target.as_ref())?;
+            client::resize(target.as_ref(), info.rows, cols, None)?;
         }
         (None, None) => {}
     }
@@ -1416,8 +1452,9 @@ fn save_buffer(args: &[String]) -> Result<i32> {
 
 fn paste_buffer(args: &[String]) -> Result<i32> {
     let target = parse_target_with_value_flags(args, &['b', 's'])?.unwrap_or_else(default_target);
+    let target = normalize_tmux_target(&target)?;
     let data = read_buffer_or_empty()?;
-    client::send(&target, data)?;
+    client::send(target.as_ref(), data)?;
     Ok(0)
 }
 
@@ -2498,7 +2535,31 @@ fn tmux_window_target_session(target: &str) -> Option<&str> {
     Some(session)
 }
 
+fn reject_unsupported_tmux_window_target(target: &str) -> Result<()> {
+    let Some((session, window)) = target.split_once(':') else {
+        return Ok(());
+    };
+    if !session.is_empty() && window == "0" {
+        return Ok(());
+    }
+    let target = sanitize::terminal_text(target);
+    bail!(
+        "unsupported tmux window target in lterm compat: {target}. \
+         lterm supports bare session targets and session:0 only."
+    )
+}
+
+fn normalize_tmux_target(target: &str) -> Result<Cow<'_, str>> {
+    reject_unsupported_tmux_window_target(target)?;
+    if let Some(session) = tmux_window_target_session(target) {
+        Ok(Cow::Borrowed(session))
+    } else {
+        Ok(Cow::Borrowed(target))
+    }
+}
+
 fn info_for_tmux_target(target: &str) -> Result<SessionInfo> {
+    reject_unsupported_tmux_window_target(target)?;
     match client::info(target) {
         Ok(info) => Ok(info),
         Err(err) => {
@@ -2950,6 +3011,8 @@ fn format_replacement<'a>(
         Some(("#{session_name}", Cow::Borrowed(info.name.as_str())))
     } else if rest.starts_with("#S") {
         Some(("#S", Cow::Borrowed(info.name.as_str())))
+    } else if rest.starts_with("#I") {
+        Some(("#I", Cow::Borrowed(WINDOW_INDEX)))
     } else if rest.starts_with("#{pane_current_command}") {
         Some(("#{pane_current_command}", Cow::Borrowed(current_command)))
     } else if rest.starts_with("#{pane_start_command}") {
@@ -3498,6 +3561,27 @@ mod tests {
             expand_format("#{pane_id} #S #{pane_current_command}", &info),
             "%1 s codex"
         );
+        assert_eq!(expand_format("#S:#I #{window_index}", &info), "s:0 0");
+    }
+
+    #[test]
+    fn rejects_unsupported_tmux_window_targets_with_stable_contract() {
+        for target in ["s:#I", "s:1", "s:0.1", ":0", "s:"] {
+            let err = reject_unsupported_tmux_window_target(target)
+                .expect_err("unsupported window target should fail")
+                .to_string();
+            assert!(
+                err.contains("unsupported tmux window target in lterm compat:"),
+                "{err:?}"
+            );
+            assert!(
+                err.contains("lterm supports bare session targets and session:0 only"),
+                "{err:?}"
+            );
+        }
+        reject_unsupported_tmux_window_target("s").expect("bare session target is supported");
+        reject_unsupported_tmux_window_target("s:0").expect("session:0 target is supported");
+        reject_unsupported_tmux_window_target("%1").expect("pane id target is supported");
     }
 
     #[test]
