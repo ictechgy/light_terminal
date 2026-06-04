@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
-    CMUX_CONTEXT_ENV, DaemonStatus, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
-    WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, PROTOCOL_VERSION, Request, Response,
+    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1742,7 +1742,9 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     cmd.arg(&spawn_command);
     cmd.cwd(PathBuf::from(&cwd));
     scrub_ambient_multiplexer_env(&mut cmd);
-    scrub_ambient_child_color_policy_env(&mut cmd);
+    if agent_name.is_some() {
+        scrub_ambient_child_color_policy_env(&mut cmd);
+    }
     for (key, value) in sanitize_child_env(params.env, params.tmux)? {
         cmd.env(key, value);
     }
@@ -2958,13 +2960,10 @@ fn os_key_starts_with_cmux_prefix(key: &std::ffi::OsStr) -> bool {
 const AMBIENT_MULTIPLEXER_ENV: &[&str] = &["TMUX", "TMUX_PANE", "LTERM_CMUX_MANAGED_ATTACH"];
 
 fn scrub_ambient_child_color_policy_env(cmd: &mut CommandBuilder) {
-    for key in AMBIENT_CHILD_COLOR_POLICY_ENV {
+    for key in CHILD_COLOR_POLICY_ENV {
         cmd.env_remove(key);
     }
 }
-
-const AMBIENT_CHILD_COLOR_POLICY_ENV: &[&str] =
-    &["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
 
 fn sanitize_child_env(
     env: HashMap<String, String>,

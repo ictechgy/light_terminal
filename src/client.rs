@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
-    CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response,
-    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION,
+    Request, Response, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -253,6 +253,7 @@ pub fn new_session(
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
     inherit_terminal_capability_env(&mut env);
+    inherit_child_color_policy_env_unless_agent(&mut env);
     if tmux {
         inherit_cmux_context_env(&mut env);
     }
@@ -281,6 +282,29 @@ fn inherit_terminal_capability_env(env: &mut std::collections::HashMap<String, S
             }
         }
     }
+}
+
+fn inherit_child_color_policy_env_unless_agent(
+    env: &mut std::collections::HashMap<String, String>,
+) {
+    if session_env_declares_agent(env) {
+        return;
+    }
+    for key in CHILD_COLOR_POLICY_ENV {
+        if env.contains_key(*key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.insert((*key).to_string(), value);
+            }
+        }
+    }
+}
+
+fn session_env_declares_agent(env: &std::collections::HashMap<String, String>) -> bool {
+    env.get("LTERM_AGENT")
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn inherit_cmux_context_env(env: &mut std::collections::HashMap<String, String>) {
@@ -1846,6 +1870,8 @@ struct AgentPresenceCue {
 
 impl AgentPresenceCue {
     fn emit_initial(&self, stdout: &mut impl Write) -> Result<()> {
+        // Callers only construct this cue after `stdout.is_terminal()` succeeds;
+        // the reset is host-local terminal state and must not be written to pipes.
         reset_host_terminal_sgr(stdout).context("reset host terminal style before agent cue")?;
         self.write_title(stdout)?;
         if agent_presence_banner_enabled() {
@@ -5601,6 +5627,14 @@ mod tests {
             piped_output.is_empty(),
             "non-terminal raw attach output must not be prefixed with host UI escapes"
         );
+
+        let mut status_piped_output = Vec::new();
+        reset_raw_attach_initial_sgr_if_needed(true, false, &mut status_piped_output)
+            .expect("status-enabled non-terminal reset check");
+        assert!(
+            status_piped_output.is_empty(),
+            "status-enabled non-terminal attach must not be prefixed with host UI escapes"
+        );
     }
 
     #[test]
@@ -6906,6 +6940,7 @@ mod tests {
             ("LC_TERMINAL".to_string(), "explicit-client".to_string()),
         ]);
         super::inherit_terminal_capability_env(&mut env);
+        super::inherit_child_color_policy_env_unless_agent(&mut env);
 
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
@@ -6926,6 +6961,42 @@ mod tests {
                 "{key} is an application color policy, not a terminal capability, and must not leak into child agent sessions"
             );
         }
+    }
+
+    #[test]
+    fn plain_new_sessions_inherit_current_color_policy_env_without_overwriting_explicit_values() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::capture(&[
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "LTERM_AGENT",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+            std::env::set_var("FORCE_COLOR", "3");
+            std::env::set_var("CLICOLOR", "0");
+            std::env::set_var("CLICOLOR_FORCE", "1");
+            std::env::remove_var("LTERM_AGENT");
+        }
+
+        let mut env = std::collections::HashMap::from([(
+            "CLICOLOR_FORCE".to_string(),
+            "explicit-client".to_string(),
+        )]);
+        super::inherit_child_color_policy_env_unless_agent(&mut env);
+
+        assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(env.get("FORCE_COLOR").map(String::as_str), Some("3"));
+        assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("0"));
+        assert_eq!(
+            env.get("CLICOLOR_FORCE").map(String::as_str),
+            Some("explicit-client"),
+            "caller-supplied session env should stay authoritative"
+        );
     }
 
     /// PR #15 quad-review HIGH 후속(#2): 성공 응답은 last 를 advance 시키는 Outcome

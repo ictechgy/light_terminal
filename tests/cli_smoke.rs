@@ -10255,6 +10255,41 @@ fi
 }
 
 #[test]
+fn plain_sessions_preserve_ambient_color_policy_env() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "3")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "1")
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "plain-color-policy",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'NO_COLOR:%s\\n' \"${NO_COLOR-unset}\"; \
+             printf 'FORCE_COLOR:%s\\n' \"${FORCE_COLOR-unset}\"; \
+             printf 'CLICOLOR:%s\\n' \"${CLICOLOR-unset}\"; \
+             printf 'CLICOLOR_FORCE:%s\\n' \"${CLICOLOR_FORCE-unset}\"; \
+             sleep 30",
+        ])
+        .status()?;
+    assert!(status.success());
+    let _cleanup = SessionCleanup::new(&env, "plain-color-policy");
+
+    let captured = env.capture_until("plain-color-policy", "CLICOLOR_FORCE:1")?;
+    assert!(captured.contains("NO_COLOR:1"), "{captured:?}");
+    assert!(captured.contains("FORCE_COLOR:3"), "{captured:?}");
+    assert!(captured.contains("CLICOLOR:0"), "{captured:?}");
+    assert!(captured.contains("CLICOLOR_FORCE:1"), "{captured:?}");
+    Ok(())
+}
+
+#[test]
 fn configured_agent_profile_launches_configured_binary() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
