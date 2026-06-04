@@ -37,8 +37,11 @@ pub fn data_dir() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    let path = PathBuf::from(home).join(".local/share").join(APP_DIR_NAME);
+    let path = if let Some(home) = env::var_os("HOME") {
+        PathBuf::from(home).join(".local/share").join(APP_DIR_NAME)
+    } else {
+        runtime_dir()?.join("data")
+    };
     ensure_private_dir(&path)?;
     Ok(path)
 }
@@ -378,6 +381,34 @@ mod tests {
                 .contains("LTERM_DATA_DIR must be an absolute path"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn data_dir_without_home_falls_back_to_tmp_runtime_data_dir() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+        }
+
+        let path = data_dir().expect("HOME-less default data dir should use runtime fallback");
+        assert!(
+            path.starts_with(tmp.path()),
+            "HOME-less data dir should stay in the sandboxed temp runtime, got {path:?}"
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("data")
+        );
+        let mode = fs::symlink_metadata(&path)
+            .expect("created fallback data dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "fallback data dir must be private");
     }
 
     #[test]

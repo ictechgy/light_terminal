@@ -11475,6 +11475,24 @@ fn cmd_for_default_fallback_test(
     Ok((cmd, tmp, data))
 }
 
+#[cfg(unix)]
+fn cmd_for_homeless_default_fallback_test(
+    sandbox: &tempfile::TempDir,
+) -> std::io::Result<(Command, std::path::PathBuf)> {
+    let tmp = sandbox.path().join("tmp");
+    std::fs::create_dir_all(&tmp)?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    cmd.env_remove("HOME")
+        .env_remove("LTERM_DATA_DIR")
+        .env_remove("LTERM_PANE")
+        .env_remove("LTERM_PARENT_TOKEN")
+        .env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &tmp);
+    Ok((cmd, tmp))
+}
+
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
@@ -11491,6 +11509,57 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
     let (mut shutdown, _, _) = cmd_for_default_fallback_test(&temp)?;
+    let _ = shutdown.arg("shutdown").status();
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn homeless_default_runtime_autostarts_and_tmux_store_uses_private_tmp_data() -> TestResult {
+    let temp = tempfile::tempdir()?;
+
+    let (mut list, tmp) = cmd_for_homeless_default_fallback_test(&temp)?;
+    let output = list.arg("list").output()?;
+    assert!(
+        output.status.success(),
+        "HOME-less list should auto-start via TMPDIR fallback: {output:?}"
+    );
+
+    let uid = std::fs::metadata(&tmp)?.uid();
+    let runtime = tmp.join(format!("light-terminal-{uid}"));
+    let data = runtime.join("data");
+    let meta = std::fs::symlink_metadata(&data)?;
+    assert!(!meta.file_type().is_symlink());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+    let (mut tmux, _) = cmd_for_homeless_default_fallback_test(&temp)?;
+    let output = tmux
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "homeless-tmux-store",
+            "-P",
+            "-F",
+            "#S:#I",
+            "sh -lc 'echo HOMELESS_TMUX_READY; sleep 1'",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "HOME-less tmux compat should persist store under runtime data: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "homeless-tmux-store:0"
+    );
+    assert!(
+        data.join("tmux-compat-store.json").exists(),
+        "tmux compat store should be created under HOME-less runtime data dir"
+    );
+
+    let (mut shutdown, _) = cmd_for_homeless_default_fallback_test(&temp)?;
     let _ = shutdown.arg("shutdown").status();
     Ok(())
 }
