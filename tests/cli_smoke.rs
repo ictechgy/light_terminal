@@ -6669,6 +6669,483 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
 }
 
 #[test]
+fn tmux_compat_display_message_expands_omc_window_shorthand() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "omc-format",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    wait_for_session_present(&env, "omc-format")?;
+
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "display-message",
+            "-p",
+            "-t",
+            "omc-format",
+            "#S:#I #{pane_id} #{pane_dead}",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    let Some(session_window) = fields.next() else {
+        return Err(format!("missing session/window field: {stdout:?}").into());
+    };
+    let Some(pane_id) = fields.next() else {
+        return Err(format!("missing pane id field: {stdout:?}").into());
+    };
+    let Some(pane_dead) = fields.next() else {
+        return Err(format!("missing pane_dead field: {stdout:?}").into());
+    };
+    assert_eq!(session_window, "omc-format:0", "{stdout:?}");
+    assert!(pane_id.starts_with('%'), "{stdout:?}");
+    assert_eq!(pane_dead, "0", "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_session_zero_alias_works_for_direct_targets() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "direct-zero-alias",
+            "sh",
+            "-lc",
+            "printf DIRECT_ZERO_ALIAS_READY; sleep 60",
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    wait_for_session_present(&env, "direct-zero-alias")?;
+
+    let has = env
+        .cmd()
+        .args(["tmux-compat", "has-session", "-t", "direct-zero-alias:0"])
+        .output()?;
+    assert!(has.status.success(), "{has:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut capture_stdout = String::new();
+    while Instant::now() < deadline {
+        let capture = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "capture-pane",
+                "-t",
+                "direct-zero-alias:0",
+                "-p",
+                "-S",
+                "-80",
+            ])
+            .output()?;
+        assert!(capture.status.success(), "{capture:?}");
+        capture_stdout = String::from_utf8_lossy(&capture.stdout).to_string();
+        if capture_stdout.contains("DIRECT_ZERO_ALIAS_READY") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        capture_stdout.contains("DIRECT_ZERO_ALIAS_READY"),
+        "direct session:0 capture did not observe output: {capture_stdout:?}"
+    );
+
+    let kill = env
+        .cmd()
+        .args(["tmux-compat", "kill-session", "-t", "direct-zero-alias:0"])
+        .output()?;
+    assert!(kill.status.success(), "{kill:?}");
+    wait_for_session_absent(&env, "direct-zero-alias")?;
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_supports_omc_default_split_flow() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("omc-default-split-marker.txt");
+    let target_file = env.temp.path().join("omc-default-split-target.txt");
+    let pane_file = env.temp.path().join("omc-default-split-pane.txt");
+    let status_file = env.temp.path().join("omc-default-split-status.txt");
+    let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let target_file_arg = shlex::try_quote(&target_file.display().to_string())?.into_owned();
+    let pane_file_arg = shlex::try_quote(&pane_file.display().to_string())?.into_owned();
+    let status_file_arg = shlex::try_quote(&status_file.display().to_string())?.into_owned();
+    let cwd_arg = shlex::try_quote(&env.temp.path().display().to_string())?.into_owned();
+    let lterm_arg = shlex::try_quote(env!("CARGO_BIN_EXE_lterm"))?.into_owned();
+    let payload = format!("printf OMC_DEFAULT_SPLIT_READY; printf ready > {marker_arg}; sleep 60");
+    let payload_arg = shlex::try_quote(&payload)?.into_owned();
+    let parent_script = format!(
+        "{lterm_arg} tmux-compat display-message -p '#S:#I #{{pane_id}}' > {target_file_arg}; \
+         {lterm_arg} tmux-compat split-window -h -t omc-default-parent:0 -d -P \
+         -F '#{{pane_id}}' -c {cwd_arg} sh -lc {payload_arg} > {pane_file_arg}; \
+         status=$?; printf %s \"$status\" > {status_file_arg}; sleep 60"
+    );
+
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "omc-default-parent",
+            "sh",
+            "-lc",
+            parent_script.as_str(),
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    wait_for_session_present(&env, "omc-default-parent")?;
+    assert_eq!(wait_for_file_contents(&status_file)?.trim(), "0");
+
+    let target_stdout = wait_for_file_contents(&target_file)?;
+    let mut target_fields = target_stdout.split_whitespace();
+    let session_window = target_fields
+        .next()
+        .ok_or_else(|| format!("missing #S:#I field: {target_stdout:?}"))?;
+    let leader_pane = target_fields
+        .next()
+        .ok_or_else(|| format!("missing leader pane field: {target_stdout:?}"))?;
+    assert_eq!(session_window, "omc-default-parent:0", "{target_stdout:?}");
+    assert!(leader_pane.starts_with('%'), "{target_stdout:?}");
+
+    let worker_pane = wait_for_file_contents(&pane_file)?.trim().to_string();
+    assert!(
+        worker_pane.starts_with('%'),
+        "split-window -P should return a pane id: {worker_pane:?}"
+    );
+    assert_ne!(
+        worker_pane, leader_pane,
+        "worker must be a helper pane, not the leader pane"
+    );
+    assert_eq!(wait_for_file_contents(&marker)?.trim(), "ready");
+
+    let capture = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-t",
+            worker_pane.as_str(),
+            "-p",
+            "-S",
+            "-80",
+        ])
+        .output()?;
+    assert!(capture.status.success(), "{capture:?}");
+    assert!(
+        String::from_utf8_lossy(&capture.stdout).contains("OMC_DEFAULT_SPLIT_READY"),
+        "{capture:?}"
+    );
+
+    let pane_dead = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "display-message",
+            "-t",
+            worker_pane.as_str(),
+            "-p",
+            "#{pane_dead}",
+        ])
+        .output()?;
+    assert!(pane_dead.status.success(), "{pane_dead:?}");
+    assert_eq!(String::from_utf8_lossy(&pane_dead.stdout).trim(), "0");
+
+    let panes = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-panes",
+            "-t",
+            session_window,
+            "-F",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_start_command}",
+        ])
+        .output()?;
+    assert!(panes.status.success(), "{panes:?}");
+    let panes_stdout = String::from_utf8_lossy(&panes.stdout);
+    assert!(
+        panes_stdout
+            .lines()
+            .any(|line| line.starts_with(leader_pane)),
+        "leader pane missing from list-panes output: {panes_stdout:?}"
+    );
+    assert!(
+        panes_stdout
+            .lines()
+            .any(|line| line.starts_with(worker_pane.as_str())),
+        "worker pane missing from list-panes output: {panes_stdout:?}"
+    );
+    assert!(
+        panes_stdout
+            .lines()
+            .all(|line| line.split('\t').count() == 3),
+        "HUD helper output must stay tab-parseable: {panes_stdout:?}"
+    );
+
+    let kill = env
+        .cmd()
+        .args(["tmux-compat", "kill-pane", "-t", worker_pane.as_str()])
+        .output()?;
+    assert!(kill.status.success(), "{kill:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_new_session_prints_omc_detached_target_format() -> TestResult {
+    let env = TestEnv::new()?;
+    let cwd_marker = env.temp.path().join("omc-detached-cwd.txt");
+    let cwd_marker_arg = shlex::try_quote(&cwd_marker.display().to_string())?.into_owned();
+    let payload = format!("pwd > {cwd_marker_arg}; printf OMC_DETACHED_READY; sleep 60");
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#S:0 #{pane_id}",
+            "-s",
+            "omc-detached",
+            "-c",
+            env.temp
+                .path()
+                .to_str()
+                .ok_or("temp path should be UTF-8")?,
+            "sh",
+            "-lc",
+            payload.as_str(),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "OMC detached new-session path should succeed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    assert_eq!(
+        fields.next(),
+        Some("omc-detached:0"),
+        "new-session -P -F should print #S:0: {stdout:?}"
+    );
+    let pane_id = fields
+        .next()
+        .ok_or_else(|| format!("new-session output missing pane id: {stdout:?}"))?;
+    assert!(pane_id.starts_with('%'), "{stdout:?}");
+    let observed_cwd = std::fs::canonicalize(wait_for_file_contents(&cwd_marker)?.trim())?;
+    let expected_cwd = std::fs::canonicalize(env.temp.path())?;
+    assert_eq!(observed_cwd, expected_cwd);
+    let capture = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "capture-pane",
+            "-t",
+            pane_id,
+            "-p",
+            "-S",
+            "-80",
+        ])
+        .output()?;
+    assert!(capture.status.success(), "{capture:?}");
+    assert!(
+        String::from_utf8_lossy(&capture.stdout).contains("OMC_DETACHED_READY"),
+        "{capture:?}"
+    );
+    let kill = env
+        .cmd()
+        .args(["tmux-compat", "kill-session", "-t", "omc-detached"])
+        .output()?;
+    assert!(kill.status.success(), "{kill:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_rejects_omc_invalid_window_targets_without_fallback() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("invalid-window-target-marker.txt");
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "invalid-window-parent",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    wait_for_session_present(&env, "invalid-window-parent")?;
+    let before = session_names_json(&env)?;
+
+    for target in [
+        "invalid-window-parent:#I",
+        "invalid-window-parent:1",
+        "invalid-window-parent:0.1",
+    ] {
+        let display = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{pane_id}",
+            ])
+            .output()?;
+        assert!(!display.status.success(), "{target}: {display:?}");
+        assert_stderr_contains(&display, "unsupported tmux window target in lterm compat:");
+        assert_stderr_contains(
+            &display,
+            "lterm supports bare session targets and session:0 only",
+        );
+    }
+
+    let split = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-P",
+            "-t",
+            "invalid-window-parent:#I",
+            "sh",
+            "-lc",
+            format!("printf bad > {}", marker.display()).as_str(),
+        ])
+        .output()?;
+    assert!(!split.status.success(), "{split:?}");
+    assert_stderr_contains(&split, "unsupported tmux window target in lterm compat:");
+    assert_stderr_contains(
+        &split,
+        "lterm supports bare session targets and session:0 only",
+    );
+    assert!(
+        !marker.exists(),
+        "invalid split target must not execute payload"
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "invalid window target must not create fallback helper sessions"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "unsupported-window-parent",
+            "sleep 60",
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    wait_for_session_present(&env, "unsupported-window-parent")?;
+    let before = session_names_json(&env)?;
+
+    let list = env.cmd().args(["tmux-compat", "list-commands"]).output()?;
+    assert!(list.status.success(), "{list:?}");
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    for unsupported in ["select-window", "new-window", "kill-window"] {
+        assert!(
+            !list_stdout.lines().any(|line| line == unsupported),
+            "{unsupported} must remain outside the baseline command list: {list_stdout:?}"
+        );
+    }
+
+    let new_window = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#S:#I #{pane_id}",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-child",
+            "-c",
+            env.temp
+                .path()
+                .to_str()
+                .ok_or("temp path should be UTF-8")?,
+            "sh",
+            "-lc",
+            "sleep 60",
+        ])
+        .output()?;
+    assert!(!new_window.status.success(), "{new_window:?}");
+    assert_stderr_contains(
+        &new_window,
+        "unsupported tmux command in lterm compat: new-window",
+    );
+    assert_stderr_contains(
+        &new_window,
+        "Run `lterm tmux-compat list-commands` to inspect supported commands",
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "unsupported new-window must not create sessions"
+    );
+
+    let kill_window = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "kill-window",
+            "-t",
+            "unsupported-window-parent",
+        ])
+        .output()?;
+    assert!(!kill_window.status.success(), "{kill_window:?}");
+    assert_stderr_contains(
+        &kill_window,
+        "unsupported tmux command in lterm compat: kill-window",
+    );
+    assert_stderr_contains(
+        &kill_window,
+        "Run `lterm tmux-compat list-commands` to inspect supported commands",
+    );
+    assert_eq!(
+        session_names_json(&env)?,
+        before,
+        "unsupported kill-window must not kill pane/session state"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_run_shell_executes_background_shell_command() -> TestResult {
     let env = TestEnv::new()?;
     let marker = env.temp.path().join("run-shell-marker.txt");
@@ -10998,6 +11475,24 @@ fn cmd_for_default_fallback_test(
     Ok((cmd, tmp, data))
 }
 
+#[cfg(unix)]
+fn cmd_for_homeless_default_fallback_test(
+    sandbox: &tempfile::TempDir,
+) -> std::io::Result<(Command, std::path::PathBuf)> {
+    let tmp = sandbox.path().join("tmp");
+    std::fs::create_dir_all(&tmp)?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    cmd.env_remove("HOME")
+        .env_remove("LTERM_DATA_DIR")
+        .env_remove("LTERM_PANE")
+        .env_remove("LTERM_PARENT_TOKEN")
+        .env_remove("LTERM_RUNTIME_DIR")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &tmp);
+    Ok((cmd, tmp))
+}
+
 #[test]
 #[cfg(unix)]
 fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
@@ -11014,6 +11509,57 @@ fn default_tmp_runtime_dir_is_private_and_not_a_symlink() -> TestResult {
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
 
     let (mut shutdown, _, _) = cmd_for_default_fallback_test(&temp)?;
+    let _ = shutdown.arg("shutdown").status();
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn homeless_default_runtime_autostarts_and_tmux_store_uses_private_tmp_data() -> TestResult {
+    let temp = tempfile::tempdir()?;
+
+    let (mut list, tmp) = cmd_for_homeless_default_fallback_test(&temp)?;
+    let output = list.arg("list").output()?;
+    assert!(
+        output.status.success(),
+        "HOME-less list should auto-start via TMPDIR fallback: {output:?}"
+    );
+
+    let uid = std::fs::metadata(&tmp)?.uid();
+    let runtime = tmp.join(format!("light-terminal-{uid}"));
+    let data = runtime.join("data");
+    let meta = std::fs::symlink_metadata(&data)?;
+    assert!(!meta.file_type().is_symlink());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+
+    let (mut tmux, _) = cmd_for_homeless_default_fallback_test(&temp)?;
+    let output = tmux
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "homeless-tmux-store",
+            "-P",
+            "-F",
+            "#S:#I",
+            "sh -lc 'echo HOMELESS_TMUX_READY; sleep 1'",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "HOME-less tmux compat should persist store under runtime data: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "homeless-tmux-store:0"
+    );
+    assert!(
+        data.join("tmux-compat-store.json").exists(),
+        "tmux compat store should be created under HOME-less runtime data dir"
+    );
+
+    let (mut shutdown, _) = cmd_for_homeless_default_fallback_test(&temp)?;
     let _ = shutdown.arg("shutdown").status();
     Ok(())
 }

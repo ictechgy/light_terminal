@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const APP_DIR_NAME: &str = "light-terminal";
+const ACTIVE_SOCKET_MARKER: &str = "active-socket";
 
 pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(dir) = env::var("LTERM_RUNTIME_DIR") {
@@ -35,8 +37,11 @@ pub fn data_dir() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    let path = PathBuf::from(home).join(".local/share").join(APP_DIR_NAME);
+    let path = if let Some(home) = env::var_os("HOME") {
+        PathBuf::from(home).join(".local/share").join(APP_DIR_NAME)
+    } else {
+        runtime_dir()?.join("data")
+    };
     ensure_private_dir(&path)?;
     Ok(path)
 }
@@ -48,6 +53,14 @@ pub fn socket_path() -> Result<PathBuf> {
         validate_socket_parent(&path)?;
         return Ok(path);
     }
+    if env::var_os("LTERM_RUNTIME_DIR").is_some() || env::var_os("XDG_RUNTIME_DIR").is_some() {
+        let path = runtime_dir()?.join("lterm.sock");
+        validate_socket_leaf(&path)?;
+        return Ok(path);
+    }
+    if let Some(path) = recorded_default_socket_path()? {
+        return Ok(path);
+    }
     let path = runtime_dir()?.join("lterm.sock");
     validate_socket_leaf(&path)?;
     Ok(path)
@@ -55,6 +68,37 @@ pub fn socket_path() -> Result<PathBuf> {
 
 pub fn log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("daemon.log"))
+}
+
+pub(crate) fn record_default_socket_path(socket: &Path) -> Result<()> {
+    if env::var_os("LTERM_SOCKET").is_some()
+        || env::var_os("LTERM_RUNTIME_DIR").is_some()
+        || env::var_os("XDG_RUNTIME_DIR").is_some()
+    {
+        return Ok(());
+    }
+    require_absolute_env_path("active socket path", socket)?;
+    validate_socket_parent(socket)?;
+
+    let marker = active_socket_marker_path()?;
+    let tmp = marker.with_file_name(format!(
+        ".{ACTIVE_SOCKET_MARKER}.{}.tmp",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("open temporary active socket marker {}", tmp.display()))?;
+    writeln!(file, "{}", socket.display())
+        .with_context(|| format!("write active socket marker {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync active socket marker {}", tmp.display()))?;
+    fs::rename(&tmp, &marker)
+        .with_context(|| format!("replace active socket marker {}", marker.display()))?;
+    Ok(())
 }
 
 pub fn shim_dir() -> Result<PathBuf> {
@@ -73,6 +117,45 @@ pub fn store_lock_path() -> Result<PathBuf> {
 
 pub fn buffer_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("tmux-buffer.txt"))
+}
+
+fn active_socket_marker_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join(ACTIVE_SOCKET_MARKER))
+}
+
+fn default_active_socket_marker_path() -> Result<Option<PathBuf>> {
+    if env::var_os("LTERM_DATA_DIR").is_some() {
+        return Ok(Some(active_socket_marker_path()?));
+    }
+    let Some(home) = env::var_os("HOME") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(home).join(".local/share").join(APP_DIR_NAME);
+    ensure_private_dir(&path)?;
+    Ok(Some(path.join(ACTIVE_SOCKET_MARKER)))
+}
+
+fn recorded_default_socket_path() -> Result<Option<PathBuf>> {
+    let Some(marker) = default_active_socket_marker_path()? else {
+        return Ok(None);
+    };
+    let text = match fs::read_to_string(&marker) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", marker.display())),
+    };
+    let raw = text.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    if validate_socket_parent(&path).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(path))
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -205,8 +288,8 @@ pub(crate) fn current_euid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_DIR_NAME, data_dir, ensure_private_dir, runtime_dir, socket_path,
-        validate_socket_parent,
+        APP_DIR_NAME, data_dir, ensure_private_dir, record_default_socket_path, runtime_dir,
+        socket_path, validate_socket_parent,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -301,6 +384,34 @@ mod tests {
     }
 
     #[test]
+    fn data_dir_without_home_falls_back_to_tmp_runtime_data_dir() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+        }
+
+        let path = data_dir().expect("HOME-less default data dir should use runtime fallback");
+        assert!(
+            path.starts_with(tmp.path()),
+            "HOME-less data dir should stay in the sandboxed temp runtime, got {path:?}"
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("data")
+        );
+        let mode = fs::symlink_metadata(&path)
+            .expect("created fallback data dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0, "fallback data dir must be private");
+    }
+
+    #[test]
     fn runtime_dir_uses_xdg_runtime_dir_child_and_preserves_private_base() {
         let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
         let _env = reset_path_env();
@@ -376,6 +487,109 @@ mod tests {
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn socket_path_reuses_recorded_default_socket_when_tmpdir_changes() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let data = tempfile::tempdir().expect("temp data dir").keep();
+        let tmp_a = tempfile::tempdir().expect("first temp dir").keep();
+        let tmp_b = tempfile::tempdir().expect("second temp dir").keep();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).expect("private data dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data);
+            std::env::set_var("TMPDIR", &tmp_a);
+        }
+
+        let first = socket_path().expect("first default socket path");
+        assert!(
+            first.starts_with(&tmp_a),
+            "initial fallback should use the current temp dir before a marker exists: {first:?}"
+        );
+        record_default_socket_path(&first).expect("record active default socket");
+
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("TMPDIR", &tmp_b);
+        }
+        assert_eq!(
+            socket_path().expect("socket path from marker"),
+            first,
+            "default clients should rejoin the active daemon even if TMPDIR changes"
+        );
+    }
+
+    #[test]
+    fn socket_path_without_home_skips_default_marker_and_uses_tmp_runtime() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+        }
+
+        let path = socket_path().expect("HOME-less default socket path should still work");
+        assert!(
+            path.starts_with(tmp.path()),
+            "HOME-less default should fall back to temp runtime, got {path:?}"
+        );
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("lterm.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_data_dir_errors_remain_strict_for_default_marker_lookup() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", tmp.path());
+            std::env::set_var("LTERM_DATA_DIR", "relative-data");
+        }
+
+        let err = socket_path().expect_err("explicit invalid data dir must not be ignored");
+        assert!(
+            err.to_string()
+                .contains("LTERM_DATA_DIR must be an absolute path"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_dir_ignores_recorded_default_socket() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let data = tempfile::tempdir().expect("temp data dir").keep();
+        let tmp = tempfile::tempdir().expect("temp dir").keep();
+        let explicit = tempfile::tempdir().expect("explicit runtime dir").keep();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).expect("private data dir");
+        fs::set_permissions(&explicit, fs::Permissions::from_mode(0o700))
+            .expect("private explicit runtime dir");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data);
+            std::env::set_var("TMPDIR", &tmp);
+        }
+        let recorded = socket_path().expect("recorded socket source");
+        record_default_socket_path(&recorded).expect("record active default socket");
+
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_RUNTIME_DIR", &explicit);
+        }
+        assert_eq!(
+            socket_path().expect("explicit runtime socket path"),
+            explicit.join("lterm.sock"),
+            "explicit runtime overrides must not be hijacked by the default marker"
         );
     }
 

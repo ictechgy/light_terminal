@@ -3792,6 +3792,9 @@ fn resolve_status_style(session_theme: Option<StatusTheme>) -> StatusStyle {
             };
         }
     }
+    if no_color_requested() {
+        return StatusStyle::Minimal;
+    }
     if theme_explicit || !prefers_minimal_status_style() {
         StatusStyle::Full(theme)
     } else {
@@ -3817,6 +3820,10 @@ fn parse_status_style(value: &str) -> Option<StatusStyle> {
         "minimal" => Some(StatusStyle::Minimal),
         _ => None,
     }
+}
+
+fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
 fn is_ssh_session() -> bool {
@@ -7610,6 +7617,7 @@ mod tests {
             "TERM_PROGRAM",
             "LC_TERMINAL",
             "TERMINAL_EMULATOR",
+            "NO_COLOR",
         ]);
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
@@ -7622,6 +7630,7 @@ mod tests {
             std::env::remove_var("TERM_PROGRAM");
             std::env::remove_var("LC_TERMINAL");
             std::env::remove_var("TERMINAL_EMULATOR");
+            std::env::remove_var("NO_COLOR");
 
             std::env::set_var("SSH_CONNECTION", "1.2.3.4 22 5.6.7.8 22");
             std::env::set_var("LTERM_STATUS_STYLE", "full");
@@ -7664,6 +7673,52 @@ mod tests {
     }
 
     #[test]
+    fn no_color_prefers_minimal_status_style_unless_lterm_style_overrides() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&[
+            "LTERM_STATUS_STYLE",
+            "LTERM_STATUS_THEME",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "TERM_PROGRAM",
+            "LC_TERMINAL",
+            "TERMINAL_EMULATOR",
+            "NO_COLOR",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("LTERM_STATUS_STYLE");
+            std::env::set_var("LTERM_STATUS_THEME", "green");
+            std::env::remove_var("SSH_CONNECTION");
+            std::env::remove_var("SSH_CLIENT");
+            std::env::remove_var("SSH_TTY");
+            std::env::remove_var("TERM_PROGRAM");
+            std::env::remove_var("LC_TERMINAL");
+            std::env::remove_var("TERMINAL_EMULATOR");
+            std::env::set_var("NO_COLOR", "1");
+        }
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Minimal,
+            "NO_COLOR should prevent colored status themes from leaking terminal-wide colors"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_STATUS_STYLE", "full");
+        }
+        assert_eq!(
+            resolve_status_style(None),
+            StatusStyle::Full(StatusTheme::Green),
+            "lterm-specific full style override remains available when color is explicitly wanted"
+        );
+    }
+
+    #[test]
     fn mobile_terminal_identity_envs_prefer_minimal_status_style() {
         let _guard = crate::TEST_ENV_LOCK
             .lock()
@@ -7677,6 +7732,7 @@ mod tests {
             "TERM_PROGRAM",
             "LC_TERMINAL",
             "TERMINAL_EMULATOR",
+            "NO_COLOR",
         ]);
 
         for (name, value) in [
@@ -7694,6 +7750,7 @@ mod tests {
                 std::env::remove_var("TERM_PROGRAM");
                 std::env::remove_var("LC_TERMINAL");
                 std::env::remove_var("TERMINAL_EMULATOR");
+                std::env::remove_var("NO_COLOR");
                 std::env::set_var(name, value);
             }
             assert_eq!(
@@ -7728,6 +7785,7 @@ mod tests {
             "TERM_PROGRAM",
             "LC_TERMINAL",
             "TERMINAL_EMULATOR",
+            "NO_COLOR",
         ]);
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
@@ -7739,6 +7797,7 @@ mod tests {
             std::env::remove_var("TERM_PROGRAM");
             std::env::remove_var("LC_TERMINAL");
             std::env::remove_var("TERMINAL_EMULATOR");
+            std::env::remove_var("NO_COLOR");
             std::env::set_var("LTERM_STATUS_THEME", "green");
         }
         assert_eq!(
