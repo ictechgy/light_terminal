@@ -518,7 +518,7 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
 }
 
 fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
-    let panes_before = window_pane_rows_for_target(target).unwrap_or_default();
+    let panes_before = window_pane_rows_for_target(target)?;
     let kill_target = panes_before
         .first()
         .map(|pane| pane.name.as_str())
@@ -743,7 +743,7 @@ fn split_window(args: &[String]) -> Result<i32> {
         }
     }
     let command = tmux_shell_command(&command)?;
-    if is_omx_hud_watch_command(command.as_deref()) {
+    if is_omx_hud_watch_command(command.as_deref(), &pane_env) {
         detached = true;
     }
 
@@ -814,14 +814,17 @@ fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_omx_hud_watch_command(command: Option<&str>) -> bool {
+fn is_omx_hud_watch_command(command: Option<&str>, pane_env: &HashMap<String, String>) -> bool {
     let Some(command) = command else {
         return false;
     };
-    let has_owner = command.contains("OMX_TMUX_HUD_OWNER=1")
+    let has_owner_env = pane_env
+        .get("OMX_TMUX_HUD_OWNER")
+        .is_some_and(|value| value.trim() == "1");
+    let has_owner_command = command.contains("OMX_TMUX_HUD_OWNER=1")
         || command.contains("OMX_TMUX_HUD_OWNER='1'")
         || command.contains("OMX_TMUX_HUD_OWNER=\"1\"");
-    has_owner && command.contains("hud --watch")
+    (has_owner_env || has_owner_command) && command.contains("hud --watch")
 }
 
 fn parse_split_window_env_assignment(
@@ -3781,6 +3784,31 @@ mod tests {
                 .to_string()
                 .contains("non-empty variable name")
         );
+    }
+
+    #[test]
+    fn omx_hud_watch_detection_accepts_command_or_env_owner() {
+        let mut env = HashMap::new();
+        assert!(is_omx_hud_watch_command(
+            Some("exec env OMX_TMUX_HUD_OWNER=1 node omx.js hud --watch"),
+            &env
+        ));
+
+        env.insert("OMX_TMUX_HUD_OWNER".to_string(), "1".to_string());
+        assert!(is_omx_hud_watch_command(
+            Some("exec node omx.js hud --watch"),
+            &env
+        ));
+        assert!(!is_omx_hud_watch_command(
+            Some("exec node omx.js hud"),
+            &env
+        ));
+
+        env.insert("OMX_TMUX_HUD_OWNER".to_string(), "0".to_string());
+        assert!(!is_omx_hud_watch_command(
+            Some("exec node omx.js hud --watch"),
+            &env
+        ));
     }
 
     #[test]

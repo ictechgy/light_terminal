@@ -6211,8 +6211,7 @@ fn tmux_compat_omx_hud_watch_split_stays_detached_in_cmux() -> TestResult {
     assert!(parent.status.success(), "{parent:?}");
     wait_for_session_present(&env, "omx-hud-parent")?;
 
-    let hud_cmd =
-        "exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%0 sh -lc 'sleep 30' # hud --watch";
+    let hud_cmd = "exec sh -lc 'sleep 30' # hud --watch";
     let split = env
         .cmd()
         .env("CMUX_WORKSPACE_ID", "workspace:1")
@@ -6225,6 +6224,10 @@ fn tmux_compat_omx_hud_watch_split_stays_detached_in_cmux() -> TestResult {
             "2",
             "-t",
             "omx-hud-parent:0",
+            "-e",
+            "OMX_TMUX_HUD_OWNER=1",
+            "-e",
+            "OMX_TMUX_HUD_LEADER_PANE=%0",
             "-P",
             "-F",
             "#{pane_id}",
