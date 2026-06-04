@@ -6,6 +6,7 @@
 .vscode/
 .claude/
 .serena/
+.codex/artifacts/
 
 # Rust
 target/
