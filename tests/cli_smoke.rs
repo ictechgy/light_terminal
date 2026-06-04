@@ -10206,6 +10206,55 @@ printf 'COLORTERM:%s\n' "${COLORTERM-}"
 }
 
 #[test]
+fn agent_alias_scrubs_ambient_color_policy_env_for_child_tui() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omx"),
+        r#"#!/bin/sh
+printf 'NO_COLOR:%s\n' "${NO_COLOR-unset}"
+printf 'FORCE_COLOR:%s\n' "${FORCE_COLOR-unset}"
+printf 'CLICOLOR:%s\n' "${CLICOLOR-unset}"
+printf 'CLICOLOR_FORCE:%s\n' "${CLICOLOR_FORCE-unset}"
+if [ -n "${NO_COLOR-}" ]; then
+  printf 'PLAIN_ONLY\n'
+else
+  printf '\033[31mCOLOR_OK\033[0m\n'
+fi
+"#,
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "3")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "1")
+        .stdin(Stdio::null())
+        .args(["omx", "--raw", "--no-status", "--", "probe"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("NO_COLOR:unset"), "{stdout:?}");
+    assert!(stdout.contains("FORCE_COLOR:unset"), "{stdout:?}");
+    assert!(stdout.contains("CLICOLOR:unset"), "{stdout:?}");
+    assert!(stdout.contains("CLICOLOR_FORCE:unset"), "{stdout:?}");
+    assert!(
+        output
+            .stdout
+            .windows(b"\x1b[31mCOLOR_OK\x1b[0m".len())
+            .any(|window| window == b"\x1b[31mCOLOR_OK\x1b[0m"),
+        "agent TUI should still be able to emit color SGR when parent lterm has NO_COLOR: {:?}",
+        stdout
+    );
+    assert!(!stdout.contains("PLAIN_ONLY"), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
 fn configured_agent_profile_launches_configured_binary() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
