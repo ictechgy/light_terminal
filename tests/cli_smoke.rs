@@ -6176,6 +6176,184 @@ fn tmux_compat_kill_pane_closes_visible_cmux_split_surface() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_omx_hud_watch_split_stays_detached_in_cmux() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-hud-watch.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               new-split|send) exit 70 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let parent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "omx-hud-parent",
+            "sh",
+            "-lc",
+            "sleep 60",
+        ])
+        .output()?;
+    assert!(parent.status.success(), "{parent:?}");
+    wait_for_session_present(&env, "omx-hud-parent")?;
+
+    let hud_cmd =
+        "exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=%0 sh -lc 'sleep 30' # hud --watch";
+    let split = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-v",
+            "-l",
+            "2",
+            "-t",
+            "omx-hud-parent:0",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            hud_cmd,
+        ])
+        .output()?;
+    assert!(
+        split.status.success(),
+        "OMX HUD watch split should be accepted without opening a visible cmux split: {split:?}"
+    );
+    let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    assert!(pane.starts_with('%'), "expected pane id, got {pane:?}");
+
+    let sessions = env.cmd().args(["ls", "--all", "--json"]).output()?;
+    assert!(sessions.status.success(), "{sessions:?}");
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout)?;
+    let attached_clients = sessions
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item["pane_id"] == pane).then(|| item["attached_clients"].as_u64())
+            })
+        })
+        .flatten();
+    assert_eq!(
+        attached_clients,
+        Some(0),
+        "HUD watch panes should be detached, not attached to a visible cmux surface: {sessions:?}"
+    );
+
+    let cmux_calls = std::fs::read_to_string(&cmux_log).unwrap_or_default();
+    assert!(
+        !cmux_calls.contains("new-split") && !cmux_calls.contains("send"),
+        "HUD watch compatibility path must not create or attach a visible cmux split: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_kill_session_closes_child_visible_cmux_split_surface() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-visible-kill-session.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:source\",\"workspace_ref\":\"workspace:1\",\"window_ref\":\"window:main\"}}}}'; exit 0 ;;\n\
+               new-split) printf '%s\\n' 'OK surface:visible-child workspace:1 window:main'; exit 0 ;;\n\
+               send) exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) exit 0 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let child_pane_file = env.temp.path().join("cmux-child-pane.txt");
+    let split_status_file = env.temp.path().join("cmux-child-split-status.txt");
+    let child_pane_file_arg =
+        shlex::try_quote(&child_pane_file.display().to_string())?.into_owned();
+    let split_status_file_arg =
+        shlex::try_quote(&split_status_file.display().to_string())?.into_owned();
+    let shell_arg = shlex::try_quote(&command_path("sh")?.display().to_string())?.into_owned();
+    let lterm_arg = shlex::try_quote(env!("CARGO_BIN_EXE_lterm"))?.into_owned();
+    let child_payload = shlex::try_quote("sleep 60")?.into_owned();
+    let path_string = path.to_string_lossy().to_string();
+    let path_arg = shlex::try_quote(&path_string)?.into_owned();
+    let parent_script = format!(
+        "PATH={path_arg}; export PATH; \
+         {lterm_arg} tmux-compat split-window -vPF '#{{pane_id}}' \
+         {shell_arg} -lc {child_payload} > {child_pane_file_arg}; \
+         status=$?; printf %s \"$status\" > {split_status_file_arg}; sleep 60"
+    );
+
+    let parent = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "cmux-visible-parent",
+            "sh",
+            "-lc",
+            parent_script.as_str(),
+        ])
+        .output()?;
+    assert!(parent.status.success(), "{parent:?}");
+    wait_for_session_present(&env, "cmux-visible-parent")?;
+    assert_eq!(wait_for_file_contents(&split_status_file)?.trim(), "0");
+    let child_pane = wait_for_file_contents(&child_pane_file)?.trim().to_string();
+    assert!(
+        child_pane.starts_with('%'),
+        "expected child pane id, got {child_pane:?}"
+    );
+
+    let kill = env
+        .cmd()
+        .env("PATH", &path)
+        .args(["tmux-compat", "kill-session", "-t", "cmux-visible-parent"])
+        .output()?;
+    assert!(kill.status.success(), "{kill:?}");
+    wait_for_session_absent(&env, "cmux-visible-parent")?;
+    let has_child = env
+        .cmd()
+        .args(["tmux-compat", "has-session", "-t", child_pane.as_str()])
+        .status()?;
+    assert!(
+        !has_child.success(),
+        "kill-session should recursively remove child pane {child_pane}"
+    );
+
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "close-surface --surface surface:visible-child --workspace workspace:1 --window window:main"
+        }),
+        "kill-session should close visible cmux split surfaces for child panes: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_stops_option_parsing_at_command() -> TestResult {
     let env = TestEnv::new()?;
     let output = env

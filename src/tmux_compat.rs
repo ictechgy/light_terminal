@@ -497,11 +497,11 @@ fn pane_number(pane_id: &str) -> Option<usize> {
 fn kill_session(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
     let target = normalize_tmux_target(&target)?;
-    kill_target_with_cmux_cleanup(target.as_ref())?;
+    kill_session_with_cmux_cleanup(target.as_ref())?;
     Ok(0)
 }
 
-fn kill_target_with_cmux_cleanup(target: &str) -> Result<()> {
+fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let before = client::info(target).ok();
     let cmux_surface = before
         .as_ref()
@@ -513,6 +513,30 @@ fn kill_target_with_cmux_cleanup(target: &str) -> Result<()> {
     }
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
+    }
+    Ok(())
+}
+
+fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
+    let panes_before = window_pane_rows_for_target(target).unwrap_or_default();
+    let kill_target = panes_before
+        .first()
+        .map(|pane| pane.name.as_str())
+        .unwrap_or(target);
+    let mut cmux_surfaces = HashSet::new();
+    for pane in &panes_before {
+        if let Some(surface) = stored_cmux_surface_for_pane(&pane.pane_id)? {
+            cmux_surfaces.insert(surface);
+        }
+    }
+
+    client::kill(kill_target)?;
+
+    for pane in panes_before {
+        forget_pane(&pane.pane_id)?;
+    }
+    for surface in &cmux_surfaces {
+        close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
     }
     Ok(())
 }
@@ -718,6 +742,11 @@ fn split_window(args: &[String]) -> Result<i32> {
             }
         }
     }
+    let command = tmux_shell_command(&command)?;
+    if is_omx_hud_watch_command(command.as_deref()) {
+        detached = true;
+    }
+
     if let Some(target) = target.as_deref() {
         reject_unsupported_tmux_window_target(target)?;
         if detached {
@@ -732,7 +761,6 @@ fn split_window(args: &[String]) -> Result<i32> {
         }
     }
 
-    let command = tmux_shell_command(&command)?;
     let cmux_surface = if detached {
         None
     } else {
@@ -784,6 +812,16 @@ fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
     info_for_tmux_target(target)
         .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
     Ok(())
+}
+
+fn is_omx_hud_watch_command(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    let has_owner = command.contains("OMX_TMUX_HUD_OWNER=1")
+        || command.contains("OMX_TMUX_HUD_OWNER='1'")
+        || command.contains("OMX_TMUX_HUD_OWNER=\"1\"");
+    has_owner && command.contains("hud --watch")
 }
 
 fn parse_split_window_env_assignment(
@@ -1057,7 +1095,7 @@ fn parse_send_keys_repeat(value: Option<String>) -> Result<usize> {
 fn kill_pane(args: &[String]) -> Result<i32> {
     let target = parse_target(args)?.unwrap_or_else(default_target);
     let target = normalize_tmux_target(&target)?;
-    kill_target_with_cmux_cleanup(target.as_ref())?;
+    kill_pane_with_cmux_cleanup(target.as_ref())?;
     Ok(0)
 }
 
@@ -2094,7 +2132,7 @@ struct CmuxCommandOutput {
     stderr: LimitedOutput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CmuxSurfaceContext {
     surface_ref: String,
     workspace_ref: Option<String>,
