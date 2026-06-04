@@ -6496,6 +6496,129 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
 }
 
 #[test]
+fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("split-team-window-target-marker.txt");
+    let pane_file = env.temp.path().join("split-team-window-target-pane.txt");
+    let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let pane_file_arg = shlex::try_quote(&pane_file.display().to_string())?.into_owned();
+    let cwd_arg = shlex::try_quote(&env.temp.path().display().to_string())?.into_owned();
+    let child_payload = format!("printf TEAM_WINDOW_TARGET_READY > {marker_arg}; sleep 60");
+    let child_payload_arg = shlex::try_quote(&child_payload)?.into_owned();
+    let parent_script = format!(
+        "\"$LTERM_BIN\" tmux-compat split-window -v -f -l 4 -t team-window-parent:0 \
+         -d -P -F '#{{pane_id}}' -c {cwd_arg} sh -lc {child_payload_arg} > {pane_file_arg}; \
+         status=$?; echo TEAM_WINDOW_SPLIT_STATUS:$status; sleep 60"
+    );
+
+    let status = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "team-window-parent",
+            "sh",
+            "-lc",
+            parent_script.as_str(),
+        ])
+        .status()?;
+    assert!(status.success(), "{status:?}");
+    env.capture_until("team-window-parent", "TEAM_WINDOW_SPLIT_STATUS:0")?;
+    let child_pane = wait_for_file_contents(&pane_file)?.trim().to_string();
+    assert!(
+        child_pane.starts_with('%'),
+        "split-window -P should print a child pane id: {child_pane:?}"
+    );
+    assert_eq!(
+        wait_for_file_contents(&marker)?.trim(),
+        "TEAM_WINDOW_TARGET_READY"
+    );
+
+    let listed = env.cmd().arg("ls").output()?;
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let parent_row = list_row(&stdout, "team-window-parent")
+        .ok_or_else(|| format!("team-window-parent row missing: {stdout:?}"))?;
+    let parent_pane = parent_row
+        .get(1)
+        .ok_or_else(|| format!("team-window-parent row missing pane id: {parent_row:?}"))?;
+
+    let display = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "display-message",
+            "-p",
+            "-t",
+            "team-window-parent:0",
+            "#{window_width}:#{pane_id}",
+        ])
+        .output()?;
+    assert!(
+        display.status.success(),
+        "display-message should resolve session:window target: {display:?}"
+    );
+    let display_stdout = String::from_utf8_lossy(&display.stdout);
+    let (width, displayed_pane) = display_stdout
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| format!("unexpected display-message output: {display_stdout:?}"))?;
+    assert!(width.parse::<u16>()? > 0, "{display_stdout:?}");
+    assert_eq!(displayed_pane, *parent_pane, "{display_stdout:?}");
+
+    let panes = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-panes",
+            "-t",
+            "team-window-parent:0",
+            "-F",
+            "#{pane_id}:#{pane_dead}:#{pane_pid}",
+        ])
+        .output()?;
+    assert!(
+        panes.status.success(),
+        "list-panes should resolve session:window target: {panes:?}"
+    );
+    let panes_stdout = String::from_utf8_lossy(&panes.stdout);
+    assert!(
+        panes_stdout
+            .lines()
+            .any(|line| line.starts_with(parent_pane)),
+        "parent pane missing from list-panes output: {panes_stdout:?}"
+    );
+    assert!(
+        panes_stdout
+            .lines()
+            .any(|line| line.starts_with(&child_pane)),
+        "child pane missing from list-panes output: {panes_stdout:?}"
+    );
+    assert!(
+        !panes_stdout.contains("#{pane_dead}") && !panes_stdout.contains("#{pane_pid}"),
+        "pane liveness formats must expand for OMX worker checks: {panes_stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_run_shell_executes_background_shell_command() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("run-shell-marker.txt");
+    let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let shell_command = format!("printf RUNSHELL_READY > {marker_arg}");
+    let output = env
+        .cmd()
+        .args(["tmux-compat", "run-shell", "-b", shell_command.as_str()])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(wait_for_file_contents(&marker)?.trim(), "RUNSHELL_READY");
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_split_window_detached_e_applies_environment_and_cluster_values() -> TestResult {
     let env = TestEnv::new()?;
     let parent_status = env

@@ -172,6 +172,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         | "show-window-option"
         | "show-window-options" => show_option(rest),
         "display-popup" | "popup" => display_popup(rest),
+        "run-shell" | "run" => run_shell(rest),
         "wait-for" | "wait" => wait_for(rest),
         "load-buffer" | "loadb" => load_buffer(rest),
         "save-buffer" | "saveb" => save_buffer(rest),
@@ -401,7 +402,7 @@ fn root_session_rows() -> Result<Vec<SessionInfo>> {
 }
 
 fn window_row_for_target(target: &str) -> Result<SessionInfo> {
-    let mut pane = client::info(target)?;
+    let mut pane = info_for_tmux_target(target)?;
     let rows = client::list_sessions()?;
     let mut seen = HashSet::new();
     while let Some(parent_session_id) = pane.parent_session_id.clone() {
@@ -434,6 +435,29 @@ fn window_row_for_target(target: &str) -> Result<SessionInfo> {
         pane = canonical.clone();
     }
     Ok(pane)
+}
+
+fn window_pane_rows_for_target(target: &str) -> Result<Vec<SessionInfo>> {
+    let root = window_row_for_target(target)?;
+    let mut panes = vec![root.clone()];
+    let mut seen = HashSet::from([root.pane_id.clone()]);
+    let mut children: Vec<_> = client::list_sessions()?
+        .into_iter()
+        .filter(|candidate| {
+            candidate
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|id| id == root.id)
+        })
+        .filter(|candidate| seen.insert(candidate.pane_id.clone()))
+        .collect();
+    children.sort_by_key(|pane| pane_number(&pane.pane_id).unwrap_or(usize::MAX));
+    panes.extend(children);
+    Ok(panes)
+}
+
+fn pane_number(pane_id: &str) -> Option<usize> {
+    pane_id.strip_prefix('%')?.parse().ok()
 }
 
 fn kill_session(args: &[String]) -> Result<i32> {
@@ -499,6 +523,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     // and `-c` are handled explicitly below; `VALUE_FLAGS` covers the
     // split-window-local value flags that the generic parser does not know.
     const VALUE_FLAGS: &[char] = &['e', 'l', 'p'];
+    const BOOLEAN_VALUE_OVERRIDES: &[char] = &['f'];
     let mut direction = "right";
     let mut print = false;
     let mut format = "#{pane_id}".to_string();
@@ -550,45 +575,91 @@ fn split_window(args: &[String]) -> Result<i32> {
                 break;
             }
             flag if flag.starts_with('-') => {
-                if has_flag_in_arg_with_value_flags(flag, 'h', VALUE_FLAGS) {
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'h',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     direction = "right";
                 }
-                if has_flag_in_arg_with_value_flags(flag, 'v', VALUE_FLAGS) {
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'v',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     direction = "down";
                 }
-                if has_flag_in_arg_with_value_flags(flag, 'd', VALUE_FLAGS) {
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'd',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     detached = true;
                 }
-                if has_flag_in_arg_with_value_flags(flag, 'P', VALUE_FLAGS) {
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'P',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     print = true;
                 }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 'F', args, i, VALUE_FLAGS)
-                {
+                if let Some((_, value)) = short_cluster_flag_value_with_extra_and_boolean_overrides(
+                    flag,
+                    'F',
+                    args,
+                    i,
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
                 }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
-                {
+                if let Some((_, value)) = short_cluster_flag_value_with_extra_and_boolean_overrides(
+                    flag,
+                    't',
+                    args,
+                    i,
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
                 }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 'c', args, i, VALUE_FLAGS)
-                {
+                if let Some((_, value)) = short_cluster_flag_value_with_extra_and_boolean_overrides(
+                    flag,
+                    'c',
+                    args,
+                    i,
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     cwd = Some(value_for_option(
                         value.or_else(|| args.get(i + 1).cloned()),
                         "-c",
                     )?);
                 }
-                if let Some((_, value)) =
-                    short_cluster_flag_value_with_extra(flag, 'e', args, i, VALUE_FLAGS)
-                {
+                if let Some((_, value)) = short_cluster_flag_value_with_extra_and_boolean_overrides(
+                    flag,
+                    'e',
+                    args,
+                    i,
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
                     parse_split_window_env_assignment(
                         value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-e")?,
                         &mut pane_env,
                     )?;
                 }
-                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+                i += flag_arg_width_with_extra_and_boolean_overrides(
+                    flag,
+                    args,
+                    i,
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                );
             }
             _ => {
                 command.extend_from_slice(&args[i..]);
@@ -658,7 +729,7 @@ fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
     // tmux compatibility follows tmux's model that a client able to name a live
     // target can launch a detached helper for orchestration. The helper runs as
     // a separate lterm session and is not attached into the target pane.
-    client::info(target)
+    info_for_tmux_target(target)
         .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
     Ok(())
 }
@@ -681,8 +752,14 @@ fn list_panes(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{pane_id}".to_string());
     if let Some(target) = parse_target(args)? {
-        let pane = client::info(&target)?;
-        println!("{}", expand_format(&format, &pane));
+        let panes = if tmux_window_target_session(&target).is_some() {
+            window_pane_rows_for_target(&target)?
+        } else {
+            vec![info_for_tmux_target(&target)?]
+        };
+        for pane in panes {
+            println!("{}", expand_format(&format, &pane));
+        }
         return Ok(0);
     }
     let mut seen = HashSet::new();
@@ -743,7 +820,7 @@ fn display_message(args: &[String]) -> Result<i32> {
         }
     }
     let target = target.unwrap_or_else(default_target);
-    let info = match client::info(&target) {
+    let info = match info_for_tmux_target(&target) {
         Ok(info) => info,
         Err(err) if explicit_target => return Err(err),
         Err(_) => client::list_sessions()
@@ -1136,6 +1213,56 @@ fn display_popup(args: &[String]) -> Result<i32> {
         Ok(status.code().unwrap_or(1))
     } else {
         Ok(0)
+    }
+}
+
+fn run_shell(args: &[String]) -> Result<i32> {
+    const VALUE_FLAGS: &[char] = &['d', 't'];
+    let mut background = false;
+    let mut command = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => {
+                command = tmux_shell_command(&args[i + 1..])?;
+                break;
+            }
+            "-b" => {
+                background = true;
+                i += 1;
+            }
+            "-d" | "-t" => {
+                value_for_option(args.get(i + 1).cloned(), args[i].as_str())?;
+                i += 2;
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                if has_flag_in_arg_with_value_flags(flag, 'b', VALUE_FLAGS) {
+                    background = true;
+                }
+                i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
+            }
+            _ => {
+                command = tmux_shell_command(&args[i..])?;
+                break;
+            }
+        }
+    }
+    let Some(command) = command else {
+        return Ok(0);
+    };
+    let mut shell = Command::new(default_shell());
+    shell.arg("-c").arg(command);
+    if background {
+        shell
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("tmux run-shell -b")?;
+        Ok(0)
+    } else {
+        let status = shell.status().context("tmux run-shell")?;
+        Ok(status.code().unwrap_or(1))
     }
 }
 
@@ -2300,6 +2427,36 @@ fn target_value(value: Option<String>, flag: &str) -> Result<Option<String>> {
     }
 }
 
+fn tmux_window_target_session(target: &str) -> Option<&str> {
+    let (session, window) = target.split_once(':')?;
+    if session.is_empty() {
+        return None;
+    }
+    let window = window.split_once('.').map_or(window, |(window, _)| window);
+    if window.is_empty() || !window.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(session)
+}
+
+fn info_for_tmux_target(target: &str) -> Result<SessionInfo> {
+    match client::info(target) {
+        Ok(info) => Ok(info),
+        Err(err) => {
+            let Some(session) = tmux_window_target_session(target) else {
+                return Err(err);
+            };
+            client::info(session).with_context(|| {
+                format!(
+                    "tmux target {} resolved to session {}",
+                    sanitize::terminal_text(target),
+                    sanitize::terminal_text(session)
+                )
+            })
+        }
+    }
+}
+
 fn value_for_option(value: Option<String>, flag: &str) -> Result<String> {
     value.with_context(|| format!("tmux option {flag} requires a value"))
 }
@@ -2309,6 +2466,15 @@ fn has_flag_in_arg(arg: &str, needle: char) -> bool {
 }
 
 fn has_flag_in_arg_with_value_flags(arg: &str, needle: char, extra_value_flags: &[char]) -> bool {
+    has_flag_in_arg_with_value_flags_and_boolean_overrides(arg, needle, extra_value_flags, &[])
+}
+
+fn has_flag_in_arg_with_value_flags_and_boolean_overrides(
+    arg: &str,
+    needle: char,
+    extra_value_flags: &[char],
+    boolean_value_overrides: &[char],
+) -> bool {
     let Some(cluster) = short_cluster(arg) else {
         return false;
     };
@@ -2316,8 +2482,17 @@ fn has_flag_in_arg_with_value_flags(arg: &str, needle: char, extra_value_flags: 
         if flag == needle {
             return true;
         }
-        if value_for_short_flag_with_extra(cluster, pos, flag, &[], 0, extra_value_flags).is_some()
-            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+        if value_for_short_flag_with_extra_and_boolean_overrides(
+            cluster,
+            pos,
+            flag,
+            &[],
+            0,
+            extra_value_flags,
+            boolean_value_overrides,
+        )
+        .is_some()
+            || (short_flag_takes_value(flag, extra_value_flags, boolean_value_overrides)
                 && cluster[pos + flag.len_utf8()..].is_empty())
         {
             break;
@@ -2485,9 +2660,19 @@ fn flag_arg_width_with_extra(
     i: usize,
     extra_value_flags: &[char],
 ) -> usize {
+    flag_arg_width_with_extra_and_boolean_overrides(flag, args, i, extra_value_flags, &[])
+}
+
+fn flag_arg_width_with_extra_and_boolean_overrides(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+    boolean_value_overrides: &[char],
+) -> usize {
     if let Some(cluster) = short_cluster(flag) {
         for (pos, short_flag) in cluster.char_indices() {
-            if is_value_taking_short_flag(short_flag) || extra_value_flags.contains(&short_flag) {
+            if short_flag_takes_value(short_flag, extra_value_flags, boolean_value_overrides) {
                 let rest = &cluster[pos + short_flag.len_utf8()..];
                 return if rest.is_empty() && args.get(i + 1).is_some() {
                     2
@@ -2516,14 +2701,40 @@ fn short_cluster_flag_value_with_extra(
     i: usize,
     extra_value_flags: &[char],
 ) -> Option<(usize, Option<String>)> {
+    short_cluster_flag_value_with_extra_and_boolean_overrides(
+        arg,
+        needle,
+        args,
+        i,
+        extra_value_flags,
+        &[],
+    )
+}
+
+fn short_cluster_flag_value_with_extra_and_boolean_overrides(
+    arg: &str,
+    needle: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+    boolean_value_overrides: &[char],
+) -> Option<(usize, Option<String>)> {
     let cluster = short_cluster(arg)?;
     for (pos, flag) in cluster.char_indices() {
-        let value = value_for_short_flag_with_extra(cluster, pos, flag, args, i, extra_value_flags);
+        let value = value_for_short_flag_with_extra_and_boolean_overrides(
+            cluster,
+            pos,
+            flag,
+            args,
+            i,
+            extra_value_flags,
+            boolean_value_overrides,
+        );
         if flag == needle {
             return Some((pos, value));
         }
         if value.is_some()
-            || ((is_value_taking_short_flag(flag) || extra_value_flags.contains(&flag))
+            || (short_flag_takes_value(flag, extra_value_flags, boolean_value_overrides)
                 && cluster[pos + flag.len_utf8()..].is_empty())
         {
             break;
@@ -2550,7 +2761,27 @@ fn value_for_short_flag_with_extra(
     i: usize,
     extra_value_flags: &[char],
 ) -> Option<String> {
-    if !is_value_taking_short_flag(flag) && !extra_value_flags.contains(&flag) {
+    value_for_short_flag_with_extra_and_boolean_overrides(
+        cluster,
+        pos,
+        flag,
+        args,
+        i,
+        extra_value_flags,
+        &[],
+    )
+}
+
+fn value_for_short_flag_with_extra_and_boolean_overrides(
+    cluster: &str,
+    pos: usize,
+    flag: char,
+    args: &[String],
+    i: usize,
+    extra_value_flags: &[char],
+    boolean_value_overrides: &[char],
+) -> Option<String> {
+    if !short_flag_takes_value(flag, extra_value_flags, boolean_value_overrides) {
         return None;
     }
     let rest = &cluster[pos + flag.len_utf8()..];
@@ -2558,6 +2789,15 @@ fn value_for_short_flag_with_extra(
         return args.get(i + 1).cloned();
     }
     Some(rest.strip_prefix('=').unwrap_or(rest).to_string())
+}
+
+fn short_flag_takes_value(
+    flag: char,
+    extra_value_flags: &[char],
+    boolean_value_overrides: &[char],
+) -> bool {
+    (is_value_taking_short_flag(flag) && !boolean_value_overrides.contains(&flag))
+        || extra_value_flags.contains(&flag)
 }
 
 fn short_cluster(arg: &str) -> Option<&str> {
@@ -2662,6 +2902,20 @@ fn format_replacement<'a>(
         Some(("#{pane_current_path}", Cow::Borrowed(info.cwd.as_str())))
     } else if rest.starts_with("#{pane_active}") {
         Some(("#{pane_active}", Cow::Borrowed(ACTIVE)))
+    } else if rest.starts_with("#{pane_dead}") {
+        Some((
+            "#{pane_dead}",
+            Cow::Borrowed(if info.alive { "0" } else { "1" }),
+        ))
+    } else if rest.starts_with("#{pane_pid}") {
+        Some((
+            "#{pane_pid}",
+            Cow::Owned(
+                info.process_id
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_default(),
+            ),
+        ))
     } else if rest.starts_with("#{pane_in_mode}") {
         Some(("#{pane_in_mode}", Cow::Borrowed(IN_MODE)))
     } else if rest.starts_with("#{window_id}") {
@@ -2714,7 +2968,9 @@ fn command_support_tier(command: &str) -> &'static str {
         "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-option"
         | "set-hook" | "set-window-option" | "show-environment" => "noop",
         "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
-        | "list-commands" | "list-sessions" | "rename-session" | "send-keys" => "full",
+        | "list-commands" | "list-sessions" | "rename-session" | "run-shell" | "send-keys" => {
+            "full"
+        }
         _ => "partial",
     }
 }
@@ -2754,6 +3010,7 @@ const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
     ("refresh-client", Some("refresh"), &[]),
     ("rename-session", Some("rename"), &[]),
     ("resize-pane", Some("resizep"), &[]),
+    ("run-shell", Some("run"), &[]),
     ("save-buffer", Some("saveb"), &[]),
     ("select-layout", Some("selectl"), &[]),
     ("select-pane", Some("selectp"), &[]),
@@ -2793,6 +3050,7 @@ fn command_usage(command: &str) -> &'static str {
         "refresh-client" => "[-S] [-t target-client]",
         "rename-session" => "[-t target-session] new-name",
         "resize-pane" => "[-x width] [-y height] [-t target-pane]",
+        "run-shell" => "[-b] shell-command",
         "save-buffer" => "path",
         "select-layout" => "[-t target-pane] [layout-name]",
         "select-pane" => "[-t target-pane]",
@@ -2804,9 +3062,7 @@ fn command_usage(command: &str) -> &'static str {
         "show-environment" => "[-t target-session] [variable]",
         "show-options" => "[-t target-pane] [option]",
         "show-window-options" => "[-t target-window] [option]",
-        "split-window" => {
-            "[-dhvP] [-F format] [-c start-directory] [shell-command]  # -t unsupported"
-        }
+        "split-window" => "[-dfhvP] [-F format] [-c start-directory] [-t target] [shell-command]",
         "wait-for" => "[-S] channel",
         _ => "",
     }
