@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
-    CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response,
-    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION,
+    Request, Response, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -75,6 +75,12 @@ const NESTED_AGENT_STABLE_POLLS: u8 = 2;
 /// narrow local reset before transcript UI text so sanitized output does not
 /// inherit stale foreground/background colors.
 const MOBILE_TRANSCRIPT_SGR_RESET: &str = "\x1b[0m";
+/// Raw attach intentionally passes PTY bytes through unchanged, but the host
+/// terminal can already be in a colored SGR state before lterm attaches (for
+/// example after a mobile SSH renderer or a previous status row).  Emit only a
+/// host-local SGR reset on lterm-owned UI boundaries so the first raw PTY bytes
+/// do not inherit stale foreground/background colors.
+const HOST_TERMINAL_SGR_RESET: &[u8] = b"\x1b[0m";
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
@@ -247,6 +253,7 @@ pub fn new_session(
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
     inherit_terminal_capability_env(&mut env);
+    inherit_child_color_policy_env_unless_agent(&mut env);
     if tmux {
         inherit_cmux_context_env(&mut env);
     }
@@ -277,6 +284,29 @@ fn inherit_terminal_capability_env(env: &mut std::collections::HashMap<String, S
     }
 }
 
+fn inherit_child_color_policy_env_unless_agent(
+    env: &mut std::collections::HashMap<String, String>,
+) {
+    if session_env_declares_agent(env) {
+        return;
+    }
+    for key in CHILD_COLOR_POLICY_ENV {
+        if env.contains_key(*key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.insert((*key).to_string(), value);
+            }
+        }
+    }
+}
+
+fn session_env_declares_agent(env: &std::collections::HashMap<String, String>) -> bool {
+    env.get("LTERM_AGENT")
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn inherit_cmux_context_env(env: &mut std::collections::HashMap<String, String>) {
     for key in CMUX_CONTEXT_ENV {
         if env.contains_key(*key) {
@@ -304,10 +334,6 @@ const TERMINAL_CAPABILITY_ENV: &[&str] = &[
     "WT_SESSION",
     "ITERM_SESSION_ID",
     "TERM_SESSION_ID",
-    "NO_COLOR",
-    "FORCE_COLOR",
-    "CLICOLOR",
-    "CLICOLOR_FORCE",
 ];
 
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
@@ -1844,6 +1870,9 @@ struct AgentPresenceCue {
 
 impl AgentPresenceCue {
     fn emit_initial(&self, stdout: &mut impl Write) -> Result<()> {
+        // Callers only construct this cue after `stdout.is_terminal()` succeeds;
+        // the reset is host-local terminal state and must not be written to pipes.
+        reset_host_terminal_sgr(stdout).context("reset host terminal style before agent cue")?;
         self.write_title(stdout)?;
         if agent_presence_banner_enabled() {
             self.write_banner(stdout)?;
@@ -1897,6 +1926,12 @@ fn agent_presence_cue_for_info(
 
 fn agent_presence_cue_enabled() -> bool {
     !env_flag_disabled("LTERM_AGENT_CUE")
+}
+
+fn reset_host_terminal_sgr(stdout: &mut impl Write) -> Result<()> {
+    stdout
+        .write_all(HOST_TERMINAL_SGR_RESET)
+        .context("write host terminal SGR reset")
 }
 
 fn write_lterm_title_cue(
@@ -3139,6 +3174,7 @@ fn attach_with_presence_and_cue(
     });
 
     let mut stdout = std::io::stdout();
+    reset_raw_attach_initial_sgr_if_needed(status_enabled, stdout.is_terminal(), &mut stdout)?;
     let status_style = status_enabled
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
@@ -3662,6 +3698,21 @@ fn forward_pty_output_frame_or_detached(
         return Err(err).context("flush stdout");
     }
     Ok(false)
+}
+
+fn reset_raw_attach_initial_sgr_if_needed(
+    status_enabled: bool,
+    stdout_is_terminal: bool,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    if status_enabled || !stdout_is_terminal {
+        return Ok(());
+    }
+    reset_host_terminal_sgr(stdout)?;
+    stdout
+        .flush()
+        .context("flush raw attach initial SGR reset")?;
+    Ok(())
 }
 
 fn anyhow_error_is_broken_pipe(err: &anyhow::Error) -> bool {
@@ -4911,7 +4962,7 @@ mod tests {
     use super::{
         AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
-        AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus,
+        AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
@@ -4930,9 +4981,9 @@ mod tests {
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
         raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
-        resolve_attach_mode, resolve_status_style, should_mobile_transcript_auto,
-        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
-        trace_output_open_context, trace_summary_text, validate_trace_replay,
+        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        trace_file_summary, trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
@@ -5519,6 +5570,70 @@ mod tests {
         assert!(
             !banner.contains('\x1b') && !banner.contains('\x07'),
             "banner must not include terminal controls: {banner:?}"
+        );
+    }
+
+    #[test]
+    fn initial_agent_presence_cue_resets_stale_host_sgr() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env_guard = EnvGuard::capture(&["LTERM_AGENT_BANNER"]);
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation in tests.
+        unsafe {
+            std::env::remove_var("LTERM_AGENT_BANNER");
+        }
+
+        let cue = AgentPresenceCue {
+            session: "omx-lterm".to_string(),
+            pane: "%0".to_string(),
+            agent: "omx".to_string(),
+        };
+        let mut output = Vec::new();
+        cue.emit_initial(&mut output).expect("initial cue");
+
+        assert!(
+            output.starts_with(HOST_TERMINAL_SGR_RESET),
+            "agent row-off cue must clear stale host SGR before title/banner: {output:?}"
+        );
+        let output = String::from_utf8(output).expect("cue output is utf8");
+        assert!(
+            output[HOST_TERMINAL_SGR_RESET.len()..].starts_with("\x1b]0;"),
+            "SGR reset should precede the terminal-title cue: {output:?}"
+        );
+        assert!(
+            output.contains("[lterm] omx-lterm %0 · omx"),
+            "initial cue should still include the explanatory banner: {output:?}"
+        );
+    }
+
+    #[test]
+    fn row_off_raw_attach_resets_stale_host_sgr_only_on_terminals() {
+        let mut terminal_output = Vec::new();
+        reset_raw_attach_initial_sgr_if_needed(false, true, &mut terminal_output)
+            .expect("row-off terminal reset");
+        assert_eq!(terminal_output, HOST_TERMINAL_SGR_RESET);
+
+        let mut status_output = Vec::new();
+        reset_raw_attach_initial_sgr_if_needed(true, true, &mut status_output)
+            .expect("status row owns its own SGR");
+        assert!(
+            status_output.is_empty(),
+            "status-enabled attach already resets through StatusBar"
+        );
+
+        let mut piped_output = Vec::new();
+        reset_raw_attach_initial_sgr_if_needed(false, false, &mut piped_output)
+            .expect("non-terminal attach reset check");
+        assert!(
+            piped_output.is_empty(),
+            "non-terminal raw attach output must not be prefixed with host UI escapes"
+        );
+
+        let mut status_piped_output = Vec::new();
+        reset_raw_attach_initial_sgr_if_needed(true, false, &mut status_piped_output)
+            .expect("status-enabled non-terminal reset check");
+        assert!(
+            status_piped_output.is_empty(),
+            "status-enabled non-terminal attach must not be prefixed with host UI escapes"
         );
     }
 
@@ -6800,6 +6915,10 @@ mod tests {
             "COLORTERM",
             "TERM_PROGRAM",
             "LC_TERMINAL",
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
             "LTERM_AGENT",
         ]);
 
@@ -6809,6 +6928,10 @@ mod tests {
             std::env::set_var("COLORTERM", "truecolor");
             std::env::set_var("TERM_PROGRAM", "Termius");
             std::env::set_var("LC_TERMINAL", "iTerm2");
+            std::env::set_var("NO_COLOR", "1");
+            std::env::set_var("FORCE_COLOR", "3");
+            std::env::set_var("CLICOLOR", "0");
+            std::env::set_var("CLICOLOR_FORCE", "1");
             std::env::set_var("LTERM_AGENT", "host-value");
         }
 
@@ -6817,6 +6940,7 @@ mod tests {
             ("LC_TERMINAL".to_string(), "explicit-client".to_string()),
         ]);
         super::inherit_terminal_capability_env(&mut env);
+        super::inherit_child_color_policy_env_unless_agent(&mut env);
 
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
@@ -6829,7 +6953,49 @@ mod tests {
         assert_eq!(
             env.get("LTERM_AGENT").map(String::as_str),
             Some("omx"),
-            "only terminal capability keys should be inherited"
+            "caller-supplied session env should stay authoritative"
+        );
+        for key in ["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"] {
+            assert!(
+                !env.contains_key(key),
+                "{key} is an application color policy, not a terminal capability, and must not leak into child agent sessions"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_new_sessions_inherit_current_color_policy_env_without_overwriting_explicit_values() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::capture(&[
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "LTERM_AGENT",
+        ]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+            std::env::set_var("FORCE_COLOR", "3");
+            std::env::set_var("CLICOLOR", "0");
+            std::env::set_var("CLICOLOR_FORCE", "1");
+            std::env::remove_var("LTERM_AGENT");
+        }
+
+        let mut env = std::collections::HashMap::from([(
+            "CLICOLOR_FORCE".to_string(),
+            "explicit-client".to_string(),
+        )]);
+        super::inherit_child_color_policy_env_unless_agent(&mut env);
+
+        assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(env.get("FORCE_COLOR").map(String::as_str), Some("3"));
+        assert_eq!(env.get("CLICOLOR").map(String::as_str), Some("0"));
+        assert_eq!(
+            env.get("CLICOLOR_FORCE").map(String::as_str),
+            Some("explicit-client"),
+            "caller-supplied session env should stay authoritative"
         );
     }
 

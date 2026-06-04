@@ -14,6 +14,8 @@ pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WINDOW_ID",
     "CMUX_SOCKET_PATH",
 ];
+pub const CHILD_COLOR_POLICY_ENV: &[&str] =
+    &["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
