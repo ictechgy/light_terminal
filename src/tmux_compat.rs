@@ -441,18 +441,22 @@ fn window_pane_rows_for_target(target: &str) -> Result<Vec<SessionInfo>> {
     let root = window_row_for_target(target)?;
     let mut panes = vec![root.clone()];
     let mut seen = HashSet::from([root.pane_id.clone()]);
-    let mut children: Vec<_> = client::list_sessions()?
-        .into_iter()
-        .filter(|candidate| {
+    let rows = client::list_sessions()?;
+    let mut pending = vec![root.id.clone()];
+    while let Some(parent_id) = pending.pop() {
+        for child in rows.iter().filter(|candidate| {
             candidate
                 .parent_session_id
                 .as_deref()
-                .is_some_and(|id| id == root.id)
-        })
-        .filter(|candidate| seen.insert(candidate.pane_id.clone()))
-        .collect();
-    children.sort_by_key(|pane| pane_number(&pane.pane_id).unwrap_or(usize::MAX));
-    panes.extend(children);
+                .is_some_and(|id| id == parent_id)
+        }) {
+            if seen.insert(child.pane_id.clone()) {
+                pending.push(child.id.clone());
+                panes.push(child.clone());
+            }
+        }
+    }
+    panes.sort_by_key(|pane| pane_number(&pane.pane_id).unwrap_or(usize::MAX));
     Ok(panes)
 }
 
@@ -1219,6 +1223,7 @@ fn display_popup(args: &[String]) -> Result<i32> {
 fn run_shell(args: &[String]) -> Result<i32> {
     const VALUE_FLAGS: &[char] = &['d', 't'];
     let mut background = false;
+    let mut delay = Duration::from_secs(0);
     let mut command = None;
     let mut i = 0;
     while i < args.len() {
@@ -1231,13 +1236,33 @@ fn run_shell(args: &[String]) -> Result<i32> {
                 background = true;
                 i += 1;
             }
-            "-d" | "-t" => {
+            "-d" => {
+                delay = parse_run_shell_delay(&value_for_option(
+                    args.get(i + 1).cloned(),
+                    args[i].as_str(),
+                )?)?;
+                i += 2;
+            }
+            "-t" => {
                 value_for_option(args.get(i + 1).cloned(), args[i].as_str())?;
                 i += 2;
             }
             flag if flag.starts_with('-') && flag != "-" => {
                 if has_flag_in_arg_with_value_flags(flag, 'b', VALUE_FLAGS) {
                     background = true;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 'd', args, i, VALUE_FLAGS)
+                {
+                    delay = parse_run_shell_delay(&value_for_option(
+                        value.or_else(|| args.get(i + 1).cloned()),
+                        "-d",
+                    )?)?;
+                }
+                if let Some((_, value)) =
+                    short_cluster_flag_value_with_extra(flag, 't', args, i, VALUE_FLAGS)
+                {
+                    value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
                 }
                 i += flag_arg_width_with_extra(flag, args, i, VALUE_FLAGS);
             }
@@ -1250,9 +1275,36 @@ fn run_shell(args: &[String]) -> Result<i32> {
     let Some(command) = command else {
         return Ok(0);
     };
-    let mut shell = Command::new(default_shell());
-    shell.arg("-c").arg(command);
+    run_shell_command(command, background, delay)
+}
+
+fn parse_run_shell_delay(value: &str) -> Result<Duration> {
+    let seconds: f64 = value
+        .parse()
+        .with_context(|| format!("tmux run-shell -d delay must be seconds: {value}"))?;
+    if !seconds.is_finite() || seconds < 0.0 || seconds > u64::MAX as f64 {
+        bail!("tmux run-shell -d delay must be a finite non-negative duration: {value}");
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn run_shell_command(command: String, background: bool, delay: Duration) -> Result<i32> {
+    let shell_path = default_shell();
+    let mut shell = Command::new(&shell_path);
     if background {
+        if delay.is_zero() {
+            shell.arg("-c").arg(command);
+        } else {
+            shell
+                .arg("-c")
+                .arg(
+                    "sleep \"$LTERM_RUN_SHELL_DELAY\"; \
+                     exec \"$LTERM_RUN_SHELL_SHELL\" -c \"$LTERM_RUN_SHELL_COMMAND\"",
+                )
+                .env("LTERM_RUN_SHELL_DELAY", delay.as_secs_f64().to_string())
+                .env("LTERM_RUN_SHELL_SHELL", &shell_path)
+                .env("LTERM_RUN_SHELL_COMMAND", command);
+        }
         shell
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1261,6 +1313,10 @@ fn run_shell(args: &[String]) -> Result<i32> {
             .context("tmux run-shell -b")?;
         Ok(0)
     } else {
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        shell.arg("-c").arg(command);
         let status = shell.status().context("tmux run-shell")?;
         Ok(status.code().unwrap_or(1))
     }
@@ -2432,8 +2488,10 @@ fn tmux_window_target_session(target: &str) -> Option<&str> {
     if session.is_empty() {
         return None;
     }
-    let window = window.split_once('.').map_or(window, |(window, _)| window);
-    if window.is_empty() || !window.chars().all(|ch| ch.is_ascii_digit()) {
+    // lterm has a single tmux-compatible window per session. Only the exact
+    // `session:0` window form falls back to the root session; pane suffixes and
+    // unsupported window indexes must preserve the original lookup failure.
+    if window != "0" {
         return None;
     }
     Some(session)

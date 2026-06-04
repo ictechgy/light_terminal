@@ -6500,10 +6500,36 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     let env = TestEnv::new()?;
     let marker = env.temp.path().join("split-team-window-target-marker.txt");
     let pane_file = env.temp.path().join("split-team-window-target-pane.txt");
+    let grandchild_marker = env
+        .temp
+        .path()
+        .join("split-team-window-target-grandchild-marker.txt");
+    let grandchild_pane_file = env
+        .temp
+        .path()
+        .join("split-team-window-target-grandchild-pane.txt");
+    let grandchild_status_file = env
+        .temp
+        .path()
+        .join("split-team-window-target-grandchild-status.txt");
     let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
     let pane_file_arg = shlex::try_quote(&pane_file.display().to_string())?.into_owned();
+    let grandchild_marker_arg =
+        shlex::try_quote(&grandchild_marker.display().to_string())?.into_owned();
+    let grandchild_pane_file_arg =
+        shlex::try_quote(&grandchild_pane_file.display().to_string())?.into_owned();
+    let grandchild_status_file_arg =
+        shlex::try_quote(&grandchild_status_file.display().to_string())?.into_owned();
     let cwd_arg = shlex::try_quote(&env.temp.path().display().to_string())?.into_owned();
-    let child_payload = format!("printf TEAM_WINDOW_TARGET_READY > {marker_arg}; sleep 60");
+    let grandchild_payload =
+        format!("printf TEAM_WINDOW_TARGET_GRANDCHILD_READY > {grandchild_marker_arg}; sleep 60");
+    let grandchild_payload_arg = shlex::try_quote(&grandchild_payload)?.into_owned();
+    let child_payload = format!(
+        "printf TEAM_WINDOW_TARGET_READY > {marker_arg}; \
+         \"$LTERM_BIN\" tmux-compat split-window -v -d -P -F '#{{pane_id}}' \
+         -t team-window-parent:0 sh -lc {grandchild_payload_arg} > {grandchild_pane_file_arg}; \
+         status=$?; printf %s \"$status\" > {grandchild_status_file_arg}; sleep 60"
+    );
     let child_payload_arg = shlex::try_quote(&child_payload)?.into_owned();
     let parent_script = format!(
         "\"$LTERM_BIN\" tmux-compat split-window -v -f -l 4 -t team-window-parent:0 \
@@ -6534,6 +6560,18 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     assert_eq!(
         wait_for_file_contents(&marker)?.trim(),
         "TEAM_WINDOW_TARGET_READY"
+    );
+    assert_eq!(wait_for_file_contents(&grandchild_status_file)?.trim(), "0");
+    let grandchild_pane = wait_for_file_contents(&grandchild_pane_file)?
+        .trim()
+        .to_string();
+    assert!(
+        grandchild_pane.starts_with('%'),
+        "nested split-window -P should print a grandchild pane id: {grandchild_pane:?}"
+    );
+    assert_eq!(
+        wait_for_file_contents(&grandchild_marker)?.trim(),
+        "TEAM_WINDOW_TARGET_GRANDCHILD_READY"
     );
 
     let listed = env.cmd().arg("ls").output()?;
@@ -6568,6 +6606,24 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     assert!(width.parse::<u16>()? > 0, "{display_stdout:?}");
     assert_eq!(displayed_pane, *parent_pane, "{display_stdout:?}");
 
+    for invalid_target in ["team-window-parent:99", "team-window-parent:0.1"] {
+        let invalid = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "display-message",
+                "-p",
+                "-t",
+                invalid_target,
+                "#{pane_id}",
+            ])
+            .output()?;
+        assert!(
+            !invalid.status.success(),
+            "unsupported window/pane target must not fall back to the session root: {invalid_target}: {invalid:?}"
+        );
+    }
+
     let panes = env
         .cmd()
         .args([
@@ -6584,22 +6640,31 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
         "list-panes should resolve session:window target: {panes:?}"
     );
     let panes_stdout = String::from_utf8_lossy(&panes.stdout);
-    assert!(
-        panes_stdout
-            .lines()
-            .any(|line| line.starts_with(parent_pane)),
-        "parent pane missing from list-panes output: {panes_stdout:?}"
-    );
-    assert!(
-        panes_stdout
-            .lines()
-            .any(|line| line.starts_with(&child_pane)),
-        "child pane missing from list-panes output: {panes_stdout:?}"
-    );
-    assert!(
-        !panes_stdout.contains("#{pane_dead}") && !panes_stdout.contains("#{pane_pid}"),
-        "pane liveness formats must expand for OMX worker checks: {panes_stdout:?}"
-    );
+    let pane_rows: Vec<Vec<&str>> = panes_stdout
+        .lines()
+        .map(|line| line.split(':').collect())
+        .collect();
+    for expected_pane in [*parent_pane, child_pane.as_str(), grandchild_pane.as_str()] {
+        let row = pane_rows
+            .iter()
+            .find(|row| row.first().copied() == Some(expected_pane))
+            .ok_or_else(|| {
+                format!("pane {expected_pane} missing from list-panes output: {panes_stdout:?}")
+            })?;
+        assert_eq!(
+            row.len(),
+            3,
+            "pane liveness row should have pane_id:pane_dead:pane_pid: {row:?}"
+        );
+        assert_eq!(
+            row[1], "0",
+            "live panes should expand pane_dead to 0: {row:?}"
+        );
+        row[2]
+            .parse::<u32>()
+            .map(|_| ())
+            .map_err(|err| format!("pane_pid should be numeric for live panes: {row:?}: {err}"))?;
+    }
     Ok(())
 }
 
@@ -6615,6 +6680,35 @@ fn tmux_compat_run_shell_executes_background_shell_command() -> TestResult {
         .output()?;
     assert!(output.status.success(), "{output:?}");
     assert_eq!(wait_for_file_contents(&marker)?.trim(), "RUNSHELL_READY");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_run_shell_background_delay_defers_execution() -> TestResult {
+    let env = TestEnv::new()?;
+    let marker = env.temp.path().join("run-shell-delayed-marker.txt");
+    let marker_arg = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let shell_command = format!("printf RUNSHELL_DELAYED_READY > {marker_arg}");
+    let output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "run-shell",
+            "-b",
+            "-d",
+            "1",
+            shell_command.as_str(),
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !marker.exists(),
+        "run-shell -b -d should return before running the delayed command"
+    );
+    assert_eq!(
+        wait_for_file_contents(&marker)?.trim(),
+        "RUNSHELL_DELAYED_READY"
+    );
     Ok(())
 }
 
