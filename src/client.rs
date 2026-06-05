@@ -3277,9 +3277,10 @@ fn attach_with_presence_and_cue(
         .map(|(info, config)| {
             // allow_color는 draw 분기에서 테마 bg on/off를 결정하므로 미리 반영한다.
             status_bar.command_allow_color = config.allow_color;
-            // 생명주기/일시정지 게이트는 metadata 스레드와 동일 패턴을 따른다.
-            // running은 공유하고, enabled는 metadata와 동일하게 항상 활성으로 시작한다.
-            let command_enabled = Arc::new(AtomicBool::new(true));
+            // 생명주기/일시정지 게이트는 metadata 스레드와 동일 토글에 연동한다.
+            // suspend/resume(alt-screen·nested agent)이 status_metadata_enabled를
+            // false/true로 토글하므로, 동일 Arc를 공유하면 command 스레드도 함께
+            // pause/resume된다(이전엔 항상 true라 alt-screen 중에도 매 interval spawn됨).
             spawn_status_command_thread(
                 info.pane_id.clone(),
                 config.argv,
@@ -3287,7 +3288,7 @@ fn attach_with_presence_and_cue(
                 config.allow_color,
                 config.debug,
                 Arc::clone(&running),
-                command_enabled,
+                Arc::clone(&status_metadata_enabled),
             )
         });
     let nested_detection = nested_monitor_enabled
@@ -3716,6 +3717,29 @@ fn parse_status_command_bool(raw: Option<&str>, default: bool) -> bool {
     }
 }
 
+/// status payload 필드 길이 상한(바이트). 자식이 stdin을 읽지 않아도
+/// `write_all`이 OS 파이프 버퍼(보통 64KB)에 다 들어가 블로킹되지 않도록,
+/// payload 총량을 파이프 버퍼보다 충분히 작게(수 KB) 유지한다. spec §6.4(견고화).
+/// session/pane은 식별자라 짧게, cwd는 경로라 가장 넉넉히 둔다.
+const STATUS_PAYLOAD_SESSION_CAP: usize = 128;
+const STATUS_PAYLOAD_PANE_CAP: usize = 128;
+const STATUS_PAYLOAD_AGENT_CAP: usize = 64;
+const STATUS_PAYLOAD_CWD_CAP: usize = 1024;
+
+/// 문자열을 최대 `max_bytes` 바이트로 char 경계에서 안전하게 절단한다.
+/// 멀티바이트 문자를 쪼개지 않도록 경계 직전까지만 남긴다. 이미 한도 이하면 그대로 반환.
+fn truncate_to_byte_cap(value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    // max_bytes 이하이면서 char 경계인 가장 큰 인덱스를 찾는다.
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
+}
+
 /// command-backed status payload 직렬화 스키마(spec §4.1). 수동 문자열 조립 대신
 /// serde_json이 escape를 책임지도록 전용 구조체를 쓴다.
 #[derive(Debug, Serialize)]
@@ -3753,17 +3777,28 @@ struct StatusCommandPayload<'a> {
 /// serde_json이 따옴표/백슬래시는 escape하지만, raw 제어문자가 JSON에 주입되는 것을
 /// 사전에 차단한다. `agent`는 신뢰되는 allowlist 토큰이라 그대로 둔다. cwd가 비면 null.
 fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
-    let session = sanitize::terminal_text(&info.name);
-    let pane = sanitize::terminal_text(&info.pane_id);
+    // 제어문자 제거 후 필드별 길이 cap을 적용해 payload 총량이 OS 파이프 버퍼보다
+    // 충분히 작게(수 KB) 유지되도록 한다. 그러면 자식이 stdin을 안 읽어도
+    // run_status_command의 write_all이 블로킹되지 않는다(H1 방어). cap은 char 경계 안전.
+    let session = truncate_to_byte_cap(
+        sanitize::terminal_text(&info.name),
+        STATUS_PAYLOAD_SESSION_CAP,
+    );
+    let pane = truncate_to_byte_cap(
+        sanitize::terminal_text(&info.pane_id),
+        STATUS_PAYLOAD_PANE_CAP,
+    );
     let session_key = format!("{session}/{pane}");
-    let cwd = sanitize::terminal_text(&info.cwd);
+    let cwd = truncate_to_byte_cap(sanitize::terminal_text(&info.cwd), STATUS_PAYLOAD_CWD_CAP);
+    let agent = agent_name_from_command(&info.command)
+        .map(|agent| truncate_to_byte_cap(agent, STATUS_PAYLOAD_AGENT_CAP));
     let payload = StatusCommandPayload {
         source: "lterm",
         version: 1,
         session,
         pane,
         session_key,
-        agent: agent_name_from_command(&info.command),
+        agent,
         cwd: (!cwd.is_empty()).then_some(cwd),
         cols,
         rows,
@@ -3772,21 +3807,36 @@ fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
     serde_json::to_string(&payload).unwrap_or_else(|_| String::from("{}"))
 }
 
+/// stdout 드레인 후 reader 스레드 join을 시도할 최대 grace(타임아웃 도달 후).
+/// 정상 경로(child.kill로 stdout fd가 닫힘)에서는 reader가 즉시 끝나므로 거의 즉시 join된다.
+/// 자손이 stdout 파이프를 점유한 드문 케이스에서만 이 grace를 소진한 뒤 결과를 포기한다.
+const STATUS_COMMAND_READER_JOIN_GRACE: Duration = Duration::from_millis(100);
+
 /// 외부 status 명령을 **shell 미경유**로 실행하고 stdout을 회수한다. spec §5.3/§6.4.
 ///
 /// 파라미터:
 /// - `argv`: 실행 명령(첫 원소가 실행 파일, 나머지는 인자). shell을 거치지 않아
 ///   인젝션 표면이 없다.
-/// - `stdin_payload`: child stdin으로 보낼 JSON payload.
+/// - `stdin_payload`: child stdin으로 보낼 JSON payload. 호출부에서 cap이 적용돼
+///   OS 파이프 버퍼보다 작으므로 자식이 stdin을 안 읽어도 write_all이 블로킹되지 않는다.
 /// - `timeout`: 1회 실행 상한. 초과 시 child를 kill 후 좀비를 회수하고 `None`.
 /// - `max_bytes`: stdout 수용 상한. 초과분은 절단한다.
 ///
 /// 반환값: 정상 종료 + 비어있지 않은 stdout이면 `Some(text)`. spawn 실패, 타임아웃,
-/// 비정상 종료, 빈 출력은 모두 `None`(호출부에서 "직전 라인 유지"로 해석).
+/// 비정상 종료, 빈 출력, reader join 실패는 모두 `None`(호출부에서 "직전 라인 유지").
 ///
-/// 설계: macOS에는 `gtimeout`이 없으므로 자체 폴링 타임아웃을 쓴다. stdin write 후
-/// drop으로 EOF를 보내 child가 읽기를 끝낼 수 있게 하고, `try_wait`를 짧은 sleep과
-/// 함께 폴링한다. 타임아웃 시 `kill`+`wait`로 좀비를 회수한 뒤에만 반환한다.
+/// 설계(견고화): macOS에는 `gtimeout`이 없으므로 자체 폴링 타임아웃을 쓴다.
+/// - 타임아웃 시계는 어떤 블로킹 호출보다도 **먼저**(spawn 직후) 시작해 방어한다.
+/// - stdout 읽기는 **별도 reader 스레드**가 `read_to_end`로 max_bytes까지 수행한다.
+///   메인 흐름은 `try_wait` deadline으로 자식 종료만 기다리고 **절대 read로 블로킹되지
+///   않는다**(H2 방어). 자식 종료/타임아웃 후 reader 스레드를 deadline 내 짧은 grace로만
+///   join 시도하고, 제때 안 끝나면(자손이 파이프 점유) 결과를 포기하고 `None`을 반환해
+///   메인 status 스레드를 진행시킨다.
+/// - `process_group(0)`(std, 무의존)로 자식을 자기 프로세스 그룹에 둔다. 정상 경로
+///   (자식 단독, 예 understatus)에서는 child.kill()로 stdout이 닫혀 reader가 정상 종료한다.
+///   Phase 2: 자손까지 죽이려면 `kill(-pgid, SIGKILL)` 같은 group-kill이 필요하고 이는
+///   libc 의존(또는 unsafe 직접 syscall)을 요하므로 의도적으로 미구현이다. 현재 핵심
+///   요구는 "status 스레드 무블로킹"이며 reader 스레드를 버리는 것으로 그 보장을 만족한다.
 fn run_status_command(
     argv: &[String],
     stdin_payload: &str,
@@ -3799,57 +3849,100 @@ fn run_status_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // 자식을 자기 프로세스 그룹에 둔다(향후 group-kill 기반, 현재는 무해한 격리).
+        .process_group(0)
         .spawn()
         .ok()?;
 
+    // 방어: 타임아웃 시계를 어떤 블로킹 호출(stdin write 등)보다 먼저 시작한다.
+    let started = Instant::now();
+
+    // stdout을 별도 스레드에서 드레인한다. 메인 스레드는 read로 블로킹되지 않는다.
+    // max_bytes + 1까지만 읽어 상한 초과 여부를 알 수 있게 한 뒤 호출부에서 절단한다.
+    let reader_handle = child.stdout.take().map(|mut stdout| {
+        let read_limit = (max_bytes as u64).saturating_add(1);
+        thread::spawn(move || -> Option<Vec<u8>> {
+            let mut buffer = Vec::new();
+            match stdout.by_ref().take(read_limit).read_to_end(&mut buffer) {
+                Ok(_) => Some(buffer),
+                Err(_) => None,
+            }
+        })
+    });
+
     // stdin write 실패는 치명적이지 않다(명령이 stdin을 안 읽을 수 있음). drop으로 EOF 전달.
+    // payload는 호출부 cap으로 파이프 버퍼보다 작아 자식이 안 읽어도 write_all이 안 막힌다.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_payload.as_bytes());
         // stdin scope를 명시적으로 닫아 EOF를 보낸다.
     }
 
-    let started = Instant::now();
+    // 메인 흐름: try_wait deadline으로 자식 종료만 기다린다(read로 블로킹하지 않음).
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if started.elapsed() >= timeout {
-                    // 타임아웃: kill 후 wait로 좀비 회수. 실패해도 None으로 안전 저하.
+                    // 타임아웃: kill 후 wait로 좀비 회수. child.kill()이 stdout fd를 닫아
+                    // 정상 경로의 reader 스레드도 곧 EOF로 종료한다.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    break None;
                 }
                 thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break None;
             }
         }
     };
 
+    // reader 스레드를 grace 안에서만 join 시도한다. 정상 경로는 fd가 닫혀 즉시 끝나지만,
+    // 자손이 stdout 파이프를 점유하면 read_to_end가 안 끝날 수 있다. 그 경우 핸들을
+    // detach(버림)하고 None을 반환해 메인 status 스레드를 절대 막지 않는다.
+    let output = match reader_handle {
+        Some(handle) => join_reader_within_grace(handle, STATUS_COMMAND_READER_JOIN_GRACE),
+        None => None,
+    };
+
+    // 비정상 종료/타임아웃이면 출력을 신뢰하지 않는다.
+    let status = status?;
     if !status.success() {
         return None;
     }
-
-    let mut stdout = child.stdout.take()?;
-    // max_bytes + 1까지만 읽어 상한 초과 여부를 알 수 있게 한 뒤 절단한다.
-    let mut buffer = Vec::new();
-    if stdout
-        .by_ref()
-        .take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut buffer)
-        .is_err()
-    {
-        return None;
-    }
+    let mut buffer = output?;
     buffer.truncate(max_bytes);
     if buffer.is_empty() {
         return None;
     }
     // 비-UTF8 stdout은 lossy 변환으로 안전하게 수용한다.
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// reader 스레드를 `grace` 안에서만 join 시도한다. 끝났으면 결과를, 아직 실행 중이면
+/// 핸들을 detach(버림)하고 `None`을 반환해 호출부가 절대 블로킹되지 않게 한다.
+///
+/// `JoinHandle::join`은 블로킹이라 타임아웃 join이 std에 없다. 대신 `is_finished()`를
+/// 짧게 폴링해 grace 안에 끝났을 때만 join한다. 끝나지 않으면 핸들을 그대로 버리는데,
+/// 데몬형 자손이 stdout을 물고 있어도 leak되는 건 reader 스레드 1개뿐이며 메인
+/// status 스레드의 무블로킹 진행이 보장된다(완전한 group-kill은 Phase 2).
+fn join_reader_within_grace(
+    handle: thread::JoinHandle<Option<Vec<u8>>>,
+    grace: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if handle.is_finished() {
+            return handle.join().ok().flatten();
+        }
+        if Instant::now() >= deadline {
+            // 자손-점유 케이스: 핸들을 버리고 결과 포기. 메인 스레드는 진행.
+            return None;
+        }
+        thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
+    }
 }
 
 /// command-backed status 폴링 스레드를 띄운다. `spawn_status_metadata_thread`와
@@ -5467,9 +5560,9 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, StatusBar, StatusCommandConfig, StatusPresencePolicy,
-        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme,
-        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
+        STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBar, StatusCommandConfig,
+        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
+        StatusTheme, TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
         apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
         compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
@@ -6072,6 +6165,24 @@ mod tests {
     }
 
     #[test]
+    fn build_status_payload_caps_long_cwd_and_stays_valid_json() {
+        // H1 견고화: 매우 긴 cwd가 cap으로 잘려도 payload는 유효 JSON이어야 하고,
+        // cwd 길이는 STATUS_PAYLOAD_CWD_CAP 이하여야 한다(char 경계 안전 절단).
+        let mut info = sample_session_info("shell", "/bin/zsh", None);
+        info.cwd = "/".to_string() + &"가".repeat(2000); // 멀티바이트로 경계 절단도 검증.
+        let payload = build_status_payload(&info, 80, 24);
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload must remain valid JSON after capping");
+        let cwd = json["cwd"].as_str().expect("cwd should be present");
+        assert!(
+            cwd.len() <= STATUS_PAYLOAD_CWD_CAP,
+            "cwd must be capped to {} bytes, got {}",
+            STATUS_PAYLOAD_CWD_CAP,
+            cwd.len()
+        );
+    }
+
+    #[test]
     fn run_status_command_returns_stdout_for_successful_command() {
         let argv = vec!["printf".to_string(), "HELLO".to_string()];
         let out = run_status_command(&argv, "", Duration::from_secs(2), 65536);
@@ -6103,6 +6214,45 @@ mod tests {
         assert_eq!(
             run_status_command(&argv, "", Duration::from_secs(1), 65536),
             None
+        );
+    }
+
+    #[test]
+    fn run_status_command_does_not_block_when_child_ignores_stdin() {
+        // H1 회귀: 자식이 stdin을 전혀 읽지 않아도(`true`), 큰 payload write_all이
+        // 블로킹되지 않고 명령이 정상적으로 deadline 안에 반환되어야 한다.
+        // payload는 호출부 cap으로 작지만, 방어적으로 넉넉한 크기를 넣어도 안전함을 본다.
+        let argv = vec!["true".to_string()];
+        let big_payload = "x".repeat(8 * 1024);
+        let started = Instant::now();
+        let out = run_status_command(&argv, &big_payload, Duration::from_secs(2), 65536);
+        // `true`는 빈 stdout이라 None(직전 라인 유지)이지만, 핵심은 블로킹 없이 반환됨.
+        assert_eq!(out, None, "empty stdout must yield None");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must return quickly without blocking on stdin write"
+        );
+    }
+
+    #[test]
+    fn run_status_command_returns_within_deadline_for_large_stdout_then_exit() {
+        // H2 회귀: 자식이 max_bytes를 크게 초과하는 stdout(파이프 버퍼엔 들어가는 크기)을
+        // 내고 정상 종료하면, reader 스레드가 드레인하고 메인 흐름은 deadline 안에 반환하며
+        // 출력은 max_bytes로 절단된다. (yes처럼 무한 출력은 reader가 멈춘 뒤 자식이 full
+        // 파이프에 막혀 timeout None이 되는 별개 경로이므로, 여기선 유한 출력으로 검증.)
+        let payload = "A".repeat(4096); // max_bytes=16보다 훨씬 크지만 파이프 버퍼(64KB) 이하.
+        let argv = vec!["printf".to_string(), "%s".to_string(), payload];
+        let started = Instant::now();
+        let out = run_status_command(&argv, "", Duration::from_secs(2), 16);
+        assert_eq!(
+            out.as_deref(),
+            Some("AAAAAAAAAAAAAAAA"),
+            "large stdout must be drained and capped to max_bytes"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "large stdout + early exit must return within deadline, got {:?}",
+            started.elapsed()
         );
     }
 
