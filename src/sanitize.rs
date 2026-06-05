@@ -104,8 +104,6 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
 ///
 /// 주의: 첫 `\n`/`\r`에서 입력을 중단한다(이후 바이트 무시). 미완결 CSI는
 /// 아무것도 emit하지 않아 payload 누수를 0으로 유지한다.
-// 다음 단계(draw 통합)에서 호출될 예정이라 현재는 미사용이다. 그 청크에서 #[allow] 제거.
-#[allow(dead_code)]
 pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
     // 파서 폭주 방지를 위한 CSI 파라미터 한도.
     const MAX_CSI_PARAM_BYTES: usize = 64;
@@ -248,8 +246,6 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
 ///
 /// 주의: 절단 시 ellipsis `…`(width 1)을 붙이되, `max_width == 1`이면 ellipsis를
 /// 생략해 가시 1칸을 콘텐츠로 쓰고, `max_width == 0`이면 빈 문자열을 반환한다.
-// 다음 단계(draw 통합)에서 호출될 예정이라 현재는 미사용이다. 그 청크에서 #[allow] 제거.
-#[allow(dead_code)]
 pub fn truncate_status_line_ansi(line: &str, max_width: u16) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
