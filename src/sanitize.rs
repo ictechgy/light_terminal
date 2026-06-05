@@ -107,6 +107,9 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
 pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
     // 파서 폭주 방지를 위한 CSI 파라미터 한도.
     const MAX_CSI_PARAM_BYTES: usize = 64;
+    // NOTE: COUNT는 `;` 구분자만 센다. truecolor 콜론형(`38:2:r:g:b`)처럼 `:`로 묶인
+    // 서브파라미터는 별도로 세지 않으며, 길이는 MAX_CSI_PARAM_BYTES(64)로만 상한이 걸린다.
+    // 콜론형은 항상 단일 SGR 토큰이라 개수 폭주 위험이 없어 의도적으로 동작을 바꾸지 않는다.
     const MAX_CSI_PARAM_COUNT: usize = 16;
 
     let mut out = String::with_capacity(bytes.len());
@@ -119,10 +122,14 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
 
     while index < bytes.len() {
         let byte = bytes[index];
+        // 단일 행 계약: LF/CR은 **모든 파서 상태**에서 정지 바이트로 취급한다.
+        // Ground뿐 아니라 OSC/DCS/CSI/escape 도중에 줄바꿈이 들어와도 즉시 멈춰,
+        // 이스케이프 내부 LF 같은 비정상 입력이 다음 줄로 누수되지 않게 한다.
+        if byte == b'\n' || byte == b'\r' {
+            break;
+        }
         match state {
             EscapeState::Ground => match byte {
-                // 단일 행: 첫 줄바꿈에서 즉시 중단.
-                b'\n' | b'\r' => break,
                 0x1b => state = EscapeState::Esc,
                 0x9b => {
                     csi_params.clear();
@@ -287,17 +294,31 @@ pub fn truncate_status_line_ansi(line: &str, max_width: u16) -> String {
         let ellipsis_margin: usize = if width >= 2 { 1 } else { 0 };
         let target = width.saturating_sub(ellipsis_margin);
         let mut acc = 0_usize;
+        // 텍스트 절단 지점 이후의 SGR은 더 push하지 않는다(잘린 영역 색 누설 방지).
+        // 일단 절단되면 보이는 콘텐츠가 더 붙지 않으므로, 이후 색 변경을 emit하면
+        // 끝의 `\x1b[0m` 직전에 무의미한 색만 남아 누설된다. truncated 시점에 중단한다.
+        let mut truncated = false;
         for segment in &segments {
+            if truncated {
+                break;
+            }
             match segment {
                 StatusSegment::Sgr(seq) => {
-                    // SGR은 폭 0으로 항상 통과(원자적, 절대 중간 절단 안 함).
-                    buf.push_str(seq);
-                    emitted_sgr = true;
+                    // SGR은 폭 0. 단, 이미 가용 폭을 다 쓴(acc >= target) 뒤의 SGR은
+                    // 더 표시될 콘텐츠가 없어 잘린 영역 색 누설일 뿐이므로 push하지 않는다.
+                    if acc < target {
+                        buf.push_str(seq);
+                        emitted_sgr = true;
+                    } else {
+                        truncated = true;
+                    }
                 }
                 StatusSegment::Text(text) => {
                     for cluster in text.graphemes(true) {
                         let cluster_width = cluster.width();
                         if acc + cluster_width > target {
+                            // 이 텍스트(및 이후 모든 세그먼트)는 표시 폭을 넘겨 잘린다.
+                            truncated = true;
                             break;
                         }
                         buf.push_str(cluster);
@@ -623,6 +644,23 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_status_command_line_stops_at_newline_in_any_parser_state() {
+        // B1: LF/CR은 OSC/escape 등 비-Ground 상태에서도 정지 바이트다.
+        // OSC 도중 LF: ESC ] 진입 후 newline에서 멈춰 payload가 다음 줄로 누수되지 않는다.
+        let out = sanitize_status_command_line(b"\x1b]osc\npayload", true);
+        assert_eq!(out, "");
+        assert!(!out.contains("payload"));
+        // 텍스트 뒤 OSC 도중 LF: 앞 텍스트만 남고 OSC 인자/이후 줄은 사라진다.
+        let out2 = sanitize_status_command_line(b"head\x1b]52;c\nsecret", true);
+        assert_eq!(out2, "head");
+        assert!(!out2.contains("secret"));
+        assert!(!out2.contains("52;c"));
+        // CSI 도중 CR도 동일하게 정지.
+        let out3 = sanitize_status_command_line(b"x\x1b[31\rrest", true);
+        assert_eq!(out3, "x");
+    }
+
+    #[test]
     fn sanitize_status_command_line_replaces_invalid_utf8() {
         // ⑪ 잘못된 UTF-8 바이트는 `\u{fffd}`로 치환.
         let out = sanitize_status_command_line(&[b'A', 0xe2], true);
@@ -716,6 +754,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_drops_sgr_after_truncation_point() {
+        // B2: 텍스트 절단 이후의 SGR은 push하지 않아 잘린 영역 색이 누설되지 않는다.
+        // `\x1b[31mAAAA\x1b[32mBBBB` width 4 → target 3(ellipsis 1칸 예약).
+        // 출력은 `\x1b[31mAAA…\x1b[0m`이고 `\x1b[32m`은 포함되지 않으며 끝은 reset.
+        let out = truncate_status_line_ansi("\x1b[31mAAAA\x1b[32mBBBB", 4);
+        assert!(
+            !out.contains("\x1b[32m"),
+            "truncated-region SGR must not leak: {out:?}"
+        );
+        assert!(out.ends_with("\x1b[0m"), "must close with reset: {out:?}");
+        assert_eq!(out, "\x1b[31mAAA…\x1b[0m");
     }
 
     #[test]
