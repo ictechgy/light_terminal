@@ -1821,6 +1821,90 @@ fn known_agent_name(name: &str) -> bool {
     )
 }
 
+/// 세션 command line에서 **알려진 에이전트 이름 문자열**(예: "codex"/"claude"/"gemini")을
+/// 추출한다. `known_agent_name_from_command`는 bool만 돌려주므로, command-backed status
+/// payload의 `agent` 필드를 채우려면 이름 자체가 필요하다. 토큰 파싱 로직
+/// (`effective_command_executable_index`/`command_token_stem`/`known_agent_name`)을
+/// 재활용해 중복을 최소화한다.
+///
+/// 파라미터:
+/// - `command`: 세션의 원시 command line(`SessionInfo::command`).
+///
+/// 반환값: 인식된 에이전트 이름(소문자 stem). 알 수 없으면 `None`.
+///
+/// 주의: shell 미경유 직접 추출이며, 실행과 무관한 순수 파싱이라 안전하다.
+// 다음 청크(draw 통합)에서 build_status_payload 경유로 배선될 예정이라 현재는 미사용이다.
+#[allow(dead_code)]
+fn agent_name_from_command(command: &str) -> Option<String> {
+    let parts = shlex::split(command).unwrap_or_else(|| {
+        command
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect()
+    });
+    let executable_index = effective_command_executable_index(&parts)?;
+    let executable = &parts[executable_index];
+    // 직접 실행 형태(`codex ...`, `/usr/bin/claude ...`)면 executable stem이 곧 이름.
+    if known_agent_command_executable_token(executable) {
+        return Some(command_token_stem(executable).to_string());
+    }
+    // node/npx/npm/pnpm/yarn/bun 등 wrapper 형태면 payload 토큰에서 이름을 찾는다.
+    agent_name_from_wrapper_command(&parts, executable_index)
+}
+
+/// `known_agent_wrapper_command_contains_agent_payload`의 이름-추출 변형.
+/// wrapper(node/npx/npm/…) payload 토큰 중 알려진 에이전트 stem을 가진 첫 토큰의
+/// 이름을 반환한다. 미상이면 `None`.
+#[allow(dead_code)]
+fn agent_name_from_wrapper_command(parts: &[String], executable_index: usize) -> Option<String> {
+    let executable = command_token_stem(&parts[executable_index]);
+    let mut payload_start = executable_index + 1;
+    match executable {
+        "node" | "deno" => {}
+        "npx" | "bunx" => {
+            payload_start = skip_wrapper_options(parts, payload_start);
+        }
+        "npm" => {
+            payload_start =
+                package_manager_execution_payload_start(parts, payload_start, &["exec", "x"])?;
+        }
+        "pnpm" | "yarn" => {
+            payload_start =
+                package_manager_execution_payload_start(parts, payload_start, &["dlx", "exec"])?;
+        }
+        "bun" => {
+            payload_start =
+                package_manager_execution_payload_start(parts, payload_start, &["x", "dlx"])?;
+        }
+        _ => return None,
+    }
+
+    parts
+        .iter()
+        .skip(payload_start)
+        .find(|part| known_agent_command_script_token(part))
+        .map(|part| agent_name_from_script_token(part))
+}
+
+/// wrapper payload script 토큰에서 표시용 에이전트 이름을 정한다. stem이 알려진
+/// 에이전트면 그 stem을, 아니면(예: `@openai/codex`, `...claude-code...`) 포함된
+/// 표준 이름을 매핑한다.
+#[allow(dead_code)]
+fn agent_name_from_script_token(token: &str) -> String {
+    let stem = command_token_stem(token);
+    if known_agent_name(stem) {
+        return stem.to_string();
+    }
+    let lower = token.to_ascii_lowercase();
+    if lower.contains("@openai/codex") {
+        return "codex".to_string();
+    }
+    if lower.contains("claude-code") {
+        return "claude".to_string();
+    }
+    stem.to_string()
+}
+
 fn nested_known_agent_present(target: &str) -> Result<bool> {
     let processes = process_tree(Some(target), true)?;
     Ok(nested_known_agent_present_in_processes(&processes))
@@ -3464,6 +3548,357 @@ fn apply_pending_status_metadata(
     changed
 }
 
+// ---------------------------------------------------------------------------
+// command-backed status (다음 청크에서 draw/attach에 배선)
+// ---------------------------------------------------------------------------
+
+/// command-backed status interval 기본값(초). spec §5.1.
+const STATUS_COMMAND_DEFAULT_INTERVAL_SECS: u64 = 2;
+/// interval 클램프 하한(초). 0/음수 입력이나 과도한 폴링을 막는다.
+const STATUS_COMMAND_MIN_INTERVAL_SECS: u64 = 1;
+/// interval 클램프 상한(초, 1시간).
+const STATUS_COMMAND_MAX_INTERVAL_SECS: u64 = 3600;
+/// 외부 status 명령 stdout 수용 상한(바이트). 초과분은 절단한다. spec §6.4.
+const STATUS_COMMAND_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// 외부 status 명령 1회 실행 타임아웃 상한. interval과 함께 min을 취한다.
+const STATUS_COMMAND_MAX_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 타임아웃 폴링 sleep 간격. try_wait 폴링 주기.
+const STATUS_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// command-backed status 채널 깊이. metadata 스레드와 동일하게 최신 1건만 의미 있다.
+const STATUS_COMMAND_CHANNEL_LIMIT: usize = 4;
+
+/// command-backed status 기능의 env/flag 설정. spec §5.1.
+///
+/// `LTERM_STATUS_COMMAND`가 없으면 `from_env`가 `None`을 반환하고, 호출부(다음 청크)는
+/// 기존 metadata-only 동작을 유지한다.
+///
+/// 필드:
+/// - `argv`: shell 미경유로 실행할 명령 argv(첫 원소가 실행 파일).
+/// - `interval`: 폴링 주기(클램프 적용 후).
+/// - `allow_color`: true면 stdout의 SGR 색을 status row로 통과시킨다.
+/// - `debug`: true면 실패를 stderr 1줄로 보고한다.
+// 다음 청크(draw 통합)에서 attach 경로가 사용한다. 그 청크에서 #[allow] 제거.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusCommandConfig {
+    argv: Vec<String>,
+    interval: Duration,
+    allow_color: bool,
+    debug: bool,
+}
+
+#[allow(dead_code)]
+impl StatusCommandConfig {
+    /// 환경 변수에서 설정을 읽는다. `LTERM_STATUS_COMMAND` 미설정이면 `None`.
+    ///
+    /// 파싱 자체는 env에 의존하지 않는 [`StatusCommandConfig::from_raw_parts`]로 분리해,
+    /// 단위 테스트는 env를 건드리지 않고 순수 함수만 검증할 수 있게 한다.
+    fn from_env() -> Option<Self> {
+        let command = std::env::var("LTERM_STATUS_COMMAND").ok()?;
+        Self::from_raw_parts(
+            &command,
+            std::env::var("LTERM_STATUS_INTERVAL").ok().as_deref(),
+            std::env::var("LTERM_STATUS_ANSI").ok().as_deref(),
+            std::env::var("LTERM_STATUS_DEBUG").ok().as_deref(),
+        )
+    }
+
+    /// env에서 분리된 순수 파싱 로직. raw 문자열 입력만으로 설정을 구성한다.
+    ///
+    /// 파라미터:
+    /// - `command`: `LTERM_STATUS_COMMAND` 원시 값.
+    /// - `interval_raw`: `LTERM_STATUS_INTERVAL`(초) 원시 값. None/파싱실패 → 기본 2.
+    /// - `ansi_raw`: `LTERM_STATUS_ANSI` 원시 값. None → 기본 true(색 통과).
+    /// - `debug_raw`: `LTERM_STATUS_DEBUG` 원시 값. None → 기본 false.
+    ///
+    /// 반환값: 유효 설정. command가 빈 문자열이거나 `shlex::split` 실패(따옴표 미닫힘 등)
+    /// 또는 argv가 비면 `None`(기능 안전 비활성). debug면 파싱 실패를 stderr로 경고.
+    fn from_raw_parts(
+        command: &str,
+        interval_raw: Option<&str>,
+        ansi_raw: Option<&str>,
+        debug_raw: Option<&str>,
+    ) -> Option<Self> {
+        let debug = parse_status_command_bool(debug_raw, false);
+        let Some(argv) = shlex::split(command) else {
+            if debug {
+                eprintln!(
+                    "lterm: LTERM_STATUS_COMMAND 파싱 실패(따옴표 미닫힘 등) — status 명령 비활성"
+                );
+            }
+            return None;
+        };
+        if argv.is_empty() {
+            if debug {
+                eprintln!("lterm: LTERM_STATUS_COMMAND가 비어 있어 status 명령 비활성");
+            }
+            return None;
+        }
+        Some(Self {
+            argv,
+            interval: parse_status_command_interval(interval_raw),
+            allow_color: parse_status_command_bool(ansi_raw, true),
+            debug,
+        })
+    }
+}
+
+/// `LTERM_STATUS_INTERVAL`(초)을 파싱하고 `[1, 3600]`으로 클램프한다.
+/// None이거나 정수 파싱 실패 시 기본값 2를 반환한다. spec §5.1.
+fn parse_status_command_interval(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(STATUS_COMMAND_DEFAULT_INTERVAL_SECS)
+        .clamp(
+            STATUS_COMMAND_MIN_INTERVAL_SECS,
+            STATUS_COMMAND_MAX_INTERVAL_SECS,
+        );
+    Duration::from_secs(secs)
+}
+
+/// command-backed status용 bool env 파싱. None이면 `default`, 그 외에는
+/// `matches_env_bool`로 명시적 true/false만 인정하고 알 수 없는 값은 `default` 유지.
+/// `LTERM_STATUS_ANSI`는 default=true(색 통과)이고 "0"/"false"에서만 false가 된다.
+fn parse_status_command_bool(raw: Option<&str>, default: bool) -> bool {
+    let Some(value) = raw else {
+        return default;
+    };
+    if matches_env_bool(value, true) {
+        true
+    } else if matches_env_bool(value, false) {
+        false
+    } else {
+        default
+    }
+}
+
+/// command-backed status payload 직렬화 스키마(spec §4.1). 수동 문자열 조립 대신
+/// serde_json이 escape를 책임지도록 전용 구조체를 쓴다.
+#[derive(Debug, Serialize)]
+struct StatusCommandPayload<'a> {
+    /// 고정 소스 식별자. 항상 "lterm".
+    source: &'a str,
+    /// payload 스키마 버전. 현재 1.
+    version: u32,
+    /// 세션 이름(제어문자 제거됨).
+    session: String,
+    /// pane id(제어문자 제거됨).
+    pane: String,
+    /// `"<session>/<pane>"` 합성 키.
+    session_key: String,
+    /// 인식된 에이전트 이름 또는 null.
+    agent: Option<String>,
+    /// 세션 cwd(제어문자 제거됨) 또는 null(빈 값일 때).
+    cwd: Option<String>,
+    /// 현재 터미널 열 수.
+    cols: u16,
+    /// 현재 터미널 행 수.
+    rows: u16,
+}
+
+/// `SessionInfo`와 현재 터미널 크기로 status 명령 stdin에 전달할 JSON payload를 만든다.
+/// spec §4.1.
+///
+/// 파라미터:
+/// - `info`: 대상 세션 메타데이터.
+/// - `cols`/`rows`: 현재 터미널 크기.
+///
+/// 반환값: 한 줄 JSON 문자열.
+///
+/// 보안: `name`/`pane_id`/`cwd`는 [`sanitize::terminal_text`]로 제어문자를 먼저 제거한다.
+/// serde_json이 따옴표/백슬래시는 escape하지만, raw 제어문자가 JSON에 주입되는 것을
+/// 사전에 차단한다. `agent`는 신뢰되는 allowlist 토큰이라 그대로 둔다. cwd가 비면 null.
+// 다음 청크(draw 통합)에서 spawn_status_command_thread 경유로 배선될 예정이라 현재는 미사용이다.
+#[allow(dead_code)]
+fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
+    let session = sanitize::terminal_text(&info.name);
+    let pane = sanitize::terminal_text(&info.pane_id);
+    let session_key = format!("{session}/{pane}");
+    let cwd = sanitize::terminal_text(&info.cwd);
+    let payload = StatusCommandPayload {
+        source: "lterm",
+        version: 1,
+        session,
+        pane,
+        session_key,
+        agent: agent_name_from_command(&info.command),
+        cwd: (!cwd.is_empty()).then_some(cwd),
+        cols,
+        rows,
+    };
+    // 전용 Serialize 구조체이므로 직렬화는 실패하지 않는다(모든 필드가 직렬화 가능).
+    serde_json::to_string(&payload).unwrap_or_else(|_| String::from("{}"))
+}
+
+/// 외부 status 명령을 **shell 미경유**로 실행하고 stdout을 회수한다. spec §5.3/§6.4.
+///
+/// 파라미터:
+/// - `argv`: 실행 명령(첫 원소가 실행 파일, 나머지는 인자). shell을 거치지 않아
+///   인젝션 표면이 없다.
+/// - `stdin_payload`: child stdin으로 보낼 JSON payload.
+/// - `timeout`: 1회 실행 상한. 초과 시 child를 kill 후 좀비를 회수하고 `None`.
+/// - `max_bytes`: stdout 수용 상한. 초과분은 절단한다.
+///
+/// 반환값: 정상 종료 + 비어있지 않은 stdout이면 `Some(text)`. spawn 실패, 타임아웃,
+/// 비정상 종료, 빈 출력은 모두 `None`(호출부에서 "직전 라인 유지"로 해석).
+///
+/// 설계: macOS에는 `gtimeout`이 없으므로 자체 폴링 타임아웃을 쓴다. stdin write 후
+/// drop으로 EOF를 보내 child가 읽기를 끝낼 수 있게 하고, `try_wait`를 짧은 sleep과
+/// 함께 폴링한다. 타임아웃 시 `kill`+`wait`로 좀비를 회수한 뒤에만 반환한다.
+// 다음 청크(draw 통합)에서 spawn_status_command_thread 경유로 배선될 예정이라 현재는 미사용이다.
+#[allow(dead_code)]
+fn run_status_command(
+    argv: &[String],
+    stdin_payload: &str,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Option<String> {
+    let executable = argv.first()?;
+    let mut child = Command::new(executable)
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // stdin write 실패는 치명적이지 않다(명령이 stdin을 안 읽을 수 있음). drop으로 EOF 전달.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_payload.as_bytes());
+        // stdin scope를 명시적으로 닫아 EOF를 보낸다.
+    }
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    // 타임아웃: kill 후 wait로 좀비 회수. 실패해도 None으로 안전 저하.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+
+    if !status.success() {
+        return None;
+    }
+
+    let mut stdout = child.stdout.take()?;
+    // max_bytes + 1까지만 읽어 상한 초과 여부를 알 수 있게 한 뒤 절단한다.
+    let mut buffer = Vec::new();
+    if stdout
+        .by_ref()
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return None;
+    }
+    buffer.truncate(max_bytes);
+    if buffer.is_empty() {
+        return None;
+    }
+    // 비-UTF8 stdout은 lossy 변환으로 안전하게 수용한다.
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// command-backed status 폴링 스레드를 띄운다. `spawn_status_metadata_thread`와
+/// 동형 패턴(sync_channel + try_recv 최신)이지만, RPC 대신 외부 명령을 실행한다.
+/// spec §5.3.
+///
+/// 매 tick(interval)마다: `Request::Info`로 `SessionInfo`를 얻고, `terminal_size()`로
+/// cols/rows를 구해 [`build_status_payload`]를 만든 뒤 [`run_status_command`]를 호출한다.
+/// 성공 출력은 [`sanitize::sanitize_status_command_line`]으로 살균해 채널로 보낸다.
+/// 실패면 보내지 않아 호출부가 직전 라인을 유지하게 한다.
+///
+/// 파라미터:
+/// - `target`: `Request::Info` 대상(보통 pane id).
+/// - `argv`: 실행할 status 명령 argv.
+/// - `interval`: 폴링 주기.
+/// - `allow_color`: stdout SGR 통과 여부.
+/// - `debug`: 실패를 stderr 1줄로 보고할지 여부.
+/// - `running`/`enabled`: metadata 스레드와 동일한 생명주기/일시정지 게이트.
+///
+/// 반환값: 살균된 status 라인 수신 채널과 스레드 핸들.
+// 다음 청크(draw 통합)에서 attach 경로가 호출한다. 그 청크에서 #[allow] 제거.
+#[allow(dead_code)]
+fn spawn_status_command_thread(
+    target: String,
+    argv: Vec<String>,
+    interval: Duration,
+    allow_color: bool,
+    debug: bool,
+    running: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel(STATUS_COMMAND_CHANNEL_LIMIT);
+    // 1회 실행 타임아웃은 interval과 상한(1500ms) 중 작은 값으로 둬 폴링이 밀리지 않게 한다.
+    let timeout = interval.min(STATUS_COMMAND_MAX_TIMEOUT);
+    let handle = thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            thread::sleep(interval);
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            if !enabled.load(Ordering::SeqCst) {
+                continue;
+            }
+            let info: Result<SessionInfo> = rpc_with_read_timeout(
+                &Request::Info {
+                    target: target.clone(),
+                },
+                Some(STATUS_METADATA_RPC_TIMEOUT),
+            );
+            let Ok(info) = info else {
+                if debug {
+                    eprintln!("lterm: status 명령 tick에서 세션 메타데이터 조회 실패");
+                }
+                continue;
+            };
+            let (cols, rows) = terminal_size();
+            let payload = build_status_payload(&info, cols, rows);
+            match run_status_command(&argv, &payload, timeout, STATUS_COMMAND_MAX_OUTPUT_BYTES) {
+                Some(output) => {
+                    let line =
+                        sanitize::sanitize_status_command_line(output.as_bytes(), allow_color);
+                    let _ = tx.try_send(line);
+                }
+                None => {
+                    if debug {
+                        eprintln!("lterm: status 명령 실행 실패/타임아웃 — 직전 라인 유지");
+                    }
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
+/// `spawn_status_command_thread` 채널에서 가장 최신 status 라인을 꺼낸다.
+/// `apply_pending_status_metadata`와 동형으로, 큐에 쌓인 것을 모두 비우고 마지막 것만 남긴다.
+///
+/// 반환값: 새 라인이 도착했으면 `Some(latest)`, 없으면 `None`(직전 라인 유지).
+// 다음 청크(draw 통합)에서 attach 출력 루프가 호출한다. 그 청크에서 #[allow] 제거.
+#[allow(dead_code)]
+fn apply_pending_status_command(rx: Option<&mpsc::Receiver<String>>) -> Option<String> {
+    let rx = rx?;
+    let mut latest = None;
+    while let Ok(line) = rx.try_recv() {
+        latest = Some(line);
+    }
+    latest
+}
+
 /// `resize_thread` 한 tick 의 처리 결과. RPC 결과는 세 가지 의미상 분기로 나뉘는데,
 /// 결정 자체는 RPC 호출과 무관한 순수 함수로 분리해 단위 테스트가 가능하도록 한다.
 #[derive(Debug, PartialEq, Eq)]
@@ -4966,25 +5401,29 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, StatusBar, StatusPresencePolicy, StatusPresenceRuntimeHandle,
-        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
-        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
-        anyhow_error_is_broken_pipe, attach_pty_rows, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private, format_status_line,
+        STATUS_HEARTBEAT_FORCED, StatusBar, StatusCommandConfig, StatusPresencePolicy,
+        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme,
+        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
+        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, current_unix_ms,
+        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
+        ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, keyboard_protocol_restore_bytes, likely_agent_session,
         matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes, parse_status_style,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
         raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        trace_file_summary, trace_output_open_context, trace_summary_text, validate_trace_replay,
-        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
+        run_status_command, should_mobile_transcript_auto, status_sgr_stack_supported,
+        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
+        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
+        write_lterm_title_cue, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -5439,6 +5878,183 @@ mod tests {
         let (line, cursor_col) = compose_prompt_line("abcdef", 5);
         assert_eq!(line, "bcdef");
         assert_eq!(cursor_col, 5);
+    }
+
+    #[test]
+    fn status_command_config_parses_command_interval_ansi_and_debug() {
+        // command 없음(빈 문자열) → None.
+        assert!(StatusCommandConfig::from_raw_parts("", None, None, None).is_none());
+        // shlex 실패(따옴표 미닫힘) → None.
+        assert!(StatusCommandConfig::from_raw_parts("foo \"bar", None, None, None).is_none());
+
+        let config = StatusCommandConfig::from_raw_parts(
+            "understatus --json",
+            Some("5"),
+            Some("0"),
+            Some("1"),
+        )
+        .expect("valid command should parse");
+        assert_eq!(config.argv, vec!["understatus", "--json"]);
+        assert_eq!(config.interval, Duration::from_secs(5));
+        assert!(!config.allow_color, "ANSI=0 should disable color");
+        assert!(config.debug, "DEBUG=1 should enable debug");
+
+        // ANSI 기본 true.
+        let default_ansi = StatusCommandConfig::from_raw_parts("cmd", None, None, None)
+            .expect("valid command should parse");
+        assert!(default_ansi.allow_color, "ANSI default must be true");
+        assert!(!default_ansi.debug, "DEBUG default must be false");
+        assert_eq!(
+            default_ansi.interval,
+            Duration::from_secs(2),
+            "interval default must be 2s"
+        );
+    }
+
+    #[test]
+    fn status_command_interval_clamps_and_falls_back() {
+        // 0 → 하한 1초.
+        assert_eq!(
+            parse_status_command_interval(Some("0")),
+            Duration::from_secs(1)
+        );
+        // 99999 → 상한 3600초.
+        assert_eq!(
+            parse_status_command_interval(Some("99999")),
+            Duration::from_secs(3600)
+        );
+        // 비숫자 → 기본 2초.
+        assert_eq!(
+            parse_status_command_interval(Some("abc")),
+            Duration::from_secs(2)
+        );
+        // None → 기본 2초.
+        assert_eq!(parse_status_command_interval(None), Duration::from_secs(2));
+        // 정상 범위 통과.
+        assert_eq!(
+            parse_status_command_interval(Some("10")),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn status_command_bool_honors_default_for_unknown_values() {
+        // None → default 그대로.
+        assert!(parse_status_command_bool(None, true));
+        assert!(!parse_status_command_bool(None, false));
+        // 명시 false.
+        assert!(!parse_status_command_bool(Some("0"), true));
+        assert!(!parse_status_command_bool(Some("false"), true));
+        // 명시 true.
+        assert!(parse_status_command_bool(Some("1"), false));
+        assert!(parse_status_command_bool(Some("on"), false));
+        // 알 수 없는 값 → default 유지.
+        assert!(parse_status_command_bool(Some("maybe"), true));
+        assert!(!parse_status_command_bool(Some("maybe"), false));
+    }
+
+    #[test]
+    fn agent_name_from_command_extracts_known_agents() {
+        assert_eq!(agent_name_from_command("codex"), Some("codex".to_string()));
+        assert_eq!(
+            agent_name_from_command("claude --model opus"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            agent_name_from_command("env FOO=1 codex"),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            agent_name_from_command("/usr/local/bin/gemini chat"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            agent_name_from_command("npx @openai/codex"),
+            Some("codex".to_string())
+        );
+        // 미상 명령 → None.
+        assert_eq!(agent_name_from_command("/bin/zsh -l"), None);
+        assert_eq!(agent_name_from_command(""), None);
+    }
+
+    #[test]
+    fn build_status_payload_emits_schema_keys_and_strips_controls() {
+        let info = sample_session_info("my\u{7}session", "/usr/local/bin/codex --model gpt", None);
+        let json: serde_json::Value = serde_json::from_str(&build_status_payload(&info, 120, 40))
+            .expect("payload should be valid JSON");
+        assert_eq!(json["source"], "lterm");
+        assert_eq!(json["version"], 1);
+        // 제어문자(BEL)가 제거된 세션 이름.
+        assert_eq!(json["session"], "mysession");
+        assert_eq!(json["pane"], "%test");
+        assert_eq!(json["session_key"], "mysession/%test");
+        assert_eq!(json["agent"], "codex");
+        assert_eq!(json["cwd"], "/tmp");
+        assert_eq!(json["cols"], 120);
+        assert_eq!(json["rows"], 40);
+    }
+
+    #[test]
+    fn build_status_payload_handles_null_agent_and_cwd() {
+        let mut info = sample_session_info("shell", "/bin/zsh", None);
+        info.cwd = String::new();
+        let json: serde_json::Value = serde_json::from_str(&build_status_payload(&info, 80, 24))
+            .expect("payload should be valid JSON");
+        assert!(json["agent"].is_null(), "unknown agent must serialize null");
+        assert!(json["cwd"].is_null(), "empty cwd must serialize null");
+        assert_eq!(json["session_key"], "shell/%test");
+    }
+
+    #[test]
+    fn run_status_command_returns_stdout_for_successful_command() {
+        let argv = vec!["printf".to_string(), "HELLO".to_string()];
+        let out = run_status_command(&argv, "", Duration::from_secs(2), 65536);
+        assert_eq!(out, Some("HELLO".to_string()));
+    }
+
+    #[test]
+    fn run_status_command_truncates_to_max_bytes() {
+        let argv = vec!["printf".to_string(), "ABCDEFGHIJ".to_string()];
+        let out = run_status_command(&argv, "", Duration::from_secs(2), 4);
+        assert_eq!(out, Some("ABCD".to_string()), "stdout must be capped");
+    }
+
+    #[test]
+    fn run_status_command_times_out_without_zombie() {
+        let argv = vec!["sleep".to_string(), "5".to_string()];
+        let started = Instant::now();
+        let out = run_status_command(&argv, "", Duration::from_millis(200), 65536);
+        assert_eq!(out, None, "timed-out command must yield None");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout must trigger well before the command would finish"
+        );
+    }
+
+    #[test]
+    fn run_status_command_returns_none_for_missing_binary() {
+        let argv = vec!["lterm-nonexistent-binary-xyz".to_string()];
+        assert_eq!(
+            run_status_command(&argv, "", Duration::from_secs(1), 65536),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_pending_status_command_keeps_only_latest() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(4);
+        assert_eq!(apply_pending_status_command(Some(&rx)), None);
+        tx.try_send("first".to_string()).unwrap();
+        tx.try_send("second".to_string()).unwrap();
+        assert_eq!(
+            apply_pending_status_command(Some(&rx)),
+            Some("second".to_string()),
+            "only the most recent line should survive"
+        );
+        // 채널 비었으면 None(직전 라인 유지).
+        assert_eq!(apply_pending_status_command(Some(&rx)), None);
+        // None receiver → None.
+        assert_eq!(apply_pending_status_command(None), None);
     }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
