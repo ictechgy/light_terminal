@@ -8130,6 +8130,88 @@ fn input_sends_text_to_pty() -> TestResult {
 }
 
 #[test]
+#[cfg(unix)]
+fn parser_degradation_keeps_wait_input_and_attach_live() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let name = "parser-degrade-live";
+
+    let status = env
+        .cmd()
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_TEST_DEGRADE_TERMINAL_PARSER", "1")
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            name,
+            "--",
+            "sh",
+            "-lc",
+            "echo READY; read first; echo GOT:$first; read second; echo GOT2:$second; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+
+    let ready = env.capture_until(name, "READY")?;
+    assert!(ready.contains("READY"), "{ready}");
+
+    let wait_output = env
+        .cmd()
+        .args([
+            "wait",
+            name,
+            "--contains",
+            "__LTERM_TEST_NEVER_MATCH_PARSER_DEGRADE__",
+            "--timeout",
+            "200ms",
+            "--json",
+        ])
+        .output()?;
+    assert_eq!(wait_output.status.code(), Some(124), "{wait_output:?}");
+    let wait_json: serde_json::Value = serde_json::from_slice(&wait_output.stdout)?;
+    assert_eq!(
+        wait_json["timed_out"], true,
+        "wait should time out rather than report output-closed after parser degradation: {wait_json}"
+    );
+    assert_eq!(wait_json["matched"], false);
+
+    let status = env
+        .cmd()
+        .args(["input", name, "AFTER_DEGRADE", "--enter"])
+        .status()?;
+    assert!(status.success(), "input command should keep writing to PTY");
+    let captured = env.capture_until(name, "GOT:AFTER_DEGRADE")?;
+    assert!(
+        captured.contains("GOT:AFTER_DEGRADE"),
+        "capture/log path must keep receiving PTY output after parser degradation: {captured}"
+    );
+
+    let (mut stream, _subscriber_id) = attach_with_geometry(&socket, name, 24, 80)?;
+    wait_for_size(&env, name, (24, 80))?;
+    let session = read_session_json(&env, name)?;
+    assert_eq!(
+        session
+            .get("attached_clients")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "degraded parser must not prevent a live attach subscription: {session}"
+    );
+
+    let status = env.cmd().args(["send", name, "SECOND\n"]).status()?;
+    assert!(status.success(), "send command should keep writing to PTY");
+    let live = read_until_marker_bytes(&mut stream, b"GOT2:SECOND", Duration::from_secs(5))?;
+    assert!(
+        live.windows(b"GOT2:SECOND".len())
+            .any(|window| window == b"GOT2:SECOND"),
+        "attached stream should receive live output after parser degradation: {:?}",
+        String::from_utf8_lossy(&live)
+    );
+    Ok(())
+}
+
+#[test]
 fn send_alias_sends_text_to_pty() -> TestResult {
     let env = TestEnv::new()?;
     let status = env

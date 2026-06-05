@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -35,6 +36,11 @@ const MAX_TERMINAL_COLS: u16 = 1000;
 const MAX_TERMINAL_CELLS: u32 = 200_000;
 const MAX_PENDING_ESCAPE_BYTES: usize = 8192;
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_MODE_ENV: &str = "LTERM_INTERNAL_TEST_MODE";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_DEGRADE_TERMINAL_PARSER_ENV: &str =
+    "LTERM_INTERNAL_TEST_DEGRADE_TERMINAL_PARSER";
 /// PR #16: subscriber 별 broadcast 채널 슬롯 한도. 슬롯 하나가 들고 있는 것은
 /// `Arc<[u8]>` 의 fat pointer 라 메모리 비용은 슬롯 수에 비례하지만 메시지 바이트
 /// 수에 비례하지 않는다. 128 → 256 으로 키운 것은 모바일 reattach 직후 PTY burst
@@ -293,6 +299,17 @@ struct Session {
     /// `terminal_screen` 의 현재 parser state 에서 직접 합성하므로, hot path 는 평상시
     /// normal output 마다 screen clone 을 만들지 않는다.
     terminal_normal_screen: Mutex<vt100::Screen>,
+    /// `vt100` terminal-screen state is an attach-snapshot convenience, not the
+    /// availability-critical raw PTY path. If parser or snapshot code panics,
+    /// this flag quarantines the session-local emulator state so the PTY reader
+    /// keeps appending raw bytes, broadcasting live output, and accepting input.
+    terminal_parser_degraded: AtomicBool,
+    #[cfg(test)]
+    terminal_parser_panic_on_next_update: AtomicBool,
+    #[cfg(test)]
+    terminal_parser_panic_on_next_snapshot: AtomicBool,
+    #[cfg(test)]
+    terminal_parser_panic_on_next_resize: AtomicBool,
     subscribers: Mutex<Vec<Subscriber>>,
     /// Coarse state mutex for operations that must observe a coherent output
     /// image. `append_output` holds it while appending to the raw ring,
@@ -417,12 +434,7 @@ impl Session {
             // match the pending bytes that will prefix the next live chunk.
             // The section ends before `broadcast_chunk`, so slow subscriber
             // sends/backpressure waits do not block attach snapshots or resize.
-            let pending_before = lock(&self.terminal_pending).pending_bytes();
-            let normal_screen = self.process_terminal_screen(bytes, &pending_before);
-            if let Some(normal_screen) = normal_screen {
-                *lock(&self.terminal_normal_screen) = normal_screen;
-            }
-            lock(&self.terminal_pending).process(bytes);
+            self.update_terminal_snapshot_state(bytes);
             self.mark_output_changed();
 
             let subscribers = lock(&self.subscribers).clone();
@@ -466,6 +478,46 @@ impl Session {
         for shutdown in shutdowns {
             shutdown();
         }
+    }
+
+    fn update_terminal_snapshot_state(&self, bytes: &[u8]) {
+        if self.terminal_parser_degraded() {
+            return;
+        }
+        if internal_test_degrade_terminal_parser() {
+            self.mark_terminal_parser_degraded("internal test requested parser degradation");
+            self.clear_terminal_pending_prefix();
+            return;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let pending_before = lock(&self.terminal_pending).pending_bytes();
+            let normal_screen = self.process_terminal_screen(bytes, &pending_before);
+            if let Some(normal_screen) = normal_screen {
+                *lock(&self.terminal_normal_screen) = normal_screen;
+            }
+            lock(&self.terminal_pending).process(bytes);
+        }));
+        if result.is_err() {
+            self.mark_terminal_parser_degraded("terminal parser panicked while processing output");
+            self.clear_terminal_pending_prefix();
+        }
+    }
+
+    fn terminal_parser_degraded(&self) -> bool {
+        self.terminal_parser_degraded.load(Ordering::SeqCst)
+    }
+
+    fn mark_terminal_parser_degraded(&self, reason: &'static str) {
+        if !self.terminal_parser_degraded.swap(true, Ordering::SeqCst) {
+            eprintln!(
+                "terminal parser degraded for pane {}: {reason}; raw PTY output will continue without screen-state snapshots",
+                self.pane_id
+            );
+        }
+    }
+
+    fn clear_terminal_pending_prefix(&self) {
+        *lock(&self.terminal_pending) = TerminalPrefixTracker::default();
     }
 
     fn mark_output_changed(&self) {
@@ -547,16 +599,7 @@ impl Session {
                 let subscribers = lock(&self.subscribers);
                 clamp_to_smallest_with_candidate(&subscribers, rows, cols)
             };
-            let terminal_screen = lock(&self.terminal_screen);
-            let normal_screen = lock(&self.terminal_normal_screen);
-            let pending = lock(&self.terminal_pending).pending_bytes();
-            screen_state_snapshot(
-                &terminal_screen,
-                &normal_screen,
-                snapshot_rows,
-                snapshot_cols,
-                &pending,
-            )
+            self.initial_screen_state_snapshot(snapshot_rows, snapshot_cols)
         } else {
             None
         };
@@ -593,16 +636,7 @@ impl Session {
                 let subscribers = lock(&self.subscribers);
                 clamp_to_smallest_with_candidate(&subscribers, rows, cols)
             };
-            let terminal_screen = lock(&self.terminal_screen);
-            let normal_screen = lock(&self.terminal_normal_screen);
-            let pending = lock(&self.terminal_pending).pending_bytes();
-            screen_state_snapshot(
-                &terminal_screen,
-                &normal_screen,
-                snapshot_rows,
-                snapshot_cols,
-                &pending,
-            )
+            self.initial_screen_state_snapshot(snapshot_rows, snapshot_cols)
         } else {
             None
         };
@@ -774,9 +808,53 @@ impl Session {
     }
 
     fn resize_terminal_screen(&self, rows: u16, cols: u16) {
-        lock(&self.terminal_screen)
-            .screen_mut()
-            .set_size(rows, cols);
+        if self.terminal_parser_degraded() {
+            return;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut terminal_screen = lock(&self.terminal_screen);
+            #[cfg(test)]
+            if self
+                .terminal_parser_panic_on_next_resize
+                .swap(false, Ordering::SeqCst)
+            {
+                panic!("test-requested terminal parser resize panic after locking parser");
+            }
+            terminal_screen.screen_mut().set_size(rows, cols);
+        }));
+        if result.is_err() {
+            self.mark_terminal_parser_degraded("terminal parser panicked while resizing");
+            self.clear_terminal_pending_prefix();
+        }
+    }
+
+    fn initial_screen_state_snapshot(&self, rows: u16, cols: u16) -> Option<OutputChunk> {
+        if self.terminal_parser_degraded() {
+            return None;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let terminal_screen = lock(&self.terminal_screen);
+            #[cfg(test)]
+            if self
+                .terminal_parser_panic_on_next_snapshot
+                .swap(false, Ordering::SeqCst)
+            {
+                panic!("test-requested terminal snapshot panic after locking parser");
+            }
+            let normal_screen = lock(&self.terminal_normal_screen);
+            let pending = lock(&self.terminal_pending).pending_bytes();
+            screen_state_snapshot(&terminal_screen, &normal_screen, rows, cols, &pending)
+        }));
+        match result {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                self.mark_terminal_parser_degraded(
+                    "terminal parser panicked while formatting attach snapshot",
+                );
+                self.clear_terminal_pending_prefix();
+                None
+            }
+        }
     }
 
     fn process_terminal_screen(
@@ -785,6 +863,13 @@ impl Session {
         pending_control_prefix: &[u8],
     ) -> Option<vt100::Screen> {
         let mut terminal_screen = lock(&self.terminal_screen);
+        #[cfg(test)]
+        if self
+            .terminal_parser_panic_on_next_update
+            .swap(false, Ordering::SeqCst)
+        {
+            panic!("test-requested terminal parser update panic after locking parser");
+        }
         let started_alt = terminal_screen.screen().alternate_screen();
 
         if !started_alt && should_scan_for_alt_enter(bytes, pending_control_prefix) {
@@ -1800,6 +1885,13 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         terminal_screen: Mutex::new(vt100::Parser::new(rows, cols, 0)),
         terminal_normal_screen: Mutex::new(vt100::Parser::new(rows, cols, 0).screen().clone()),
         terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
+        terminal_parser_degraded: AtomicBool::new(false),
+        #[cfg(test)]
+        terminal_parser_panic_on_next_update: AtomicBool::new(false),
+        #[cfg(test)]
+        terminal_parser_panic_on_next_snapshot: AtomicBool::new(false),
+        #[cfg(test)]
+        terminal_parser_panic_on_next_resize: AtomicBool::new(false),
         subscribers: Mutex::new(Vec::new()),
         output_state: Mutex::new(()),
         output_progress: (Mutex::new(OutputProgress::default()), Condvar::new()),
@@ -3175,6 +3267,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+fn internal_test_degrade_terminal_parser() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static DEGRADE_TERMINAL_PARSER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DEGRADE_TERMINAL_PARSER.get_or_init(|| {
+            env_bool(INTERNAL_TEST_MODE_ENV) && env_bool(INTERNAL_TEST_DEGRADE_TERMINAL_PARSER_ENV)
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[cfg(debug_assertions)]
+fn env_bool(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 struct UmaskGuard {
     previous: mode_t,
 }
@@ -3899,6 +4015,10 @@ mod tests {
             terminal_screen: Mutex::new(vt100::Parser::new(24, 80, 0)),
             terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
             terminal_normal_screen: Mutex::new(vt100::Parser::new(24, 80, 0).screen().clone()),
+            terminal_parser_degraded: AtomicBool::new(false),
+            terminal_parser_panic_on_next_update: AtomicBool::new(false),
+            terminal_parser_panic_on_next_snapshot: AtomicBool::new(false),
+            terminal_parser_panic_on_next_resize: AtomicBool::new(false),
             subscribers: Mutex::new(Vec::new()),
             output_state: Mutex::new(()),
             output_progress: (Mutex::new(OutputProgress::default()), Condvar::new()),
@@ -4639,6 +4759,125 @@ mod tests {
                 "cancelled or ST-terminated control prefix must be dropped: {bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_parser_update_panic_degrades_but_keeps_raw_output_live() {
+        let session = build_test_session("parser-update-degraded");
+        session
+            .terminal_parser_panic_on_next_update
+            .store(true, Ordering::SeqCst);
+
+        session.append_output(b"RAW-BEFORE-DEGRADE\n");
+
+        assert!(
+            session.terminal_parser_degraded(),
+            "caught parser panic should quarantine only terminal snapshot state"
+        );
+        let captured = String::from_utf8_lossy(&session.capture_bytes(None, None)).to_string();
+        assert!(
+            captured.contains("RAW-BEFORE-DEGRADE"),
+            "raw ring/capture must keep bytes appended by the failing update: {captured:?}"
+        );
+        assert!(
+            !super::lock(&session.output_progress.0).closed,
+            "parser degradation must not close output progress"
+        );
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe after parser degradation");
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "degraded parser must skip synthetic attach snapshots instead of replaying stale state"
+        );
+
+        session.append_output(b"LIVE-AFTER-DEGRADE\n");
+        let live = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("live output after degradation");
+        assert_eq!(
+            live.as_ref(),
+            b"LIVE-AFTER-DEGRADE\n",
+            "live broadcast must continue after parser degradation"
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_panic_degrades_and_future_live_chunks_continue() {
+        let session = build_test_session("snapshot-degraded");
+        session.append_output(b"SNAPSHOT-CANDIDATE\n");
+        session
+            .terminal_parser_panic_on_next_snapshot
+            .store(true, Ordering::SeqCst);
+
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (_id, rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe should survive snapshot formatter panic");
+
+        assert!(
+            session.terminal_parser_degraded(),
+            "snapshot formatter panic should degrade only the terminal parser state"
+        );
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "failed snapshot should not enqueue a stale or partial initial chunk"
+        );
+
+        session.append_output(b"SNAPSHOT-PANIC-LIVE\n");
+        let live = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("live output after snapshot degradation");
+        assert_eq!(live.as_ref(), b"SNAPSHOT-PANIC-LIVE\n");
+    }
+
+    #[test]
+    fn terminal_resize_panic_degrades_but_cached_geometry_still_updates() {
+        let session = build_test_session("resize-degraded");
+        let original_screen_size = session
+            .terminal_screen
+            .lock()
+            .expect("terminal screen")
+            .screen()
+            .size();
+        session
+            .terminal_parser_panic_on_next_resize
+            .store(true, Ordering::SeqCst);
+
+        session
+            .apply_pty_size(12, 40, "test resize degradation")
+            .expect("PTY resize should still succeed when parser resize panics");
+
+        assert!(
+            session.terminal_parser_degraded(),
+            "resize panic should quarantine terminal parser state"
+        );
+        assert_eq!(*session.rows.lock().expect("rows"), 12);
+        assert_eq!(*session.cols.lock().expect("cols"), 40);
+        assert_eq!(
+            super::lock(&session.terminal_screen).screen().size(),
+            original_screen_size,
+            "test hook panics before parser resize, but cached PTY geometry must still move on"
+        );
+
+        session
+            .apply_pty_size(10, 30, "test resize after degradation")
+            .expect("later PTY resize should skip parser but keep cached geometry current");
+        assert_eq!(*session.rows.lock().expect("rows after degradation"), 10);
+        assert_eq!(*session.cols.lock().expect("cols after degradation"), 30);
+        assert_eq!(
+            super::lock(&session.terminal_screen).screen().size(),
+            original_screen_size,
+            "degraded parser must be skipped on later resizes"
+        );
     }
 
     #[test]
