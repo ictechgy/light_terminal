@@ -1833,8 +1833,6 @@ fn known_agent_name(name: &str) -> bool {
 /// 반환값: 인식된 에이전트 이름(소문자 stem). 알 수 없으면 `None`.
 ///
 /// 주의: shell 미경유 직접 추출이며, 실행과 무관한 순수 파싱이라 안전하다.
-// 다음 청크(draw 통합)에서 build_status_payload 경유로 배선될 예정이라 현재는 미사용이다.
-#[allow(dead_code)]
 fn agent_name_from_command(command: &str) -> Option<String> {
     let parts = shlex::split(command).unwrap_or_else(|| {
         command
@@ -1855,7 +1853,6 @@ fn agent_name_from_command(command: &str) -> Option<String> {
 /// `known_agent_wrapper_command_contains_agent_payload`의 이름-추출 변형.
 /// wrapper(node/npx/npm/…) payload 토큰 중 알려진 에이전트 stem을 가진 첫 토큰의
 /// 이름을 반환한다. 미상이면 `None`.
-#[allow(dead_code)]
 fn agent_name_from_wrapper_command(parts: &[String], executable_index: usize) -> Option<String> {
     let executable = command_token_stem(&parts[executable_index]);
     let mut payload_start = executable_index + 1;
@@ -1889,7 +1886,6 @@ fn agent_name_from_wrapper_command(parts: &[String], executable_index: usize) ->
 /// wrapper payload script 토큰에서 표시용 에이전트 이름을 정한다. stem이 알려진
 /// 에이전트면 그 stem을, 아니면(예: `@openai/codex`, `...claude-code...`) 포함된
 /// 표준 이름을 매핑한다.
-#[allow(dead_code)]
 fn agent_name_from_script_token(token: &str) -> String {
     let stem = command_token_stem(token);
     if known_agent_name(stem) {
@@ -3270,6 +3266,30 @@ fn attach_with_presence_and_cue(
             Arc::clone(&status_metadata_enabled),
         )
     });
+    // command-backed status: status가 켜져 있고 LTERM_STATUS_COMMAND가 설정됐을 때만
+    // 외부 명령 폴링 스레드를 띄운다. 미설정/파싱 실패면 None이 되어 기존 metadata-only
+    // 동작(format_status_line fallback)을 그대로 유지한다. spec §5.1/§5.3.
+    // Phase 2: CLI 플래그(`--status-command`) 우선 적용은 추후 추가. 현재는 env-only.
+    let status_command = status_info
+        .as_ref()
+        .filter(|_| status_enabled)
+        .and_then(|info| StatusCommandConfig::from_env().map(|config| (info, config)))
+        .map(|(info, config)| {
+            // allow_color는 draw 분기에서 테마 bg on/off를 결정하므로 미리 반영한다.
+            status_bar.command_allow_color = config.allow_color;
+            // 생명주기/일시정지 게이트는 metadata 스레드와 동일 패턴을 따른다.
+            // running은 공유하고, enabled는 metadata와 동일하게 항상 활성으로 시작한다.
+            let command_enabled = Arc::new(AtomicBool::new(true));
+            spawn_status_command_thread(
+                info.pane_id.clone(),
+                config.argv,
+                config.interval,
+                config.allow_color,
+                config.debug,
+                Arc::clone(&running),
+                command_enabled,
+            )
+        });
     let nested_detection = nested_monitor_enabled
         .then(|| spawn_nested_agent_detection_thread(target.to_string(), Arc::clone(&running)));
     if idle_wakeup_enabled {
@@ -3288,6 +3308,7 @@ fn attach_with_presence_and_cue(
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
+    let status_command_rx = status_command.as_ref().map(|(rx, _)| rx);
     let nested_detection_rx = nested_detection.as_ref().map(|(rx, _)| rx);
     let mut nested_detector = NestedAgentDetector::new();
     let output_result = (|| -> Result<()> {
@@ -3348,6 +3369,28 @@ fn attach_with_presence_and_cue(
                     )?
                 {
                     break;
+                }
+            }
+
+            // command-backed status: 새 명령 출력이 도착했고 직전 값과 다르면 status_bar에
+            // 반영하고 metadata와 동일한 redraw 경로로 status row를 다시 그린다. 변화가 없으면
+            // 직전 라인을 유지해 불필요한 redraw를 피한다.
+            if let Some(latest) = apply_pending_status_command(status_command_rx)
+                && status_bar.command_line.as_deref() != Some(latest.as_str())
+            {
+                status_bar.command_line = Some(latest);
+                if row_runtime.can_draw_status() {
+                    status_dirty = true;
+                    if !alt_screen_active
+                        && refresh_status_or_detached(
+                            &mut status_bar,
+                            &mut stdout,
+                            &mut status_dirty,
+                            &mut last_status_refresh,
+                        )?
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -3472,6 +3515,10 @@ fn attach_with_presence_and_cue(
     if let Some((_, status_metadata_thread)) = status_metadata {
         let _ = status_metadata_thread.join();
     }
+    // command thread는 공유 running 플래그가 이미 false라 다음 tick에서 종료된다.
+    if let Some((_, status_command_thread)) = status_command {
+        let _ = status_command_thread.join();
+    }
     if let Some((_, nested_detection_thread)) = nested_detection {
         let _ = nested_detection_thread.join();
     }
@@ -3549,7 +3596,7 @@ fn apply_pending_status_metadata(
 }
 
 // ---------------------------------------------------------------------------
-// command-backed status (다음 청크에서 draw/attach에 배선)
+// command-backed status (attach 출력 루프와 draw_at_size에 배선됨)
 // ---------------------------------------------------------------------------
 
 /// command-backed status interval 기본값(초). spec §5.1.
@@ -3569,16 +3616,14 @@ const STATUS_COMMAND_CHANNEL_LIMIT: usize = 4;
 
 /// command-backed status 기능의 env/flag 설정. spec §5.1.
 ///
-/// `LTERM_STATUS_COMMAND`가 없으면 `from_env`가 `None`을 반환하고, 호출부(다음 청크)는
-/// 기존 metadata-only 동작을 유지한다.
+/// `LTERM_STATUS_COMMAND`가 없으면 `from_env`가 `None`을 반환하고, attach 호출부는
+/// 기존 metadata-only 동작(format_status_line fallback)을 유지한다.
 ///
 /// 필드:
 /// - `argv`: shell 미경유로 실행할 명령 argv(첫 원소가 실행 파일).
 /// - `interval`: 폴링 주기(클램프 적용 후).
 /// - `allow_color`: true면 stdout의 SGR 색을 status row로 통과시킨다.
 /// - `debug`: true면 실패를 stderr 1줄로 보고한다.
-// 다음 청크(draw 통합)에서 attach 경로가 사용한다. 그 청크에서 #[allow] 제거.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusCommandConfig {
     argv: Vec<String>,
@@ -3587,7 +3632,6 @@ struct StatusCommandConfig {
     debug: bool,
 }
 
-#[allow(dead_code)]
 impl StatusCommandConfig {
     /// 환경 변수에서 설정을 읽는다. `LTERM_STATUS_COMMAND` 미설정이면 `None`.
     ///
@@ -3708,8 +3752,6 @@ struct StatusCommandPayload<'a> {
 /// 보안: `name`/`pane_id`/`cwd`는 [`sanitize::terminal_text`]로 제어문자를 먼저 제거한다.
 /// serde_json이 따옴표/백슬래시는 escape하지만, raw 제어문자가 JSON에 주입되는 것을
 /// 사전에 차단한다. `agent`는 신뢰되는 allowlist 토큰이라 그대로 둔다. cwd가 비면 null.
-// 다음 청크(draw 통합)에서 spawn_status_command_thread 경유로 배선될 예정이라 현재는 미사용이다.
-#[allow(dead_code)]
 fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
     let session = sanitize::terminal_text(&info.name);
     let pane = sanitize::terminal_text(&info.pane_id);
@@ -3745,8 +3787,6 @@ fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
 /// 설계: macOS에는 `gtimeout`이 없으므로 자체 폴링 타임아웃을 쓴다. stdin write 후
 /// drop으로 EOF를 보내 child가 읽기를 끝낼 수 있게 하고, `try_wait`를 짧은 sleep과
 /// 함께 폴링한다. 타임아웃 시 `kill`+`wait`로 좀비를 회수한 뒤에만 반환한다.
-// 다음 청크(draw 통합)에서 spawn_status_command_thread 경유로 배선될 예정이라 현재는 미사용이다.
-#[allow(dead_code)]
 fn run_status_command(
     argv: &[String],
     stdin_payload: &str,
@@ -3830,8 +3870,6 @@ fn run_status_command(
 /// - `running`/`enabled`: metadata 스레드와 동일한 생명주기/일시정지 게이트.
 ///
 /// 반환값: 살균된 status 라인 수신 채널과 스레드 핸들.
-// 다음 청크(draw 통합)에서 attach 경로가 호출한다. 그 청크에서 #[allow] 제거.
-#[allow(dead_code)]
 fn spawn_status_command_thread(
     target: String,
     argv: Vec<String>,
@@ -3888,8 +3926,6 @@ fn spawn_status_command_thread(
 /// `apply_pending_status_metadata`와 동형으로, 큐에 쌓인 것을 모두 비우고 마지막 것만 남긴다.
 ///
 /// 반환값: 새 라인이 도착했으면 `Some(latest)`, 없으면 `None`(직전 라인 유지).
-// 다음 청크(draw 통합)에서 attach 출력 루프가 호출한다. 그 청크에서 #[allow] 제거.
-#[allow(dead_code)]
 fn apply_pending_status_command(rx: Option<&mpsc::Receiver<String>>) -> Option<String> {
     let rx = rx?;
     let mut latest = None;
@@ -4348,6 +4384,14 @@ struct StatusBar {
     /// lterm's own `SGR 0` and theme writes. Detected conservatively once at
     /// attach start and overridable with `LTERM_STATUS_SGR_STACK`.
     preserve_sgr_stack: bool,
+    /// command-backed status의 최신 출력(이미 `sanitize_status_command_line`으로
+    /// 살균된 단일행, **폭 미절단**). `None`이면 기존 `format_status_line` fallback을
+    /// 사용한다. `apply_pending_status_command`로 갱신된다.
+    command_line: Option<String>,
+    /// command-backed status가 자체 ANSI 색을 쓰도록 허용할지 여부(config의 allow_color).
+    /// true면 draw에서 테마 bg를 입히지 않고 reset으로 시작해 understatus 색이 살게 한다.
+    /// false면 plain fallback과 동일하게 테마 bg를 적용한다.
+    command_allow_color: bool,
 }
 
 impl StatusBar {
@@ -4370,6 +4414,10 @@ impl StatusBar {
             style,
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: status_sgr_stack_supported(),
+            // command-backed status는 attach에서 config가 있을 때만 활성화된다.
+            // 기본은 비활성(None)이라 LTERM_STATUS_COMMAND 미설정 시 기존 동작과 동일하다.
+            command_line: None,
+            command_allow_color: false,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -4439,16 +4487,34 @@ impl StatusBar {
         // 마지막 칸까지 채우면 일부 모바일 터미널(예: Termius)에서 deferred-wrap 미구현으로
         // 즉시 스크롤이 발생해 status line이 본문으로 밀려 올라간다. cols-1만 그린다.
         let safe_width = cols.saturating_sub(1).max(1);
-        let line = format_status_line(&self.session_name, &self.pane_id, safe_width);
+        // status row의 콘텐츠 소스와 테마 bg 적용 여부를 결정한다.
+        // command_line이 Some(비어있지 않음)이면 command-backed 모드로, 살균된 출력을
+        // safe_width로 ANSI-aware 절단해 쓴다. allow_color면 understatus 자체 색이 살도록
+        // 테마 bg를 입히지 않는다. None이거나 빈 문자열이면 기존 format_status_line fallback.
+        let (line, use_theme_bg) = match self.command_line.as_deref() {
+            Some(cmd) if !cmd.is_empty() => (
+                sanitize::truncate_status_line_ansi(cmd, safe_width),
+                !self.command_allow_color,
+            ),
+            _ => (
+                format_status_line(&self.session_name, &self.pane_id, safe_width),
+                true,
+            ),
+        };
         // \x1b[2K로 행을 먼저 비워야 옛 상태(긴 세션명 잔재)가 남지 않는다.
-        // 두 모드 모두 \x1b[0m로 시작해 이전 PTY rendition(bold/italic/inverse 등)이
+        // fallback/plain 모드는 \x1b[0m로 시작해 이전 PTY rendition(bold/italic/inverse 등)이
         // status line으로 새는 것을 차단한다. Full은 theme enum에서 고른 고정 SGR만
         // 적용하므로 사용자 입력 escape sequence가 status row에 주입되지 않는다.
         // (bold(1)은 두 모드 모두에서 사용하지 않는다: bold+black을 흰색으로 렌더하는 터미널이 있다.)
-        let sgr = match self.style {
-            Some(style) => style.sgr(),
+        //
+        // command-backed + allow_color 모드에서는 테마 bg를 입히지 않고 reset(\x1b[0m)으로
+        // 시작해 understatus가 emit한 SGR 색이 그대로 보이게 한다. 살균 단계에서 위험한
+        // escape는 이미 제거되고 SGR 끝에 reset이 붙으므로 색 누수는 차단된다.
+        let style = match self.style {
+            Some(style) => style,
             None => return Ok(()),
         };
+        let sgr = if use_theme_bg { style.sgr() } else { "\x1b[0m" };
         // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
         // 이는 strict atomicity 보장은 아니다 (write_all은 내부적으로 여러 syscall 가능).
         // TTY/PTY는 POSIX PIPE_BUF atomicity 적용 대상이 아니므로 partial-write 가능성 잔존.
@@ -7154,6 +7220,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7185,6 +7253,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7230,6 +7300,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7265,6 +7337,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7292,6 +7366,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: vec![20],
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7317,6 +7393,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: vec![20],
             preserve_sgr_stack: false,
+            command_line: None,
+            command_allow_color: false,
         };
         let mut output = Vec::new();
 
@@ -7358,6 +7436,179 @@ mod tests {
             restore_payload.ends_with("\x1b[0m\x1b[2K\x1b8"),
             "status restore still clears the active status row and restores cursor: {restore_payload:?}"
         );
+        status_bar.style = None;
+    }
+
+    // ===== command-backed status: draw_at_size 분기 =====
+
+    #[test]
+    fn status_bar_command_line_with_allow_color_omits_theme_bg() {
+        // command_allow_color=true면 테마 bg SGR(`\x1b[0;30;104m`)을 입히지 않고
+        // reset(`\x1b[0m`)으로 시작해 understatus 자체 색이 살아야 한다.
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            // 살균을 거친(완결 SGR) 형태를 직접 주입한다.
+            command_line: Some("\x1b[31mstatus\x1b[0m".to_string()),
+            command_allow_color: true,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw command-backed status with color");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+
+        // 테마 bg는 들어가지 않는다.
+        assert!(
+            !payload.contains("\x1b[0;30;104m"),
+            "allow_color command status must not paint theme bg: {payload:?}"
+        );
+        // status row는 위치 지정 + reset으로 시작한다(테마 bg 대신 \x1b[0m).
+        assert!(
+            payload.contains("\x1b[24;1H\x1b[2K\x1b[0m\x1b[31mstatus"),
+            "allow_color command status should start with reset then command content: {payload:?}"
+        );
+        // 명령 콘텐츠가 포함된다.
+        assert!(
+            payload.contains("status"),
+            "command content must be present: {payload:?}"
+        );
+        // 끝 보호장치: \x1b[0m\x1b[K 유지.
+        assert!(
+            payload.contains("\x1b[0m\x1b[K"),
+            "trailing reset + clear-to-eol must be preserved: {payload:?}"
+        );
+        // scroll-region/cursor save·restore + SGR stack 보호장치 유지.
+        assert!(
+            payload.starts_with("\x1b7\x1b[#{"),
+            "cursor save + SGR push preserved: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b[#}\x1b8"),
+            "SGR pop + cursor restore preserved: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_command_line_plain_without_color_keeps_theme_bg() {
+        // command_allow_color=false면 plain 콘텐츠라도 테마 bg를 유지해 fallback과
+        // 동일한 스타일로 그린다.
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: Some("plain-status".to_string()),
+            command_allow_color: false,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw command-backed plain status");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+
+        assert!(
+            payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104mplain-status"),
+            "plain command status with color disabled keeps theme bg: {payload:?}"
+        );
+        assert!(
+            payload.contains("\x1b[0m\x1b[K"),
+            "trailing reset + clear-to-eol must be preserved: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_command_line_none_matches_format_status_line_bytes() {
+        // command_line=None이면 기존 format_status_line 경로와 바이트 동일이어야 한다(회귀 0).
+        let mut command_bar = StatusBar {
+            session_name: "api".to_string(),
+            pane_id: "%1".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            // allow_color가 true라도 command_line이 None이면 fallback이라 영향 없어야 한다.
+            command_allow_color: true,
+        };
+        let mut command_output = Vec::new();
+        command_bar
+            .draw_at_size(&mut command_output, 80, 24)
+            .expect("draw fallback status");
+
+        // command-backed 필드를 전혀 안 쓰는 기준 인스턴스.
+        let mut baseline_bar = StatusBar {
+            session_name: "api".to_string(),
+            pane_id: "%1".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+        };
+        let mut baseline_output = Vec::new();
+        baseline_bar
+            .draw_at_size(&mut baseline_output, 80, 24)
+            .expect("draw baseline status");
+
+        assert_eq!(
+            command_output, baseline_output,
+            "None command_line must produce byte-identical output to format_status_line path"
+        );
+        // 실제로 format_status_line 콘텐츠가 들어갔는지도 확인.
+        let payload = String::from_utf8(command_output).expect("status payload should be utf8");
+        assert!(
+            payload.contains(&format_status_line("api", "%1", 79)),
+            "fallback must render format_status_line content: {payload:?}"
+        );
+        command_bar.style = None;
+        baseline_bar.style = None;
+    }
+
+    #[test]
+    fn status_bar_command_line_long_is_ansi_truncated_without_dangling_esc() {
+        // 긴 command_line이 safe_width(=cols-1)로 ANSI-aware 절단되고 미완 ESC가 없어야 한다.
+        let long = format!("\x1b[31m{}\x1b[0m", "x".repeat(200));
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: Some(long),
+            command_allow_color: true,
+        };
+        let mut output = Vec::new();
+        // cols=20 → safe_width=19.
+        status_bar
+            .draw_at_size(&mut output, 20, 24)
+            .expect("draw long command-backed status");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+
+        // 절단된 콘텐츠는 truncate_status_line_ansi 결과와 일치해야 한다.
+        let expected_content = crate::sanitize::truncate_status_line_ansi(
+            &format!("\x1b[31m{}\x1b[0m", "x".repeat(200)),
+            19,
+        );
+        assert!(
+            payload.contains(&expected_content),
+            "long command line must be ANSI-truncated to safe_width: {payload:?}"
+        );
+        // status row 위치 지정 직후 마지막 escape는 완결된 SGR(`m`)이어야 한다 — 미완 ESC 금지.
+        // 페이로드 전체에서 마지막 ESC가 `m`으로 끝나는지(보호장치 \x1b8 제외) 확인.
+        if let Some(body_start) = payload.find("\x1b[24;1H") {
+            let body = &payload[body_start..];
+            // 본문 영역의 SGR은 모두 `m`으로 종결됨을 보장하기 위해 미완 `\x1b[<숫자>` 잔존이 없어야 한다.
+            assert!(
+                !body.contains("\x1b[31\x1b8") && !body.ends_with("\x1b[31"),
+                "no dangling ESC may remain in truncated body: {body:?}"
+            );
+        }
         status_bar.style = None;
     }
 
@@ -7511,6 +7762,8 @@ mod tests {
             style: Some(StatusStyle::Full(StatusTheme::Blue)),
             drawn_status_rows: Vec::new(),
             preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
         };
         status_bar
             .draw_at_size(&mut output, 80, 24)
