@@ -67,6 +67,10 @@ const AGENT_TITLE_REFRESH: Duration = Duration::from_secs(2);
 const STATUS_METADATA_POLL: Duration = Duration::from_millis(500);
 const STATUS_METADATA_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 const STATUS_METADATA_CHANNEL_LIMIT: usize = 4;
+/// status 폴링 스레드의 interval 대기를 쪼개는 청크 길이. `running`이 꺼졌을 때
+/// teardown의 `join()`이 최대 이 길이만 블로킹되도록 보장한다. interval이 최대 1시간
+/// (`LTERM_STATUS_INTERVAL`)까지 늘어나도 detach 시 즉시 깨어나야 하기 때문이다.
+const STATUS_POLL_INTERRUPT_CHUNK: Duration = Duration::from_millis(100);
 const NESTED_AGENT_POLL: Duration = Duration::from_millis(500);
 const NESTED_AGENT_DETECTION_CHANNEL_LIMIT: usize = 4;
 const NESTED_AGENT_STABLE_POLLS: u8 = 2;
@@ -3278,9 +3282,10 @@ fn attach_with_presence_and_cue(
             // allow_color는 draw 분기에서 테마 bg on/off를 결정하므로 미리 반영한다.
             status_bar.command_allow_color = config.allow_color;
             // 생명주기/일시정지 게이트는 metadata 스레드와 동일 토글에 연동한다.
-            // suspend/resume(alt-screen·nested agent)이 status_metadata_enabled를
-            // false/true로 토글하므로, 동일 Arc를 공유하면 command 스레드도 함께
-            // pause/resume된다(이전엔 항상 true라 alt-screen 중에도 매 interval spawn됨).
+            // status_metadata_enabled는 nested-agent suspend/resume 시 false/true로
+            // 토글되므로 동일 Arc를 공유해 command 스레드도 함께 pause/resume된다.
+            // alt-screen(vim 등) 게이트는 별도로 alt_screen_state를 공유해, 활성 중에는
+            // 그리지도 않을 출력을 위한 외부 프로세스 spawn을 건너뛴다(draw 가드와 일관).
             spawn_status_command_thread(
                 info.pane_id.clone(),
                 config.argv,
@@ -3289,6 +3294,7 @@ fn attach_with_presence_and_cue(
                 config.debug,
                 Arc::clone(&running),
                 Arc::clone(&status_metadata_enabled),
+                Arc::clone(&alt_screen_state),
             )
         });
     let nested_detection = nested_monitor_enabled
@@ -3516,7 +3522,8 @@ fn attach_with_presence_and_cue(
     if let Some((_, status_metadata_thread)) = status_metadata {
         let _ = status_metadata_thread.join();
     }
-    // command thread는 공유 running 플래그가 이미 false라 다음 tick에서 종료된다.
+    // command thread는 공유 running 플래그가 이미 false라 interruptible_sleep이
+    // 다음 청크(≤100ms) 내에 깨어 종료된다. 긴 interval에서도 teardown이 블로킹되지 않는다.
     if let Some((_, status_command_thread)) = status_command {
         let _ = status_command_thread.join();
     }
@@ -3538,6 +3545,25 @@ fn status_scroll_bottom_for_terminal_rows(rows: u16, show_status: bool) -> Optio
     (show_status && rows > 1).then_some(rows - 1)
 }
 
+/// `total` 만큼 대기하되, [`STATUS_POLL_INTERRUPT_CHUNK`] 단위로 쪼개 매 청크마다
+/// `running`을 확인한다. `running`이 `false`가 되면 즉시 중단해 teardown의 `join()`이
+/// 긴 interval(최대 1시간) 내내 블로킹되지 않게 한다.
+///
+/// 반환값: 끝까지 대기하면 `true`(정상 tick 진행), 중간에 `running`이 꺼져 조기
+/// 중단됐으면 `false`(루프 종료 신호).
+fn interruptible_sleep(total: Duration, running: &AtomicBool) -> bool {
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if !running.load(Ordering::SeqCst) {
+            return false;
+        }
+        let chunk = remaining.min(STATUS_POLL_INTERRUPT_CHUNK);
+        thread::sleep(chunk);
+        remaining -= chunk;
+    }
+    running.load(Ordering::SeqCst)
+}
+
 fn spawn_status_metadata_thread(
     target: String,
     running: Arc<AtomicBool>,
@@ -3546,8 +3572,7 @@ fn spawn_status_metadata_thread(
     let (tx, rx) = mpsc::sync_channel(STATUS_METADATA_CHANNEL_LIMIT);
     let handle = thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
-            thread::sleep(STATUS_METADATA_POLL);
-            if !running.load(Ordering::SeqCst) {
+            if !interruptible_sleep(STATUS_METADATA_POLL, &running) {
                 break;
             }
             if !enabled.load(Ordering::SeqCst) {
@@ -3961,8 +3986,12 @@ fn join_reader_within_grace(
 /// - `allow_color`: stdout SGR 통과 여부.
 /// - `debug`: 실패를 stderr 1줄로 보고할지 여부.
 /// - `running`/`enabled`: metadata 스레드와 동일한 생명주기/일시정지 게이트.
+/// - `alt_screen`: alt-screen(vim 등) 활성 상태. 활성 중에는 그리기가 막히므로
+///   외부 명령 실행도 건너뛴다(draw 가드와 일관). 그리지도 않을 출력을 위해 매
+///   interval마다 외부 프로세스를 spawn하는 낭비를 막는다.
 ///
 /// 반환값: 살균된 status 라인 수신 채널과 스레드 핸들.
+#[allow(clippy::too_many_arguments)]
 fn spawn_status_command_thread(
     target: String,
     argv: Vec<String>,
@@ -3971,17 +4000,21 @@ fn spawn_status_command_thread(
     debug: bool,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
+    alt_screen: Arc<AltScreenState>,
 ) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(STATUS_COMMAND_CHANNEL_LIMIT);
     // 1회 실행 타임아웃은 interval과 상한(1500ms) 중 작은 값으로 둬 폴링이 밀리지 않게 한다.
     let timeout = interval.min(STATUS_COMMAND_MAX_TIMEOUT);
     let handle = thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
-            thread::sleep(interval);
-            if !running.load(Ordering::SeqCst) {
+            // interval을 짧은 청크로 쪼개 대기하며 매 청크마다 running을 확인한다.
+            // detach 시 긴 interval(최대 1시간) 내내 teardown join()이 블로킹되지 않게 한다.
+            if !interruptible_sleep(interval, &running) {
                 break;
             }
-            if !enabled.load(Ordering::SeqCst) {
+            // enabled(nested-agent suspend 게이트)이거나 alt-screen 활성 중이면 명령을
+            // 실행하지 않는다. alt-screen 중에는 status row를 그리지 않으므로 spawn 낭비다.
+            if !enabled.load(Ordering::SeqCst) || alt_screen.active.load(Ordering::Relaxed) {
                 continue;
             }
             let info: Result<SessionInfo> = rpc_with_read_timeout(
@@ -5572,17 +5605,17 @@ mod tests {
         cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
-        hex_encode, hex_encoded_len, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
-        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
-        parse_status_command_bool, parse_status_command_interval, parse_status_style,
-        raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
-        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
-        run_status_command, should_mobile_transcript_auto, status_sgr_stack_supported,
-        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
-        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
-        write_lterm_title_cue, write_mobile_transcript_update,
+        hex_encode, hex_encoded_len, interruptible_sleep, keyboard_protocol_restore_bytes,
+        likely_agent_session, matches_env_bool, mobile_client_detected,
+        mobile_transcript_capture_changed, nested_known_agent_present_in_processes,
+        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
+        parse_status_style, raw_attach_command_hint, read_attach_response_header,
+        read_trace_jsonl_line, reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode,
+        resolve_status_style, run_status_command, should_mobile_transcript_auto,
+        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
+        trace_output_open_context, trace_summary_text, validate_trace_replay,
+        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -6271,6 +6304,51 @@ mod tests {
         assert_eq!(apply_pending_status_command(Some(&rx)), None);
         // None receiver → None.
         assert_eq!(apply_pending_status_command(None), None);
+    }
+
+    #[test]
+    fn interruptible_sleep_completes_when_running_stays_true() {
+        use std::sync::atomic::AtomicBool;
+        let running = AtomicBool::new(true);
+        // 짧은 total은 정상적으로 끝까지 대기하고 true를 반환한다.
+        assert!(interruptible_sleep(Duration::from_millis(50), &running));
+    }
+
+    #[test]
+    fn interruptible_sleep_wakes_promptly_when_running_cleared() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        // 1시간 interval을 흉내내 long sleep 중 detach를 시뮬레이션한다.
+        let running = Arc::new(AtomicBool::new(true));
+        let waker = Arc::clone(&running);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            waker.store(false, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let completed = interruptible_sleep(Duration::from_secs(3600), &running);
+        let elapsed = started.elapsed();
+        stopper.join().unwrap();
+        // running=false면 조기 중단 신호로 false를 반환한다.
+        assert!(
+            !completed,
+            "running이 꺼지면 false(루프 종료)를 반환해야 한다"
+        );
+        // 청크(100ms) + store 지연(50ms)을 고려해도 긴 interval 내내 블로킹되지 않는다.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "조기 중단이 1초 내에 일어나야 하는데 {elapsed:?} 걸렸다"
+        );
+    }
+
+    #[test]
+    fn interruptible_sleep_returns_false_when_already_stopped() {
+        use std::sync::atomic::AtomicBool;
+        let running = AtomicBool::new(false);
+        // 시작부터 running=false면 즉시 false를 반환한다(대기 없음).
+        let started = Instant::now();
+        assert!(!interruptible_sleep(Duration::from_secs(3600), &running));
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
