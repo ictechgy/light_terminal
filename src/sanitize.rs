@@ -87,6 +87,291 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
     out
 }
 
+/// 신뢰할 수 없는 외부 명령(understatus 등)의 stdout을 lterm 하단 status row에
+/// 안전하게 그리기 위한 **단일 행** 살균 함수.
+///
+/// `terminal_capture`의 상태머신을 본떠 작성하되, 위험한 escape는 전부 차단하고
+/// `allow_color == true`일 때 **SGR(색) 시퀀스만** 선택적으로 통과시킨다.
+/// 폭 절단은 하지 않는다 — 그 책임은 `truncate_status_line_ansi`가 진다.
+///
+/// 파라미터:
+/// - `bytes`: 신뢰 불가 stdout 원시 바이트.
+/// - `allow_color`: true면 유효한 SGR(`\x1b[<params>m`)을 정규화해 통과시키고,
+///   false면 색을 포함한 모든 escape를 제거한 plain 단일행을 반환한다.
+///
+/// 반환값: 단일 행 안전 문자열. `allow_color`이고 SGR을 하나라도 emit했다면
+/// 색 누수 차단을 위해 끝에 `\x1b[0m`를 부착한다.
+///
+/// 주의: 첫 `\n`/`\r`에서 입력을 중단한다(이후 바이트 무시). 미완결 CSI는
+/// 아무것도 emit하지 않아 payload 누수를 0으로 유지한다.
+// 다음 단계(draw 통합)에서 호출될 예정이라 현재는 미사용이다. 그 청크에서 #[allow] 제거.
+#[allow(dead_code)]
+pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
+    // 파서 폭주 방지를 위한 CSI 파라미터 한도.
+    const MAX_CSI_PARAM_BYTES: usize = 64;
+    const MAX_CSI_PARAM_COUNT: usize = 16;
+
+    let mut out = String::with_capacity(bytes.len());
+    let mut state = EscapeState::Ground;
+    // CSI 파라미터/intermediate 바이트 누적 버퍼와 유효성 플래그.
+    let mut csi_params: Vec<u8> = Vec::new();
+    let mut csi_valid = true;
+    let mut emitted_sgr = false;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match state {
+            EscapeState::Ground => match byte {
+                // 단일 행: 첫 줄바꿈에서 즉시 중단.
+                b'\n' | b'\r' => break,
+                0x1b => state = EscapeState::Esc,
+                0x9b => {
+                    csi_params.clear();
+                    csi_valid = true;
+                    state = EscapeState::Csi;
+                }
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
+                0x80..=0x9f => {}
+                b'\t' => {}
+                0x00..=0x1f | 0x7f => {}
+                0x00..=0x7f => out.push(byte as char),
+                _ => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        match ch {
+                            '\u{009b}' => {
+                                csi_params.clear();
+                                csi_valid = true;
+                                state = EscapeState::Csi;
+                            }
+                            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                                state = EscapeState::String
+                            }
+                            ch if is_c0_or_c1(ch) => {}
+                            _ => out.push(ch),
+                        }
+                        index += len;
+                        continue;
+                    }
+                    out.push('\u{fffd}');
+                }
+            },
+            EscapeState::Esc => match byte {
+                0x18 | 0x1a => state = EscapeState::Ground,
+                0x1b => state = EscapeState::Esc,
+                b'[' => {
+                    csi_params.clear();
+                    csi_valid = true;
+                    state = EscapeState::Csi;
+                }
+                b']' | b'P' | b'_' | b'^' | b'X' => state = EscapeState::String,
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state = EscapeState::Charset,
+                0x9b => {
+                    csi_params.clear();
+                    csi_valid = true;
+                    state = EscapeState::Csi;
+                }
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
+                0x20..=0x2f => {}
+                _ => state = EscapeState::Ground,
+            },
+            EscapeState::Csi => match byte {
+                // CAN/SUB/ST: 시퀀스 중단 후 폐기.
+                0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
+                // 중간 ESC는 재동기화.
+                0x1b => state = EscapeState::Esc,
+                // 최종 바이트에서 판정.
+                byte if (0x40..=0x7e).contains(&byte) => {
+                    let is_sgr = byte == b'm';
+                    // 파라미터 개수 = (`;` 개수 + 1). count + 1 <= MAX 는 count < MAX 와 동치.
+                    let within_limits = csi_params.len() <= MAX_CSI_PARAM_BYTES
+                        && csi_params.iter().filter(|&&b| b == b';').count() < MAX_CSI_PARAM_COUNT;
+                    if allow_color && is_sgr && csi_valid && within_limits {
+                        // 정규 `\x1b[<params>m` 형태로 emit(C1형도 정규화됨).
+                        out.push('\u{001b}');
+                        out.push('[');
+                        // 파라미터 바이트는 `[0-9;:]`만 통과했으므로 ASCII 안전.
+                        for &param_byte in &csi_params {
+                            out.push(param_byte as char);
+                        }
+                        out.push('m');
+                        emitted_sgr = true;
+                    }
+                    // SGR이 아니거나 무효/한도 초과면 시퀀스 전체 폐기.
+                    state = EscapeState::Ground;
+                }
+                // 파라미터 바이트: `[0-9;:]`만 유효.
+                byte if matches!(byte, b'0'..=b'9' | b';' | b':') => {
+                    if csi_valid {
+                        csi_params.push(byte);
+                    }
+                }
+                // private(`<=>?`)·intermediate(`0x20..=0x2f`)·기타는 무효 표시.
+                _ => csi_valid = false,
+            },
+            EscapeState::String => match byte {
+                0x18 | 0x1a => state = EscapeState::Ground,
+                0x07 | 0x9c => state = EscapeState::Ground,
+                0x1b => state = EscapeState::StringEsc,
+                _ => {}
+            },
+            EscapeState::StringEsc => {
+                state = if byte == b'\\' {
+                    EscapeState::Ground
+                } else {
+                    EscapeState::String
+                };
+            }
+            EscapeState::Charset => state = EscapeState::Ground,
+        }
+        index += 1;
+    }
+
+    // 색 누수 차단: SGR을 하나라도 emit했으면 reset으로 닫는다.
+    if emitted_sgr {
+        out.push_str("\u{001b}[0m");
+    }
+
+    out
+}
+
+/// `sanitize_status_command_line` 출력(완결 SGR만 포함된 단일행)을 **ANSI-aware**로
+/// 폭 절단한다. `format_status_line`의 grapheme/CJK/ellipsis 정책과 일관되게 동작한다.
+///
+/// 파라미터:
+/// - `line`: 살균된 단일행(SGR 시퀀스 외 위험 escape 없음).
+/// - `max_width`: status row의 가용 표시 폭(셀 단위).
+///
+/// 반환값: 폭이 `max_width`를 넘지 않는 문자열. SGR 시퀀스는 폭 0으로 통과하며
+/// 절대 중간에서 잘리지 않는다(원자적 취급). 출력에 SGR이 하나라도 있으면 색 누수
+/// 차단을 위해 끝에 `\x1b[0m`를 부착한다.
+///
+/// 주의: 절단 시 ellipsis `…`(width 1)을 붙이되, `max_width == 1`이면 ellipsis를
+/// 생략해 가시 1칸을 콘텐츠로 쓰고, `max_width == 0`이면 빈 문자열을 반환한다.
+// 다음 단계(draw 통합)에서 호출될 예정이라 현재는 미사용이다. 그 청크에서 #[allow] 제거.
+#[allow(dead_code)]
+pub fn truncate_status_line_ansi(line: &str, max_width: u16) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let width = max_width as usize;
+    if width == 0 {
+        return String::new();
+    }
+
+    // 입력을 SGR 시퀀스(폭 0, 원자적)와 가시 grapheme cluster로 분해한다.
+    // SGR은 `format_status_line`이 다루지 않던 추가 토큰이므로 여기서 별도 처리.
+    let segments = split_sgr_and_text(line);
+
+    // 1차 패스: 전체 가시 폭을 계산해 절단 필요 여부 판단.
+    let total_visible_width: usize = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            StatusSegment::Text(text) => Some(text.width()),
+            StatusSegment::Sgr(_) => None,
+        })
+        .sum();
+
+    let mut emitted_sgr = false;
+    let mut buf = String::new();
+
+    if total_visible_width <= width {
+        // 절단 불필요: 그대로 재조립.
+        for segment in &segments {
+            match segment {
+                StatusSegment::Sgr(seq) => {
+                    buf.push_str(seq);
+                    emitted_sgr = true;
+                }
+                StatusSegment::Text(text) => buf.push_str(text),
+            }
+        }
+    } else {
+        // 절단 필요: `…` 한 칸 예약(width >= 2일 때만), grapheme 단위 누적.
+        let ellipsis_margin: usize = if width >= 2 { 1 } else { 0 };
+        let target = width.saturating_sub(ellipsis_margin);
+        let mut acc = 0_usize;
+        for segment in &segments {
+            match segment {
+                StatusSegment::Sgr(seq) => {
+                    // SGR은 폭 0으로 항상 통과(원자적, 절대 중간 절단 안 함).
+                    buf.push_str(seq);
+                    emitted_sgr = true;
+                }
+                StatusSegment::Text(text) => {
+                    for cluster in text.graphemes(true) {
+                        let cluster_width = cluster.width();
+                        if acc + cluster_width > target {
+                            break;
+                        }
+                        buf.push_str(cluster);
+                        acc += cluster_width;
+                    }
+                }
+            }
+        }
+        if ellipsis_margin > 0 {
+            buf.push('…');
+        }
+    }
+
+    // 색 누수 차단: SGR이 하나라도 있으면 reset으로 닫는다.
+    if emitted_sgr {
+        buf.push_str("\u{001b}[0m");
+    }
+
+    buf
+}
+
+/// `truncate_status_line_ansi`가 사용하는 토큰: 완결 SGR 시퀀스(폭 0) 또는 가시 텍스트.
+enum StatusSegment<'a> {
+    /// `\x1b[...m` 형태의 SGR 시퀀스. 폭 0으로 취급하며 원자적으로 보존한다.
+    Sgr(&'a str),
+    /// 가시 문자 구간. grapheme/폭 계산 대상.
+    Text(&'a str),
+}
+
+/// 살균된 단일행을 SGR 시퀀스와 가시 텍스트 구간으로 분해한다.
+///
+/// 입력은 `sanitize_status_command_line` 출력을 가정하므로 escape는 `\x1b[...m`
+/// (최종 바이트 `m`) SGR뿐이다. 그 외 ESC는 나타나지 않지만, 방어적으로 `m`을
+/// 만나지 못하면 남은 전체를 SGR로 흡수해 ESC 누수를 막는다.
+fn split_sgr_and_text(line: &str) -> Vec<StatusSegment<'_>> {
+    let bytes = line.as_bytes();
+    let mut segments: Vec<StatusSegment<'_>> = Vec::new();
+    let mut text_start = 0_usize;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        // `\x1b[` 로 시작하는 SGR 시퀀스 탐지.
+        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            if text_start < index {
+                segments.push(StatusSegment::Text(&line[text_start..index]));
+            }
+            // 최종 바이트 `m`까지 흡수.
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end] != b'm' {
+                end += 1;
+            }
+            // `m`을 포함하도록 확장(존재 시).
+            if end < bytes.len() {
+                end += 1;
+            }
+            segments.push(StatusSegment::Sgr(&line[index..end]));
+            index = end;
+            text_start = index;
+            continue;
+        }
+        index += 1;
+    }
+
+    if text_start < bytes.len() {
+        segments.push(StatusSegment::Text(&line[text_start..]));
+    }
+
+    segments
+}
+
 fn is_c0_or_c1(ch: char) -> bool {
     matches!(ch, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}')
 }
@@ -250,5 +535,206 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ===== sanitize_status_command_line (함수 1) =====
+
+    #[test]
+    fn sanitize_status_command_line_preserves_color_when_allowed() {
+        // ① allow_color로 SGR 색이 보존되고, emit 후 reset으로 닫힌다.
+        let out = sanitize_status_command_line(b"\x1b[31mred\x1b[0m", true);
+        assert_eq!(out, "\x1b[31mred\x1b[0m\x1b[0m");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_non_sgr_csi() {
+        // ② non-`m` CSI(`\x1b[2J` 화면 클리어)는 폐기.
+        let out = sanitize_status_command_line(b"a\x1b[2Jb", true);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_csi_with_intermediate() {
+        // ③ intermediate(`0x20` 공백)가 낀 CSI는 무효 → 폐기.
+        let out = sanitize_status_command_line(b"a\x1b[31 mb", true);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_drops_incomplete_csi_without_leak() {
+        // ④ 미완결 CSI(`\x1b[31` + EOF)는 아무것도 emit하지 않는다(누수 0).
+        let out = sanitize_status_command_line(b"a\x1b[31", true);
+        assert_eq!(out, "a");
+        assert!(!out.contains('3'));
+        assert!(!out.contains('1'));
+    }
+
+    #[test]
+    fn sanitize_status_command_line_normalizes_c1_csi_to_esc_bracket() {
+        // ⑤ C1 `\x9b31m`·UTF-8형 `\u{009b}…` SGR을 `\x1b[31m`로 정규화 통과.
+        let raw_c1 = sanitize_status_command_line(b"\x9b31mred", true);
+        assert_eq!(raw_c1, "\x1b[31mred\x1b[0m");
+
+        let utf8_c1 = sanitize_status_command_line("\u{009b}31mred".as_bytes(), true);
+        assert_eq!(utf8_c1, "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_osc_payload() {
+        // ⑥ OSC52 clipboard 시퀀스는 폐기(secret 누수 없음).
+        let out = sanitize_status_command_line(b"a\x1b]52;c;secret\x07b", true);
+        assert_eq!(out, "ab");
+        assert!(!out.contains("secret"));
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_lone_esc_and_charset() {
+        // ⑦ 단독 ESC와 charset 지정 시퀀스는 폐기.
+        // 입력 끝의 단독 ESC: 아무것도 emit하지 않음(누수 0).
+        assert_eq!(sanitize_status_command_line(b"a\x1b", true), "a");
+        // 알 수 없는 2바이트 escape(`\x1bb`): terminal_capture와 동일하게 종결 바이트
+        // `b`까지 escape의 일부로 소비되어 폐기된다.
+        assert_eq!(sanitize_status_command_line(b"a\x1bbX", true), "aX");
+        // charset 지정(`\x1b(B`)은 3바이트 모두 폐기, 이후 텍스트는 보존.
+        assert_eq!(sanitize_status_command_line(b"a\x1b(Bb", true), "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_csi_over_param_byte_limit() {
+        // ⑧ 파라미터 바이트 길이 > 64면 폐기.
+        let mut payload = Vec::from(&b"a\x1b["[..]);
+        payload.extend(std::iter::repeat_n(b'1', 65));
+        payload.push(b'm');
+        payload.push(b'b');
+        let out = sanitize_status_command_line(&payload, true);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_discards_csi_over_param_count_limit() {
+        // ⑨ `;`로 분리된 파라미터 개수 > 16이면 폐기(`1;1;...;1` 17개).
+        let params = vec!["1"; 17].join(";");
+        let payload = format!("a\x1b[{params}mb");
+        let out = sanitize_status_command_line(payload.as_bytes(), true);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_stops_at_first_newline() {
+        // ⑩ multiline `a\nb` → 첫 줄 `a`만(이후 무시).
+        assert_eq!(sanitize_status_command_line(b"a\nb", true), "a");
+        assert_eq!(sanitize_status_command_line(b"a\rb", true), "a");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_replaces_invalid_utf8() {
+        // ⑪ 잘못된 UTF-8 바이트는 `\u{fffd}`로 치환.
+        let out = sanitize_status_command_line(&[b'A', 0xe2], true);
+        assert_eq!(out, "A\u{fffd}");
+        let out2 = sanitize_status_command_line(&[b'A', 0xf5, b'B'], true);
+        assert_eq!(out2, "A\u{fffd}B");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_strips_all_escapes_when_color_disabled() {
+        // ⑫ allow_color=false면 SGR까지 전량 strip(plain 단일행).
+        let out = sanitize_status_command_line(b"\x1b[31mred\x1b[0m", false);
+        assert_eq!(out, "red");
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn sanitize_status_command_line_allows_extended_sgr_but_rejects_private() {
+        // ⑬ 유효 256색·트루컬러 콜론형은 통과, private(`?`)는 폐기.
+        let out256 = sanitize_status_command_line(b"\x1b[38;5;200mx", true);
+        assert_eq!(out256, "\x1b[38;5;200mx\x1b[0m");
+
+        let truecolor = sanitize_status_command_line(b"\x1b[38:2:1:2:3mx", true);
+        assert_eq!(truecolor, "\x1b[38:2:1:2:3mx\x1b[0m");
+
+        // private `\x1b[?25h`(커서 표시)는 무효 → 폐기, reset도 없음.
+        let private = sanitize_status_command_line(b"a\x1b[?25hb", true);
+        assert_eq!(private, "ab");
+        assert!(!private.contains('\x1b'));
+    }
+
+    // ===== truncate_status_line_ansi (함수 2) =====
+
+    #[test]
+    fn truncate_status_line_ansi_truncates_plain_with_ellipsis() {
+        // ⑭ plain 폭 절단 + `…`(width=5: 4칸 콘텐츠 + ellipsis).
+        let out = truncate_status_line_ansi("abcdefgh", 5);
+        assert_eq!(out, "abcd…");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_counts_cjk_as_two_cells() {
+        // ⑮ CJK는 2폭. `한국어`(6폭)를 width=4로 자르면 ellipsis 1 + 한 글자(2폭).
+        let out = truncate_status_line_ansi("한국어", 4);
+        assert_eq!(out, "한…");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_preserves_zwj_emoji_grapheme() {
+        // ⑯ ZWJ 가족 이모지를 grapheme cluster로 보존(부분 cluster 잔존 금지).
+        let family = "👨\u{200d}👩\u{200d}👧";
+        // 충분한 폭에서는 cluster가 통째로 살아남는다.
+        let out = truncate_status_line_ansi(&format!("{family}x"), 10);
+        assert!(out.contains(family));
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_treats_sgr_as_zero_width() {
+        // ⑰ SGR은 폭 0으로 통과, 가시 문자만 카운트(색이 폭을 잡아먹지 않음).
+        // 가시 4칸 + 색 시퀀스만. SGR이 폭을 잡아먹지 않으므로 width=4에 정확히 맞아
+        // 절단이 일어나지 않는다. 색 → 텍스트 순서로 emit되어 가시 문자만 카운트됨을 확인.
+        let line = "\x1b[31mabcd";
+        let out = truncate_status_line_ansi(line, 4);
+        // 절단 없음: 색 보존 + 누수 차단 reset 부착.
+        assert_eq!(out, "\x1b[31mabcd\x1b[0m");
+        // SGR 4개를 텍스트 사이에 끼워도 가시 폭은 동일(4칸).
+        let interleaved = "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md";
+        let out2 = truncate_status_line_ansi(interleaved, 4);
+        assert_eq!(out2, "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md\x1b[0m");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_never_leaves_dangling_esc() {
+        // ⑱ 임의 폭에서 절단해도 미완결 ESC 0 + SGR 있으면 끝에 `\x1b[0m`.
+        let line = "\x1b[31mabcdefgh\x1b[0m";
+        for max_width in 0_u16..=12 {
+            let out = truncate_status_line_ansi(line, max_width);
+            // ESC가 있으면 마지막 escape는 반드시 완결된 `m`으로 끝나야 한다.
+            if let Some(last_esc) = out.rfind('\x1b') {
+                let tail = &out[last_esc..];
+                assert!(
+                    tail.ends_with('m'),
+                    "max_width={max_width} left dangling ESC: {out:?}"
+                );
+            }
+            // SGR이 하나라도 있으면 reset으로 닫혀야 한다.
+            if out.contains('\x1b') {
+                assert!(
+                    out.ends_with("\x1b[0m"),
+                    "max_width={max_width} missing closing reset: {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_returns_empty_for_zero_width() {
+        // ⑲ max_width=0 → 빈 문자열.
+        assert_eq!(truncate_status_line_ansi("abc", 0), "");
+        assert_eq!(truncate_status_line_ansi("\x1b[31mabc\x1b[0m", 0), "");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_width_one_shows_visible_cell_without_ellipsis() {
+        // ⑳ max_width=1 → ellipsis 생략, 가시 1칸 표시.
+        assert_eq!(truncate_status_line_ansi("abc", 1), "a");
+        // SGR 포함 시에도 가시 1칸 + 닫힘. (color → text 1칸, ellipsis 생략)
+        let out = truncate_status_line_ansi("\x1b[31mabc", 1);
+        assert_eq!(out, "\x1b[31ma\x1b[0m");
     }
 }
