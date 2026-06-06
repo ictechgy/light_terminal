@@ -3328,6 +3328,11 @@ fn attach_with_presence_and_cue(
     // 동기화 상태로 유지된다.
     let mut damage_pending = false;
     let mut last_status_refresh = Instant::now();
+    // content-dedup 백스톱: dedup이 idle에서 실제 redraw를 "내용 변경 시에만"으로 줄였기에
+    // 주기적 redraw가 수행하던 host-side 손상 자가복구(scroll-region 재확인 + 추적 고스트 청소)가
+    // 사라진다. STATUS_HEARTBEAT_FORCED(2초)마다 1번 force_redraw로 dedup을 우회해 실제 redraw를
+    // 강제, 이 자가복구를 복원한다. ~0.5Hz라 4Hz 커서 깜빡임은 재발하지 않는다.
+    let mut last_forced_redraw = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
     let status_command_rx = status_command.as_ref().map(|(rx, _)| rx);
@@ -3466,6 +3471,13 @@ fn attach_with_presence_and_cue(
             // forced(STATUS_HEARTBEAT_FORCED) 세 경로를 가진다. busy PTY 출력 중 확정 손상은
             // fast lane으로 ~50ms 내, 그 외 dirty는 forced 경로로 self-heal이 발화한다.
             // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
+            // content-dedup 백스톱 게이트: idle에서 heartbeat가 발화해 refresh를 시도할 때,
+            // 2초마다 한 번 force_redraw=true로 dedup을 우회해 실제 redraw(reserve 재확인+고스트
+            // 청소+커서 숨김)를 일으킨다. 나머지 시도는 dedup 생략을 유지해 커서를 건드리지 않는다.
+            if last_forced_redraw.elapsed() >= STATUS_HEARTBEAT_FORCED {
+                status_bar.force_redraw = true;
+                last_forced_redraw = Instant::now();
+            }
             if row_runtime.can_draw_status()
                 && !alt_screen_active
                 && heartbeat_due(last_status_refresh.elapsed(), status_dirty, damage_pending)
