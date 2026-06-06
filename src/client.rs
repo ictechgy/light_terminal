@@ -52,6 +52,11 @@ const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 /// 있어 busy-output self-heal은 idle redraw보다 훨씬 느리게 둔다. 평소에는
 /// `ATTACH_OUTPUT_IDLE_TIMEOUT` 경로가 출력이 잠잠해진 직후 status를 복구한다.
 const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_secs(2);
+/// 확정 손상(ED/DECSTBM reset/RIS) 감지 시 self-heal deadline. `observe()`가 status row
+/// 손상을 정밀 판정한 경우(`status_area_dirty`)에만 활성화되는 fast lane이다. 이 값은 동시에
+/// rate-limit 역할도 한다: 연속 출력 중 매 프레임 repaint 폭주를 막으면서도 forced 2초 백스톱
+/// 대신 ~50ms 안에 색/잔상 손상을 복구한다. 50ms는 체감상 즉시이면서 폭주를 억제하는 균형값.
+const STATUS_DAMAGE_HEARTBEAT: Duration = Duration::from_millis(50);
 /// Attach output idle wakeup. This bounds status-bar redraw latency without the
 /// previous 30ms hot poll; heartbeat logic still owns the actual redraw cadence.
 const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3312,6 +3317,11 @@ fn attach_with_presence_and_cue(
     }
     let mut buf = [0_u8; 8192];
     let mut status_dirty = false;
+    // `observe()`가 status row 손상(ED/DECSTBM reset/RIS)을 확정 감지하면 true가 되어 heartbeat
+    // fast lane(STATUS_DAMAGE_HEARTBEAT)을 활성화한다. 성공 repaint로 status_dirty가 클리어되면
+    // (루프 상단에서) 같이 클리어한다. 손상은 항상 status_dirty도 같이 set하므로 두 플래그는
+    // 동기화 상태로 유지된다.
+    let mut damage_pending = false;
     let mut last_status_refresh = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
@@ -3324,6 +3334,13 @@ fn attach_with_presence_and_cue(
                 break;
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
+            // 직전 iteration의 성공 repaint가 status_dirty를 클리어했다면 손상도 복구된 것이므로
+            // damage_pending을 같은 자리에서 클리어한다. 손상 감지는 항상 status_dirty도 set하므로
+            // (forward_pty_output_frame_or_detached), 이 단일 지점만으로 모든 repaint 경로(heartbeat
+            // fast lane, idle, metadata/command, resume/suspend)의 클리어가 누락 없이 커버된다.
+            if !status_dirty {
+                damage_pending = false;
+            }
 
             if let Some(rx) = nested_detection_rx {
                 while let Ok(presence) = rx.try_recv() {
@@ -3438,12 +3455,13 @@ fn attach_with_presence_and_cue(
                     break 'output;
                 }
             }
-            // heartbeat는 idle(STATUS_HEARTBEAT) + forced(STATUS_HEARTBEAT_FORCED) 두 경로를
-            // 모두 가진다. busy PTY 출력 중에도 forced 경로로 self-heal이 발화한다.
+            // heartbeat는 idle(STATUS_HEARTBEAT) + 손상 fast lane(STATUS_DAMAGE_HEARTBEAT) +
+            // forced(STATUS_HEARTBEAT_FORCED) 세 경로를 가진다. busy PTY 출력 중 확정 손상은
+            // fast lane으로 ~50ms 내, 그 외 dirty는 forced 경로로 self-heal이 발화한다.
             // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
             if row_runtime.can_draw_status()
                 && !alt_screen_active
-                && heartbeat_due(last_status_refresh.elapsed(), status_dirty)
+                && heartbeat_due(last_status_refresh.elapsed(), status_dirty, damage_pending)
                 && refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
@@ -3488,7 +3506,11 @@ fn attach_with_presence_and_cue(
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
-            terminal_output_tracker.observe(&buf[..n]);
+            let output_effects = terminal_output_tracker.observe(&buf[..n]);
+            if output_effects.status_area_dirty {
+                // 확정 손상: heartbeat fast lane을 활성화해 forced 2초 대신 ~50ms 내 self-heal한다.
+                damage_pending = true;
+            }
             if let Some(title_cue) = title_cue_runtime.as_mut() {
                 title_cue.observe_pty_output();
             }
@@ -4284,7 +4306,8 @@ fn forward_pty_output_frame_or_detached(
         // agent TUI's erase and subsequent redraw has repeatedly caused submitted
         // prompt lines and color state to disappear. The read timeout/heartbeat
         // paths repaint after output goes quiet, while the forced heartbeat still
-        // bounds recovery during continuous output.
+        // bounds recovery during continuous output. 확정 손상(ED/DECSTBM reset/RIS)은
+        // heartbeat fast lane(STATUS_DAMAGE_HEARTBEAT)으로 ~50ms 내 빠르게 복구된다.
         *status_dirty = true;
     }
 
@@ -4327,12 +4350,21 @@ fn anyhow_error_is_broken_pipe(err: &anyhow::Error) -> bool {
 ///
 /// - **idle 경로**: `!status_dirty` 이고 `STATUS_HEARTBEAT` 경과 시 발화 — PTY가 잠잠한
 ///   동안 외부 DECSTBM 리셋(다른 앱 백그라운드 등)을 self-heal.
+/// - **fast lane(손상 경로)**: `damage_pending`(=`observe()`가 ED/DECSTBM reset/RIS로 status
+///   row 손상을 확정 감지)이고 `STATUS_DAMAGE_HEARTBEAT` 경과 시 발화 — 풀스크린 에이전트
+///   TUI가 status 영역을 손상시킨 경우 forced 2초 백스톱 대신 ~50ms 내 self-heal한다.
+///   `STATUS_DAMAGE_HEARTBEAT` 간격 자체가 rate-limit이라 연속 출력 중에도 매 프레임 repaint
+///   폭주가 일어나지 않는다.
 /// - **forced 경로**: `STATUS_HEARTBEAT_FORCED` 경과 시 dirty 여부와 무관하게 발화 —
 ///   PTY가 연속 출력 중이면 read()가 매번 Ok(n)을 반환해 WouldBlock 분기가 fire하지
 ///   않으므로 status_dirty가 영원히 클리어되지 않는다. 이 경로가 없으면 cmux pane swap /
-///   Termius 백그라운드 복귀 후 status 영역 자가복구가 무한히 차단된다.
-fn heartbeat_due(elapsed: Duration, status_dirty: bool) -> bool {
+///   Termius 백그라운드 복귀 후 status 영역 자가복구가 무한히 차단된다. fast lane이 잡지 못하는
+///   비손상 dirty(예: metadata 변경)의 백스톱이기도 하다.
+fn heartbeat_due(elapsed: Duration, status_dirty: bool, damage_pending: bool) -> bool {
     if !status_dirty && elapsed >= STATUS_HEARTBEAT {
+        return true;
+    }
+    if damage_pending && elapsed >= STATUS_DAMAGE_HEARTBEAT {
         return true;
     }
     elapsed >= STATUS_HEARTBEAT_FORCED
@@ -5592,18 +5624,18 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
-        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBar, StatusCommandConfig,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
-        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, current_unix_ms,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, format_status_line,
+        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBar,
+        StatusCommandConfig, StatusPresencePolicy, StatusPresenceRuntimeHandle,
+        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
+        agent_name_from_command, agent_presence_banner_enabled, agent_presence_cue_enabled,
+        alt_screen_param_matches, anyhow_error_is_broken_pipe, apply_pending_status_command,
+        attach_pty_rows, build_status_payload, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
+        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, keyboard_protocol_restore_bytes,
         likely_agent_session, matches_env_bool, mobile_client_detected,
@@ -8790,35 +8822,70 @@ mod tests {
     #[test]
     fn heartbeat_idle_path_fires_only_when_clean_and_interval_elapsed() {
         // idle 경로: status_dirty=false 이고 STATUS_HEARTBEAT 경과 시 발화한다.
-        // attach 루프 시작 직후 ZERO elapsed는 두 경로 모두 false여야 한다.
-        assert!(!heartbeat_due(Duration::ZERO, false));
-        assert!(!heartbeat_due(Duration::ZERO, true));
+        // damage_pending=false 이므로 fast lane은 비활성. attach 루프 시작 직후
+        // ZERO elapsed는 모든 경로가 false여야 한다.
+        assert!(!heartbeat_due(Duration::ZERO, false, false));
+        assert!(!heartbeat_due(Duration::ZERO, true, false));
         assert!(!heartbeat_due(
             STATUS_HEARTBEAT - Duration::from_millis(1),
+            false,
             false
         ));
-        assert!(heartbeat_due(STATUS_HEARTBEAT, false));
+        assert!(heartbeat_due(STATUS_HEARTBEAT, false, false));
         assert!(heartbeat_due(
             STATUS_HEARTBEAT + Duration::from_millis(50),
+            false,
             false
         ));
     }
 
     #[test]
     fn heartbeat_dirty_blocks_idle_path_until_forced_threshold() {
-        // status_dirty=true 면 STATUS_HEARTBEAT 경과만으로는 발화하지 않고,
-        // STATUS_HEARTBEAT_FORCED 경과 후에 강제 발화한다. 이 경로가 없으면
-        // PTY 연속 출력 중 외부 DECSTBM 리셋을 영원히 회복하지 못한다.
-        assert!(!heartbeat_due(STATUS_HEARTBEAT, true));
+        // status_dirty=true 이고 damage_pending=false 면 STATUS_HEARTBEAT 경과만으로는
+        // 발화하지 않고, STATUS_HEARTBEAT_FORCED 경과 후에 강제 발화한다. 이 경로가 없으면
+        // PTY 연속 출력 중 외부 DECSTBM 리셋을 영원히 회복하지 못한다. fast lane 도입 후에도
+        // 비손상 dirty(damage_pending=false)의 백스톱 타이밍은 불변이어야 한다 — spec (d).
+        assert!(!heartbeat_due(STATUS_HEARTBEAT, true, false));
         assert!(!heartbeat_due(
             STATUS_HEARTBEAT_FORCED - Duration::from_millis(1),
-            true
+            true,
+            false
         ));
-        assert!(heartbeat_due(STATUS_HEARTBEAT_FORCED, true));
+        assert!(heartbeat_due(STATUS_HEARTBEAT_FORCED, true, false));
         assert!(heartbeat_due(
             STATUS_HEARTBEAT_FORCED + Duration::from_millis(100),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn heartbeat_damage_fast_lane_fires_at_short_interval_and_rate_limits() {
+        // 확정 손상 fast lane: damage_pending=true 이고 STATUS_DAMAGE_HEARTBEAT 경과 시
+        // forced 2초를 기다리지 않고 발화한다 — spec (a).
+        assert!(heartbeat_due(STATUS_DAMAGE_HEARTBEAT, true, true));
+        assert!(heartbeat_due(
+            STATUS_DAMAGE_HEARTBEAT + Duration::from_millis(10),
+            true,
             true
         ));
+        // status_dirty=false 여도(예외적) 손상이 확정되면 fast lane이 발화한다.
+        assert!(heartbeat_due(STATUS_DAMAGE_HEARTBEAT, false, true));
+        // rate-limit: STATUS_DAMAGE_HEARTBEAT 미경과면 손상 중이라도 발화하지 않아
+        // 연속 출력 중 매 프레임 repaint 폭주를 막는다 — spec (b).
+        assert!(!heartbeat_due(Duration::ZERO, true, true));
+        assert!(!heartbeat_due(
+            STATUS_DAMAGE_HEARTBEAT - Duration::from_millis(1),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn heartbeat_damage_fast_lane_is_faster_than_forced_backstop() {
+        // fast lane이 forced 백스톱보다 훨씬 빨라야 손상 복구가 체감상 즉시여야 한다.
+        assert!(STATUS_DAMAGE_HEARTBEAT < STATUS_HEARTBEAT_FORCED);
+        assert!(STATUS_DAMAGE_HEARTBEAT < STATUS_HEARTBEAT);
     }
 
     #[test]
