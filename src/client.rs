@@ -3266,7 +3266,12 @@ fn attach_with_presence_and_cue(
     reset_raw_attach_initial_sgr_if_needed(status_enabled, stdout.is_terminal(), &mut stdout)?;
     let status_style = status_enabled
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
-    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
+    let mut status_bar = StatusBar::enter(
+        status_info.as_ref(),
+        status_style,
+        Some(Arc::clone(&alt_screen_state)),
+        &mut stdout,
+    )?;
     let status_metadata_enabled = Arc::new(AtomicBool::new(status_enabled));
     let status_metadata = status_info.as_ref().map(|info| {
         spawn_status_metadata_thread(
@@ -4558,12 +4563,17 @@ struct StatusBar {
     /// true면 draw에서 테마 bg를 입히지 않고 reset으로 시작해 understatus 색이 살게 한다.
     /// false면 plain fallback과 동일하게 테마 bg를 적용한다.
     command_allow_color: bool,
+    /// PTY 출력 스트림에서 추적한 터미널 상태(커서 visibility 등). status 행 repaint 시
+    /// 커서를 잠깐 숨겼다가 PTY 앱이 마지막으로 설정한 visibility로 복원하기 위해 참조한다.
+    /// `None`이면(테스트/미배선) 커서가 보이는 상태(true)로 가정한다.
+    terminal_state: Option<Arc<AltScreenState>>,
 }
 
 impl StatusBar {
     fn enter(
         info: Option<&SessionInfo>,
         style: Option<StatusStyle>,
+        terminal_state: Option<Arc<AltScreenState>>,
         stdout: &mut impl Write,
     ) -> Result<Self> {
         let (session_name, pane_id) = info
@@ -4584,6 +4594,7 @@ impl StatusBar {
             // 기본은 비활성(None)이라 LTERM_STATUS_COMMAND 미설정 시 기존 동작과 동일하다.
             command_line: None,
             command_allow_color: false,
+            terminal_state,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -4627,6 +4638,27 @@ impl StatusBar {
         true
     }
 
+    /// PTY 앱이 노출 중인 커서 visibility. `terminal_state`가 미배선(None)이면 커서가
+    /// 보이는 상태(true)로 가정한다 — 즉 repaint 후 `\x1b[?25h`로 복원해 기존 동작
+    /// (커서를 끄지 않던 시절)을 회귀 없이 유지한다.
+    fn cursor_visible(&self) -> bool {
+        self.terminal_state
+            .as_ref()
+            .is_none_or(|state| state.cursor_visible.load(Ordering::Relaxed))
+    }
+
+    /// repaint 시 커서가 status 행으로 튀어 깜빡이지 않도록, 페이로드 끝에서 PTY 앱의
+    /// 추적된 visibility로 커서를 복원하는 시퀀스. 보임이면 `\x1b[?25h`, 숨김이면
+    /// `\x1b[?25l`. 페이로드 앞에는 항상 `\x1b[?25l`(숨김)을 붙여 cursor save/move/draw/
+    /// restore 동안 커서가 보이지 않게 한다.
+    fn cursor_restore_suffix(&self) -> &'static str {
+        if self.cursor_visible() {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        }
+    }
+
     fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
         if self.style.is_none() {
             return Ok(());
@@ -4635,8 +4667,15 @@ impl StatusBar {
             return Ok(());
         }
         let scroll_bottom = rows - 1;
-        write!(stdout, "\x1b7\x1b[1;{scroll_bottom}r\x1b8")
-            .context("reserve lterm status bar row")?;
+        // DECSTBM(`\x1b[1;{n}r`)은 커서를 home으로 이동시킨다. save/restore로 위치는
+        // 복원되지만, 그 사이 커서가 보이면 codex처럼 메인 버퍼 입력 커서를 노출하는
+        // TUI에서 커서가 잠깐 튄다. 숨김→reserve→추적 상태로 복원으로 감싼다.
+        let cursor_restore = self.cursor_restore_suffix();
+        write!(
+            stdout,
+            "\x1b[?25l\x1b7\x1b[1;{scroll_bottom}r\x1b8{cursor_restore}"
+        )
+        .context("reserve lterm status bar row")?;
         Ok(())
     }
 
@@ -4704,7 +4743,14 @@ impl StatusBar {
         } else {
             ""
         };
-        let mut payload = format!("\x1b7{sgr_push}");
+        // idle 상태에서 status 행은 ~250ms마다(STATUS_HEARTBEAT) repaint된다. cursor
+        // save(`\x1b7`)→status 행으로 이동→draw→restore(`\x1b8`)를 하는 동안 커서가 보이면
+        // codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가 4Hz로 status 행으로 튀며
+        // 깜빡인다. 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에
+        // 설정한 visibility로 복원한다. 단일 write_all로 나가므로 터미널이 한 번에 처리해
+        // 중간 상태(커서가 status 행에 보이는 순간)가 사용자에게 노출되지 않는다.
+        let cursor_restore = self.cursor_restore_suffix();
+        let mut payload = format!("\x1b[?25l\x1b7{sgr_push}");
         for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
@@ -4717,7 +4763,7 @@ impl StatusBar {
             "\x1b[2K"
         };
         payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8"
+            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8{cursor_restore}"
         ));
         stdout
             .write_all(payload.as_bytes())
@@ -4849,17 +4895,38 @@ struct KeyboardProtocolRestoreState {
     kitty_direct_flags: AtomicU32,
 }
 
-/// PTY가 alternate screen buffer에 진입했는지 추적한다. true 동안에는 host-side
-/// status bar 그리기를 일시 중단해 vim/htop 같은 alt-screen 앱과 화면 충돌을 피한다.
-/// PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h` (enter) 와 대응하는 `l` (exit)을 관찰.
+/// PTY가 alternate screen buffer에 진입했는지, 그리고 PTY 앱이 커서를 보이도록
+/// 두고 있는지를 추적한다.
 ///
-/// `Arc<AtomicBool>` + `Ordering::Relaxed` 사용 근거: 현재 단일 attach 스레드에서
+/// `active`: true 동안에는 host-side status bar 그리기를 일시 중단해 vim/htop 같은
+/// alt-screen 앱과 화면 충돌을 피한다. PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h`
+/// (enter) 와 대응하는 `l` (exit)을 관찰한다.
+///
+/// `cursor_visible`: PTY 앱이 마지막으로 설정한 DECTCEM(`\x1b[?25h` 보이기 /
+/// `\x1b[?25l` 숨기기) 상태. status 행 repaint 시 커서를 잠깐 숨겼다가 이 추적값으로
+/// 복원하기 위해 사용한다. codex처럼 메인 버퍼에서 입력 커서를 노출하는 TUI는
+/// 커서가 보이는 상태인데, status repaint가 커서 저장/이동/복원을 하면서 커서를
+/// 숨기지 않으면 4Hz로 커서가 status 행으로 튀며 깜빡인다. 커서는 기본 표시
+/// 상태이므로 초기값은 **true** 다.
+///
+/// `AtomicBool` + `Ordering::Relaxed` 사용 근거: 현재 단일 attach 스레드에서
 /// observe(write)와 attach 루프(read)가 모두 일어나므로 ordering 요구는 없다.
 /// `Arc`는 향후 PTY reader/observer 분리를 대비한 형태이며, 그 때에는 publishing
 /// data가 동반되지 않으면 Relaxed로 충분하다.
-#[derive(Default)]
 struct AltScreenState {
     active: AtomicBool,
+    /// PTY 앱이 노출 중인 커서 visibility(DECTCEM). 기본 true(보임).
+    cursor_visible: AtomicBool,
+}
+
+impl Default for AltScreenState {
+    fn default() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            // 커서는 기본적으로 보이는 상태이므로 true 로 시작한다.
+            cursor_visible: AtomicBool::new(true),
+        }
+    }
 }
 
 struct TerminalOutputTracker {
@@ -5220,10 +5287,12 @@ fn observe_alt_screen_sequences(bytes: &[u8], alt_screen: &AltScreenState) {
 ///   현 구현 수용.
 /// - chunk 경계 분할은 [`TerminalOutputTracker`]가 tail buffer 로 처리한다.
 ///
-/// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)를
-/// 관찰해 `alt_screen.active`를 갱신한다. 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를
-/// 합쳐서 다시 부르며, 그 경우 `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를
-/// 다시 처리하지 않게 막는다.
+/// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)와
+/// 커서 visibility(DECTCEM, `CSI ? 25 h|l`)를 함께 관찰해 각각 `alt_screen.active`와
+/// `alt_screen.cursor_visible`를 갱신한다. 둘 다 같은 `CSI ? <params> h|l` 형태라 한 번의
+/// 스캔으로 처리하며, `?1049;25l`처럼 한 시퀀스에 두 mode가 묶여 오면 둘 다 갱신한다.
+/// 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를 합쳐서 다시 부르며, 그 경우
+/// `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를 다시 처리하지 않게 막는다.
 fn observe_alt_screen_sequences_after(
     bytes: &[u8],
     min_final_index: usize,
@@ -5249,8 +5318,14 @@ fn observe_alt_screen_sequences_after(
             if (0x40..=0x7e).contains(&byte) {
                 if (byte == b'h' || byte == b'l') && j >= min_final_index {
                     let params = &bytes[i + 3..j];
+                    let set = byte == b'h';
                     if alt_screen_param_matches(params) {
-                        alt_screen.active.store(byte == b'h', Ordering::Relaxed);
+                        alt_screen.active.store(set, Ordering::Relaxed);
+                    }
+                    // DECTCEM(`?25h` 보이기 / `?25l` 숨기기) 추적. alt-screen 토글과
+                    // 독립적으로 갱신하므로 `?1049;25l` 같은 그룹에서 둘 다 반영된다.
+                    if dectcem_param_matches(params) {
+                        alt_screen.cursor_visible.store(set, Ordering::Relaxed);
                     }
                 }
                 break;
@@ -5269,6 +5344,17 @@ fn alt_screen_param_matches(params: &[u8]) -> bool {
     params
         .split(|byte| *byte == b';')
         .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
+}
+
+/// `CSI ? <params> h|l`의 params에 DECTCEM(커서 visibility) mode 25가 포함됐는지 검사한다.
+/// `alt_screen_param_matches`와 동일하게 `;`(ECMA-48 parameter separator)로만 split한다.
+/// `:`(subparameter separator)는 split하지 않으므로 `?25:5h`처럼 25의 subparameter가 붙은
+/// 경우를 "mode 25"로 오인하지 않는다. `?1049;25l`처럼 다른 mode와 그룹으로 묶인 경우도
+/// split 후 `25` 토큰을 정확히 잡아낸다.
+fn dectcem_param_matches(params: &[u8]) -> bool {
+    params
+        .split(|byte| *byte == b';')
+        .any(|param| param == b"25")
 }
 
 struct RawModeGuard {
@@ -5643,7 +5729,8 @@ mod tests {
         compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
         compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
         compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
-        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private, format_status_line,
+        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, keyboard_protocol_restore_bytes,
         likely_agent_session, matches_env_bool, mobile_client_detected,
@@ -7490,6 +7577,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7514,6 +7602,118 @@ mod tests {
     }
 
     #[test]
+    fn draw_at_size_hides_cursor_and_restores_visible_by_default() {
+        // terminal_state=None이면 커서가 보이는 상태로 가정 → 페이로드는 `\x1b[?25l`로
+        // 시작하고 `\x1b[?25h`(보임 복원)로 끝나야 한다. repaint 중 커서가 status 행으로
+        // 튀어 깜빡이는 것을 막는다.
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: None,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw with default cursor visibility");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b[?25l"),
+            "draw payload must start by hiding the cursor: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b8\x1b[?25h"),
+            "draw payload must restore cursor visible after \\x1b8: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn draw_at_size_restores_hidden_cursor_when_pty_hid_it() {
+        // PTY 앱이 커서를 숨겨둔 상태(cursor_visible=false)면 repaint 후에도 숨김으로
+        // 복원해야 한다 — 즉 페이로드는 `\x1b[?25l`로 시작하고 `\x1b[?25l`로 끝난다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(Arc::clone(&state)),
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw with hidden cursor");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b[?25l"),
+            "draw payload must start by hiding the cursor: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b8\x1b[?25l"),
+            "draw payload must keep cursor hidden when PTY had it hidden: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn reserve_terminal_area_wraps_cursor_visibility() {
+        // reserve도 DECSTBM이 커서를 home으로 옮기므로 같은 패턴으로 감싼다.
+        // 기본(보임)이면 `\x1b[?25l`로 시작, `\x1b[?25h`로 끝.
+        let status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: None,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .reserve_terminal_area(&mut output, 24)
+            .expect("reserve with default cursor visibility");
+        let payload = String::from_utf8(output).expect("reserve payload should be utf8");
+        assert_eq!(
+            payload, "\x1b[?25l\x1b7\x1b[1;23r\x1b8\x1b[?25h",
+            "reserve must hide cursor, set scroll region, then restore visible"
+        );
+
+        // PTY가 커서를 숨긴 상태면 `\x1b[?25l`로 닫는다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let hidden_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(state),
+        };
+        let mut hidden_output = Vec::new();
+        hidden_bar
+            .reserve_terminal_area(&mut hidden_output, 24)
+            .expect("reserve with hidden cursor");
+        let hidden_payload =
+            String::from_utf8(hidden_output).expect("reserve payload should be utf8");
+        assert_eq!(
+            hidden_payload, "\x1b[?25l\x1b7\x1b[1;23r\x1b8\x1b[?25l",
+            "reserve must keep cursor hidden when PTY had it hidden"
+        );
+    }
+
+    #[test]
     fn status_bar_redraw_clears_rows_hidden_by_shrink_then_growth() {
         let mut status_bar = StatusBar {
             session_name: "omx-lterm".to_string(),
@@ -7523,6 +7723,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7570,6 +7771,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7607,6 +7809,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7616,12 +7819,12 @@ mod tests {
 
         let payload = String::from_utf8(output).expect("status payload should be utf8");
         assert!(
-            payload.starts_with("\x1b7\x1b[#{"),
-            "status redraw should push SGR before any host-side resets: {payload:?}"
+            payload.starts_with("\x1b[?25l\x1b7\x1b[#{"),
+            "status redraw should hide cursor, then push SGR before any host-side resets: {payload:?}"
         );
         assert!(
-            payload.ends_with("\x1b[#}\x1b8"),
-            "status redraw should pop SGR before restoring the application cursor: {payload:?}"
+            payload.ends_with("\x1b[#}\x1b8\x1b[?25h"),
+            "status redraw should pop SGR, restore cursor position, then restore cursor visibility: {payload:?}"
         );
         status_bar.style = None;
     }
@@ -7636,6 +7839,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7663,6 +7867,7 @@ mod tests {
             preserve_sgr_stack: false,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
 
@@ -7675,8 +7880,12 @@ mod tests {
             "status redraw must not emit private SGR stack controls when disabled: {draw_payload:?}"
         );
         assert!(
-            draw_payload.starts_with("\x1b7"),
-            "status redraw still saves the cursor without SGR stack: {draw_payload:?}"
+            draw_payload.starts_with("\x1b[?25l\x1b7"),
+            "status redraw still hides cursor then saves it without SGR stack: {draw_payload:?}"
+        );
+        assert!(
+            draw_payload.ends_with("\x1b8\x1b[?25h"),
+            "status redraw still restores cursor position then visibility without SGR stack: {draw_payload:?}"
         );
         assert!(
             draw_payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
@@ -7722,6 +7931,7 @@ mod tests {
             // 살균을 거친(완결 SGR) 형태를 직접 주입한다.
             command_line: Some("\x1b[31mstatus\x1b[0m".to_string()),
             command_allow_color: true,
+            terminal_state: None,
         };
         let mut output = Vec::new();
         status_bar
@@ -7749,14 +7959,14 @@ mod tests {
             payload.contains("\x1b[0m\x1b[K"),
             "trailing reset + clear-to-eol must be preserved: {payload:?}"
         );
-        // scroll-region/cursor save·restore + SGR stack 보호장치 유지.
+        // cursor hide + scroll-region/cursor save·restore + SGR stack 보호장치 + cursor 복원 유지.
         assert!(
-            payload.starts_with("\x1b7\x1b[#{"),
-            "cursor save + SGR push preserved: {payload:?}"
+            payload.starts_with("\x1b[?25l\x1b7\x1b[#{"),
+            "cursor hide + cursor save + SGR push preserved: {payload:?}"
         );
         assert!(
-            payload.ends_with("\x1b[#}\x1b8"),
-            "SGR pop + cursor restore preserved: {payload:?}"
+            payload.ends_with("\x1b[#}\x1b8\x1b[?25h"),
+            "SGR pop + cursor position restore + cursor visibility restore preserved: {payload:?}"
         );
         status_bar.style = None;
     }
@@ -7773,6 +7983,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: Some("plain-status".to_string()),
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut output = Vec::new();
         status_bar
@@ -7803,6 +8014,7 @@ mod tests {
             command_line: None,
             // allow_color가 true라도 command_line이 None이면 fallback이라 영향 없어야 한다.
             command_allow_color: true,
+            terminal_state: None,
         };
         let mut command_output = Vec::new();
         command_bar
@@ -7818,6 +8030,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         let mut baseline_output = Vec::new();
         baseline_bar
@@ -7850,6 +8063,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: Some(long),
             command_allow_color: true,
+            terminal_state: None,
         };
         let mut output = Vec::new();
         // cols=20 → safe_width=19.
@@ -8032,6 +8246,7 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
         };
         status_bar
             .draw_at_size(&mut output, 80, 24)
@@ -8744,17 +8959,85 @@ mod tests {
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
         let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
-        // xterm 그룹 set: ?47;1049h → 1049 매치 → enter
+        // 기본 cursor visibility는 보임(true).
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+
+        // xterm 그룹 set: ?47;1049h → 1049 매치 → enter (커서 visibility는 미변경)
         tracker.observe(b"\x1b[?47;1049h");
         assert!(state.active.load(Ordering::Relaxed));
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
 
-        // 그룹 reset: ?1049;25l → 1049 매치 → exit
+        // 그룹 reset: ?1049;25l → 1049 매치 → exit, 그리고 25 매치 → 커서 숨김.
+        // 한 시퀀스에 alt-screen과 DECTCEM이 함께 와도 둘 다 갱신돼야 한다.
         tracker.observe(b"\x1b[?1049;25l");
         assert!(!state.active.load(Ordering::Relaxed));
+        assert!(
+            !state.cursor_visible.load(Ordering::Relaxed),
+            "그룹 param의 25l은 커서 visibility도 false로 갱신해야 한다"
+        );
 
-        // 첫번째 파라미터가 무관해도 두번째가 alt-screen이면 매치
+        // 첫번째 파라미터가 무관해도 두번째가 alt-screen이면 매치.
+        // ?25;1049h → 1049 매치 → enter, 그리고 25h → 커서 보임 복원.
         tracker.observe(b"\x1b[?25;1049h");
         assert!(state.active.load(Ordering::Relaxed));
+        assert!(
+            state.cursor_visible.load(Ordering::Relaxed),
+            "그룹 param의 25h은 커서 visibility도 true로 갱신해야 한다"
+        );
+    }
+
+    #[test]
+    fn dectcem_param_matches_detects_mode_25_only() {
+        // 단일 mode 25 → true
+        assert!(dectcem_param_matches(b"25"));
+        // 그룹의 끝/중간/시작에 25가 있으면 true (`;` split 기반)
+        assert!(dectcem_param_matches(b"1049;25"));
+        assert!(dectcem_param_matches(b"25;1049"));
+        assert!(dectcem_param_matches(b"47;25;1006"));
+        // 25를 포함하지 않는 mode들 → false
+        assert!(!dectcem_param_matches(b"47"));
+        assert!(!dectcem_param_matches(b"2004"));
+        assert!(!dectcem_param_matches(b"1004"));
+        // 25를 부분 문자열로 포함하지만 독립 토큰이 아니면 false (`;` split이라 1025/250 미오인)
+        assert!(!dectcem_param_matches(b"1025"));
+        assert!(!dectcem_param_matches(b"250"));
+        // `:`는 subparameter separator라 split하지 않는다 → `25:5`는 mode 25가 아님
+        assert!(!dectcem_param_matches(b"25:5"));
+    }
+
+    #[test]
+    fn cursor_visibility_tracker_observes_hide_and_show() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
+
+        // 기본은 보임(true).
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        // ?25l → 숨김
+        tracker.observe(b"prompt\x1b[?25lhidden");
+        assert!(!state.cursor_visible.load(Ordering::Relaxed));
+        // ?25h → 다시 보임
+        tracker.observe(b"\x1b[?25hshown");
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        // DECTCEM 토글은 alt-screen active를 건드리지 않는다.
+        assert!(!state.active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cursor_visibility_sequence_split_across_chunks_observed() {
+        // 청크 경계로 `\x1b[?25l`이 쪼개져도 tail 버퍼 합성 경로가 잡아낸다.
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
+
+        tracker.observe(b"prefix\x1b[?2");
+        // 아직 종결자 없음 → 미변경(기본 true 유지)
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        tracker.observe(b"5l");
+        assert!(
+            !state.cursor_visible.load(Ordering::Relaxed),
+            "청크 경계로 잘린 ?25l도 boundary 경로가 잡아 숨김으로 갱신해야 한다"
+        );
     }
 
     #[test]
