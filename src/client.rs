@@ -3428,17 +3428,18 @@ fn attach_with_presence_and_cue(
             // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
             // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
             // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
-            if row_runtime.can_draw_status()
-                && prev_alt_screen_active
-                && !alt_screen_active
-                && refresh_status_or_detached(
+            if row_runtime.can_draw_status() && prev_alt_screen_active && !alt_screen_active {
+                // alt-screen에서 status 행이 숨겨졌다 복귀한 것이라, 그릴 본문이 직전과
+                // 동일해도 content-dedup을 우회해 반드시 한 번 그려야 한다.
+                status_bar.force_redraw = true;
+                if refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?
-            {
-                break;
+                )? {
+                    break;
+                }
             }
             prev_alt_screen_active = alt_screen_active;
 
@@ -3523,6 +3524,9 @@ fn attach_with_presence_and_cue(
             if output_effects.status_area_dirty {
                 // 확정 손상: heartbeat fast lane을 활성화해 forced 2초 대신 ~50ms 내 self-heal한다.
                 damage_pending = true;
+                // 손상은 그릴 본문이 직전과 동일해도 화면이 깨진 상태라 content-dedup을 우회해
+                // 반드시 한 번 redraw해야 한다. force_redraw로 다음 refresh가 dedup을 강제 통과한다.
+                status_bar.force_redraw = true;
             }
             if let Some(title_cue) = title_cue_runtime.as_mut() {
                 title_cue.observe_pty_output();
@@ -4144,8 +4148,14 @@ fn refresh_status(
     status_dirty: &mut bool,
     last_status_refresh: &mut Instant,
 ) -> Result<()> {
-    status_bar.refresh(stdout)?;
-    stdout.flush().context("flush stdout")?;
+    // content-dedup으로 본문이 직전과 동일하면 refresh가 아무것도 쓰지 않고 drew=false를
+    // 반환한다 — 이때 flush는 생략한다(불필요한 syscall 회피). status_dirty는 어느 경우든
+    // 클리어해 "처리됨"으로 표시하고, 타이머는 매 attempt 리셋해 idle 재검 250ms 스로틀을
+    // 유지한다(본문 변화가 없으면 drew=false라 실제 redraw 빈도는 4Hz→내용변경 시에만으로 준다).
+    let drew = status_bar.refresh(stdout)?;
+    if drew {
+        stdout.flush().context("flush stdout")?;
+    }
     *status_dirty = false;
     *last_status_refresh = Instant::now();
     Ok(())
@@ -4263,6 +4273,9 @@ fn resume_status_row(
                     .set_status_scroll_bottom(status_scroll_bottom_for_terminal_rows(rows, true));
                 status_bar.update_info(&info);
                 status_bar.style = Some(resolve_status_style(info.status_theme));
+                // suspend 동안 status 행이 화면에서 사라졌으므로, 복귀 시 본문이 직전과
+                // 동일해도 content-dedup을 우회해 반드시 한 번 그려야 한다.
+                status_bar.force_redraw = true;
                 match refresh_status_or_detached(
                     status_bar,
                     stdout,
@@ -4567,6 +4580,16 @@ struct StatusBar {
     /// 커서를 잠깐 숨겼다가 PTY 앱이 마지막으로 설정한 visibility로 복원하기 위해 참조한다.
     /// `None`이면(테스트/미배선) 커서가 보이는 상태(true)로 가정한다.
     terminal_state: Option<Arc<AltScreenState>>,
+    /// 직전 `refresh`에서 실제로 화면에 쓴 "본문"(reserve seq + 행 draw 페이로드, 단 커서
+    /// visibility 토글은 제외). content-dedup 키로 쓴다. codex 같은 메인버퍼 TUI는 idle에서도
+    /// 스피너를 ~4회/초 출력해 status_dirty를 계속 set하지만, 그릴 본문이 직전과 동일하면
+    /// reserve/draw/커서 envelope를 통째로 생략해 4Hz 커서 건드림(=깜빡임)을 없앤다.
+    /// `None`이면 아직 한 번도 그리지 않은 상태라 무조건 그린다.
+    last_body: Option<String>,
+    /// 본문이 직전과 동일해도 반드시 redraw해야 하는 경우(화면 손상, alt-screen 복귀,
+    /// resume 등)에 한 번 true로 세팅한다. dedup 키와 무관하게 한 번 강제로 그린 뒤
+    /// `refresh` 내부에서 false로 리셋한다. enter 시점 첫 draw도 기본 true로 커버한다.
+    force_redraw: bool,
 }
 
 impl StatusBar {
@@ -4595,6 +4618,10 @@ impl StatusBar {
             command_line: None,
             command_allow_color: false,
             terminal_state,
+            // 첫 draw는 last_body가 없어 어차피 dedup 미스로 그려지지만, force_redraw=true로도
+            // 명시해 enter 시점 reserve+draw가 확실히 화면에 나가게 한다.
+            last_body: None,
+            force_redraw: true,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -4621,10 +4648,42 @@ impl StatusBar {
         Ok(status)
     }
 
-    fn refresh(&mut self, stdout: &mut impl Write) -> Result<()> {
-        let (_, rows) = terminal_size();
-        self.reserve_terminal_area(stdout, rows)?;
-        self.draw(stdout)
+    /// status 행을 다시 그린다. content-dedup: 그릴 "본문"(reserve seq + 행 draw 페이로드,
+    /// 커서 visibility 토글은 제외)이 직전과 동일하고 `force_redraw`도 아니면 reserve/draw/커서를
+    /// 일절 건드리지 않고 `Ok(false)`를 반환한다. codex 같은 메인버퍼 TUI는 idle에서도 스피너를
+    /// ~4회/초 출력해 status_dirty를 계속 set하지만, 본문이 같으면 이 dedup이 4Hz 커서 건드림
+    /// (=깜빡임)을 없앤다. 실제로 그릴 때는 reserve+draw+커서 envelope를 단일 write_all로 묶어
+    /// `\x1b[?25l`(숨김) → 본문 → 추적 visibility 복원 1회로 내보내 중간 깜빡임을 방지한다.
+    /// 반환값은 실제로 화면에 썼는지(drew) 여부 — 호출자는 true일 때만 flush한다.
+    fn refresh(&mut self, stdout: &mut impl Write) -> Result<bool> {
+        let (cols, rows) = terminal_size();
+        // 본문 = reserve seq + 행 draw 페이로드. 둘 다 커서 visibility 토글을 제외한 순수 본문이라
+        // 커서가 보임↔숨김으로만 바뀐 경우는 dedup 키가 동일해 redraw하지 않는다(의도).
+        let body = self.build_reserve_body(rows) + &self.build_draw_body(cols, rows);
+        if body.is_empty() {
+            // rows<=1/cols<=1 등으로 그릴 본문이 없으면 아무것도 쓰지 않는다. force_redraw와
+            // last_body는 유지해, 터미널이 다시 커져 그릴 수 있게 되면 그때 반영되도록 한다.
+            return Ok(false);
+        }
+        // force_redraw가 아니고 본문이 직전과 같으면 reserve/draw/커서 전부 생략한다.
+        if !self.force_redraw && self.last_body.as_deref() == Some(body.as_str()) {
+            return Ok(false);
+        }
+        // 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에 설정한
+        // visibility로 복원한다. reserve+draw+커서 envelope를 합쳐 단일 write_all로 내보낸다.
+        let cursor_restore = self.cursor_restore_suffix();
+        let payload = format!("\x1b[?25l{body}{cursor_restore}");
+        stdout
+            .write_all(payload.as_bytes())
+            .context("refresh lterm status bar")?;
+        // draw 본문이 실제로 나갔으므로 drawn_status_rows bookkeeping을 갱신한다.
+        // build_draw_body는 non-mutating이라 그 사이 drawn_status_rows가 바뀌지 않았고,
+        // 따라서 여기서 다시 계산한 rows_to_clear는 본문 빌드 때와 동일하다.
+        let rows_to_clear = self.visible_previous_status_rows(rows);
+        self.remember_status_row(rows, &rows_to_clear);
+        self.last_body = Some(body);
+        self.force_redraw = false;
+        Ok(true)
     }
 
     fn update_info(&mut self, info: &SessionInfo) -> bool {
@@ -4659,23 +4718,28 @@ impl StatusBar {
         }
     }
 
-    fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
-        if self.style.is_none() {
-            return Ok(());
-        }
-        if rows <= 1 {
-            return Ok(());
+    /// reserve의 "본문"(커서 visibility 토글 제외): `\x1b7\x1b[1;{n}r\x1b8`. style이 없거나
+    /// rows<=1이면 빈 문자열을 반환한다. content-dedup 키 구성과 envelope 1회 wrap에 쓰인다.
+    /// DECSTBM(`\x1b[1;{n}r`)은 커서를 home으로 이동시키지만 save/restore(`\x1b7`/`\x1b8`)로
+    /// 위치는 복원된다. 커서 숨김/복원은 호출자(`reserve_terminal_area`/`refresh`)가 감싼다.
+    fn build_reserve_body(&self, rows: u16) -> String {
+        if self.style.is_none() || rows <= 1 {
+            return String::new();
         }
         let scroll_bottom = rows - 1;
-        // DECSTBM(`\x1b[1;{n}r`)은 커서를 home으로 이동시킨다. save/restore로 위치는
-        // 복원되지만, 그 사이 커서가 보이면 codex처럼 메인 버퍼 입력 커서를 노출하는
-        // TUI에서 커서가 잠깐 튄다. 숨김→reserve→추적 상태로 복원으로 감싼다.
+        format!("\x1b7\x1b[1;{scroll_bottom}r\x1b8")
+    }
+
+    fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
+        let body = self.build_reserve_body(rows);
+        if body.is_empty() {
+            return Ok(());
+        }
+        // 그 사이 커서가 보이면 codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가
+        // 잠깐 튄다. 숨김→reserve→추적 상태로 복원으로 감싼다.
         let cursor_restore = self.cursor_restore_suffix();
-        write!(
-            stdout,
-            "\x1b[?25l\x1b7\x1b[1;{scroll_bottom}r\x1b8{cursor_restore}"
-        )
-        .context("reserve lterm status bar row")?;
+        write!(stdout, "\x1b[?25l{body}{cursor_restore}")
+            .context("reserve lterm status bar row")?;
         Ok(())
     }
 
@@ -4684,10 +4748,15 @@ impl StatusBar {
         self.draw_at_size(stdout, cols, rows)
     }
 
-    fn draw_at_size(&mut self, stdout: &mut impl Write, cols: u16, rows: u16) -> Result<()> {
+    /// status 행 draw의 "본문"(커서 visibility 토글 제외)을 만든다. 페이로드 형태는
+    /// `\x1b7{sgr_push}{이전행 clear}*\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8`.
+    /// 가드(rows<=1/cols<=1/style None)에 걸리면 빈 문자열을 반환한다. 순수 함수라
+    /// `remember_status_row` 같은 side-effect는 호출하지 않는다 — content-dedup 키 구성과
+    /// envelope 1회 wrap에 안전하게 재사용하기 위함이다.
+    fn build_draw_body(&self, cols: u16, rows: u16) -> String {
         // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
         if rows <= 1 || cols <= 1 {
-            return Ok(());
+            return String::new();
         }
         // 마지막 칸까지 채우면 일부 모바일 터미널(예: Termius)에서 deferred-wrap 미구현으로
         // 즉시 스크롤이 발생해 status line이 본문으로 밀려 올라간다. cols-1만 그린다.
@@ -4717,7 +4786,7 @@ impl StatusBar {
         // escape는 이미 제거되고 SGR 끝에 reset이 붙으므로 색 누수는 차단된다.
         let style = match self.style {
             Some(style) => style,
-            None => return Ok(()),
+            None => return String::new(),
         };
         let sgr = if use_theme_bg { style.sgr() } else { "\x1b[0m" };
         // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
@@ -4743,31 +4812,41 @@ impl StatusBar {
         } else {
             ""
         };
-        // idle 상태에서 status 행은 ~250ms마다(STATUS_HEARTBEAT) repaint된다. cursor
-        // save(`\x1b7`)→status 행으로 이동→draw→restore(`\x1b8`)를 하는 동안 커서가 보이면
-        // codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가 4Hz로 status 행으로 튀며
-        // 깜빡인다. 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에
-        // 설정한 visibility로 복원한다. 단일 write_all로 나가므로 터미널이 한 번에 처리해
-        // 중간 상태(커서가 status 행에 보이는 순간)가 사용자에게 노출되지 않는다.
-        let cursor_restore = self.cursor_restore_suffix();
-        let mut payload = format!("\x1b[?25l\x1b7{sgr_push}");
+        let mut body = format!("\x1b7{sgr_push}");
         for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
             // 중간에 남아 "statusline 여러 개"처럼 보인다.
-            payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
+            body.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
         let current_row_clear = if self.drawn_status_rows.contains(&rows) {
             ""
         } else {
             "\x1b[2K"
         };
-        payload.push_str(&format!(
-            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8{cursor_restore}"
+        body.push_str(&format!(
+            "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8"
         ));
+        body
+    }
+
+    fn draw_at_size(&mut self, stdout: &mut impl Write, cols: u16, rows: u16) -> Result<()> {
+        let body = self.build_draw_body(cols, rows);
+        if body.is_empty() {
+            return Ok(());
+        }
+        // idle 상태에서 status 행은 ~250ms마다(STATUS_HEARTBEAT) repaint된다. cursor
+        // save(`\x1b7`)→status 행으로 이동→draw→restore(`\x1b8`)를 하는 동안 커서가 보이면
+        // codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가 status 행으로 튀며
+        // 깜빡인다. 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에
+        // 설정한 visibility로 복원한다. 단일 write_all로 나가므로 터미널이 한 번에 처리해
+        // 중간 상태(커서가 status 행에 보이는 순간)가 사용자에게 노출되지 않는다.
+        let cursor_restore = self.cursor_restore_suffix();
+        let payload = format!("\x1b[?25l{body}{cursor_restore}");
         stdout
             .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
+        let rows_to_clear = self.visible_previous_status_rows(rows);
         self.remember_status_row(rows, &rows_to_clear);
         Ok(())
     }
@@ -7578,6 +7657,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7615,6 +7696,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         status_bar
@@ -7647,6 +7730,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: Some(Arc::clone(&state)),
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         status_bar
@@ -7677,6 +7762,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         status_bar
@@ -7700,6 +7787,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: Some(state),
+            last_body: None,
+            force_redraw: true,
         };
         let mut hidden_output = Vec::new();
         hidden_bar
@@ -7713,6 +7802,177 @@ mod tests {
         );
     }
 
+    /// content-dedup 테스트용 StatusBar 생성. command_line으로 본문을 결정적으로 바꿔
+    /// terminal_size()(테스트 환경 fallback 80x24)와 무관하게 dedup 키 차이를 만든다.
+    fn dedup_test_status_bar(command_line: Option<&str>) -> StatusBar {
+        StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: command_line.map(str::to_string),
+            command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+        }
+    }
+
+    /// dedup이 안정화될 때까지 refresh를 반복한다(=Ok(false)로 skip할 때까지). 첫 draw는
+    /// 현재 행을 `\x1b[2K`로 비우지만, drawn_status_rows에 등록된 뒤(remember_status_row)에는
+    /// 같은 행 redraw가 그 clear를 생략한다(same-row flicker 회피). 따라서 본문은 첫 draw
+    /// 후 한 번 바뀐 뒤 안정화되므로, dedup 테스트는 그 안정 지점부터 검증한다.
+    fn refresh_until_stable(status_bar: &mut StatusBar) {
+        for _ in 0..4 {
+            let mut sink = Vec::new();
+            if !status_bar
+                .refresh(&mut sink)
+                .expect("refresh while stabilizing")
+            {
+                return;
+            }
+        }
+        panic!("refresh did not stabilize (dedup never engaged)");
+    }
+
+    #[test]
+    fn refresh_skips_redraw_when_body_unchanged() {
+        // (a) 동일 본문 + force_redraw=false면 refresh가 Ok(false)로 skip하고 아무것도 쓰지 않는다.
+        // codex 스피너가 status_dirty를 4Hz로 set해도 본문이 같으면 커서를 일절 건드리지 않는다.
+        let mut status_bar = dedup_test_status_bar(None);
+        let mut first = Vec::new();
+        let drew_first = status_bar.refresh(&mut first).expect("first refresh draws");
+        assert!(
+            drew_first,
+            "first refresh must draw (force_redraw 기본 true)"
+        );
+        assert!(!first.is_empty(), "first refresh must write a payload");
+
+        refresh_until_stable(&mut status_bar);
+
+        // 안정화 이후 동일 본문 refresh는 아무것도 쓰지 않아야 한다(커서 미접촉).
+        let mut deduped = Vec::new();
+        let drew = status_bar
+            .refresh(&mut deduped)
+            .expect("stable refresh dedups");
+        assert!(
+            !drew,
+            "refresh with identical body must return Ok(false) once stable"
+        );
+        assert!(
+            deduped.is_empty(),
+            "deduped refresh must not write anything (cursor untouched): {deduped:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_redraws_when_body_changes() {
+        // (b) 본문이 바뀌면(command_line 변경) Ok(true)로 다시 쓴다.
+        let mut status_bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut status_bar);
+
+        // 같은 본문 — skip.
+        let mut unchanged = Vec::new();
+        assert!(
+            !status_bar
+                .refresh(&mut unchanged)
+                .expect("unchanged refresh"),
+            "identical body should dedup once stable"
+        );
+
+        // command_line을 바꿔 본문을 변경 → 다시 그려야 한다.
+        status_bar.command_line = Some("\x1b[32mbusy\x1b[0m".to_string());
+        let mut changed = Vec::new();
+        let drew = status_bar.refresh(&mut changed).expect("changed refresh");
+        assert!(drew, "changed body must redraw");
+        assert!(!changed.is_empty(), "changed refresh must write a payload");
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_force_redraw_overrides_dedup() {
+        // (c) force_redraw=true면 본문이 동일해도 다시 쓰고, 그 후 force_redraw는 false로 리셋된다.
+        let mut status_bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut status_bar);
+
+        status_bar.force_redraw = true;
+        let mut forced = Vec::new();
+        let drew = status_bar.refresh(&mut forced).expect("forced refresh");
+        assert!(drew, "force_redraw must draw even with identical body");
+        assert!(!forced.is_empty(), "forced refresh must write a payload");
+        assert!(
+            !status_bar.force_redraw,
+            "force_redraw must reset to false after a real draw"
+        );
+
+        // 리셋 후 동일 본문은 다시 dedup된다.
+        let mut after = Vec::new();
+        assert!(
+            !status_bar.refresh(&mut after).expect("post-force refresh"),
+            "after force_redraw reset, identical body dedups again"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_payload_hides_cursor_and_restores_tracked_visibility() {
+        // (d) 실제로 쓸 때 페이로드는 `\x1b[?25l`(숨김)로 시작하고 추적된 visibility로 복원한다.
+        // terminal_state=None(보임 가정) → `\x1b[?25h`로 끝난다.
+        let mut visible_bar = dedup_test_status_bar(None);
+        let mut visible_payload = Vec::new();
+        assert!(
+            visible_bar
+                .refresh(&mut visible_payload)
+                .expect("visible refresh"),
+            "first refresh draws"
+        );
+        let visible = String::from_utf8(visible_payload).expect("payload utf8");
+        assert!(
+            visible.starts_with("\x1b[?25l"),
+            "refresh payload must start by hiding the cursor: {visible:?}"
+        );
+        assert!(
+            visible.ends_with("\x1b[?25h"),
+            "refresh payload must restore cursor visible by default: {visible:?}"
+        );
+        visible_bar.style = None;
+
+        // PTY가 커서를 숨긴 상태면 `\x1b[?25l`로 닫는다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let mut hidden_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(state),
+            last_body: None,
+            force_redraw: true,
+        };
+        let mut hidden_payload = Vec::new();
+        assert!(
+            hidden_bar
+                .refresh(&mut hidden_payload)
+                .expect("hidden refresh"),
+            "first refresh draws"
+        );
+        let hidden = String::from_utf8(hidden_payload).expect("payload utf8");
+        assert!(
+            hidden.starts_with("\x1b[?25l"),
+            "refresh payload must start by hiding the cursor: {hidden:?}"
+        );
+        assert!(
+            hidden.ends_with("\x1b[?25l"),
+            "refresh payload must keep cursor hidden when PTY had it hidden: {hidden:?}"
+        );
+        hidden_bar.style = None;
+    }
+
     #[test]
     fn status_bar_redraw_clears_rows_hidden_by_shrink_then_growth() {
         let mut status_bar = StatusBar {
@@ -7724,6 +7984,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7772,6 +8034,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7810,6 +8074,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7840,6 +8106,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7868,6 +8136,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
 
@@ -7932,6 +8202,8 @@ mod tests {
             command_line: Some("\x1b[31mstatus\x1b[0m".to_string()),
             command_allow_color: true,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         status_bar
@@ -7984,6 +8256,8 @@ mod tests {
             command_line: Some("plain-status".to_string()),
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         status_bar
@@ -8015,6 +8289,8 @@ mod tests {
             // allow_color가 true라도 command_line이 None이면 fallback이라 영향 없어야 한다.
             command_allow_color: true,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut command_output = Vec::new();
         command_bar
@@ -8031,6 +8307,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut baseline_output = Vec::new();
         baseline_bar
@@ -8064,6 +8342,8 @@ mod tests {
             command_line: Some(long),
             command_allow_color: true,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         let mut output = Vec::new();
         // cols=20 → safe_width=19.
@@ -8247,6 +8527,8 @@ mod tests {
             command_line: None,
             command_allow_color: false,
             terminal_state: None,
+            last_body: None,
+            force_redraw: true,
         };
         status_bar
             .draw_at_size(&mut output, 80, 24)
