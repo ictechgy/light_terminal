@@ -3334,10 +3334,11 @@ fn attach_with_presence_and_cue(
                 break;
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
-            // 직전 iteration의 성공 repaint가 status_dirty를 클리어했다면 손상도 복구된 것이므로
-            // damage_pending을 같은 자리에서 클리어한다. 손상 감지는 항상 status_dirty도 set하므로
-            // (forward_pty_output_frame_or_detached), 이 단일 지점만으로 모든 repaint 경로(heartbeat
-            // fast lane, idle, metadata/command, resume/suspend)의 클리어가 누락 없이 커버된다.
+            // 백스톱 클리어: idle/alt-exit/resume 등 출력이 잠잠한 repaint 경로는 status_dirty를
+            // 클리어한 뒤 다시 set하지 않으므로, 여기서 damage_pending도 함께 내린다. can_draw_status가
+            // false인 suspend 구간에서 set된 damage_pending(이때는 status_dirty가 set되지 않음)도
+            // 여기서 안전하게 정리된다. 단, busy 출력 경로는 forward가 매 iteration status_dirty를
+            // 다시 set해 이 지점이 발화하지 못하므로, fast lane 분기가 복구 시점에 직접 클리어한다(아래).
             if !status_dirty {
                 damage_pending = false;
             }
@@ -3462,14 +3463,21 @@ fn attach_with_presence_and_cue(
             if row_runtime.can_draw_status()
                 && !alt_screen_active
                 && heartbeat_due(last_status_refresh.elapsed(), status_dirty, damage_pending)
-                && refresh_status_or_detached(
+            {
+                // 이 repaint가 status row 손상을 복구하므로 fast lane 플래그를 여기서 내린다.
+                // busy 출력은 forward가 매 iteration status_dirty를 다시 set해 루프 상단의
+                // `!status_dirty` 백스톱이 발화하지 못한다 — 복구 시점에 직접 클리어하지 않으면
+                // 단발 손상 후에도 출력이 끝날 때까지 50ms마다 불필요한 repaint가 지속된다.
+                // 새 손상이 오면 observe()가 다음 청크에서 다시 set한다.
+                damage_pending = false;
+                if refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?
-            {
-                break;
+                )? {
+                    break;
+                }
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
