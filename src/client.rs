@@ -4458,6 +4458,97 @@ fn status_sgr_stack_supported() -> bool {
         || matches!(term.as_str(), "xterm" | "wezterm")
 }
 
+// ── cross-env status 백엔드 라우팅 (PoC1: 순수 결정 함수 + 타입만, 아직 미배선) ──
+//
+// 연구 결론(memory: lterm-status-default-on §B): 일반 터미널 + 메인버퍼 에이전트에서
+// 분리형 status 한 줄의 무손상 공존은 원리적으로 불가능하다. 안전은 (1) host가 곧
+// 터미널이거나(tmux/cmux) (2) 셀 그리드 밖 네이티브 렌더(iTerm)일 때만 성립한다.
+// 따라서 단일 boolean(status_enabled) 대신 환경/정책으로 "가장 안전한 메커니즘"을
+// 고르는 라우팅이 필요하다. 이 PoC는 그 결정 로직만 순수 함수로 확정하고, 실제 렌더
+// 배선(StatusBackend trait, cmux surface 위임 등)은 후속 단계로 분리한다.
+
+/// status row를 어떤 메커니즘으로 표시할지 결정한 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // PoC1: 라우팅 결정만 — 렌더 배선은 후속에서 소비.
+enum StatusBackend {
+    /// 미표시(env 강제 off / 비-TTY / 기하 부족).
+    Disabled,
+    /// 현행 DECSTBM 단일행 오버레이(plain 터미널 best-effort, 에이전트와 ~50ms 수렴).
+    DecstbmOverlay,
+    /// 터미널 네이티브 chrome(iTerm OSC1337 user var/타이틀). 셀 그리드 밖, plain text·단일라인.
+    NativeChrome,
+    /// 별도 surface 위임(cmux split=ghostty PTY / 진짜 tmux status-line). 멀티라인·truecolor 안전.
+    DelegatedSurface(SurfaceKind),
+    /// 에이전트엔 분리형 row를 양보하고 타이틀 cue + LTERM_SESSION/LTERM_PANE 위임(유일 무손상).
+    TitleCueDelegation,
+}
+
+/// [`StatusBackend::DelegatedSurface`]가 위임할 외부 surface 종류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SurfaceKind {
+    /// cmux 별도 surface(open_cmux_split/send_cmux_attach 경로).
+    Cmux,
+    /// 진짜 tmux status-line(set-option status-left/right + #(cmd)).
+    Tmux,
+}
+
+/// [`select_status_backend`]의 순수 입력. 환경 신호 스냅샷(side-effect 없이 테스트가 구성).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct StatusEnvSnapshot {
+    /// TTY + rows>1 + cols>0. false면 무조건 Disabled.
+    terminal_capable: bool,
+    /// LTERM_NO_STATUS=1 또는 LTERM_STATUS=0로 강제 off([`status_bar_disabled_by_env`]).
+    forced_off: bool,
+    /// cmux 환경([`crate::tmux_compat::inside_cmux`] 상당). 별도 surface가 에이전트와도 안전.
+    inside_cmux: bool,
+    /// 진짜 tmux 내부($TMUX). lterm이 tmux-compat를 '제공'하는 케이스는 제외해야 함.
+    real_tmux: bool,
+    /// iTerm2 식별(TERM_PROGRAM/LC_TERMINAL에 iterm).
+    is_iterm: bool,
+    /// iTerm 네이티브 chrome 위임 opt-in(예: LTERM_STATUS_ITERM=1). 명시 설정시에만 NativeChrome.
+    iterm_native_optin: bool,
+}
+
+/// 환경/정책으로 가장 안전한 status 백엔드를 고른다(순수 함수, side-effect 없음).
+///
+/// 우선순위는 "자원 경쟁 없는 분리 렌더"부터 "scroll-region 공유 best-effort"까지 내림차순:
+/// 1) env 강제 off / 터미널·기하 미충족 → `Disabled`.
+/// 2) `ForceRow`(사용자가 in-terminal row를 명시 강제) → `DecstbmOverlay`(위임보다 우선).
+/// 3) cmux → `DelegatedSurface(Cmux)`. 별 surface라 에이전트와도 무손상 → RowOff 검사보다 먼저.
+/// 4) 진짜 tmux → `DelegatedSurface(Tmux)`. status-line이 행을 전담.
+/// 5) iTerm2 + opt-in → `NativeChrome`. 셀 그리드 밖 안전(명시 opt-in은 사용자 의도이므로
+///    에이전트(RowOff)보다 먼저 — opt-in 했다면 에이전트 status도 네이티브로 보고 싶다는 뜻).
+/// 6) `RowOff`(에이전트) → `TitleCueDelegation`. 분리형 row 미표시 + 타이틀/자체 statusline 위임.
+/// 7) 그 외(`RowAuto`, plain/iTerm-no-optin) → `DecstbmOverlay` best-effort.
+///
+/// 주: 3)에서 cmux는 RowAuto(셸) 세션도 별 surface로 위임한다(배치 일관성). 셸은 에이전트
+/// 충돌이 없어 in-pane DECSTBM도 안전하므로, 셸에 한해 in-pane row를 원하면 3)을 6) 뒤로
+/// 옮기면 된다 — 이 PoC는 그 결정을 테스트로 못박아 리뷰 가능하게 한다.
+#[allow(dead_code)]
+fn select_status_backend(policy: StatusPresencePolicy, env: &StatusEnvSnapshot) -> StatusBackend {
+    if env.forced_off || !env.terminal_capable {
+        return StatusBackend::Disabled;
+    }
+    if policy == StatusPresencePolicy::ForceRow {
+        return StatusBackend::DecstbmOverlay;
+    }
+    if env.inside_cmux {
+        return StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+    }
+    if env.real_tmux {
+        return StatusBackend::DelegatedSurface(SurfaceKind::Tmux);
+    }
+    if env.is_iterm && env.iterm_native_optin {
+        return StatusBackend::NativeChrome;
+    }
+    if policy == StatusPresencePolicy::RowOff {
+        return StatusBackend::TitleCueDelegation;
+    }
+    StatusBackend::DecstbmOverlay
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -5844,8 +5935,9 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
-        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBar,
-        StatusCommandConfig, StatusPresencePolicy, StatusPresenceRuntimeHandle,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
+        StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
+        StatusPresenceRuntimeHandle, SurfaceKind,
         StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
         agent_name_from_command, agent_presence_banner_enabled, agent_presence_cue_enabled,
         alt_screen_param_matches, anyhow_error_is_broken_pipe, apply_pending_status_command,
@@ -5864,8 +5956,9 @@ mod tests {
         panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
         parse_status_style, raw_attach_command_hint, read_attach_response_header,
         read_trace_jsonl_line, reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode,
-        resolve_status_style, run_status_command, should_mobile_transcript_auto,
-        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
+        resolve_status_style, run_status_command, select_status_backend,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        trace_file_summary,
         trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
@@ -8010,6 +8103,118 @@ mod tests {
             "force_redraw must include DECSTBM reserve: {reserve_payload:?}"
         );
         bar.style = None;
+    }
+
+    // ── select_status_backend 라우팅 매트릭스 (PoC1) ──
+
+    /// 모든 신호 false + terminal_capable=true인 기준 스냅샷. 테스트가 필드만 덮어쓴다.
+    fn capable_env() -> StatusEnvSnapshot {
+        StatusEnvSnapshot {
+            terminal_capable: true,
+            forced_off: false,
+            inside_cmux: false,
+            real_tmux: false,
+            is_iterm: false,
+            iterm_native_optin: false,
+        }
+    }
+
+    /// env 강제 off는 정책/환경과 무관하게 Disabled.
+    #[test]
+    fn backend_forced_off_disables() {
+        let env = StatusEnvSnapshot { forced_off: true, inside_cmux: true, ..capable_env() };
+        for policy in [StatusPresencePolicy::RowAuto, StatusPresencePolicy::RowOff, StatusPresencePolicy::ForceRow] {
+            assert_eq!(select_status_backend(policy, &env), StatusBackend::Disabled);
+        }
+    }
+
+    /// 터미널/기하 미충족(비-TTY 등)은 Disabled.
+    #[test]
+    fn backend_not_capable_disables() {
+        let env = StatusEnvSnapshot { terminal_capable: false, ..capable_env() };
+        assert_eq!(select_status_backend(StatusPresencePolicy::ForceRow, &env), StatusBackend::Disabled);
+        assert_eq!(select_status_backend(StatusPresencePolicy::RowAuto, &env), StatusBackend::Disabled);
+    }
+
+    /// ForceRow는 위임(cmux 포함)보다 우선해 in-terminal DECSTBM row를 강제한다.
+    #[test]
+    fn backend_force_row_overrides_cmux() {
+        let env = StatusEnvSnapshot { inside_cmux: true, real_tmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::ForceRow, &env),
+            StatusBackend::DecstbmOverlay
+        );
+    }
+
+    /// cmux는 셸(RowAuto)·에이전트(RowOff) 모두 별 surface로 위임(에이전트 검사보다 먼저).
+    #[test]
+    fn backend_cmux_delegates_for_shell_and_agent() {
+        let env = StatusEnvSnapshot { inside_cmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+    }
+
+    /// 진짜 tmux는 status-line으로 위임(에이전트 포함). cmux가 동시 참이면 cmux 우선.
+    #[test]
+    fn backend_real_tmux_delegates_and_cmux_wins() {
+        let tmux_only = StatusEnvSnapshot { real_tmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &tmux_only),
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
+        );
+        let both = StatusEnvSnapshot { real_tmux: true, inside_cmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &both),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+    }
+
+    /// iTerm+opt-in은 셀 그리드 밖 NativeChrome(명시 opt-in은 에이전트보다 우선).
+    #[test]
+    fn backend_iterm_optin_uses_native_chrome_before_agent() {
+        let env = StatusEnvSnapshot { is_iterm: true, iterm_native_optin: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::NativeChrome
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::NativeChrome
+        );
+    }
+
+    /// iTerm이지만 opt-in 없으면 NativeChrome로 가지 않는다(에이전트→타이틀, 셸→DECSTBM).
+    #[test]
+    fn backend_iterm_without_optin_falls_through() {
+        let env = StatusEnvSnapshot { is_iterm: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::TitleCueDelegation
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DecstbmOverlay
+        );
+    }
+
+    /// plain 터미널: 에이전트(RowOff)는 타이틀 위임, 셸(RowAuto)은 DECSTBM best-effort.
+    #[test]
+    fn backend_plain_agent_delegates_shell_overlays() {
+        let env = capable_env();
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::TitleCueDelegation
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DecstbmOverlay
+        );
     }
 
     #[test]
