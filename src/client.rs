@@ -3472,10 +3472,13 @@ fn attach_with_presence_and_cue(
             // fast lane으로 ~50ms 내, 그 외 dirty는 forced 경로로 self-heal이 발화한다.
             // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
             // content-dedup 백스톱 게이트: idle에서 heartbeat가 발화해 refresh를 시도할 때,
-            // 2초마다 한 번 force_redraw=true로 dedup을 우회해 실제 redraw(reserve 재확인+고스트
-            // 청소+커서 숨김)를 일으킨다. 나머지 시도는 dedup 생략을 유지해 커서를 건드리지 않는다.
+            // 2초마다 한 번 force_content_redraw=true로 dedup을 우회해 **내용만** redraw(고스트
+            // 청소+커서 숨김)한다. reserve(DECSTBM scroll-region 재설정)는 내보내지 않아 codex 등이
+            // 쓰는 자체 scroll-region을 덮어쓰지 않는다(주기적 reserve 재확인이 codex idle 레이아웃을
+            // 침범해 입력칸이 늘어나던 회귀를 차단). 실제 화면 손상은 fast lane/force_redraw 경로가
+            // reserve 포함 redraw로 따로 복구한다. 나머지 시도는 dedup 생략을 유지해 커서를 건드리지 않는다.
             if last_forced_redraw.elapsed() >= STATUS_HEARTBEAT_FORCED {
-                status_bar.force_redraw = true;
+                status_bar.force_content_redraw = true;
                 last_forced_redraw = Instant::now();
             }
             if row_runtime.can_draw_status()
@@ -4601,7 +4604,14 @@ struct StatusBar {
     /// 본문이 직전과 동일해도 반드시 redraw해야 하는 경우(화면 손상, alt-screen 복귀,
     /// resume 등)에 한 번 true로 세팅한다. dedup 키와 무관하게 한 번 강제로 그린 뒤
     /// `refresh` 내부에서 false로 리셋한다. enter 시점 첫 draw도 기본 true로 커버한다.
+    /// 이 플래그는 reserve(DECSTBM scroll-region 재설정)를 포함한 전체 redraw를 강제한다.
     force_redraw: bool,
+    /// 주기적 백스톱(STATUS_HEARTBEAT_FORCED)이 status 내용만 다시 그리도록 한 번 true로
+    /// 세팅한다. `force_redraw`와 달리 reserve(DECSTBM scroll-region 재설정)를 포함하지 않아
+    /// codex 등이 쓰는 자체 scroll-region을 덮어쓰지 않는다. 화면 손상 없이 idle에서 status
+    /// 행만 추적-청소+커서 숨김 envelope로 다시 그릴 때 쓴다. `refresh` 내부에서 false로
+    /// 리셋한다. `force_redraw`가 함께 참이면 reserve 포함 redraw가 우선한다.
+    force_content_redraw: bool,
 }
 
 impl StatusBar {
@@ -4634,6 +4644,8 @@ impl StatusBar {
             // 명시해 enter 시점 reserve+draw가 확실히 화면에 나가게 한다.
             last_body: None,
             force_redraw: true,
+            // 백스톱 전용 플래그. enter 시점에는 force_redraw가 reserve 포함 첫 draw를 보장한다.
+            force_content_redraw: false,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -4660,31 +4672,52 @@ impl StatusBar {
         Ok(status)
     }
 
-    /// status 행을 다시 그린다. content-dedup: 그릴 "본문"(reserve seq + 행 draw 페이로드,
-    /// 커서 visibility 토글은 제외)이 직전과 동일하고 `force_redraw`도 아니면 reserve/draw/커서를
-    /// 일절 건드리지 않고 `Ok(false)`를 반환한다. codex 같은 메인버퍼 TUI는 idle에서도 스피너를
-    /// ~4회/초 출력해 status_dirty를 계속 set하지만, 본문이 같으면 이 dedup이 4Hz 커서 건드림
-    /// (=깜빡임)을 없앤다. 실제로 그릴 때는 reserve+draw+커서 envelope를 단일 write_all로 묶어
-    /// `\x1b[?25l`(숨김) → 본문 → 추적 visibility 복원 1회로 내보내 중간 깜빡임을 방지한다.
-    /// 반환값은 실제로 화면에 썼는지(drew) 여부 — 호출자는 true일 때만 flush한다.
+    /// status 행을 다시 그린다. content-dedup 키는 행 draw 페이로드(`build_draw_body`)만으로
+    /// 구성한다 — reserve(DECSTBM scroll-region 명령)는 매번 동일해 내용 변화 판정에 무관하므로
+    /// 키에서 제외한다. draw 본문이 직전과 같고 `force_redraw`/`force_content_redraw` 둘 다
+    /// 아니면 reserve/draw/커서를 일절 건드리지 않고 `Ok(false)`를 반환한다. codex 같은 메인버퍼
+    /// TUI는 idle에서도 스피너를 ~4회/초 출력해 status_dirty를 계속 set하지만, 본문이 같으면 이
+    /// dedup이 4Hz 커서 건드림(=깜빡임)을 없앤다.
+    ///
+    /// 실제로 그릴 때는 두 경로가 있다:
+    /// - `write_with_reserve`(force_redraw 또는 내용 변경): reserve(scroll-region 재설정) +
+    ///   draw + 커서 envelope. damage/alt-exit/resume/enter/내용변경에서 쓴다.
+    /// - `write_content_only`(force_content_redraw, 백스톱): reserve 없이 draw + 커서 envelope.
+    ///   codex 자체 scroll-region을 덮어쓰지 않도록 DECSTBM을 내보내지 않는다.
+    ///
+    /// 둘 다 참이면 reserve 포함 경로가 우선한다. 모든 경로는 reserve(또는 "")+draw+커서를 단일
+    /// write_all로 묶어 `\x1b[?25l`(숨김) → 본문 → 추적 visibility 복원 1회로 내보내 중간 깜빡임을
+    /// 방지한다. 반환값은 실제로 화면에 썼는지(drew) 여부 — 호출자는 true일 때만 flush한다.
     fn refresh(&mut self, stdout: &mut impl Write) -> Result<bool> {
         let (cols, rows) = terminal_size();
-        // 본문 = reserve seq + 행 draw 페이로드. 둘 다 커서 visibility 토글을 제외한 순수 본문이라
-        // 커서가 보임↔숨김으로만 바뀐 경우는 dedup 키가 동일해 redraw하지 않는다(의도).
-        let body = self.build_reserve_body(rows) + &self.build_draw_body(cols, rows);
-        if body.is_empty() {
-            // rows<=1/cols<=1 등으로 그릴 본문이 없으면 아무것도 쓰지 않는다. force_redraw와
+        // dedup 키는 draw 본문만으로 구성한다. reserve는 매번 동일한 scroll-region 명령이라
+        // 내용 변화 판정에 불필요하므로 키에서 제외한다. 커서 visibility 토글도 제외된 순수
+        // 본문이라 커서가 보임↔숨김으로만 바뀐 경우는 키가 동일해 redraw하지 않는다(의도).
+        let draw_body = self.build_draw_body(cols, rows);
+        if draw_body.is_empty() {
+            // rows<=1/cols<=1 등으로 그릴 본문이 없으면 아무것도 쓰지 않는다. force 플래그와
             // last_body는 유지해, 터미널이 다시 커져 그릴 수 있게 되면 그때 반영되도록 한다.
             return Ok(false);
         }
-        // force_redraw가 아니고 본문이 직전과 같으면 reserve/draw/커서 전부 생략한다.
-        if !self.force_redraw && self.last_body.as_deref() == Some(body.as_str()) {
+        let changed = self.last_body.as_deref() != Some(draw_body.as_str());
+        // damage/alt-exit/resume/enter/내용변경 → reserve(scroll-region 재설정) 포함.
+        let write_with_reserve = self.force_redraw || changed;
+        // 백스톱 → reserve 없이 내용만(codex scroll-region 보존).
+        let write_content_only = self.force_content_redraw;
+        if !write_with_reserve && !write_content_only {
+            // idle 동일 내용 + 두 플래그 모두 false면 reserve/draw/커서 전부 생략한다.
             return Ok(false);
         }
+        // 둘 다 참이면 reserve 포함이 우선한다. content-only 경로는 reserve를 빈 문자열로 둔다.
+        let reserve = if write_with_reserve {
+            self.build_reserve_body(rows)
+        } else {
+            String::new()
+        };
         // 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에 설정한
         // visibility로 복원한다. reserve+draw+커서 envelope를 합쳐 단일 write_all로 내보낸다.
         let cursor_restore = self.cursor_restore_suffix();
-        let payload = format!("\x1b[?25l{body}{cursor_restore}");
+        let payload = format!("\x1b[?25l{reserve}{draw_body}{cursor_restore}");
         stdout
             .write_all(payload.as_bytes())
             .context("refresh lterm status bar")?;
@@ -4693,8 +4726,9 @@ impl StatusBar {
         // 따라서 여기서 다시 계산한 rows_to_clear는 본문 빌드 때와 동일하다.
         let rows_to_clear = self.visible_previous_status_rows(rows);
         self.remember_status_row(rows, &rows_to_clear);
-        self.last_body = Some(body);
+        self.last_body = Some(draw_body);
         self.force_redraw = false;
+        self.force_content_redraw = false;
         Ok(true)
     }
 
@@ -7671,6 +7705,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7710,6 +7745,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -7744,6 +7780,7 @@ mod tests {
             terminal_state: Some(Arc::clone(&state)),
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -7776,6 +7813,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -7801,6 +7839,7 @@ mod tests {
             terminal_state: Some(state),
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut hidden_output = Vec::new();
         hidden_bar
@@ -7828,6 +7867,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         }
     }
 
@@ -7929,6 +7969,50 @@ mod tests {
     }
 
     #[test]
+    fn refresh_content_only_backstop_omits_reserve() {
+        // 백스톱(force_content_redraw)은 내용만 redraw하고 reserve(DECSTBM scroll-region 재설정)를
+        // 내보내지 않아 codex 등이 쓰는 자체 scroll-region을 보존한다(주기적 reserve 재확인이 codex
+        // idle 레이아웃을 침범해 입력칸이 늘어나던 회귀 차단). 대조로 force_redraw는 reserve를 포함한다.
+        // reserve = `\x1b7\x1b[1;{N}r\x1b8`이므로 DECSTBM 마커 `\x1b[1;`의 유무로 판정한다
+        // (draw 본문은 `\x1b[{rows};1H`만 써 `\x1b[1;`을 만들지 않는다).
+        let mut bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut bar);
+
+        // (1) content-only: reserve(DECSTBM) 없이 그린다.
+        bar.force_content_redraw = true;
+        let mut content_only = Vec::new();
+        assert!(
+            bar.refresh(&mut content_only).expect("content-only refresh"),
+            "force_content_redraw must draw even with identical body"
+        );
+        let payload = String::from_utf8(content_only).expect("payload utf8");
+        assert!(!payload.is_empty(), "content-only must write a payload");
+        assert!(
+            !payload.contains("\x1b[1;"),
+            "content-only must NOT re-issue DECSTBM scroll-region: {payload:?}"
+        );
+        assert!(
+            !bar.force_content_redraw,
+            "force_content_redraw must reset to false after a draw"
+        );
+
+        // (2) 대조: force_redraw는 reserve(DECSTBM)를 포함한다.
+        refresh_until_stable(&mut bar);
+        bar.force_redraw = true;
+        let mut with_reserve = Vec::new();
+        assert!(
+            bar.refresh(&mut with_reserve).expect("forced refresh"),
+            "force_redraw draws"
+        );
+        let reserve_payload = String::from_utf8(with_reserve).expect("payload utf8");
+        assert!(
+            reserve_payload.contains("\x1b[1;"),
+            "force_redraw must include DECSTBM reserve: {reserve_payload:?}"
+        );
+        bar.style = None;
+    }
+
+    #[test]
     fn refresh_payload_hides_cursor_and_restores_tracked_visibility() {
         // (d) 실제로 쓸 때 페이로드는 `\x1b[?25l`(숨김)로 시작하고 추적된 visibility로 복원한다.
         // terminal_state=None(보임 가정) → `\x1b[?25h`로 끝난다.
@@ -7965,6 +8049,7 @@ mod tests {
             terminal_state: Some(state),
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut hidden_payload = Vec::new();
         assert!(
@@ -7998,6 +8083,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -8048,6 +8134,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -8088,6 +8175,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -8120,6 +8208,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -8150,6 +8239,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -8216,6 +8306,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -8270,6 +8361,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -8303,6 +8395,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut command_output = Vec::new();
         command_bar
@@ -8321,6 +8414,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut baseline_output = Vec::new();
         baseline_bar
@@ -8356,6 +8450,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         // cols=20 → safe_width=19.
@@ -8541,6 +8636,7 @@ mod tests {
             terminal_state: None,
             last_body: None,
             force_redraw: true,
+            force_content_redraw: false,
         };
         status_bar
             .draw_at_size(&mut output, 80, 24)
