@@ -11,10 +11,10 @@
 
 | 불변식 | 테스트 (src/client.rs) |
 |---|---|
-| 손상(ED `CSI J` / DECSTBM-reset / RIS) 감지 | `terminal_output_tracker_marks_status_damage_for_screen_erases_and_scroll_resets` (9409) |
-| chunk 경계 분할 손상도 감지 | `terminal_output_tracker_marks_status_damage_across_chunk_boundaries` (9464) |
-| 손상 시 50ms fast-lane 발화 + rate-limit | `heartbeat_damage_fast_lane_fires_at_short_interval_and_rate_limits` (9749) |
-| fast-lane(50ms)이 forced 백스톱(2s)보다 빠름 | `heartbeat_damage_fast_lane_is_faster_than_forced_backstop` (9771) |
+| 손상(ED `CSI J` / DECSTBM-reset / RIS) 감지 | `terminal_output_tracker_marks_status_damage_for_screen_erases_and_scroll_resets` |
+| chunk 경계 분할 손상도 감지 | `terminal_output_tracker_marks_status_damage_across_chunk_boundaries` |
+| 손상 시 50ms fast-lane 발화 + rate-limit | `heartbeat_damage_fast_lane_fires_at_short_interval_and_rate_limits` |
+| fast-lane(50ms)이 forced 백스톱(2s)보다 빠름 | `heartbeat_damage_fast_lane_is_faster_than_forced_backstop` |
 | **content-only 백스톱은 reserve(DECSTBM) 미방출 = codex scroll-region 보존(입력칸 가드)** | `refresh_content_only_backstop_omits_reserve` (신규) |
 
 → "손상 감지 → ~50ms 수렴", "백스톱은 codex scroll-region 불간섭"은 코드로 증명됨.

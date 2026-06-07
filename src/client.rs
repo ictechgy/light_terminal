@@ -3452,6 +3452,11 @@ fn attach_with_presence_and_cue(
                 let (_, current_rows) = terminal_size();
                 terminal_output_tracker
                     .set_status_scroll_bottom(row_runtime.status_scroll_bottom_for(current_rows));
+                // resize는 reserve(DECSTBM scroll-region, rows 의존)를 반드시 재발행해야 하므로
+                // force_redraw를 명시한다. dedup의 draw-body 변화 감지에 간접 의존하지 않고 직접
+                // 보장하며, alt-exit/resume/damage 경로와 일관된다(alt-screen 중이면 refresh가
+                // skip되지만 플래그는 sticky라 종료 후 edge refresh가 reserve 포함으로 소비).
+                status_bar.force_redraw = true;
                 // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
@@ -4501,9 +4506,15 @@ struct StatusEnvSnapshot {
     terminal_capable: bool,
     /// LTERM_NO_STATUS=1 또는 LTERM_STATUS=0로 강제 off([`status_bar_disabled_by_env`]).
     forced_off: bool,
-    /// cmux 환경([`crate::tmux_compat::inside_cmux`] 상당). 별도 surface가 에이전트와도 안전.
+    /// cmux 환경. 별도 surface가 에이전트와도 안전.
+    /// 배선 TODO: 신호원 `tmux_compat::inside_cmux`는 현재 **private** — 배선 시 `pub(crate)`
+    /// 승격(또는 래퍼)이 필요하다.
     inside_cmux: bool,
-    /// 진짜 tmux 내부($TMUX). lterm이 tmux-compat를 '제공'하는 케이스는 제외해야 함.
+    /// 진짜 tmux 내부($TMUX).
+    /// 배선 TODO: lterm은 tmux-compat 호스트로서 자식에 `TMUX`를 **스스로 export**하므로
+    /// (`tmux_compat.rs`), 순진하게 `$TMUX` 존재로 채우면 lterm-as-tmux 세션이
+    /// DelegatedSurface(Tmux)로 **오분류**된다. 배선 시 lterm 고유 마커로 self-provided TMUX를
+    /// 식별해 `real_tmux=false`로 둬야 한다(순수 함수 `select_status_backend`는 이 신호를 신뢰만 함).
     real_tmux: bool,
     /// iTerm2 식별(TERM_PROGRAM/LC_TERMINAL에 iterm).
     is_iterm: bool,
@@ -8085,6 +8096,10 @@ mod tests {
             "content-only must NOT re-issue DECSTBM scroll-region: {payload:?}"
         );
         assert!(
+            payload.starts_with("\x1b[?25l"),
+            "content-only도 force_redraw와 동일하게 커서 숨김 envelope로 시작해야 함: {payload:?}"
+        );
+        assert!(
             !bar.force_content_redraw,
             "force_content_redraw must reset to false after a draw"
         );
@@ -8101,6 +8116,26 @@ mod tests {
         assert!(
             reserve_payload.contains("\x1b[1;"),
             "force_redraw must include DECSTBM reserve: {reserve_payload:?}"
+        );
+
+        // (3) 두 플래그 동시 참: reserve 포함 경로가 우선(write_with_reserve = force_redraw || changed)
+        //     해야 손상 복구가 content-only로 떨어지지 않는다. 그린 뒤 두 플래그 모두 리셋.
+        refresh_until_stable(&mut bar);
+        bar.force_redraw = true;
+        bar.force_content_redraw = true;
+        let mut both = Vec::new();
+        assert!(
+            bar.refresh(&mut both).expect("both-flags refresh"),
+            "both flags must draw"
+        );
+        let both_payload = String::from_utf8(both).expect("payload utf8");
+        assert!(
+            both_payload.contains("\x1b[1;"),
+            "force_redraw+force_content_redraw 동시엔 reserve 포함 경로가 우선해야 함: {both_payload:?}"
+        );
+        assert!(
+            !bar.force_redraw && !bar.force_content_redraw,
+            "두 플래그 모두 draw 후 리셋되어야 함"
         );
         bar.style = None;
     }
@@ -8119,11 +8154,22 @@ mod tests {
         }
     }
 
-    /// env 강제 off는 정책/환경과 무관하게 Disabled.
+    /// env 강제 off는 다른 모든 신호(cmux/tmux/iTerm)와 정책을 무력화하고 Disabled.
     #[test]
-    fn backend_forced_off_disables() {
-        let env = StatusEnvSnapshot { forced_off: true, inside_cmux: true, ..capable_env() };
-        for policy in [StatusPresencePolicy::RowAuto, StatusPresencePolicy::RowOff, StatusPresencePolicy::ForceRow] {
+    fn backend_forced_off_overrides_all_signals() {
+        let env = StatusEnvSnapshot {
+            forced_off: true,
+            inside_cmux: true,
+            real_tmux: true,
+            is_iterm: true,
+            iterm_native_optin: true,
+            ..capable_env()
+        };
+        for policy in [
+            StatusPresencePolicy::RowAuto,
+            StatusPresencePolicy::RowOff,
+            StatusPresencePolicy::ForceRow,
+        ] {
             assert_eq!(select_status_backend(policy, &env), StatusBackend::Disabled);
         }
     }
@@ -8136,10 +8182,16 @@ mod tests {
         assert_eq!(select_status_backend(StatusPresencePolicy::RowAuto, &env), StatusBackend::Disabled);
     }
 
-    /// ForceRow는 위임(cmux 포함)보다 우선해 in-terminal DECSTBM row를 강제한다.
+    /// ForceRow는 모든 위임 신호(cmux/tmux/iTerm)보다 우선해 in-terminal DECSTBM row를 강제한다.
     #[test]
-    fn backend_force_row_overrides_cmux() {
-        let env = StatusEnvSnapshot { inside_cmux: true, real_tmux: true, ..capable_env() };
+    fn backend_force_row_overrides_all_delegations() {
+        let env = StatusEnvSnapshot {
+            inside_cmux: true,
+            real_tmux: true,
+            is_iterm: true,
+            iterm_native_optin: true,
+            ..capable_env()
+        };
         assert_eq!(
             select_status_backend(StatusPresencePolicy::ForceRow, &env),
             StatusBackend::DecstbmOverlay
@@ -8164,8 +8216,13 @@ mod tests {
     #[test]
     fn backend_real_tmux_delegates_and_cmux_wins() {
         let tmux_only = StatusEnvSnapshot { real_tmux: true, ..capable_env() };
+        // 에이전트(RowOff)·셸(RowAuto) 모두 tmux status-line으로 위임(정책보다 tmux가 먼저).
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowOff, &tmux_only),
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &tmux_only),
             StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
         );
         let both = StatusEnvSnapshot { real_tmux: true, inside_cmux: true, ..capable_env() };

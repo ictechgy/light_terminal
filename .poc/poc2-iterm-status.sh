@@ -27,11 +27,22 @@
 set -euo pipefail
 
 emit_user_var() {
-  # $1 = 표시할 plain 문자열. OSC 1337 ; SetUserVar=lterm=<base64> BEL
+  # $1 = 표시할 plain 문자열. OSC 1337 ; SetUserVar=lterm=<base64> BEL.
+  # base64 인코딩이라 OSC 종결자(BEL/ST)·제어문자가 페이로드에 들어갈 수 없어 인젝션 불가.
   local value_b64
   value_b64="$(printf '%s' "$1" | base64 | tr -d '\n')"
   printf '\033]1337;SetUserVar=lterm=%s\007' "$value_b64"
 }
+
+# 비-iTerm 터미널에선 OSC 1337이 무의미하므로 경고만 하고 진행은 허용한다.
+case "${TERM_PROGRAM:-}${LC_TERMINAL:-}" in
+  *[iI][tT][eE][rR][mM]*) ;;
+  *) echo "[poc2] 경고: iTerm2가 아닌 것 같습니다(TERM_PROGRAM='${TERM_PROGRAM:-}'). OSC 1337은 무시될 수 있습니다." >&2 ;;
+esac
+
+# 종료(Ctrl-C 포함) 시 user.lterm를 비워 iTerm status bar에 stale 값이 남지 않게 한다.
+# (--once는 1회 표시가 목적이라 trap을 걸지 않는다 — 루프 모드에만 등록한다.)
+cleanup() { emit_user_var ""; echo; }
 
 if [[ "${1:-}" == "--once" ]]; then
   emit_user_var "lt:api:%3 codex 78% (poc2 once)"
@@ -39,6 +50,7 @@ if [[ "${1:-}" == "--once" ]]; then
   exit 0
 fi
 
+trap cleanup INT TERM EXIT
 echo "[poc2] 2초 간격으로 user.lterm 주입 시작. iTerm status bar를 보세요. Ctrl-C로 종료."
 echo "[poc2] (같은 창에서 codex/vim을 띄운 채로도 손상 없이 갱신되는지 확인)"
 i=0
