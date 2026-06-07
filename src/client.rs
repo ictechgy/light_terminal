@@ -52,6 +52,11 @@ const STATUS_HEARTBEAT: Duration = Duration::from_millis(250);
 /// 있어 busy-output self-heal은 idle redraw보다 훨씬 느리게 둔다. 평소에는
 /// `ATTACH_OUTPUT_IDLE_TIMEOUT` 경로가 출력이 잠잠해진 직후 status를 복구한다.
 const STATUS_HEARTBEAT_FORCED: Duration = Duration::from_secs(2);
+/// 확정 손상(ED/DECSTBM reset/RIS) 감지 시 self-heal deadline. `observe()`가 status row
+/// 손상을 정밀 판정한 경우(`status_area_dirty`)에만 활성화되는 fast lane이다. 이 값은 동시에
+/// rate-limit 역할도 한다: 연속 출력 중 매 프레임 repaint 폭주를 막으면서도 forced 2초 백스톱
+/// 대신 ~50ms 안에 색/잔상 손상을 복구한다. 50ms는 체감상 즉시이면서 폭주를 억제하는 균형값.
+const STATUS_DAMAGE_HEARTBEAT: Duration = Duration::from_millis(50);
 /// Attach output idle wakeup. This bounds status-bar redraw latency without the
 /// previous 30ms hot poll; heartbeat logic still owns the actual redraw cadence.
 const ATTACH_OUTPUT_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3261,7 +3266,12 @@ fn attach_with_presence_and_cue(
     reset_raw_attach_initial_sgr_if_needed(status_enabled, stdout.is_terminal(), &mut stdout)?;
     let status_style = status_enabled
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
-    let mut status_bar = StatusBar::enter(status_info.as_ref(), status_style, &mut stdout)?;
+    let mut status_bar = StatusBar::enter(
+        status_info.as_ref(),
+        status_style,
+        Some(Arc::clone(&alt_screen_state)),
+        &mut stdout,
+    )?;
     let status_metadata_enabled = Arc::new(AtomicBool::new(status_enabled));
     let status_metadata = status_info.as_ref().map(|info| {
         spawn_status_metadata_thread(
@@ -3312,7 +3322,17 @@ fn attach_with_presence_and_cue(
     }
     let mut buf = [0_u8; 8192];
     let mut status_dirty = false;
+    // `observe()`가 status row 손상(ED/DECSTBM reset/RIS)을 확정 감지하면 true가 되어 heartbeat
+    // fast lane(STATUS_DAMAGE_HEARTBEAT)을 활성화한다. 성공 repaint로 status_dirty가 클리어되면
+    // (루프 상단에서) 같이 클리어한다. 손상은 항상 status_dirty도 같이 set하므로 두 플래그는
+    // 동기화 상태로 유지된다.
+    let mut damage_pending = false;
     let mut last_status_refresh = Instant::now();
+    // content-dedup 백스톱: dedup이 idle에서 실제 redraw를 "내용 변경 시에만"으로 줄였기에
+    // 주기적 redraw가 수행하던 host-side 손상 자가복구(scroll-region 재확인 + 추적 고스트 청소)가
+    // 사라진다. STATUS_HEARTBEAT_FORCED(2초)마다 1번 force_redraw로 dedup을 우회해 실제 redraw를
+    // 강제, 이 자가복구를 복원한다. ~0.5Hz라 4Hz 커서 깜빡임은 재발하지 않는다.
+    let mut last_forced_redraw = Instant::now();
     let mut prev_alt_screen_active = false;
     let status_metadata_rx = status_metadata.as_ref().map(|(rx, _)| rx);
     let status_command_rx = status_command.as_ref().map(|(rx, _)| rx);
@@ -3324,6 +3344,14 @@ fn attach_with_presence_and_cue(
                 break;
             }
             let alt_screen_active = alt_screen_state.active.load(Ordering::Relaxed);
+            // 백스톱 클리어: idle/alt-exit/resume 등 출력이 잠잠한 repaint 경로는 status_dirty를
+            // 클리어한 뒤 다시 set하지 않으므로, 여기서 damage_pending도 함께 내린다. can_draw_status가
+            // false인 suspend 구간에서 set된 damage_pending(이때는 status_dirty가 set되지 않음)도
+            // 여기서 안전하게 정리된다. 단, busy 출력 경로는 forward가 매 iteration status_dirty를
+            // 다시 set해 이 지점이 발화하지 못하므로, fast lane 분기가 복구 시점에 직접 클리어한다(아래).
+            if !status_dirty {
+                damage_pending = false;
+            }
 
             if let Some(rx) = nested_detection_rx {
                 while let Ok(presence) = rx.try_recv() {
@@ -3405,17 +3433,18 @@ fn attach_with_presence_and_cue(
             // 다음 heartbeat까지 빈 상태가 되지 않게 한 번 redraw한다. 이 redraw가 PTY의
             // main-buffer redraw와 시점이 겹치면 미세한 깜빡임이 가능하나, scroll region
             // (rows-1)이 PTY 본문을 status row와 분리하므로 실용적 문제는 없다.
-            if row_runtime.can_draw_status()
-                && prev_alt_screen_active
-                && !alt_screen_active
-                && refresh_status_or_detached(
+            if row_runtime.can_draw_status() && prev_alt_screen_active && !alt_screen_active {
+                // alt-screen에서 status 행이 숨겨졌다 복귀한 것이라, 그릴 본문이 직전과
+                // 동일해도 content-dedup을 우회해 반드시 한 번 그려야 한다.
+                status_bar.force_redraw = true;
+                if refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?
-            {
-                break;
+                )? {
+                    break;
+                }
             }
             prev_alt_screen_active = alt_screen_active;
 
@@ -3423,6 +3452,11 @@ fn attach_with_presence_and_cue(
                 let (_, current_rows) = terminal_size();
                 terminal_output_tracker
                     .set_status_scroll_bottom(row_runtime.status_scroll_bottom_for(current_rows));
+                // resize는 reserve(DECSTBM scroll-region, rows 의존)를 반드시 재발행해야 하므로
+                // force_redraw를 명시한다. dedup의 draw-body 변화 감지에 간접 의존하지 않고 직접
+                // 보장하며, alt-exit/resume/damage 경로와 일관된다(alt-screen 중이면 refresh가
+                // skip되지만 플래그는 sticky라 종료 후 edge refresh가 reserve 포함으로 소비).
+                status_bar.force_redraw = true;
                 // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
@@ -3438,20 +3472,38 @@ fn attach_with_presence_and_cue(
                     break 'output;
                 }
             }
-            // heartbeat는 idle(STATUS_HEARTBEAT) + forced(STATUS_HEARTBEAT_FORCED) 두 경로를
-            // 모두 가진다. busy PTY 출력 중에도 forced 경로로 self-heal이 발화한다.
+            // heartbeat는 idle(STATUS_HEARTBEAT) + 손상 fast lane(STATUS_DAMAGE_HEARTBEAT) +
+            // forced(STATUS_HEARTBEAT_FORCED) 세 경로를 가진다. busy PTY 출력 중 확정 손상은
+            // fast lane으로 ~50ms 내, 그 외 dirty는 forced 경로로 self-heal이 발화한다.
             // 자세한 조건은 `heartbeat_due` 도큐먼트 참조.
+            // content-dedup 백스톱 게이트: idle에서 heartbeat가 발화해 refresh를 시도할 때,
+            // 2초마다 한 번 force_content_redraw=true로 dedup을 우회해 **내용만** redraw(고스트
+            // 청소+커서 숨김)한다. reserve(DECSTBM scroll-region 재설정)는 내보내지 않아 codex 등이
+            // 쓰는 자체 scroll-region을 덮어쓰지 않는다(주기적 reserve 재확인이 codex idle 레이아웃을
+            // 침범해 입력칸이 늘어나던 회귀를 차단). 실제 화면 손상은 fast lane/force_redraw 경로가
+            // reserve 포함 redraw로 따로 복구한다. 나머지 시도는 dedup 생략을 유지해 커서를 건드리지 않는다.
+            if last_forced_redraw.elapsed() >= STATUS_HEARTBEAT_FORCED {
+                status_bar.force_content_redraw = true;
+                last_forced_redraw = Instant::now();
+            }
             if row_runtime.can_draw_status()
                 && !alt_screen_active
-                && heartbeat_due(last_status_refresh.elapsed(), status_dirty)
-                && refresh_status_or_detached(
+                && heartbeat_due(last_status_refresh.elapsed(), status_dirty, damage_pending)
+            {
+                // 이 repaint가 status row 손상을 복구하므로 fast lane 플래그를 여기서 내린다.
+                // busy 출력은 forward가 매 iteration status_dirty를 다시 set해 루프 상단의
+                // `!status_dirty` 백스톱이 발화하지 못한다 — 복구 시점에 직접 클리어하지 않으면
+                // 단발 손상 후에도 출력이 끝날 때까지 50ms마다 불필요한 repaint가 지속된다.
+                // 새 손상이 오면 observe()가 다음 청크에서 다시 set한다.
+                damage_pending = false;
+                if refresh_status_or_detached(
                     &mut status_bar,
                     &mut stdout,
                     &mut status_dirty,
                     &mut last_status_refresh,
-                )?
-            {
-                break;
+                )? {
+                    break;
+                }
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -3488,7 +3540,14 @@ fn attach_with_presence_and_cue(
                 }
                 Err(err) => return Err(err).context("read pty output"),
             };
-            terminal_output_tracker.observe(&buf[..n]);
+            let output_effects = terminal_output_tracker.observe(&buf[..n]);
+            if output_effects.status_area_dirty {
+                // 확정 손상: heartbeat fast lane을 활성화해 forced 2초 대신 ~50ms 내 self-heal한다.
+                damage_pending = true;
+                // 손상은 그릴 본문이 직전과 동일해도 화면이 깨진 상태라 content-dedup을 우회해
+                // 반드시 한 번 redraw해야 한다. force_redraw로 다음 refresh가 dedup을 강제 통과한다.
+                status_bar.force_redraw = true;
+            }
             if let Some(title_cue) = title_cue_runtime.as_mut() {
                 title_cue.observe_pty_output();
             }
@@ -4109,8 +4168,14 @@ fn refresh_status(
     status_dirty: &mut bool,
     last_status_refresh: &mut Instant,
 ) -> Result<()> {
-    status_bar.refresh(stdout)?;
-    stdout.flush().context("flush stdout")?;
+    // content-dedup으로 본문이 직전과 동일하면 refresh가 아무것도 쓰지 않고 drew=false를
+    // 반환한다 — 이때 flush는 생략한다(불필요한 syscall 회피). status_dirty는 어느 경우든
+    // 클리어해 "처리됨"으로 표시하고, 타이머는 매 attempt 리셋해 idle 재검 250ms 스로틀을
+    // 유지한다(본문 변화가 없으면 drew=false라 실제 redraw 빈도는 4Hz→내용변경 시에만으로 준다).
+    let drew = status_bar.refresh(stdout)?;
+    if drew {
+        stdout.flush().context("flush stdout")?;
+    }
     *status_dirty = false;
     *last_status_refresh = Instant::now();
     Ok(())
@@ -4228,6 +4293,9 @@ fn resume_status_row(
                     .set_status_scroll_bottom(status_scroll_bottom_for_terminal_rows(rows, true));
                 status_bar.update_info(&info);
                 status_bar.style = Some(resolve_status_style(info.status_theme));
+                // suspend 동안 status 행이 화면에서 사라졌으므로, 복귀 시 본문이 직전과
+                // 동일해도 content-dedup을 우회해 반드시 한 번 그려야 한다.
+                status_bar.force_redraw = true;
                 match refresh_status_or_detached(
                     status_bar,
                     stdout,
@@ -4284,7 +4352,8 @@ fn forward_pty_output_frame_or_detached(
         // agent TUI's erase and subsequent redraw has repeatedly caused submitted
         // prompt lines and color state to disappear. The read timeout/heartbeat
         // paths repaint after output goes quiet, while the forced heartbeat still
-        // bounds recovery during continuous output.
+        // bounds recovery during continuous output. 확정 손상(ED/DECSTBM reset/RIS)은
+        // heartbeat fast lane(STATUS_DAMAGE_HEARTBEAT)으로 ~50ms 내 빠르게 복구된다.
         *status_dirty = true;
     }
 
@@ -4327,12 +4396,21 @@ fn anyhow_error_is_broken_pipe(err: &anyhow::Error) -> bool {
 ///
 /// - **idle 경로**: `!status_dirty` 이고 `STATUS_HEARTBEAT` 경과 시 발화 — PTY가 잠잠한
 ///   동안 외부 DECSTBM 리셋(다른 앱 백그라운드 등)을 self-heal.
+/// - **fast lane(손상 경로)**: `damage_pending`(=`observe()`가 ED/DECSTBM reset/RIS로 status
+///   row 손상을 확정 감지)이고 `STATUS_DAMAGE_HEARTBEAT` 경과 시 발화 — 풀스크린 에이전트
+///   TUI가 status 영역을 손상시킨 경우 forced 2초 백스톱 대신 ~50ms 내 self-heal한다.
+///   `STATUS_DAMAGE_HEARTBEAT` 간격 자체가 rate-limit이라 연속 출력 중에도 매 프레임 repaint
+///   폭주가 일어나지 않는다.
 /// - **forced 경로**: `STATUS_HEARTBEAT_FORCED` 경과 시 dirty 여부와 무관하게 발화 —
 ///   PTY가 연속 출력 중이면 read()가 매번 Ok(n)을 반환해 WouldBlock 분기가 fire하지
 ///   않으므로 status_dirty가 영원히 클리어되지 않는다. 이 경로가 없으면 cmux pane swap /
-///   Termius 백그라운드 복귀 후 status 영역 자가복구가 무한히 차단된다.
-fn heartbeat_due(elapsed: Duration, status_dirty: bool) -> bool {
+///   Termius 백그라운드 복귀 후 status 영역 자가복구가 무한히 차단된다. fast lane이 잡지 못하는
+///   비손상 dirty(예: metadata 변경)의 백스톱이기도 하다.
+fn heartbeat_due(elapsed: Duration, status_dirty: bool, damage_pending: bool) -> bool {
     if !status_dirty && elapsed >= STATUS_HEARTBEAT {
+        return true;
+    }
+    if damage_pending && elapsed >= STATUS_DAMAGE_HEARTBEAT {
         return true;
     }
     elapsed >= STATUS_HEARTBEAT_FORCED
@@ -4383,6 +4461,103 @@ fn status_sgr_stack_supported() -> bool {
         || terminal_identity.contains("iterm")
         || terminal_identity.contains("wezterm")
         || matches!(term.as_str(), "xterm" | "wezterm")
+}
+
+// ── cross-env status 백엔드 라우팅 (PoC1: 순수 결정 함수 + 타입만, 아직 미배선) ──
+//
+// 연구 결론(memory: lterm-status-default-on §B): 일반 터미널 + 메인버퍼 에이전트에서
+// 분리형 status 한 줄의 무손상 공존은 원리적으로 불가능하다. 안전은 (1) host가 곧
+// 터미널이거나(tmux/cmux) (2) 셀 그리드 밖 네이티브 렌더(iTerm)일 때만 성립한다.
+// 따라서 단일 boolean(status_enabled) 대신 환경/정책으로 "가장 안전한 메커니즘"을
+// 고르는 라우팅이 필요하다. 이 PoC는 그 결정 로직만 순수 함수로 확정하고, 실제 렌더
+// 배선(StatusBackend trait, cmux surface 위임 등)은 후속 단계로 분리한다.
+
+/// status row를 어떤 메커니즘으로 표시할지 결정한 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // PoC1: 라우팅 결정만 — 렌더 배선은 후속에서 소비.
+enum StatusBackend {
+    /// 미표시(env 강제 off / 비-TTY / 기하 부족).
+    Disabled,
+    /// 현행 DECSTBM 단일행 오버레이(plain 터미널 best-effort, 에이전트와 ~50ms 수렴).
+    DecstbmOverlay,
+    /// 터미널 네이티브 chrome(iTerm OSC1337 user var/타이틀). 셀 그리드 밖, plain text·단일라인.
+    NativeChrome,
+    /// 별도 surface 위임(cmux split=ghostty PTY / 진짜 tmux status-line). 멀티라인·truecolor 안전.
+    DelegatedSurface(SurfaceKind),
+    /// 에이전트엔 분리형 row를 양보하고 타이틀 cue + LTERM_SESSION/LTERM_PANE 위임(유일 무손상).
+    TitleCueDelegation,
+}
+
+/// [`StatusBackend::DelegatedSurface`]가 위임할 외부 surface 종류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SurfaceKind {
+    /// cmux 별도 surface(open_cmux_split/send_cmux_attach 경로).
+    Cmux,
+    /// 진짜 tmux status-line(set-option status-left/right + #(cmd)).
+    Tmux,
+}
+
+/// [`select_status_backend`]의 순수 입력. 환경 신호 스냅샷(side-effect 없이 테스트가 구성).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct StatusEnvSnapshot {
+    /// TTY + rows>1 + cols>0. false면 무조건 Disabled.
+    terminal_capable: bool,
+    /// LTERM_NO_STATUS=1 또는 LTERM_STATUS=0로 강제 off([`status_bar_disabled_by_env`]).
+    forced_off: bool,
+    /// cmux 환경. 별도 surface가 에이전트와도 안전.
+    /// 배선 TODO: 신호원 `tmux_compat::inside_cmux`는 현재 **private** — 배선 시 `pub(crate)`
+    /// 승격(또는 래퍼)이 필요하다.
+    inside_cmux: bool,
+    /// 진짜 tmux 내부($TMUX).
+    /// 배선 TODO: lterm은 tmux-compat 호스트로서 자식에 `TMUX`를 **스스로 export**하므로
+    /// (`tmux_compat.rs`), 순진하게 `$TMUX` 존재로 채우면 lterm-as-tmux 세션이
+    /// DelegatedSurface(Tmux)로 **오분류**된다. 배선 시 lterm 고유 마커로 self-provided TMUX를
+    /// 식별해 `real_tmux=false`로 둬야 한다(순수 함수 `select_status_backend`는 이 신호를 신뢰만 함).
+    real_tmux: bool,
+    /// iTerm2 식별(TERM_PROGRAM/LC_TERMINAL에 iterm).
+    is_iterm: bool,
+    /// iTerm 네이티브 chrome 위임 opt-in(예: LTERM_STATUS_ITERM=1). 명시 설정시에만 NativeChrome.
+    iterm_native_optin: bool,
+}
+
+/// 환경/정책으로 가장 안전한 status 백엔드를 고른다(순수 함수, side-effect 없음).
+///
+/// 우선순위는 "자원 경쟁 없는 분리 렌더"부터 "scroll-region 공유 best-effort"까지 내림차순:
+/// 1) env 강제 off / 터미널·기하 미충족 → `Disabled`.
+/// 2) `ForceRow`(사용자가 in-terminal row를 명시 강제) → `DecstbmOverlay`(위임보다 우선).
+/// 3) cmux → `DelegatedSurface(Cmux)`. 별 surface라 에이전트와도 무손상 → RowOff 검사보다 먼저.
+/// 4) 진짜 tmux → `DelegatedSurface(Tmux)`. status-line이 행을 전담.
+/// 5) iTerm2 + opt-in → `NativeChrome`. 셀 그리드 밖 안전(명시 opt-in은 사용자 의도이므로
+///    에이전트(RowOff)보다 먼저 — opt-in 했다면 에이전트 status도 네이티브로 보고 싶다는 뜻).
+/// 6) `RowOff`(에이전트) → `TitleCueDelegation`. 분리형 row 미표시 + 타이틀/자체 statusline 위임.
+/// 7) 그 외(`RowAuto`, plain/iTerm-no-optin) → `DecstbmOverlay` best-effort.
+///
+/// 주: 3)에서 cmux는 RowAuto(셸) 세션도 별 surface로 위임한다(배치 일관성). 셸은 에이전트
+/// 충돌이 없어 in-pane DECSTBM도 안전하므로, 셸에 한해 in-pane row를 원하면 3)을 6) 뒤로
+/// 옮기면 된다 — 이 PoC는 그 결정을 테스트로 못박아 리뷰 가능하게 한다.
+#[allow(dead_code)]
+fn select_status_backend(policy: StatusPresencePolicy, env: &StatusEnvSnapshot) -> StatusBackend {
+    if env.forced_off || !env.terminal_capable {
+        return StatusBackend::Disabled;
+    }
+    if policy == StatusPresencePolicy::ForceRow {
+        return StatusBackend::DecstbmOverlay;
+    }
+    if env.inside_cmux {
+        return StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+    }
+    if env.real_tmux {
+        return StatusBackend::DelegatedSurface(SurfaceKind::Tmux);
+    }
+    if env.is_iterm && env.iterm_native_optin {
+        return StatusBackend::NativeChrome;
+    }
+    if policy == StatusPresencePolicy::RowOff {
+        return StatusBackend::TitleCueDelegation;
+    }
+    StatusBackend::DecstbmOverlay
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -4518,12 +4693,34 @@ struct StatusBar {
     /// true면 draw에서 테마 bg를 입히지 않고 reset으로 시작해 understatus 색이 살게 한다.
     /// false면 plain fallback과 동일하게 테마 bg를 적용한다.
     command_allow_color: bool,
+    /// PTY 출력 스트림에서 추적한 터미널 상태(커서 visibility 등). status 행 repaint 시
+    /// 커서를 잠깐 숨겼다가 PTY 앱이 마지막으로 설정한 visibility로 복원하기 위해 참조한다.
+    /// `None`이면(테스트/미배선) 커서가 보이는 상태(true)로 가정한다.
+    terminal_state: Option<Arc<AltScreenState>>,
+    /// 직전 `refresh`에서 실제로 화면에 쓴 "본문"(reserve seq + 행 draw 페이로드, 단 커서
+    /// visibility 토글은 제외). content-dedup 키로 쓴다. codex 같은 메인버퍼 TUI는 idle에서도
+    /// 스피너를 ~4회/초 출력해 status_dirty를 계속 set하지만, 그릴 본문이 직전과 동일하면
+    /// reserve/draw/커서 envelope를 통째로 생략해 4Hz 커서 건드림(=깜빡임)을 없앤다.
+    /// `None`이면 아직 한 번도 그리지 않은 상태라 무조건 그린다.
+    last_body: Option<String>,
+    /// 본문이 직전과 동일해도 반드시 redraw해야 하는 경우(화면 손상, alt-screen 복귀,
+    /// resume 등)에 한 번 true로 세팅한다. dedup 키와 무관하게 한 번 강제로 그린 뒤
+    /// `refresh` 내부에서 false로 리셋한다. enter 시점 첫 draw도 기본 true로 커버한다.
+    /// 이 플래그는 reserve(DECSTBM scroll-region 재설정)를 포함한 전체 redraw를 강제한다.
+    force_redraw: bool,
+    /// 주기적 백스톱(STATUS_HEARTBEAT_FORCED)이 status 내용만 다시 그리도록 한 번 true로
+    /// 세팅한다. `force_redraw`와 달리 reserve(DECSTBM scroll-region 재설정)를 포함하지 않아
+    /// codex 등이 쓰는 자체 scroll-region을 덮어쓰지 않는다. 화면 손상 없이 idle에서 status
+    /// 행만 추적-청소+커서 숨김 envelope로 다시 그릴 때 쓴다. `refresh` 내부에서 false로
+    /// 리셋한다. `force_redraw`가 함께 참이면 reserve 포함 redraw가 우선한다.
+    force_content_redraw: bool,
 }
 
 impl StatusBar {
     fn enter(
         info: Option<&SessionInfo>,
         style: Option<StatusStyle>,
+        terminal_state: Option<Arc<AltScreenState>>,
         stdout: &mut impl Write,
     ) -> Result<Self> {
         let (session_name, pane_id) = info
@@ -4544,6 +4741,13 @@ impl StatusBar {
             // 기본은 비활성(None)이라 LTERM_STATUS_COMMAND 미설정 시 기존 동작과 동일하다.
             command_line: None,
             command_allow_color: false,
+            terminal_state,
+            // 첫 draw는 last_body가 없어 어차피 dedup 미스로 그려지지만, force_redraw=true로도
+            // 명시해 enter 시점 reserve+draw가 확실히 화면에 나가게 한다.
+            last_body: None,
+            force_redraw: true,
+            // 백스톱 전용 플래그. enter 시점에는 force_redraw가 reserve 포함 첫 draw를 보장한다.
+            force_content_redraw: false,
         };
         // attach 시작 시점에 rows를 한 번만 읽어 reserve와 cursor clamp가 동일 값을 본다.
         // 이전에는 reserve_terminal_area와 cursor clamp helper가 각각 terminal_size()를
@@ -4570,10 +4774,64 @@ impl StatusBar {
         Ok(status)
     }
 
-    fn refresh(&mut self, stdout: &mut impl Write) -> Result<()> {
-        let (_, rows) = terminal_size();
-        self.reserve_terminal_area(stdout, rows)?;
-        self.draw(stdout)
+    /// status 행을 다시 그린다. content-dedup 키는 행 draw 페이로드(`build_draw_body`)만으로
+    /// 구성한다 — reserve(DECSTBM scroll-region 명령)는 매번 동일해 내용 변화 판정에 무관하므로
+    /// 키에서 제외한다. draw 본문이 직전과 같고 `force_redraw`/`force_content_redraw` 둘 다
+    /// 아니면 reserve/draw/커서를 일절 건드리지 않고 `Ok(false)`를 반환한다. codex 같은 메인버퍼
+    /// TUI는 idle에서도 스피너를 ~4회/초 출력해 status_dirty를 계속 set하지만, 본문이 같으면 이
+    /// dedup이 4Hz 커서 건드림(=깜빡임)을 없앤다.
+    ///
+    /// 실제로 그릴 때는 두 경로가 있다:
+    /// - `write_with_reserve`(force_redraw 또는 내용 변경): reserve(scroll-region 재설정) +
+    ///   draw + 커서 envelope. damage/alt-exit/resume/enter/내용변경에서 쓴다.
+    /// - `write_content_only`(force_content_redraw, 백스톱): reserve 없이 draw + 커서 envelope.
+    ///   codex 자체 scroll-region을 덮어쓰지 않도록 DECSTBM을 내보내지 않는다.
+    ///
+    /// 둘 다 참이면 reserve 포함 경로가 우선한다. 모든 경로는 reserve(또는 "")+draw+커서를 단일
+    /// write_all로 묶어 `\x1b[?25l`(숨김) → 본문 → 추적 visibility 복원 1회로 내보내 중간 깜빡임을
+    /// 방지한다. 반환값은 실제로 화면에 썼는지(drew) 여부 — 호출자는 true일 때만 flush한다.
+    fn refresh(&mut self, stdout: &mut impl Write) -> Result<bool> {
+        let (cols, rows) = terminal_size();
+        // dedup 키는 draw 본문만으로 구성한다. reserve는 매번 동일한 scroll-region 명령이라
+        // 내용 변화 판정에 불필요하므로 키에서 제외한다. 커서 visibility 토글도 제외된 순수
+        // 본문이라 커서가 보임↔숨김으로만 바뀐 경우는 키가 동일해 redraw하지 않는다(의도).
+        let draw_body = self.build_draw_body(cols, rows);
+        if draw_body.is_empty() {
+            // rows<=1/cols<=1 등으로 그릴 본문이 없으면 아무것도 쓰지 않는다. force 플래그와
+            // last_body는 유지해, 터미널이 다시 커져 그릴 수 있게 되면 그때 반영되도록 한다.
+            return Ok(false);
+        }
+        let changed = self.last_body.as_deref() != Some(draw_body.as_str());
+        // damage/alt-exit/resume/enter/내용변경 → reserve(scroll-region 재설정) 포함.
+        let write_with_reserve = self.force_redraw || changed;
+        // 백스톱 → reserve 없이 내용만(codex scroll-region 보존).
+        let write_content_only = self.force_content_redraw;
+        if !write_with_reserve && !write_content_only {
+            // idle 동일 내용 + 두 플래그 모두 false면 reserve/draw/커서 전부 생략한다.
+            return Ok(false);
+        }
+        // 둘 다 참이면 reserve 포함이 우선한다. content-only 경로는 reserve를 빈 문자열로 둔다.
+        let reserve = if write_with_reserve {
+            self.build_reserve_body(rows)
+        } else {
+            String::new()
+        };
+        // 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에 설정한
+        // visibility로 복원한다. reserve+draw+커서 envelope를 합쳐 단일 write_all로 내보낸다.
+        let cursor_restore = self.cursor_restore_suffix();
+        let payload = format!("\x1b[?25l{reserve}{draw_body}{cursor_restore}");
+        stdout
+            .write_all(payload.as_bytes())
+            .context("refresh lterm status bar")?;
+        // draw 본문이 실제로 나갔으므로 drawn_status_rows bookkeeping을 갱신한다.
+        // build_draw_body는 non-mutating이라 그 사이 drawn_status_rows가 바뀌지 않았고,
+        // 따라서 여기서 다시 계산한 rows_to_clear는 본문 빌드 때와 동일하다.
+        let rows_to_clear = self.visible_previous_status_rows(rows);
+        self.remember_status_row(rows, &rows_to_clear);
+        self.last_body = Some(draw_body);
+        self.force_redraw = false;
+        self.force_content_redraw = false;
+        Ok(true)
     }
 
     fn update_info(&mut self, info: &SessionInfo) -> bool {
@@ -4587,15 +4845,48 @@ impl StatusBar {
         true
     }
 
-    fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
-        if self.style.is_none() {
-            return Ok(());
+    /// PTY 앱이 노출 중인 커서 visibility. `terminal_state`가 미배선(None)이면 커서가
+    /// 보이는 상태(true)로 가정한다 — 즉 repaint 후 `\x1b[?25h`로 복원해 기존 동작
+    /// (커서를 끄지 않던 시절)을 회귀 없이 유지한다.
+    fn cursor_visible(&self) -> bool {
+        self.terminal_state
+            .as_ref()
+            .is_none_or(|state| state.cursor_visible.load(Ordering::Relaxed))
+    }
+
+    /// repaint 시 커서가 status 행으로 튀어 깜빡이지 않도록, 페이로드 끝에서 PTY 앱의
+    /// 추적된 visibility로 커서를 복원하는 시퀀스. 보임이면 `\x1b[?25h`, 숨김이면
+    /// `\x1b[?25l`. 페이로드 앞에는 항상 `\x1b[?25l`(숨김)을 붙여 cursor save/move/draw/
+    /// restore 동안 커서가 보이지 않게 한다.
+    fn cursor_restore_suffix(&self) -> &'static str {
+        if self.cursor_visible() {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
         }
-        if rows <= 1 {
-            return Ok(());
+    }
+
+    /// reserve의 "본문"(커서 visibility 토글 제외): `\x1b7\x1b[1;{n}r\x1b8`. style이 없거나
+    /// rows<=1이면 빈 문자열을 반환한다. content-dedup 키 구성과 envelope 1회 wrap에 쓰인다.
+    /// DECSTBM(`\x1b[1;{n}r`)은 커서를 home으로 이동시키지만 save/restore(`\x1b7`/`\x1b8`)로
+    /// 위치는 복원된다. 커서 숨김/복원은 호출자(`reserve_terminal_area`/`refresh`)가 감싼다.
+    fn build_reserve_body(&self, rows: u16) -> String {
+        if self.style.is_none() || rows <= 1 {
+            return String::new();
         }
         let scroll_bottom = rows - 1;
-        write!(stdout, "\x1b7\x1b[1;{scroll_bottom}r\x1b8")
+        format!("\x1b7\x1b[1;{scroll_bottom}r\x1b8")
+    }
+
+    fn reserve_terminal_area(&self, stdout: &mut impl Write, rows: u16) -> Result<()> {
+        let body = self.build_reserve_body(rows);
+        if body.is_empty() {
+            return Ok(());
+        }
+        // 그 사이 커서가 보이면 codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가
+        // 잠깐 튄다. 숨김→reserve→추적 상태로 복원으로 감싼다.
+        let cursor_restore = self.cursor_restore_suffix();
+        write!(stdout, "\x1b[?25l{body}{cursor_restore}")
             .context("reserve lterm status bar row")?;
         Ok(())
     }
@@ -4605,10 +4896,15 @@ impl StatusBar {
         self.draw_at_size(stdout, cols, rows)
     }
 
-    fn draw_at_size(&mut self, stdout: &mut impl Write, cols: u16, rows: u16) -> Result<()> {
+    /// status 행 draw의 "본문"(커서 visibility 토글 제외)을 만든다. 페이로드 형태는
+    /// `\x1b7{sgr_push}{이전행 clear}*\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8`.
+    /// 가드(rows<=1/cols<=1/style None)에 걸리면 빈 문자열을 반환한다. 순수 함수라
+    /// `remember_status_row` 같은 side-effect는 호출하지 않는다 — content-dedup 키 구성과
+    /// envelope 1회 wrap에 안전하게 재사용하기 위함이다.
+    fn build_draw_body(&self, cols: u16, rows: u16) -> String {
         // cols<=1이면 마지막 칸을 비우고도 그릴 공간이 없어 autowrap 회피 의미가 사라진다.
         if rows <= 1 || cols <= 1 {
-            return Ok(());
+            return String::new();
         }
         // 마지막 칸까지 채우면 일부 모바일 터미널(예: Termius)에서 deferred-wrap 미구현으로
         // 즉시 스크롤이 발생해 status line이 본문으로 밀려 올라간다. cols-1만 그린다.
@@ -4638,7 +4934,7 @@ impl StatusBar {
         // escape는 이미 제거되고 SGR 끝에 reset이 붙으므로 색 누수는 차단된다.
         let style = match self.style {
             Some(style) => style,
-            None => return Ok(()),
+            None => return String::new(),
         };
         let sgr = if use_theme_bg { style.sgr() } else { "\x1b[0m" };
         // SGR + cursor save/restore + 본문을 단일 String 으로 buffer 후 write_all 1회 호출.
@@ -4664,24 +4960,41 @@ impl StatusBar {
         } else {
             ""
         };
-        let mut payload = format!("\x1b7{sgr_push}");
+        let mut body = format!("\x1b7{sgr_push}");
         for previous_row in &rows_to_clear {
             // 새 terminal height 에서 예전 status row 가 보이는 경우 먼저 default 배경으로
             // 지운다. 그렇지 않으면 pane grow / mobile rotate 뒤 예전 status row 가 본문
             // 중간에 남아 "statusline 여러 개"처럼 보인다.
-            payload.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
+            body.push_str(&format!("\x1b[{previous_row};1H\x1b[0m\x1b[2K"));
         }
         let current_row_clear = if self.drawn_status_rows.contains(&rows) {
             ""
         } else {
             "\x1b[2K"
         };
-        payload.push_str(&format!(
+        body.push_str(&format!(
             "\x1b[{rows};1H{current_row_clear}{sgr}{line}\x1b[0m\x1b[K{sgr_pop}\x1b8"
         ));
+        body
+    }
+
+    fn draw_at_size(&mut self, stdout: &mut impl Write, cols: u16, rows: u16) -> Result<()> {
+        let body = self.build_draw_body(cols, rows);
+        if body.is_empty() {
+            return Ok(());
+        }
+        // idle 상태에서 status 행은 ~250ms마다(STATUS_HEARTBEAT) repaint된다. cursor
+        // save(`\x1b7`)→status 행으로 이동→draw→restore(`\x1b8`)를 하는 동안 커서가 보이면
+        // codex처럼 메인 버퍼 입력 커서를 노출하는 TUI에서 커서가 status 행으로 튀며
+        // 깜빡인다. 페이로드 맨 앞에서 커서를 숨기고(`\x1b[?25l`), 맨 끝에서 PTY 앱이 마지막에
+        // 설정한 visibility로 복원한다. 단일 write_all로 나가므로 터미널이 한 번에 처리해
+        // 중간 상태(커서가 status 행에 보이는 순간)가 사용자에게 노출되지 않는다.
+        let cursor_restore = self.cursor_restore_suffix();
+        let payload = format!("\x1b[?25l{body}{cursor_restore}");
         stdout
             .write_all(payload.as_bytes())
             .context("draw lterm status bar")?;
+        let rows_to_clear = self.visible_previous_status_rows(rows);
         self.remember_status_row(rows, &rows_to_clear);
         Ok(())
     }
@@ -4809,17 +5122,38 @@ struct KeyboardProtocolRestoreState {
     kitty_direct_flags: AtomicU32,
 }
 
-/// PTY가 alternate screen buffer에 진입했는지 추적한다. true 동안에는 host-side
-/// status bar 그리기를 일시 중단해 vim/htop 같은 alt-screen 앱과 화면 충돌을 피한다.
-/// PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h` (enter) 와 대응하는 `l` (exit)을 관찰.
+/// PTY가 alternate screen buffer에 진입했는지, 그리고 PTY 앱이 커서를 보이도록
+/// 두고 있는지를 추적한다.
 ///
-/// `Arc<AtomicBool>` + `Ordering::Relaxed` 사용 근거: 현재 단일 attach 스레드에서
+/// `active`: true 동안에는 host-side status bar 그리기를 일시 중단해 vim/htop 같은
+/// alt-screen 앱과 화면 충돌을 피한다. PTY 출력 스트림에서 `\x1b[?1049h/47h/1047h`
+/// (enter) 와 대응하는 `l` (exit)을 관찰한다.
+///
+/// `cursor_visible`: PTY 앱이 마지막으로 설정한 DECTCEM(`\x1b[?25h` 보이기 /
+/// `\x1b[?25l` 숨기기) 상태. status 행 repaint 시 커서를 잠깐 숨겼다가 이 추적값으로
+/// 복원하기 위해 사용한다. codex처럼 메인 버퍼에서 입력 커서를 노출하는 TUI는
+/// 커서가 보이는 상태인데, status repaint가 커서 저장/이동/복원을 하면서 커서를
+/// 숨기지 않으면 4Hz로 커서가 status 행으로 튀며 깜빡인다. 커서는 기본 표시
+/// 상태이므로 초기값은 **true** 다.
+///
+/// `AtomicBool` + `Ordering::Relaxed` 사용 근거: 현재 단일 attach 스레드에서
 /// observe(write)와 attach 루프(read)가 모두 일어나므로 ordering 요구는 없다.
 /// `Arc`는 향후 PTY reader/observer 분리를 대비한 형태이며, 그 때에는 publishing
 /// data가 동반되지 않으면 Relaxed로 충분하다.
-#[derive(Default)]
 struct AltScreenState {
     active: AtomicBool,
+    /// PTY 앱이 노출 중인 커서 visibility(DECTCEM). 기본 true(보임).
+    cursor_visible: AtomicBool,
+}
+
+impl Default for AltScreenState {
+    fn default() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            // 커서는 기본적으로 보이는 상태이므로 true 로 시작한다.
+            cursor_visible: AtomicBool::new(true),
+        }
+    }
 }
 
 struct TerminalOutputTracker {
@@ -5180,10 +5514,12 @@ fn observe_alt_screen_sequences(bytes: &[u8], alt_screen: &AltScreenState) {
 ///   현 구현 수용.
 /// - chunk 경계 분할은 [`TerminalOutputTracker`]가 tail buffer 로 처리한다.
 ///
-/// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)를
-/// 관찰해 `alt_screen.active`를 갱신한다. 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를
-/// 합쳐서 다시 부르며, 그 경우 `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를
-/// 다시 처리하지 않게 막는다.
+/// PTY 출력에서 alternate screen buffer 진입/종료 시퀀스(`CSI ? 47 / 1047 / 1049 h|l`)와
+/// 커서 visibility(DECTCEM, `CSI ? 25 h|l`)를 함께 관찰해 각각 `alt_screen.active`와
+/// `alt_screen.cursor_visible`를 갱신한다. 둘 다 같은 `CSI ? <params> h|l` 형태라 한 번의
+/// 스캔으로 처리하며, `?1049;25l`처럼 한 시퀀스에 두 mode가 묶여 오면 둘 다 갱신한다.
+/// 청크 경계로 잘린 시퀀스는 호출자가 tail 버퍼를 합쳐서 다시 부르며, 그 경우
+/// `min_final_index`로 이전 청크에 이미 본 종결자(`h`/`l`)를 다시 처리하지 않게 막는다.
 fn observe_alt_screen_sequences_after(
     bytes: &[u8],
     min_final_index: usize,
@@ -5209,8 +5545,14 @@ fn observe_alt_screen_sequences_after(
             if (0x40..=0x7e).contains(&byte) {
                 if (byte == b'h' || byte == b'l') && j >= min_final_index {
                     let params = &bytes[i + 3..j];
+                    let set = byte == b'h';
                     if alt_screen_param_matches(params) {
-                        alt_screen.active.store(byte == b'h', Ordering::Relaxed);
+                        alt_screen.active.store(set, Ordering::Relaxed);
+                    }
+                    // DECTCEM(`?25h` 보이기 / `?25l` 숨기기) 추적. alt-screen 토글과
+                    // 독립적으로 갱신하므로 `?1049;25l` 같은 그룹에서 둘 다 반영된다.
+                    if dectcem_param_matches(params) {
+                        alt_screen.cursor_visible.store(set, Ordering::Relaxed);
                     }
                 }
                 break;
@@ -5229,6 +5571,17 @@ fn alt_screen_param_matches(params: &[u8]) -> bool {
     params
         .split(|byte| *byte == b';')
         .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
+}
+
+/// `CSI ? <params> h|l`의 params에 DECTCEM(커서 visibility) mode 25가 포함됐는지 검사한다.
+/// `alt_screen_param_matches`와 동일하게 `;`(ECMA-48 parameter separator)로만 split한다.
+/// `:`(subparameter separator)는 split하지 않으므로 `?25:5h`처럼 25의 subparameter가 붙은
+/// 경우를 "mode 25"로 오인하지 않는다. `?1049;25l`처럼 다른 mode와 그룹으로 묶인 경우도
+/// split 후 `25` 토큰을 정확히 잡아낸다.
+fn dectcem_param_matches(params: &[u8]) -> bool {
+    params
+        .split(|byte| *byte == b';')
+        .any(|param| param == b"25")
 }
 
 struct RawModeGuard {
@@ -5592,17 +5945,19 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
         KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
         MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
-        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_HEARTBEAT,
-        STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBar, StatusCommandConfig,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
-        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, current_unix_ms,
-        cursor_clamp_into_scroll_region, ensure_panic_terminal_cleanup_hook,
+        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
+        StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
+        StatusPresenceRuntimeHandle, SurfaceKind,
+        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
+        agent_name_from_command, agent_presence_banner_enabled, agent_presence_cue_enabled,
+        alt_screen_param_matches, anyhow_error_is_broken_pipe, apply_pending_status_command,
+        attach_pty_rows, build_status_payload, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
+        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, keyboard_protocol_restore_bytes,
@@ -5612,8 +5967,9 @@ mod tests {
         panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
         parse_status_style, raw_attach_command_hint, read_attach_response_header,
         read_trace_jsonl_line, reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode,
-        resolve_status_style, run_status_command, should_mobile_transcript_auto,
-        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
+        resolve_status_style, run_status_command, select_status_backend,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        trace_file_summary,
         trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
@@ -7450,6 +7806,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7474,6 +7834,505 @@ mod tests {
     }
 
     #[test]
+    fn draw_at_size_hides_cursor_and_restores_visible_by_default() {
+        // terminal_state=None이면 커서가 보이는 상태로 가정 → 페이로드는 `\x1b[?25l`로
+        // 시작하고 `\x1b[?25h`(보임 복원)로 끝나야 한다. repaint 중 커서가 status 행으로
+        // 튀어 깜빡이는 것을 막는다.
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw with default cursor visibility");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b[?25l"),
+            "draw payload must start by hiding the cursor: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b8\x1b[?25h"),
+            "draw payload must restore cursor visible after \\x1b8: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn draw_at_size_restores_hidden_cursor_when_pty_hid_it() {
+        // PTY 앱이 커서를 숨겨둔 상태(cursor_visible=false)면 repaint 후에도 숨김으로
+        // 복원해야 한다 — 즉 페이로드는 `\x1b[?25l`로 시작하고 `\x1b[?25l`로 끝난다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let mut status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(Arc::clone(&state)),
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .draw_at_size(&mut output, 80, 24)
+            .expect("draw with hidden cursor");
+        let payload = String::from_utf8(output).expect("status payload should be utf8");
+        assert!(
+            payload.starts_with("\x1b[?25l"),
+            "draw payload must start by hiding the cursor: {payload:?}"
+        );
+        assert!(
+            payload.ends_with("\x1b8\x1b[?25l"),
+            "draw payload must keep cursor hidden when PTY had it hidden: {payload:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn reserve_terminal_area_wraps_cursor_visibility() {
+        // reserve도 DECSTBM이 커서를 home으로 옮기므로 같은 패턴으로 감싼다.
+        // 기본(보임)이면 `\x1b[?25l`로 시작, `\x1b[?25h`로 끝.
+        let status_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        };
+        let mut output = Vec::new();
+        status_bar
+            .reserve_terminal_area(&mut output, 24)
+            .expect("reserve with default cursor visibility");
+        let payload = String::from_utf8(output).expect("reserve payload should be utf8");
+        assert_eq!(
+            payload, "\x1b[?25l\x1b7\x1b[1;23r\x1b8\x1b[?25h",
+            "reserve must hide cursor, set scroll region, then restore visible"
+        );
+
+        // PTY가 커서를 숨긴 상태면 `\x1b[?25l`로 닫는다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let hidden_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(state),
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        };
+        let mut hidden_output = Vec::new();
+        hidden_bar
+            .reserve_terminal_area(&mut hidden_output, 24)
+            .expect("reserve with hidden cursor");
+        let hidden_payload =
+            String::from_utf8(hidden_output).expect("reserve payload should be utf8");
+        assert_eq!(
+            hidden_payload, "\x1b[?25l\x1b7\x1b[1;23r\x1b8\x1b[?25l",
+            "reserve must keep cursor hidden when PTY had it hidden"
+        );
+    }
+
+    /// content-dedup 테스트용 StatusBar 생성. command_line으로 본문을 결정적으로 바꿔
+    /// terminal_size()(테스트 환경 fallback 80x24)와 무관하게 dedup 키 차이를 만든다.
+    fn dedup_test_status_bar(command_line: Option<&str>) -> StatusBar {
+        StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: command_line.map(str::to_string),
+            command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        }
+    }
+
+    /// dedup이 안정화될 때까지 refresh를 반복한다(=Ok(false)로 skip할 때까지). 첫 draw는
+    /// 현재 행을 `\x1b[2K`로 비우지만, drawn_status_rows에 등록된 뒤(remember_status_row)에는
+    /// 같은 행 redraw가 그 clear를 생략한다(same-row flicker 회피). 따라서 본문은 첫 draw
+    /// 후 한 번 바뀐 뒤 안정화되므로, dedup 테스트는 그 안정 지점부터 검증한다.
+    fn refresh_until_stable(status_bar: &mut StatusBar) {
+        for _ in 0..4 {
+            let mut sink = Vec::new();
+            if !status_bar
+                .refresh(&mut sink)
+                .expect("refresh while stabilizing")
+            {
+                return;
+            }
+        }
+        panic!("refresh did not stabilize (dedup never engaged)");
+    }
+
+    #[test]
+    fn refresh_skips_redraw_when_body_unchanged() {
+        // (a) 동일 본문 + force_redraw=false면 refresh가 Ok(false)로 skip하고 아무것도 쓰지 않는다.
+        // codex 스피너가 status_dirty를 4Hz로 set해도 본문이 같으면 커서를 일절 건드리지 않는다.
+        let mut status_bar = dedup_test_status_bar(None);
+        let mut first = Vec::new();
+        let drew_first = status_bar.refresh(&mut first).expect("first refresh draws");
+        assert!(
+            drew_first,
+            "first refresh must draw (force_redraw 기본 true)"
+        );
+        assert!(!first.is_empty(), "first refresh must write a payload");
+
+        refresh_until_stable(&mut status_bar);
+
+        // 안정화 이후 동일 본문 refresh는 아무것도 쓰지 않아야 한다(커서 미접촉).
+        let mut deduped = Vec::new();
+        let drew = status_bar
+            .refresh(&mut deduped)
+            .expect("stable refresh dedups");
+        assert!(
+            !drew,
+            "refresh with identical body must return Ok(false) once stable"
+        );
+        assert!(
+            deduped.is_empty(),
+            "deduped refresh must not write anything (cursor untouched): {deduped:?}"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_redraws_when_body_changes() {
+        // (b) 본문이 바뀌면(command_line 변경) Ok(true)로 다시 쓴다.
+        let mut status_bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut status_bar);
+
+        // 같은 본문 — skip.
+        let mut unchanged = Vec::new();
+        assert!(
+            !status_bar
+                .refresh(&mut unchanged)
+                .expect("unchanged refresh"),
+            "identical body should dedup once stable"
+        );
+
+        // command_line을 바꿔 본문을 변경 → 다시 그려야 한다.
+        status_bar.command_line = Some("\x1b[32mbusy\x1b[0m".to_string());
+        let mut changed = Vec::new();
+        let drew = status_bar.refresh(&mut changed).expect("changed refresh");
+        assert!(drew, "changed body must redraw");
+        assert!(!changed.is_empty(), "changed refresh must write a payload");
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_force_redraw_overrides_dedup() {
+        // (c) force_redraw=true면 본문이 동일해도 다시 쓰고, 그 후 force_redraw는 false로 리셋된다.
+        let mut status_bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut status_bar);
+
+        status_bar.force_redraw = true;
+        let mut forced = Vec::new();
+        let drew = status_bar.refresh(&mut forced).expect("forced refresh");
+        assert!(drew, "force_redraw must draw even with identical body");
+        assert!(!forced.is_empty(), "forced refresh must write a payload");
+        assert!(
+            !status_bar.force_redraw,
+            "force_redraw must reset to false after a real draw"
+        );
+
+        // 리셋 후 동일 본문은 다시 dedup된다.
+        let mut after = Vec::new();
+        assert!(
+            !status_bar.refresh(&mut after).expect("post-force refresh"),
+            "after force_redraw reset, identical body dedups again"
+        );
+        status_bar.style = None;
+    }
+
+    #[test]
+    fn refresh_content_only_backstop_omits_reserve() {
+        // 백스톱(force_content_redraw)은 내용만 redraw하고 reserve(DECSTBM scroll-region 재설정)를
+        // 내보내지 않아 codex 등이 쓰는 자체 scroll-region을 보존한다(주기적 reserve 재확인이 codex
+        // idle 레이아웃을 침범해 입력칸이 늘어나던 회귀 차단). 대조로 force_redraw는 reserve를 포함한다.
+        // reserve = `\x1b7\x1b[1;{N}r\x1b8`이므로 DECSTBM 마커 `\x1b[1;`의 유무로 판정한다
+        // (draw 본문은 `\x1b[{rows};1H`만 써 `\x1b[1;`을 만들지 않는다).
+        let mut bar = dedup_test_status_bar(None);
+        refresh_until_stable(&mut bar);
+
+        // (1) content-only: reserve(DECSTBM) 없이 그린다.
+        bar.force_content_redraw = true;
+        let mut content_only = Vec::new();
+        assert!(
+            bar.refresh(&mut content_only).expect("content-only refresh"),
+            "force_content_redraw must draw even with identical body"
+        );
+        let payload = String::from_utf8(content_only).expect("payload utf8");
+        assert!(!payload.is_empty(), "content-only must write a payload");
+        assert!(
+            !payload.contains("\x1b[1;"),
+            "content-only must NOT re-issue DECSTBM scroll-region: {payload:?}"
+        );
+        assert!(
+            payload.starts_with("\x1b[?25l"),
+            "content-only도 force_redraw와 동일하게 커서 숨김 envelope로 시작해야 함: {payload:?}"
+        );
+        assert!(
+            !bar.force_content_redraw,
+            "force_content_redraw must reset to false after a draw"
+        );
+
+        // (2) 대조: force_redraw는 reserve(DECSTBM)를 포함한다.
+        refresh_until_stable(&mut bar);
+        bar.force_redraw = true;
+        let mut with_reserve = Vec::new();
+        assert!(
+            bar.refresh(&mut with_reserve).expect("forced refresh"),
+            "force_redraw draws"
+        );
+        let reserve_payload = String::from_utf8(with_reserve).expect("payload utf8");
+        assert!(
+            reserve_payload.contains("\x1b[1;"),
+            "force_redraw must include DECSTBM reserve: {reserve_payload:?}"
+        );
+
+        // (3) 두 플래그 동시 참: reserve 포함 경로가 우선(write_with_reserve = force_redraw || changed)
+        //     해야 손상 복구가 content-only로 떨어지지 않는다. 그린 뒤 두 플래그 모두 리셋.
+        refresh_until_stable(&mut bar);
+        bar.force_redraw = true;
+        bar.force_content_redraw = true;
+        let mut both = Vec::new();
+        assert!(
+            bar.refresh(&mut both).expect("both-flags refresh"),
+            "both flags must draw"
+        );
+        let both_payload = String::from_utf8(both).expect("payload utf8");
+        assert!(
+            both_payload.contains("\x1b[1;"),
+            "force_redraw+force_content_redraw 동시엔 reserve 포함 경로가 우선해야 함: {both_payload:?}"
+        );
+        assert!(
+            !bar.force_redraw && !bar.force_content_redraw,
+            "두 플래그 모두 draw 후 리셋되어야 함"
+        );
+        bar.style = None;
+    }
+
+    // ── select_status_backend 라우팅 매트릭스 (PoC1) ──
+
+    /// 모든 신호 false + terminal_capable=true인 기준 스냅샷. 테스트가 필드만 덮어쓴다.
+    fn capable_env() -> StatusEnvSnapshot {
+        StatusEnvSnapshot {
+            terminal_capable: true,
+            forced_off: false,
+            inside_cmux: false,
+            real_tmux: false,
+            is_iterm: false,
+            iterm_native_optin: false,
+        }
+    }
+
+    /// env 강제 off는 다른 모든 신호(cmux/tmux/iTerm)와 정책을 무력화하고 Disabled.
+    #[test]
+    fn backend_forced_off_overrides_all_signals() {
+        let env = StatusEnvSnapshot {
+            forced_off: true,
+            inside_cmux: true,
+            real_tmux: true,
+            is_iterm: true,
+            iterm_native_optin: true,
+            ..capable_env()
+        };
+        for policy in [
+            StatusPresencePolicy::RowAuto,
+            StatusPresencePolicy::RowOff,
+            StatusPresencePolicy::ForceRow,
+        ] {
+            assert_eq!(select_status_backend(policy, &env), StatusBackend::Disabled);
+        }
+    }
+
+    /// 터미널/기하 미충족(비-TTY 등)은 Disabled.
+    #[test]
+    fn backend_not_capable_disables() {
+        let env = StatusEnvSnapshot { terminal_capable: false, ..capable_env() };
+        assert_eq!(select_status_backend(StatusPresencePolicy::ForceRow, &env), StatusBackend::Disabled);
+        assert_eq!(select_status_backend(StatusPresencePolicy::RowAuto, &env), StatusBackend::Disabled);
+    }
+
+    /// ForceRow는 모든 위임 신호(cmux/tmux/iTerm)보다 우선해 in-terminal DECSTBM row를 강제한다.
+    #[test]
+    fn backend_force_row_overrides_all_delegations() {
+        let env = StatusEnvSnapshot {
+            inside_cmux: true,
+            real_tmux: true,
+            is_iterm: true,
+            iterm_native_optin: true,
+            ..capable_env()
+        };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::ForceRow, &env),
+            StatusBackend::DecstbmOverlay
+        );
+    }
+
+    /// cmux는 셸(RowAuto)·에이전트(RowOff) 모두 별 surface로 위임(에이전트 검사보다 먼저).
+    #[test]
+    fn backend_cmux_delegates_for_shell_and_agent() {
+        let env = StatusEnvSnapshot { inside_cmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+    }
+
+    /// 진짜 tmux는 status-line으로 위임(에이전트 포함). cmux가 동시 참이면 cmux 우선.
+    #[test]
+    fn backend_real_tmux_delegates_and_cmux_wins() {
+        let tmux_only = StatusEnvSnapshot { real_tmux: true, ..capable_env() };
+        // 에이전트(RowOff)·셸(RowAuto) 모두 tmux status-line으로 위임(정책보다 tmux가 먼저).
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &tmux_only),
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &tmux_only),
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
+        );
+        let both = StatusEnvSnapshot { real_tmux: true, inside_cmux: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &both),
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
+        );
+    }
+
+    /// iTerm+opt-in은 셀 그리드 밖 NativeChrome(명시 opt-in은 에이전트보다 우선).
+    #[test]
+    fn backend_iterm_optin_uses_native_chrome_before_agent() {
+        let env = StatusEnvSnapshot { is_iterm: true, iterm_native_optin: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::NativeChrome
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::NativeChrome
+        );
+    }
+
+    /// iTerm이지만 opt-in 없으면 NativeChrome로 가지 않는다(에이전트→타이틀, 셸→DECSTBM).
+    #[test]
+    fn backend_iterm_without_optin_falls_through() {
+        let env = StatusEnvSnapshot { is_iterm: true, ..capable_env() };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::TitleCueDelegation
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DecstbmOverlay
+        );
+    }
+
+    /// plain 터미널: 에이전트(RowOff)는 타이틀 위임, 셸(RowAuto)은 DECSTBM best-effort.
+    #[test]
+    fn backend_plain_agent_delegates_shell_overlays() {
+        let env = capable_env();
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowOff, &env),
+            StatusBackend::TitleCueDelegation
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::DecstbmOverlay
+        );
+    }
+
+    #[test]
+    fn refresh_payload_hides_cursor_and_restores_tracked_visibility() {
+        // (d) 실제로 쓸 때 페이로드는 `\x1b[?25l`(숨김)로 시작하고 추적된 visibility로 복원한다.
+        // terminal_state=None(보임 가정) → `\x1b[?25h`로 끝난다.
+        let mut visible_bar = dedup_test_status_bar(None);
+        let mut visible_payload = Vec::new();
+        assert!(
+            visible_bar
+                .refresh(&mut visible_payload)
+                .expect("visible refresh"),
+            "first refresh draws"
+        );
+        let visible = String::from_utf8(visible_payload).expect("payload utf8");
+        assert!(
+            visible.starts_with("\x1b[?25l"),
+            "refresh payload must start by hiding the cursor: {visible:?}"
+        );
+        assert!(
+            visible.ends_with("\x1b[?25h"),
+            "refresh payload must restore cursor visible by default: {visible:?}"
+        );
+        visible_bar.style = None;
+
+        // PTY가 커서를 숨긴 상태면 `\x1b[?25l`로 닫는다.
+        let state = Arc::new(AltScreenState::default());
+        state.cursor_visible.store(false, Ordering::Relaxed);
+        let mut hidden_bar = StatusBar {
+            session_name: "omx-lterm".to_string(),
+            pane_id: "%0".to_string(),
+            style: Some(StatusStyle::Full(StatusTheme::Blue)),
+            drawn_status_rows: Vec::new(),
+            preserve_sgr_stack: true,
+            command_line: None,
+            command_allow_color: false,
+            terminal_state: Some(state),
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
+        };
+        let mut hidden_payload = Vec::new();
+        assert!(
+            hidden_bar
+                .refresh(&mut hidden_payload)
+                .expect("hidden refresh"),
+            "first refresh draws"
+        );
+        let hidden = String::from_utf8(hidden_payload).expect("payload utf8");
+        assert!(
+            hidden.starts_with("\x1b[?25l"),
+            "refresh payload must start by hiding the cursor: {hidden:?}"
+        );
+        assert!(
+            hidden.ends_with("\x1b[?25l"),
+            "refresh payload must keep cursor hidden when PTY had it hidden: {hidden:?}"
+        );
+        hidden_bar.style = None;
+    }
+
+    #[test]
     fn status_bar_redraw_clears_rows_hidden_by_shrink_then_growth() {
         let mut status_bar = StatusBar {
             session_name: "omx-lterm".to_string(),
@@ -7483,6 +8342,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7530,6 +8393,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7567,6 +8434,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7576,12 +8447,12 @@ mod tests {
 
         let payload = String::from_utf8(output).expect("status payload should be utf8");
         assert!(
-            payload.starts_with("\x1b7\x1b[#{"),
-            "status redraw should push SGR before any host-side resets: {payload:?}"
+            payload.starts_with("\x1b[?25l\x1b7\x1b[#{"),
+            "status redraw should hide cursor, then push SGR before any host-side resets: {payload:?}"
         );
         assert!(
-            payload.ends_with("\x1b[#}\x1b8"),
-            "status redraw should pop SGR before restoring the application cursor: {payload:?}"
+            payload.ends_with("\x1b[#}\x1b8\x1b[?25h"),
+            "status redraw should pop SGR, restore cursor position, then restore cursor visibility: {payload:?}"
         );
         status_bar.style = None;
     }
@@ -7596,6 +8467,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7623,6 +8498,10 @@ mod tests {
             preserve_sgr_stack: false,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
 
@@ -7635,8 +8514,12 @@ mod tests {
             "status redraw must not emit private SGR stack controls when disabled: {draw_payload:?}"
         );
         assert!(
-            draw_payload.starts_with("\x1b7"),
-            "status redraw still saves the cursor without SGR stack: {draw_payload:?}"
+            draw_payload.starts_with("\x1b[?25l\x1b7"),
+            "status redraw still hides cursor then saves it without SGR stack: {draw_payload:?}"
+        );
+        assert!(
+            draw_payload.ends_with("\x1b8\x1b[?25h"),
+            "status redraw still restores cursor position then visibility without SGR stack: {draw_payload:?}"
         );
         assert!(
             draw_payload.contains("\x1b[24;1H\x1b[2K\x1b[0;30;104m"),
@@ -7682,6 +8565,10 @@ mod tests {
             // 살균을 거친(완결 SGR) 형태를 직접 주입한다.
             command_line: Some("\x1b[31mstatus\x1b[0m".to_string()),
             command_allow_color: true,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -7709,14 +8596,14 @@ mod tests {
             payload.contains("\x1b[0m\x1b[K"),
             "trailing reset + clear-to-eol must be preserved: {payload:?}"
         );
-        // scroll-region/cursor save·restore + SGR stack 보호장치 유지.
+        // cursor hide + scroll-region/cursor save·restore + SGR stack 보호장치 + cursor 복원 유지.
         assert!(
-            payload.starts_with("\x1b7\x1b[#{"),
-            "cursor save + SGR push preserved: {payload:?}"
+            payload.starts_with("\x1b[?25l\x1b7\x1b[#{"),
+            "cursor hide + cursor save + SGR push preserved: {payload:?}"
         );
         assert!(
-            payload.ends_with("\x1b[#}\x1b8"),
-            "SGR pop + cursor restore preserved: {payload:?}"
+            payload.ends_with("\x1b[#}\x1b8\x1b[?25h"),
+            "SGR pop + cursor position restore + cursor visibility restore preserved: {payload:?}"
         );
         status_bar.style = None;
     }
@@ -7733,6 +8620,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: Some("plain-status".to_string()),
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         status_bar
@@ -7763,6 +8654,10 @@ mod tests {
             command_line: None,
             // allow_color가 true라도 command_line이 None이면 fallback이라 영향 없어야 한다.
             command_allow_color: true,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut command_output = Vec::new();
         command_bar
@@ -7778,6 +8673,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut baseline_output = Vec::new();
         baseline_bar
@@ -7810,6 +8709,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: Some(long),
             command_allow_color: true,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         let mut output = Vec::new();
         // cols=20 → safe_width=19.
@@ -7992,6 +8895,10 @@ mod tests {
             preserve_sgr_stack: true,
             command_line: None,
             command_allow_color: false,
+            terminal_state: None,
+            last_body: None,
+            force_redraw: true,
+            force_content_redraw: false,
         };
         status_bar
             .draw_at_size(&mut output, 80, 24)
@@ -8704,17 +9611,85 @@ mod tests {
         let kbd = Arc::new(KeyboardProtocolRestoreState::default());
         let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
 
-        // xterm 그룹 set: ?47;1049h → 1049 매치 → enter
+        // 기본 cursor visibility는 보임(true).
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+
+        // xterm 그룹 set: ?47;1049h → 1049 매치 → enter (커서 visibility는 미변경)
         tracker.observe(b"\x1b[?47;1049h");
         assert!(state.active.load(Ordering::Relaxed));
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
 
-        // 그룹 reset: ?1049;25l → 1049 매치 → exit
+        // 그룹 reset: ?1049;25l → 1049 매치 → exit, 그리고 25 매치 → 커서 숨김.
+        // 한 시퀀스에 alt-screen과 DECTCEM이 함께 와도 둘 다 갱신돼야 한다.
         tracker.observe(b"\x1b[?1049;25l");
         assert!(!state.active.load(Ordering::Relaxed));
+        assert!(
+            !state.cursor_visible.load(Ordering::Relaxed),
+            "그룹 param의 25l은 커서 visibility도 false로 갱신해야 한다"
+        );
 
-        // 첫번째 파라미터가 무관해도 두번째가 alt-screen이면 매치
+        // 첫번째 파라미터가 무관해도 두번째가 alt-screen이면 매치.
+        // ?25;1049h → 1049 매치 → enter, 그리고 25h → 커서 보임 복원.
         tracker.observe(b"\x1b[?25;1049h");
         assert!(state.active.load(Ordering::Relaxed));
+        assert!(
+            state.cursor_visible.load(Ordering::Relaxed),
+            "그룹 param의 25h은 커서 visibility도 true로 갱신해야 한다"
+        );
+    }
+
+    #[test]
+    fn dectcem_param_matches_detects_mode_25_only() {
+        // 단일 mode 25 → true
+        assert!(dectcem_param_matches(b"25"));
+        // 그룹의 끝/중간/시작에 25가 있으면 true (`;` split 기반)
+        assert!(dectcem_param_matches(b"1049;25"));
+        assert!(dectcem_param_matches(b"25;1049"));
+        assert!(dectcem_param_matches(b"47;25;1006"));
+        // 25를 포함하지 않는 mode들 → false
+        assert!(!dectcem_param_matches(b"47"));
+        assert!(!dectcem_param_matches(b"2004"));
+        assert!(!dectcem_param_matches(b"1004"));
+        // 25를 부분 문자열로 포함하지만 독립 토큰이 아니면 false (`;` split이라 1025/250 미오인)
+        assert!(!dectcem_param_matches(b"1025"));
+        assert!(!dectcem_param_matches(b"250"));
+        // `:`는 subparameter separator라 split하지 않는다 → `25:5`는 mode 25가 아님
+        assert!(!dectcem_param_matches(b"25:5"));
+    }
+
+    #[test]
+    fn cursor_visibility_tracker_observes_hide_and_show() {
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
+
+        // 기본은 보임(true).
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        // ?25l → 숨김
+        tracker.observe(b"prompt\x1b[?25lhidden");
+        assert!(!state.cursor_visible.load(Ordering::Relaxed));
+        // ?25h → 다시 보임
+        tracker.observe(b"\x1b[?25hshown");
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        // DECTCEM 토글은 alt-screen active를 건드리지 않는다.
+        assert!(!state.active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cursor_visibility_sequence_split_across_chunks_observed() {
+        // 청크 경계로 `\x1b[?25l`이 쪼개져도 tail 버퍼 합성 경로가 잡아낸다.
+        let state = Arc::new(AltScreenState::default());
+        let kbd = Arc::new(KeyboardProtocolRestoreState::default());
+        let mut tracker = TerminalOutputTracker::new(Arc::clone(&kbd), Arc::clone(&state), None);
+
+        tracker.observe(b"prefix\x1b[?2");
+        // 아직 종결자 없음 → 미변경(기본 true 유지)
+        assert!(state.cursor_visible.load(Ordering::Relaxed));
+        tracker.observe(b"5l");
+        assert!(
+            !state.cursor_visible.load(Ordering::Relaxed),
+            "청크 경계로 잘린 ?25l도 boundary 경로가 잡아 숨김으로 갱신해야 한다"
+        );
     }
 
     #[test]
@@ -8790,35 +9765,70 @@ mod tests {
     #[test]
     fn heartbeat_idle_path_fires_only_when_clean_and_interval_elapsed() {
         // idle 경로: status_dirty=false 이고 STATUS_HEARTBEAT 경과 시 발화한다.
-        // attach 루프 시작 직후 ZERO elapsed는 두 경로 모두 false여야 한다.
-        assert!(!heartbeat_due(Duration::ZERO, false));
-        assert!(!heartbeat_due(Duration::ZERO, true));
+        // damage_pending=false 이므로 fast lane은 비활성. attach 루프 시작 직후
+        // ZERO elapsed는 모든 경로가 false여야 한다.
+        assert!(!heartbeat_due(Duration::ZERO, false, false));
+        assert!(!heartbeat_due(Duration::ZERO, true, false));
         assert!(!heartbeat_due(
             STATUS_HEARTBEAT - Duration::from_millis(1),
+            false,
             false
         ));
-        assert!(heartbeat_due(STATUS_HEARTBEAT, false));
+        assert!(heartbeat_due(STATUS_HEARTBEAT, false, false));
         assert!(heartbeat_due(
             STATUS_HEARTBEAT + Duration::from_millis(50),
+            false,
             false
         ));
     }
 
     #[test]
     fn heartbeat_dirty_blocks_idle_path_until_forced_threshold() {
-        // status_dirty=true 면 STATUS_HEARTBEAT 경과만으로는 발화하지 않고,
-        // STATUS_HEARTBEAT_FORCED 경과 후에 강제 발화한다. 이 경로가 없으면
-        // PTY 연속 출력 중 외부 DECSTBM 리셋을 영원히 회복하지 못한다.
-        assert!(!heartbeat_due(STATUS_HEARTBEAT, true));
+        // status_dirty=true 이고 damage_pending=false 면 STATUS_HEARTBEAT 경과만으로는
+        // 발화하지 않고, STATUS_HEARTBEAT_FORCED 경과 후에 강제 발화한다. 이 경로가 없으면
+        // PTY 연속 출력 중 외부 DECSTBM 리셋을 영원히 회복하지 못한다. fast lane 도입 후에도
+        // 비손상 dirty(damage_pending=false)의 백스톱 타이밍은 불변이어야 한다 — spec (d).
+        assert!(!heartbeat_due(STATUS_HEARTBEAT, true, false));
         assert!(!heartbeat_due(
             STATUS_HEARTBEAT_FORCED - Duration::from_millis(1),
-            true
+            true,
+            false
         ));
-        assert!(heartbeat_due(STATUS_HEARTBEAT_FORCED, true));
+        assert!(heartbeat_due(STATUS_HEARTBEAT_FORCED, true, false));
         assert!(heartbeat_due(
             STATUS_HEARTBEAT_FORCED + Duration::from_millis(100),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn heartbeat_damage_fast_lane_fires_at_short_interval_and_rate_limits() {
+        // 확정 손상 fast lane: damage_pending=true 이고 STATUS_DAMAGE_HEARTBEAT 경과 시
+        // forced 2초를 기다리지 않고 발화한다 — spec (a).
+        assert!(heartbeat_due(STATUS_DAMAGE_HEARTBEAT, true, true));
+        assert!(heartbeat_due(
+            STATUS_DAMAGE_HEARTBEAT + Duration::from_millis(10),
+            true,
             true
         ));
+        // status_dirty=false 여도(예외적) 손상이 확정되면 fast lane이 발화한다.
+        assert!(heartbeat_due(STATUS_DAMAGE_HEARTBEAT, false, true));
+        // rate-limit: STATUS_DAMAGE_HEARTBEAT 미경과면 손상 중이라도 발화하지 않아
+        // 연속 출력 중 매 프레임 repaint 폭주를 막는다 — spec (b).
+        assert!(!heartbeat_due(Duration::ZERO, true, true));
+        assert!(!heartbeat_due(
+            STATUS_DAMAGE_HEARTBEAT - Duration::from_millis(1),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn heartbeat_damage_fast_lane_is_faster_than_forced_backstop() {
+        // fast lane이 forced 백스톱보다 훨씬 빨라야 손상 복구가 체감상 즉시여야 한다.
+        assert!(STATUS_DAMAGE_HEARTBEAT < STATUS_HEARTBEAT_FORCED);
+        assert!(STATUS_DAMAGE_HEARTBEAT < STATUS_HEARTBEAT);
     }
 
     #[test]
