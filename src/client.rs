@@ -3086,7 +3086,15 @@ fn attach_with_presence_and_cue(
 ) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
-    let status_enabled = status_bar_supported(presence_policy.requests_row());
+    // status 백엔드 라우팅: 환경 스냅샷으로 가장 안전한 백엔드를 고른다(PoC1을 라이브 배선).
+    // behavior-preserving: in-pane DECSTBM row를 그릴지(`status_enabled`)는 현행과 동일하게
+    // 결정한다 — `backend != Disabled && requests_row()`는 기존
+    // `status_bar_supported(requests_row())`와 정확히 동치다(backend != Disabled ⟺
+    // !forced_off && terminal_capable ⟺ status_bar_supported의 env/geometry/TTY 부분).
+    // 미구현 백엔드(NativeChrome/DelegatedSurface/TitleCueDelegation)의 실렌더 배선은 후속 단계.
+    let status_backend = select_status_backend(presence_policy, &gather_status_env_snapshot());
+    let status_enabled =
+        status_backend != StatusBackend::Disabled && presence_policy.requests_row();
     let mut title_cue_runtime = agent_presence_cue.map(AgentTitleCueRuntime::new);
     let idle_wakeup_enabled = status_enabled || title_cue_runtime.is_some();
     // status bar 는 SessionInfo 의 메타데이터 (이름/명령 등) 가 필요하므로 켜졌을 때만
@@ -4416,16 +4424,6 @@ fn heartbeat_due(elapsed: Duration, status_dirty: bool, damage_pending: bool) ->
     elapsed >= STATUS_HEARTBEAT_FORCED
 }
 
-fn status_bar_supported(show_status: bool) -> bool {
-    let (cols, rows) = terminal_size();
-    show_status
-        && !status_bar_disabled_by_env()
-        && rows > 1
-        && cols > 0
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-}
-
 fn status_bar_disabled_by_env() -> bool {
     env_flag_enabled("LTERM_NO_STATUS") || env_flag_disabled("LTERM_STATUS")
 }
@@ -4474,7 +4472,6 @@ fn status_sgr_stack_supported() -> bool {
 
 /// status row를 어떤 메커니즘으로 표시할지 결정한 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // PoC1: 라우팅 결정만 — 렌더 배선은 후속에서 소비.
 enum StatusBackend {
     /// 미표시(env 강제 off / 비-TTY / 기하 부족).
     Disabled,
@@ -4490,7 +4487,6 @@ enum StatusBackend {
 
 /// [`StatusBackend::DelegatedSurface`]가 위임할 외부 surface 종류.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum SurfaceKind {
     /// cmux 별도 surface(open_cmux_split/send_cmux_attach 경로).
     Cmux,
@@ -4500,7 +4496,6 @@ enum SurfaceKind {
 
 /// [`select_status_backend`]의 순수 입력. 환경 신호 스냅샷(side-effect 없이 테스트가 구성).
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 struct StatusEnvSnapshot {
     /// TTY + rows>1 + cols>0. false면 무조건 Disabled.
     terminal_capable: bool,
@@ -4537,7 +4532,6 @@ struct StatusEnvSnapshot {
 /// 주: 3)에서 cmux는 RowAuto(셸) 세션도 별 surface로 위임한다(배치 일관성). 셸은 에이전트
 /// 충돌이 없어 in-pane DECSTBM도 안전하므로, 셸에 한해 in-pane row를 원하면 3)을 6) 뒤로
 /// 옮기면 된다 — 이 PoC는 그 결정을 테스트로 못박아 리뷰 가능하게 한다.
-#[allow(dead_code)]
 fn select_status_backend(policy: StatusPresencePolicy, env: &StatusEnvSnapshot) -> StatusBackend {
     if env.forced_off || !env.terminal_capable {
         return StatusBackend::Disabled;
@@ -4558,6 +4552,82 @@ fn select_status_backend(policy: StatusPresencePolicy, env: &StatusEnvSnapshot) 
         return StatusBackend::TitleCueDelegation;
     }
     StatusBackend::DecstbmOverlay
+}
+
+/// `$TMUX`의 socket 필드가 lterm self-provided TMUX인지 판정한다(순수, env 비의존).
+///
+/// lterm은 tmux-compat 호스트로서 자식에 `TMUX={lterm_socket},{pid},0`
+/// (`server::fake_tmux_value`)과 `LTERM_SOCKET={lterm_socket}`(tmux_compat.rs)을 함께 export한다.
+/// 따라서 `$TMUX`의 socket 필드(`,` 앞)가 lterm 소켓 경로(`LTERM_SOCKET` 또는
+/// `paths::socket_path()`)와 일치하면 진짜 외부 tmux가 아니라 lterm 자신이다.
+///
+/// # 인자
+/// - `tmux_socket_field`: `$TMUX`를 `,`로 가른 첫 필드(socket 경로).
+/// - `lterm_socket_env`: `LTERM_SOCKET` 값(있으면).
+/// - `lterm_socket_path`: `paths::socket_path()` 결과 문자열(있으면, 보조 비교).
+///
+/// # 반환
+/// socket 필드가 lterm 소켓과 일치하면 `true`(self-provided). 빈 필드는 판정 불가로 `false`.
+fn is_self_provided_tmux(
+    tmux_socket_field: &str,
+    lterm_socket_env: Option<&str>,
+    lterm_socket_path: Option<&str>,
+) -> bool {
+    if tmux_socket_field.is_empty() {
+        return false;
+    }
+    lterm_socket_env == Some(tmux_socket_field) || lterm_socket_path == Some(tmux_socket_field)
+}
+
+/// 진짜 외부 tmux 안에서 실행 중인지 판정한다(lterm self-provided TMUX는 제외).
+///
+/// 순진한 `$TMUX` 존재 검사는 lterm-as-tmux 세션을 진짜 tmux로 **오분류**한다(lterm이 자식에 TMUX를
+/// 스스로 export하므로). [`is_self_provided_tmux`]로 lterm 소켓 일치를 걸러 오분류를 막는다.
+fn detect_real_tmux() -> bool {
+    let Some(tmux) = std::env::var_os("TMUX") else {
+        return false;
+    };
+    let tmux = tmux.to_string_lossy();
+    let socket_field = tmux.split(',').next().unwrap_or("");
+    if socket_field.is_empty() {
+        return false;
+    }
+    let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
+    let lterm_socket_path = paths::socket_path().ok().map(|p| p.display().to_string());
+    !is_self_provided_tmux(
+        socket_field,
+        lterm_socket_env.as_deref(),
+        lterm_socket_path.as_deref(),
+    )
+}
+
+/// iTerm2 터미널인지 판정한다(`TERM_PROGRAM`/`LC_TERMINAL`에 "iterm" 포함).
+fn detect_is_iterm() -> bool {
+    let identity = [
+        std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        std::env::var("LC_TERMINAL").unwrap_or_default(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    identity.contains("iterm")
+}
+
+/// 실제 환경에서 [`StatusEnvSnapshot`]을 수집한다([`select_status_backend`] 입력).
+///
+/// `terminal_capable`는 이전 `status_bar_supported`가 쓰던 geometry/TTY 검사와 동일 신호이되 `show_status`
+/// (정책)는 제외한다 — 정책은 [`select_status_backend`]에 별도 전달되기 때문이다.
+fn gather_status_env_snapshot() -> StatusEnvSnapshot {
+    let (cols, rows) = terminal_size();
+    let terminal_capable =
+        rows > 1 && cols > 0 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    StatusEnvSnapshot {
+        terminal_capable,
+        forced_off: status_bar_disabled_by_env(),
+        inside_cmux: crate::tmux_compat::inside_cmux(),
+        real_tmux: detect_real_tmux(),
+        is_iterm: detect_is_iterm(),
+        iterm_native_optin: env_flag_enabled("LTERM_STATUS_ITERM"),
+    }
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -5948,28 +6018,27 @@ mod tests {
         NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
         STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
         StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
-        StatusPresenceRuntimeHandle, SurfaceKind,
-        StatusPresenceState, StatusStyle, StatusTheme, TerminalOutputTracker,
-        agent_name_from_command, agent_presence_banner_enabled, agent_presence_cue_enabled,
-        alt_screen_param_matches, anyhow_error_is_broken_pipe, apply_pending_status_command,
-        attach_pty_rows, build_status_payload, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
+        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
+        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, current_unix_ms,
+        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
-        hex_encode, hex_encoded_len, interruptible_sleep, keyboard_protocol_restore_bytes,
-        likely_agent_session, matches_env_bool, mobile_client_detected,
-        mobile_transcript_capture_changed, nested_known_agent_present_in_processes,
-        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
-        parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_trace_jsonl_line, reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode,
-        resolve_status_style, run_status_command, select_status_backend,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        trace_file_summary,
+        hex_encode, hex_encoded_len, interruptible_sleep, is_self_provided_tmux,
+        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
+        mobile_client_detected, mobile_transcript_capture_changed,
+        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
+        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
+        run_status_command, select_status_backend, should_mobile_transcript_auto,
+        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
         trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
     };
@@ -8086,7 +8155,8 @@ mod tests {
         bar.force_content_redraw = true;
         let mut content_only = Vec::new();
         assert!(
-            bar.refresh(&mut content_only).expect("content-only refresh"),
+            bar.refresh(&mut content_only)
+                .expect("content-only refresh"),
             "force_content_redraw must draw even with identical body"
         );
         let payload = String::from_utf8(content_only).expect("payload utf8");
@@ -8140,6 +8210,43 @@ mod tests {
         bar.style = None;
     }
 
+    // ── 지뢰 처리: self-provided TMUX 식별 (real_tmux 오분류 방지) ──
+
+    /// lterm self-provided TMUX(`$TMUX` socket 필드 == LTERM_SOCKET)는 self로 식별된다.
+    #[test]
+    fn self_provided_tmux_matches_lterm_socket_env() {
+        let sock = "/run/user/501/lterm.sock";
+        assert!(is_self_provided_tmux(sock, Some(sock), None));
+    }
+
+    /// `$TMUX` socket 필드가 paths::socket_path()와 일치해도 self로 식별된다(LTERM_SOCKET 미설정 폴백).
+    #[test]
+    fn self_provided_tmux_matches_socket_path_fallback() {
+        let sock = "/tmp/lterm-runtime/lterm.sock";
+        assert!(is_self_provided_tmux(sock, None, Some(sock)));
+    }
+
+    /// 진짜 외부 tmux(소켓 경로가 lterm과 다름)는 self가 아니다 → real_tmux로 분류되어야 한다.
+    #[test]
+    fn external_tmux_is_not_self_provided() {
+        let real_tmux_sock = "/private/tmp/tmux-501/default";
+        let lterm_sock = "/run/user/501/lterm.sock";
+        assert!(!is_self_provided_tmux(
+            real_tmux_sock,
+            Some(lterm_sock),
+            Some(lterm_sock)
+        ));
+        // lterm 마커가 전혀 없어도(둘 다 None) 외부 tmux는 self가 아니다.
+        assert!(!is_self_provided_tmux(real_tmux_sock, None, None));
+    }
+
+    /// 빈 socket 필드는 판정 불가로 self가 아니다(real_tmux=false로 떨어져 오분류 방지).
+    #[test]
+    fn empty_tmux_socket_field_is_not_self() {
+        assert!(!is_self_provided_tmux("", Some("/x"), Some("/y")));
+        assert!(!is_self_provided_tmux("", None, None));
+    }
+
     // ── select_status_backend 라우팅 매트릭스 (PoC1) ──
 
     /// 모든 신호 false + terminal_capable=true인 기준 스냅샷. 테스트가 필드만 덮어쓴다.
@@ -8177,9 +8284,18 @@ mod tests {
     /// 터미널/기하 미충족(비-TTY 등)은 Disabled.
     #[test]
     fn backend_not_capable_disables() {
-        let env = StatusEnvSnapshot { terminal_capable: false, ..capable_env() };
-        assert_eq!(select_status_backend(StatusPresencePolicy::ForceRow, &env), StatusBackend::Disabled);
-        assert_eq!(select_status_backend(StatusPresencePolicy::RowAuto, &env), StatusBackend::Disabled);
+        let env = StatusEnvSnapshot {
+            terminal_capable: false,
+            ..capable_env()
+        };
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::ForceRow, &env),
+            StatusBackend::Disabled
+        );
+        assert_eq!(
+            select_status_backend(StatusPresencePolicy::RowAuto, &env),
+            StatusBackend::Disabled
+        );
     }
 
     /// ForceRow는 모든 위임 신호(cmux/tmux/iTerm)보다 우선해 in-terminal DECSTBM row를 강제한다.
@@ -8201,7 +8317,10 @@ mod tests {
     /// cmux는 셸(RowAuto)·에이전트(RowOff) 모두 별 surface로 위임(에이전트 검사보다 먼저).
     #[test]
     fn backend_cmux_delegates_for_shell_and_agent() {
-        let env = StatusEnvSnapshot { inside_cmux: true, ..capable_env() };
+        let env = StatusEnvSnapshot {
+            inside_cmux: true,
+            ..capable_env()
+        };
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowAuto, &env),
             StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
@@ -8215,7 +8334,10 @@ mod tests {
     /// 진짜 tmux는 status-line으로 위임(에이전트 포함). cmux가 동시 참이면 cmux 우선.
     #[test]
     fn backend_real_tmux_delegates_and_cmux_wins() {
-        let tmux_only = StatusEnvSnapshot { real_tmux: true, ..capable_env() };
+        let tmux_only = StatusEnvSnapshot {
+            real_tmux: true,
+            ..capable_env()
+        };
         // 에이전트(RowOff)·셸(RowAuto) 모두 tmux status-line으로 위임(정책보다 tmux가 먼저).
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowOff, &tmux_only),
@@ -8225,7 +8347,11 @@ mod tests {
             select_status_backend(StatusPresencePolicy::RowAuto, &tmux_only),
             StatusBackend::DelegatedSurface(SurfaceKind::Tmux)
         );
-        let both = StatusEnvSnapshot { real_tmux: true, inside_cmux: true, ..capable_env() };
+        let both = StatusEnvSnapshot {
+            real_tmux: true,
+            inside_cmux: true,
+            ..capable_env()
+        };
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowAuto, &both),
             StatusBackend::DelegatedSurface(SurfaceKind::Cmux)
@@ -8235,7 +8361,11 @@ mod tests {
     /// iTerm+opt-in은 셀 그리드 밖 NativeChrome(명시 opt-in은 에이전트보다 우선).
     #[test]
     fn backend_iterm_optin_uses_native_chrome_before_agent() {
-        let env = StatusEnvSnapshot { is_iterm: true, iterm_native_optin: true, ..capable_env() };
+        let env = StatusEnvSnapshot {
+            is_iterm: true,
+            iterm_native_optin: true,
+            ..capable_env()
+        };
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowAuto, &env),
             StatusBackend::NativeChrome
@@ -8249,7 +8379,10 @@ mod tests {
     /// iTerm이지만 opt-in 없으면 NativeChrome로 가지 않는다(에이전트→타이틀, 셸→DECSTBM).
     #[test]
     fn backend_iterm_without_optin_falls_through() {
-        let env = StatusEnvSnapshot { is_iterm: true, ..capable_env() };
+        let env = StatusEnvSnapshot {
+            is_iterm: true,
+            ..capable_env()
+        };
         assert_eq!(
             select_status_backend(StatusPresencePolicy::RowOff, &env),
             StatusBackend::TitleCueDelegation
