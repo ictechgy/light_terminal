@@ -2231,7 +2231,11 @@ fn join_limited_reader(
         .map_err(|_| io::Error::other("cmux output reader panicked"))?
 }
 
-fn inside_cmux() -> bool {
+/// cmux 멀티플렉서 내부에서 실행 중인지 판정한다(`CMUX_*` env / 검증된 소켓).
+///
+/// status 백엔드 라우팅([`crate::client`]의 `gather_status_env_snapshot`)이 `inside_cmux` 신호를
+/// 읽을 수 있도록 `pub(crate)`로 노출한다(이전엔 module-private였음).
+pub(crate) fn inside_cmux() -> bool {
     if std::env::var_os("CMUX_WORKSPACE_ID").is_some()
         || std::env::var_os("CMUX_SURFACE_ID").is_some()
     {
