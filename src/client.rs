@@ -3295,7 +3295,7 @@ fn attach_with_presence_and_cue(
     let status_command = status_info
         .as_ref()
         .filter(|_| status_enabled)
-        .and_then(|info| StatusCommandConfig::from_env().map(|config| (info, config)))
+        .zip(StatusCommandConfig::from_env())
         .map(|(info, config)| {
             // allow_color는 draw 분기에서 테마 bg on/off를 결정하므로 미리 반영한다.
             status_bar.command_allow_color = config.allow_color;
