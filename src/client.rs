@@ -1926,6 +1926,7 @@ pub fn attach_info_with_policy(
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
     options: AttachPolicyOptions,
+    explicit_no_status: bool,
 ) -> Result<()> {
     let use_mobile = match options.mode {
         AttachMode::Raw => false,
@@ -1946,6 +1947,7 @@ pub fn attach_info_with_policy(
             presence_policy,
             stdin_eof,
             agent_presence_cue,
+            explicit_no_status,
         )
     }
 }
@@ -3063,10 +3065,14 @@ impl NestedAgentDetector {
 }
 
 pub fn attach(target: &str, show_status: bool, stdin_eof: AttachStdinEof) -> Result<()> {
+    // legacy show_status=false는 "agent 기본 RowOff"에 해당하며 사용자가 --no-status를
+    // 명시한 것이 아니다 → explicit_no_status=false. cmux pill sink는 명시적 비활성에서만
+    // 꺼지므로 이 구분이 중요하다(설계 §4.1).
     attach_with_presence(
         target,
         StatusPresencePolicy::from_legacy_show_status(show_status),
         stdin_eof,
+        false,
     )
 }
 
@@ -3074,8 +3080,9 @@ pub fn attach_with_presence(
     target: &str,
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
+    explicit_no_status: bool,
 ) -> Result<()> {
-    attach_with_presence_and_cue(target, presence_policy, stdin_eof, None)
+    attach_with_presence_and_cue(target, presence_policy, stdin_eof, None, explicit_no_status)
 }
 
 fn attach_with_presence_and_cue(
@@ -3083,35 +3090,79 @@ fn attach_with_presence_and_cue(
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
     agent_presence_cue: Option<AgentPresenceCue>,
+    // 사용자가 `--no-status`를 명시했는지. 정책 `RowOff`는 "agent 기본"과 "--no-status"를
+    // 구분 못 하므로, cmux pill sink 게이트(`sink_enabled`)는 이 신호로 명시적 비활성을 존중한다.
+    explicit_no_status: bool,
 ) -> Result<()> {
     ensure_server()?;
     ensure_panic_terminal_cleanup_hook();
-    // status 백엔드 라우팅: 환경 스냅샷으로 가장 안전한 백엔드를 고른다(PoC1을 라이브 배선).
-    // behavior-preserving: in-pane DECSTBM row를 그릴지(`status_enabled`)는 현행과 동일하게
-    // 결정한다 — `backend != Disabled && requests_row()`는 기존
-    // `status_bar_supported(requests_row())`와 정확히 동치다(backend != Disabled ⟺
-    // !forced_off && terminal_capable ⟺ status_bar_supported의 env/geometry/TTY 부분).
-    // 미구현 백엔드(NativeChrome/DelegatedSurface/TitleCueDelegation)의 실렌더 배선은 후속 단계.
+    // status 백엔드 라우팅: 환경 스냅샷으로 가장 안전한 백엔드를 고른다.
+    // in-pane DECSTBM row를 그릴지는 `in_grid` 게이트가, off-grid cmux pill sink를 켤지는
+    // `sink_enabled` 게이트가 각각 결정한다(아래). NativeChrome/DelegatedSurface(Tmux)/
+    // TitleCueDelegation의 실렌더 배선은 후속 단계.
     let status_backend = select_status_backend(presence_policy, &gather_status_env_snapshot());
-    let status_enabled =
-        status_backend != StatusBackend::Disabled && presence_policy.requests_row();
+    // 라우팅 정합성(설계 §4.1): in-grid DECSTBM row와 off-grid cmux pill sink를 별도 게이트로
+    // 분리한다. R8 상호배타(sink_enabled ⟹ in_grid==false)는 compute_in_grid의 `!sink_enabled`
+    // 항으로 구조적으로 보장된다.
+    //
+    // sink_enabled를 먼저 계산한 뒤 in_grid를 결정한다(in_grid가 sink_enabled에 의존).
+    // status 명령 설정을 게이트 밖으로 호이스트(설계 §4.1, Critic m1): `sink_enabled`가
+    // `status_command_config.is_some()`(= LTERM_STATUS_COMMAND 설정됨)을 읽어야 하므로.
+    // argv 파싱은 env-only라 부작용 없음.
+    let status_command_config = StatusCommandConfig::from_env();
+    // off-grid cmux pill sink 게이트(설계 §4.1): backend==Cmux + 콘텐츠 명령 구성됨 +
+    // 명시적 비활성(--no-status) 아님. `requests_row()`에 종속되지 않아 codex(RowOff)에서도 켜진다.
+    let sink_enabled = compute_sink_enabled(
+        status_backend,
+        status_command_config.is_some(),
+        explicit_no_status,
+    );
+    // pill 활성 세션만 off-grid(in_grid=false). cmux 셸 세션(sink_enabled=false)은 기존
+    // DECSTBM 동작 보존. sink_enabled=true면 구조적으로 in_grid=false가 보장된다(R8).
+    let in_grid = compute_in_grid(status_backend, presence_policy, sink_enabled);
+    // cmux pill sink가 켜지면 attach 시점 1회 워크스페이스 컨텍스트를 확보한다(설계 §4.2,
+    // UUID 우선·stored 우선). 이 컨텍스트는 아래에서 `CmuxStatusSink::new`로 소비된다.
+    // sink가 꺼져 있으면 `cmux identify`를 호출하지 않아 비-cmux 환경의 불필요한 서브프로세스
+    // 스폰을 피한다. 식별 실패(`None`)면 sink를 만들지 않는다(blackout — 별도 처리 없음).
+    let cmux_status_context = sink_enabled
+        .then(|| crate::tmux_compat::cmux_status_identity(target))
+        .flatten();
+    // 콘텐츠/메타/poll은 in-grid든 sink든 모두 필요하다. StatusBar(enter/refresh)와 DECSTBM
+    // row 예약은 in-grid 경로에서만 한다(아래 개별 분기).
+    let content_active = in_grid || sink_enabled;
     let mut title_cue_runtime = agent_presence_cue.map(AgentTitleCueRuntime::new);
-    let idle_wakeup_enabled = status_enabled || title_cue_runtime.is_some();
+    let idle_wakeup_enabled = content_active || title_cue_runtime.is_some();
     // status bar 는 SessionInfo 의 메타데이터 (이름/명령 등) 가 필요하므로 켜졌을 때만
     // info() 를 호출한다. PR #14 의 client-side first-attach guard 가 사라졌으므로
     // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
     // smallest 로 사이즈 정책을 결정한다 (PR #15).
-    let status_info = if status_enabled {
+    let status_info = if content_active {
         Some(info(target)?)
     } else {
         None
     };
-    let nested_monitor_enabled = status_enabled
+    // off-grid cmux pill sink(설계 §3.1/§4.3). 식별된 워크스페이스 컨텍스트가 있을 때만 생성하며,
+    // 라이프타임은 attach 함수 스코프에 결박된다(끝에서 `Drop`이 자기 키를 전부 청소 — 누수 1차
+    // 방어). 생성 직후 1회 `reconcile_orphans`로 직전 하드킬/abort 잔재(자기 prefix)를 청소한다
+    // (누수 2차 방어 — list-status 실패 시 best-effort 생략). 키 prefix는 안정적인 canonical
+    // pane id(`status_info.pane_id`)로 만들어 다중 세션 키 충돌을 차단한다.
+    let mut cmux_status_sink = cmux_status_context.map(|context| {
+        let pane_id = status_info
+            .as_ref()
+            .map(|info| info.pane_id.as_str())
+            .unwrap_or(target);
+        let mut sink = crate::tmux_compat::CmuxStatusSink::new(context, pane_id);
+        sink.reconcile_orphans();
+        sink
+    });
+    let nested_monitor_enabled = in_grid
         && presence_policy.allows_nested_suspend()
         && status_info
             .as_ref()
             .is_some_and(|info| info.agent_name.is_none());
-    let row_runtime = StatusPresenceRuntimeHandle::new(status_enabled);
+    // row_runtime은 in-grid DECSTBM row 예약(pty rows-1, scroll-region)을 관장한다.
+    // sink(cmux pill)는 off-grid라 풀 rows를 PTY에 넘겨야 하므로 in_grid만 전달한다.
+    let row_runtime = StatusPresenceRuntimeHandle::new(in_grid);
     let (cols, rows) = terminal_size();
     let pty_rows = row_runtime.pty_rows_for(rows);
 
@@ -3271,8 +3322,12 @@ fn attach_with_presence_and_cue(
     });
 
     let mut stdout = std::io::stdout();
-    reset_raw_attach_initial_sgr_if_needed(status_enabled, stdout.is_terminal(), &mut stdout)?;
-    let status_style = status_enabled
+    // in-grid status row 전용 host SGR reset. off-grid sink는 in-grid row를 그리지 않으므로
+    // in_grid 경로에서만 reset한다(기존 status_enabled 의미 보존).
+    reset_raw_attach_initial_sgr_if_needed(in_grid, stdout.is_terminal(), &mut stdout)?;
+    // status_style은 in-grid DECSTBM row의 시각 스타일이다. sink 경로(in_grid=false)에서는
+    // None이 되어 StatusBar::enter의 reserve_terminal_area가 no-op이 된다(DECSTBM 미출현 보장).
+    let status_style = in_grid
         .then(|| resolve_status_style(status_info.as_ref().and_then(|info| info.status_theme)));
     let mut status_bar = StatusBar::enter(
         status_info.as_ref(),
@@ -3280,7 +3335,10 @@ fn attach_with_presence_and_cue(
         Some(Arc::clone(&alt_screen_state)),
         &mut stdout,
     )?;
-    let status_metadata_enabled = Arc::new(AtomicBool::new(status_enabled));
+    // metadata/command 스레드 생명·일시정지 토글. 콘텐츠가 흐르는 경로(in_grid 또는 sink)에서
+    // 활성화한다. sink는 아직 소비처(C6)가 없어 콘텐츠는 무시되지만, 폴링 파이프라인 자체는
+    // C5/C6가 받을 수 있도록 켜둔다.
+    let status_metadata_enabled = Arc::new(AtomicBool::new(content_active));
     let status_metadata = status_info.as_ref().map(|info| {
         spawn_status_metadata_thread(
             info.pane_id.clone(),
@@ -3294,8 +3352,8 @@ fn attach_with_presence_and_cue(
     // Phase 2: CLI 플래그(`--status-command`) 우선 적용은 추후 추가. 현재는 env-only.
     let status_command = status_info
         .as_ref()
-        .filter(|_| status_enabled)
-        .zip(StatusCommandConfig::from_env())
+        .filter(|_| content_active)
+        .zip(status_command_config)
         .map(|(info, config)| {
             // allow_color는 draw 분기에서 테마 bg on/off를 결정하므로 미리 반영한다.
             status_bar.command_allow_color = config.allow_color;
@@ -3313,12 +3371,13 @@ fn attach_with_presence_and_cue(
                 Arc::clone(&running),
                 Arc::clone(&status_metadata_enabled),
                 Arc::clone(&alt_screen_state),
+                status_backend.surface_format(),
             )
         });
     let nested_detection = nested_monitor_enabled
         .then(|| spawn_nested_agent_detection_thread(target.to_string(), Arc::clone(&running)));
     if idle_wakeup_enabled {
-        let output_idle_timeout = if status_enabled {
+        let output_idle_timeout = if content_active {
             ATTACH_OUTPUT_IDLE_TIMEOUT
         } else {
             AGENT_TITLE_REFRESH
@@ -3415,24 +3474,30 @@ fn attach_with_presence_and_cue(
                 }
             }
 
-            // command-backed status: 새 명령 출력이 도착했고 직전 값과 다르면 status_bar에
-            // 반영하고 metadata와 동일한 redraw 경로로 status row를 다시 그린다. 변화가 없으면
-            // 직전 라인을 유지해 불필요한 redraw를 피한다.
-            if let Some(latest) = apply_pending_status_command(status_command_rx)
-                && status_bar.command_line.as_deref() != Some(latest.as_str())
-            {
-                status_bar.command_line = Some(latest);
-                if row_runtime.can_draw_status() {
-                    status_dirty = true;
-                    if !alt_screen_active
-                        && refresh_status_or_detached(
-                            &mut status_bar,
-                            &mut stdout,
-                            &mut status_dirty,
-                            &mut last_status_refresh,
-                        )?
-                    {
-                        break;
+            // command-backed status: 새 명령 출력(understatus stdout)이 도착하면 두 경로로 분기한다.
+            // - cmux pill sink 활성(`cmux_status_sink`가 Some): off-grid pill 경로다. 출력을
+            //   `sink.apply`로 넘겨 cmux 사이드바 pill만 갱신하고 **StatusBar(`command_line`)와
+            //   DECSTBM redraw(`refresh_status_or_detached`)에는 절대 진입하지 않는다**(설계 §3.1
+            //   in_grid 전용 경로 우회 — Cmux pill 경로는 StatusBar를 건드리지 않는다).
+            // - sink 비활성(None): 기존 in-grid 경로 그대로. 직전 값과 다르면 `command_line`을
+            //   갱신하고 metadata와 동일한 redraw 경로로 status row를 다시 그린다(바이트 불변).
+            if let Some(latest) = apply_pending_status_command(status_command_rx) {
+                if let Some(sink) = cmux_status_sink.as_mut() {
+                    sink.apply(&latest);
+                } else if status_bar.command_line.as_deref() != Some(latest.as_str()) {
+                    status_bar.command_line = Some(latest);
+                    if row_runtime.can_draw_status() {
+                        status_dirty = true;
+                        if !alt_screen_active
+                            && refresh_status_or_detached(
+                                &mut status_bar,
+                                &mut stdout,
+                                &mut status_dirty,
+                                &mut last_status_refresh,
+                            )?
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -3840,6 +3905,10 @@ struct StatusCommandPayload<'a> {
     source: &'a str,
     /// payload 스키마 버전. 현재 1.
     version: u32,
+    /// 콘텐츠 명령이 내야 할 출력 포맷(설계 §3.3, additive-optional).
+    /// backend==DelegatedSurface(Cmux)면 `"cmux-status"`(pill JSON), 그 외엔 `"oneline"`(기존 SGR 한 줄).
+    /// 구버전 understatus는 이 필드를 무시하고 oneline을 내며, lterm sink가 non-JSON으로 무해 처리한다.
+    surface_format: &'a str,
     /// 세션 이름(제어문자 제거됨).
     session: String,
     /// pane id(제어문자 제거됨).
@@ -3862,13 +3931,15 @@ struct StatusCommandPayload<'a> {
 /// 파라미터:
 /// - `info`: 대상 세션 메타데이터.
 /// - `cols`/`rows`: 현재 터미널 크기.
+/// - `surface_format`: 콘텐츠 명령이 낼 출력 포맷(`"cmux-status"` 또는 `"oneline"`). 설계 §3.3.
+///   신뢰되는 내부 상수(backend에서 파생)라 escape 대상이 아니지만 serde_json이 처리한다.
 ///
 /// 반환값: 한 줄 JSON 문자열.
 ///
 /// 보안: `name`/`pane_id`/`cwd`는 [`sanitize::terminal_text`]로 제어문자를 먼저 제거한다.
 /// serde_json이 따옴표/백슬래시는 escape하지만, raw 제어문자가 JSON에 주입되는 것을
 /// 사전에 차단한다. `agent`는 신뢰되는 allowlist 토큰이라 그대로 둔다. cwd가 비면 null.
-fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
+fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16, surface_format: &str) -> String {
     // 제어문자 제거 후 필드별 길이 cap을 적용해 payload 총량이 OS 파이프 버퍼보다
     // 충분히 작게(수 KB) 유지되도록 한다. 그러면 자식이 stdin을 안 읽어도
     // run_status_command의 write_all이 블로킹되지 않는다(H1 방어). cap은 char 경계 안전.
@@ -3887,6 +3958,7 @@ fn build_status_payload(info: &SessionInfo, cols: u16, rows: u16) -> String {
     let payload = StatusCommandPayload {
         source: "lterm",
         version: 1,
+        surface_format,
         session,
         pane,
         session_key,
@@ -4056,6 +4128,8 @@ fn join_reader_within_grace(
 /// - `alt_screen`: alt-screen(vim 등) 활성 상태. 활성 중에는 그리기가 막히므로
 ///   외부 명령 실행도 건너뛴다(draw 가드와 일관). 그리지도 않을 출력을 위해 매
 ///   interval마다 외부 프로세스를 spawn하는 낭비를 막는다.
+/// - `surface_format`: 매 tick의 payload에 직렬화할 출력 포맷(`"cmux-status"`/`"oneline"`).
+///   backend에서 파생된 내부 상수라 `&'static str`. 설계 §3.3.
 ///
 /// 반환값: 살균된 status 라인 수신 채널과 스레드 핸들.
 #[allow(clippy::too_many_arguments)]
@@ -4068,6 +4142,7 @@ fn spawn_status_command_thread(
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     alt_screen: Arc<AltScreenState>,
+    surface_format: &'static str,
 ) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(STATUS_COMMAND_CHANNEL_LIMIT);
     // 1회 실행 타임아웃은 interval과 상한(1500ms) 중 작은 값으로 둬 폴링이 밀리지 않게 한다.
@@ -4097,7 +4172,7 @@ fn spawn_status_command_thread(
                 continue;
             };
             let (cols, rows) = terminal_size();
-            let payload = build_status_payload(&info, cols, rows);
+            let payload = build_status_payload(&info, cols, rows, surface_format);
             match run_status_command(&argv, &payload, timeout, STATUS_COMMAND_MAX_OUTPUT_BYTES) {
                 Some(output) => {
                     let line =
@@ -4485,6 +4560,19 @@ enum StatusBackend {
     TitleCueDelegation,
 }
 
+impl StatusBackend {
+    /// 콘텐츠 명령이 내야 할 출력 포맷 식별자(payload `surface_format` 필드, 설계 §3.3).
+    ///
+    /// `DelegatedSurface(Cmux)`는 cmux 네이티브 pill JSON(`"cmux-status"`)을, 그 외 백엔드는
+    /// 기존 SGR 한 줄(`"oneline"`)을 요청한다. understatus가 이 값으로 출력 모드를 분기한다.
+    fn surface_format(self) -> &'static str {
+        match self {
+            StatusBackend::DelegatedSurface(SurfaceKind::Cmux) => "cmux-status",
+            _ => "oneline",
+        }
+    }
+}
+
 /// [`StatusBackend::DelegatedSurface`]가 위임할 외부 surface 종류.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceKind {
@@ -4552,6 +4640,42 @@ fn select_status_backend(policy: StatusPresencePolicy, env: &StatusEnvSnapshot) 
         return StatusBackend::TitleCueDelegation;
     }
     StatusBackend::DecstbmOverlay
+}
+
+/// in-grid DECSTBM row를 예약할지 결정한다(순수 함수, 설계 §4.1).
+///
+/// `sink_enabled`(off-grid cmux pill)가 켜져 있지 않고, backend가 Disabled가 아니며,
+/// 정책이 행을 원할 때(`requests_row()`) true.
+///
+/// 기존 `reserves_in_grid_row() && requests_row()` 로직과의 차이: cmux 셸 세션처럼
+/// `sink_enabled=false` 이면서 backend==`DelegatedSurface(Cmux)`인 경우(LTERM_STATUS_COMMAND
+/// 미설정)도 in-grid DECSTBM 행을 보존한다. pill이 실제 활성일 때(`sink_enabled=true`)만
+/// off-grid로 전환되므로 R8 상호배타(sink_enabled ⟹ in_grid==false)는 `!sink_enabled` 항으로
+/// 구조적으로 유지된다.
+fn compute_in_grid(
+    backend: StatusBackend,
+    policy: StatusPresencePolicy,
+    sink_enabled: bool,
+) -> bool {
+    !sink_enabled && backend != StatusBackend::Disabled && policy.requests_row()
+}
+
+/// off-grid cmux pill sink를 켤지 결정한다(순수 함수, 설계 §4.1).
+///
+/// 조건: backend==`DelegatedSurface(Cmux)` + 콘텐츠 명령 구성됨(`command_configured` =
+/// LTERM_STATUS_COMMAND 설정) + 명시적 비활성 아님(`!explicit_no_status`, 즉 `--no-status` 아님).
+///
+/// `requests_row()`에 종속되지 않으므로 codex 같은 agent 세션(RowOff)에서도 켜진다 — 이것이
+/// R3 BLOCKER 교정의 핵심이다. sink_enabled=true면 `compute_in_grid`가 `!sink_enabled` 항으로
+/// in_grid=false를 보장하므로 DECSTBM+pill 이중 렌더(R8)는 구조적으로 차단된다.
+fn compute_sink_enabled(
+    backend: StatusBackend,
+    command_configured: bool,
+    explicit_no_status: bool,
+) -> bool {
+    matches!(backend, StatusBackend::DelegatedSurface(SurfaceKind::Cmux))
+        && command_configured
+        && !explicit_no_status
 }
 
 /// `$TMUX`의 socket 필드가 lterm self-provided TMUX인지 판정한다(순수, env 비의존).
@@ -6025,8 +6149,9 @@ mod tests {
         compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
         compose_push_paste, compose_refresh_interval, compose_render_action,
         compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, current_unix_ms,
-        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
+        compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
+        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, is_self_provided_tmux,
@@ -6597,10 +6722,12 @@ mod tests {
     #[test]
     fn build_status_payload_emits_schema_keys_and_strips_controls() {
         let info = sample_session_info("my\u{7}session", "/usr/local/bin/codex --model gpt", None);
-        let json: serde_json::Value = serde_json::from_str(&build_status_payload(&info, 120, 40))
-            .expect("payload should be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&build_status_payload(&info, 120, 40, "oneline"))
+                .expect("payload should be valid JSON");
         assert_eq!(json["source"], "lterm");
         assert_eq!(json["version"], 1);
+        assert_eq!(json["surface_format"], "oneline");
         // 제어문자(BEL)가 제거된 세션 이름.
         assert_eq!(json["session"], "mysession");
         assert_eq!(json["pane"], "%test");
@@ -6611,12 +6738,43 @@ mod tests {
         assert_eq!(json["rows"], 40);
     }
 
+    /// C3: backend==Cmux면 payload의 surface_format이 "cmux-status"여야 한다(설계 §3.3 AC).
+    /// surface_format은 backend에서 파생되므로 StatusBackend::surface_format()도 함께 단언한다.
+    #[test]
+    fn build_status_payload_surface_format_reflects_backend() {
+        let info = sample_session_info("codex", "/usr/local/bin/codex", None);
+        // backend==DelegatedSurface(Cmux) → "cmux-status".
+        let cmux_format = StatusBackend::DelegatedSurface(SurfaceKind::Cmux).surface_format();
+        assert_eq!(cmux_format, "cmux-status");
+        let cmux_json: serde_json::Value =
+            serde_json::from_str(&build_status_payload(&info, 120, 40, cmux_format))
+                .expect("payload should be valid JSON");
+        assert_eq!(cmux_json["surface_format"], "cmux-status");
+
+        // 그 외 backend(예: DecstbmOverlay/Tmux) → "oneline".
+        assert_eq!(StatusBackend::DecstbmOverlay.surface_format(), "oneline");
+        assert_eq!(
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux).surface_format(),
+            "oneline"
+        );
+        assert_eq!(StatusBackend::Disabled.surface_format(), "oneline");
+        let oneline_json: serde_json::Value = serde_json::from_str(&build_status_payload(
+            &info,
+            120,
+            40,
+            StatusBackend::DecstbmOverlay.surface_format(),
+        ))
+        .expect("payload should be valid JSON");
+        assert_eq!(oneline_json["surface_format"], "oneline");
+    }
+
     #[test]
     fn build_status_payload_handles_null_agent_and_cwd() {
         let mut info = sample_session_info("shell", "/bin/zsh", None);
         info.cwd = String::new();
-        let json: serde_json::Value = serde_json::from_str(&build_status_payload(&info, 80, 24))
-            .expect("payload should be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&build_status_payload(&info, 80, 24, "oneline"))
+                .expect("payload should be valid JSON");
         assert!(json["agent"].is_null(), "unknown agent must serialize null");
         assert!(json["cwd"].is_null(), "empty cwd must serialize null");
         assert_eq!(json["session_key"], "shell/%test");
@@ -6628,7 +6786,7 @@ mod tests {
         // cwd 길이는 STATUS_PAYLOAD_CWD_CAP 이하여야 한다(char 경계 안전 절단).
         let mut info = sample_session_info("shell", "/bin/zsh", None);
         info.cwd = "/".to_string() + &"가".repeat(2000); // 멀티바이트로 경계 절단도 검증.
-        let payload = build_status_payload(&info, 80, 24);
+        let payload = build_status_payload(&info, 80, 24, "oneline");
         let json: serde_json::Value =
             serde_json::from_str(&payload).expect("payload must remain valid JSON after capping");
         let cwd = json["cwd"].as_str().expect("cwd should be present");
@@ -8405,6 +8563,142 @@ mod tests {
             select_status_backend(StatusPresencePolicy::RowAuto, &env),
             StatusBackend::DecstbmOverlay
         );
+    }
+
+    // ── C4: in_grid / sink_enabled 라우팅 게이트 (R8 BLOCKER 회귀 봉인) ──
+
+    /// R8 핵심: pill 활성(sink_enabled=true) Cmux 세션은 in_grid=false → 풀 rows.
+    /// pill 비활성(sink_enabled=false) Cmux 셸 세션은 in_grid=true → DECSTBM 보존.
+    /// DecstbmOverlay는 항상 rows-1 예약. DECSTBM+pill 이중 렌더 방지.
+    #[test]
+    fn cmux_routes_full_rows_decstbm_reserves_one() {
+        let cmux_backend = StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+
+        // Cmux + sink_enabled=true(pill 활성): off-grid → in_grid=false → 풀 rows.
+        let cmux_sink_on = compute_in_grid(cmux_backend, StatusPresencePolicy::RowAuto, true);
+        assert!(
+            !cmux_sink_on,
+            "cmux with active pill must not reserve an in-grid row"
+        );
+        assert_eq!(
+            attach_pty_rows(40, cmux_sink_on),
+            40,
+            "cmux pill-on gets full rows"
+        );
+
+        // Cmux + sink_enabled=false + requests_row: LTERM_STATUS_COMMAND 미설정 셸 세션 →
+        // in_grid=true → DECSTBM 행 보존(회귀 수정 핵심).
+        let cmux_sink_off = compute_in_grid(cmux_backend, StatusPresencePolicy::RowAuto, false);
+        assert!(
+            cmux_sink_off,
+            "cmux shell session (sink off) must preserve DECSTBM row"
+        );
+        assert_eq!(
+            attach_pty_rows(40, cmux_sink_off),
+            39,
+            "cmux sink-off gets rows-1"
+        );
+
+        // DecstbmOverlay + RowAuto + sink_enabled=false: in_grid=true → rows-1 예약.
+        let decstbm_in_grid = compute_in_grid(
+            StatusBackend::DecstbmOverlay,
+            StatusPresencePolicy::RowAuto,
+            false,
+        );
+        assert!(decstbm_in_grid, "decstbm overlay reserves an in-grid row");
+        assert_eq!(
+            attach_pty_rows(40, decstbm_in_grid),
+            39,
+            "decstbm gets rows-1"
+        );
+    }
+
+    /// R8: sink_enabled=true면 in_grid는 반드시 false(동시 true 불가).
+    /// `!sink_enabled` 항으로 구조적 보장. DecstbmOverlay면 sink는 항상 false다.
+    #[test]
+    fn in_grid_and_sink_enabled_are_mutually_exclusive() {
+        // Cmux + sink_enabled=true: 어떤 정책이든 in_grid=false.
+        for policy in [
+            StatusPresencePolicy::RowAuto,
+            StatusPresencePolicy::RowOff,
+            StatusPresencePolicy::ForceRow,
+        ] {
+            let backend = StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+            let sink = compute_sink_enabled(backend, true, false);
+            let in_grid = compute_in_grid(backend, policy, sink);
+            assert!(sink, "sink must be enabled when command configured");
+            assert!(
+                !in_grid,
+                "in_grid must be false when sink_enabled for policy {policy:?}"
+            );
+            assert!(!(in_grid && sink), "in_grid and sink must not both be true");
+        }
+        // DecstbmOverlay: sink는 항상 false(non-cmux backend).
+        assert!(!compute_sink_enabled(
+            StatusBackend::DecstbmOverlay,
+            true,
+            false
+        ));
+    }
+
+    /// sink 활성(BLOCKER 회귀 봉인): codex 시나리오 — backend=Cmux, LTERM_STATUS_COMMAND 설정,
+    /// no_status=false → sink_enabled==true. presence=RowOff(agent)여도 켜지는 게 핵심이다.
+    #[test]
+    fn sink_enabled_true_for_codex_cmux_with_command() {
+        let backend = StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+        // command 설정됨(true) + 명시 비활성 아님(false) → 켜짐. (정책 비종속이므로 policy 입력 없음.)
+        assert!(compute_sink_enabled(backend, true, false));
+    }
+
+    /// 명시 비활성/명령 미설정: --no-status(explicit_no_status=true) → sink off.
+    /// LTERM_STATUS_COMMAND 미설정(command_configured=false) → sink off.
+    #[test]
+    fn sink_enabled_false_when_disabled_or_no_command() {
+        let backend = StatusBackend::DelegatedSurface(SurfaceKind::Cmux);
+        // --no-status 명시.
+        assert!(!compute_sink_enabled(backend, true, true));
+        // LTERM_STATUS_COMMAND 미설정.
+        assert!(!compute_sink_enabled(backend, false, false));
+        // 둘 다.
+        assert!(!compute_sink_enabled(backend, false, true));
+    }
+
+    /// non-cmux backend는 command가 설정돼 있어도 sink를 켜지 않는다(sink는 Cmux 전용).
+    #[test]
+    fn sink_enabled_false_for_non_cmux_backends() {
+        for backend in [
+            StatusBackend::Disabled,
+            StatusBackend::DecstbmOverlay,
+            StatusBackend::NativeChrome,
+            StatusBackend::TitleCueDelegation,
+            StatusBackend::DelegatedSurface(SurfaceKind::Tmux),
+        ] {
+            assert!(
+                !compute_sink_enabled(backend, true, false),
+                "{backend:?} must not enable cmux pill sink"
+            );
+        }
+    }
+
+    /// in_grid은 정책이 행을 원할 때만(`requests_row()`) true. DecstbmOverlay+RowOff는 false.
+    /// sink_enabled=false(pill 비활성) 기준.
+    #[test]
+    fn in_grid_requires_requests_row() {
+        assert!(compute_in_grid(
+            StatusBackend::DecstbmOverlay,
+            StatusPresencePolicy::RowAuto,
+            false
+        ));
+        assert!(compute_in_grid(
+            StatusBackend::DecstbmOverlay,
+            StatusPresencePolicy::ForceRow,
+            false
+        ));
+        assert!(!compute_in_grid(
+            StatusBackend::DecstbmOverlay,
+            StatusPresencePolicy::RowOff,
+            false
+        ));
     }
 
     #[test]
