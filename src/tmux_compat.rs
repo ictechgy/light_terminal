@@ -3430,20 +3430,14 @@ fn control_key_byte(key: &str) -> Option<u8> {
 // 구동한다. 본 모듈은 sink 자체(파싱·diff·apply·Drop·서킷브레이커)만 담는다 —
 // 소비점(client.rs) 배선은 후속 청크(C6)에서 한다.
 //
-// 본 청크(C5)는 sink 모듈만 구현하고 소비점(client.rs:3421) 배선은 다음 청크(C6)에서
-// 한다. 그때까지 공개 API(`CmuxStatusSink::new`/`apply`/`Drop`)와 그 의존 내부가
-// 비-test 빌드에서 호출되지 않으므로, 모듈 단위 `#![allow(dead_code)]`로 한 곳에서
-// 허용한다(C6 배선 시 호출되면 자연히 사용됨). 단위테스트는 모듈 내부에서 전 경로를
-// 실제로 검증한다.
+// C6에서 소비점(client.rs)이 sink를 owned 로컬로 생성·보유하고 `apply`를 호출하므로
+// 공개 API(`CmuxStatusSink::new`/`apply`/`reconcile_orphans`/`Drop`)와 그 의존 내부가
+// 비-test 빌드에서 실제로 호출된다. 따라서 C5의 모듈 단위 `#![allow(dead_code)]`는 제거됐다.
 //
-// 이 re-export는 C6 소비점(client.rs)이 `crate::tmux_compat::CmuxStatusSink`로 참조할
-// 진입점이다. C6 배선 전까지는 미사용이므로 `allow(unused_imports)`로 둔다.
-#[allow(unused_imports)]
+// 이 re-export는 C6 소비점(client.rs)이 `crate::tmux_compat::CmuxStatusSink`로 참조하는 진입점이다.
 pub(crate) use cmux_status::CmuxStatusSink;
 
 mod cmux_status {
-    #![allow(dead_code)]
-
     use super::{CmuxSurfaceContext, Command, client, run_cmux_command, sanitize};
     use serde::Deserialize;
     use std::collections::BTreeMap;
@@ -3890,6 +3884,101 @@ mod cmux_status {
                 self.progress_applied = None;
             }
         }
+
+        /// 고아 pill 재조정(누수 2차 방어, 설계 §4.3 — attach 시 필수).
+        ///
+        /// 이번 세션이 아직 쓰지 않은 직전 하드킬/abort 잔재(SIGKILL·`panic=abort` 복구의 유일
+        /// 경로)를 청소한다. `cmux list-status`(워크스페이스 한정)로 현재 키 집합을 조회해 자기
+        /// `key_prefix`로 시작하는 키를 전부 `clear-status`한다. `applied`가 비어 있는 sink 생성
+        /// 직후 호출이 전제이므로 이번 세션 desired는 아직 없고, 매치되는 prefix 키는 모두 잔재다.
+        ///
+        /// best-effort: `list-status` 자체가 실패하면(stale ref "Tab not found" 등) 재조정을
+        /// 생략한다(복구 경로 실패가 sink 생성/동작을 막지 않음, 설계 §4.3 Critic gap).
+        /// `cmux_available=false`거나 `healthy=false`면 조회 없이 즉시 반환한다.
+        pub(crate) fn reconcile_orphans(&mut self) {
+            if !self.cmux_available || !self.healthy {
+                return;
+            }
+            let mut runner = CliCmuxCommandRunner;
+            self.reconcile_orphans_with_runner(&mut runner);
+        }
+
+        /// [`CmuxStatusSink::reconcile_orphans`]의 list-runner 주입판(테스트용 collector mock 경로).
+        fn reconcile_orphans_with_runner<R: CmuxStatusListRunner>(&mut self, runner: &mut R) {
+            // list-status 실패(stale ref 등)는 best-effort로 재조정 생략(설계 §4.3).
+            let Some(keys) = runner.list_status(&self.workspace) else {
+                return;
+            };
+            let orphans = orphan_keys_to_clear(&keys, &self.key_prefix);
+            for key in orphans {
+                let _ = runner.run(&CmuxCommand::ClearStatus { key }, &self.workspace);
+            }
+        }
+    }
+
+    /// `cmux list-status` 실행 + clear-status 발행을 추상화한다(테스트 mock 주입용).
+    ///
+    /// 재조정은 `list-status` 조회(키 집합 산출)와 `clear-status` 발행 두 동작이 필요하다.
+    /// `list_status`는 조회 성공 시 `Some(키 목록)`, 실패(stale ref·비-cmux 등) 시 `None`을 돌려준다.
+    trait CmuxStatusListRunner: CmuxCommandRunner {
+        /// 워크스페이스 한정 `cmux list-status`를 실행해 현재 status 키 목록을 돌려준다.
+        /// 조회가 실패하면 `None`(best-effort 재조정 생략 신호).
+        fn list_status(&mut self, surface: &CmuxSurfaceContext) -> Option<Vec<String>>;
+    }
+
+    impl CmuxStatusListRunner for CliCmuxCommandRunner {
+        fn list_status(&mut self, surface: &CmuxSurfaceContext) -> Option<Vec<String>> {
+            let mut cmd = Command::new("cmux");
+            cmd.arg("list-status");
+            add_cmux_status_target_args(&mut cmd, surface);
+            let output = run_cmux_command(&mut cmd).ok()?;
+            if !output.status.success() {
+                // "Tab not found"류 stale ref 실패 → best-effort 생략.
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout.bytes);
+            Some(parse_cmux_list_status_keys(&text))
+        }
+    }
+
+    /// `cmux list-status` 출력에서 status 키만 추출한다(순수, 설계 §4.3 / AC 자동 1).
+    ///
+    /// 출력 1줄 형식은 `key=value icon=<name> color=<#hex> priority=<n>`(설계 §0.1)이며,
+    /// 각 줄의 첫 `key=` 토큰의 키 부분만 취한다. 빈 출력/"No status entries"/"Tab not found"류
+    /// 비-키 줄(`=` 없음)은 건너뛰어 빈 vec를 낸다(에러 아님). 키가 빈 줄도 건너뛴다.
+    fn parse_cmux_list_status_keys(output: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // 첫 공백 전까지가 `key=value` 토큰. `=`가 없으면 키 줄이 아니므로 건너뛴다
+            // ("No status entries"/"Tab not found" 등 메시지 줄 흡수).
+            let Some(first_token) = trimmed.split_whitespace().next() else {
+                continue;
+            };
+            let Some((key, _value)) = first_token.split_once('=') else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            keys.push(key.to_string());
+        }
+        keys
+    }
+
+    /// `list-status` 키 집합 중 `key_prefix`로 시작하는 고아 키를 산출한다(순수, 설계 §4.3 / AC 자동 2).
+    ///
+    /// sink 생성 직후(이번 세션 desired 없음) 호출이므로, prefix 매치 키는 전부 직전 세션 잔재다.
+    /// 입력 순서를 보존하고 중복은 그대로 둔다(clear-status는 멱등이라 무해).
+    fn orphan_keys_to_clear(list_status_keys: &[String], key_prefix: &str) -> Vec<String> {
+        list_status_keys
+            .iter()
+            .filter(|key| key.starts_with(key_prefix))
+            .cloned()
+            .collect()
     }
 
     /// pill JSON의 진행바 입력을 양자화된 [`ProgressState`]로 변환한다(없으면 `None`).
@@ -3969,6 +4058,44 @@ mod cmux_status {
             fn run(&mut self, command: &CmuxCommand, _surface: &CmuxSurfaceContext) -> bool {
                 self.commands.push(command.clone());
                 self.succeed
+            }
+        }
+
+        /// 재조정 테스트용 mock. `list_status`가 돌려줄 키 목록(또는 실패 시 `None`)을 미리
+        /// 구성하고, 실행된 `clear-status` 명령을 순서대로 기록한다.
+        struct ListingRunner {
+            /// `list_status`가 돌려줄 값. `None`이면 list-status 실패(stale ref)를 모사.
+            list_result: Option<Vec<String>>,
+            /// 재조정 중 발행된 명령 기록(전부 clear-status여야 한다).
+            commands: Vec<CmuxCommand>,
+        }
+
+        impl ListingRunner {
+            fn with_keys(keys: &[&str]) -> Self {
+                Self {
+                    list_result: Some(keys.iter().map(|key| key.to_string()).collect()),
+                    commands: Vec::new(),
+                }
+            }
+
+            fn failing_list() -> Self {
+                Self {
+                    list_result: None,
+                    commands: Vec::new(),
+                }
+            }
+        }
+
+        impl CmuxCommandRunner for ListingRunner {
+            fn run(&mut self, command: &CmuxCommand, _surface: &CmuxSurfaceContext) -> bool {
+                self.commands.push(command.clone());
+                true
+            }
+        }
+
+        impl CmuxStatusListRunner for ListingRunner {
+            fn list_status(&mut self, _surface: &CmuxSurfaceContext) -> Option<Vec<String>> {
+                self.list_result.clone()
             }
         }
 
@@ -4324,6 +4451,106 @@ mod cmux_status {
             sink.apply_with_runner(payload, &mut runner);
             assert!(runner.commands.is_empty());
             assert!(sink.applied.is_empty());
+        }
+
+        // ── C6: list-status 파서 + 고아 재조정 ──
+
+        /// AC 자동 1: list-status 파서 — 다중행 `key=value icon=.. color=.. priority=..` → 키 추출.
+        #[test]
+        fn parse_list_status_extracts_keys_from_multiline() {
+            let output = "lterm._3.model=opus icon=sparkles color=#7AA2F7 priority=60\n\
+                          lterm._3.cpu=cpu 31% color=#9ECE6A priority=100\n\
+                          other.tool.build=ok priority=10";
+            let keys = parse_cmux_list_status_keys(output);
+            assert_eq!(
+                keys,
+                vec![
+                    "lterm._3.model".to_string(),
+                    "lterm._3.cpu".to_string(),
+                    "other.tool.build".to_string(),
+                ]
+            );
+        }
+
+        /// AC 자동 1: 빈 출력 / "No status entries" / "Tab not found" → 빈 vec(에러 아님).
+        #[test]
+        fn parse_list_status_non_key_lines_yield_empty() {
+            assert!(parse_cmux_list_status_keys("").is_empty());
+            assert!(parse_cmux_list_status_keys("\n   \n").is_empty());
+            assert!(parse_cmux_list_status_keys("No status entries").is_empty());
+            assert!(parse_cmux_list_status_keys("Tab not found").is_empty());
+            // `=`로 시작해 키가 빈 줄도 건너뛴다.
+            assert!(parse_cmux_list_status_keys("=value priority=1").is_empty());
+        }
+
+        /// AC 자동 2: 고아 산출 — prefix 매치 키만 clear 대상, 비매치는 제외.
+        #[test]
+        fn orphan_keys_filters_by_prefix() {
+            let keys = vec![
+                "lterm._3.model".to_string(),
+                "lterm._3.cpu".to_string(),
+                "lterm._9.model".to_string(), // 다른 pane prefix → 제외
+                "other.tool.build".to_string(), // 비-lterm → 제외
+            ];
+            let orphans = orphan_keys_to_clear(&keys, "lterm._3.");
+            assert_eq!(
+                orphans,
+                vec!["lterm._3.model".to_string(), "lterm._3.cpu".to_string()]
+            );
+        }
+
+        /// AC 자동 2: prefix 매치 없으면 빈 vec.
+        #[test]
+        fn orphan_keys_empty_when_no_prefix_match() {
+            let keys = vec!["other.tool.build".to_string()];
+            assert!(orphan_keys_to_clear(&keys, "lterm._3.").is_empty());
+        }
+
+        /// 재조정: 자기 prefix 잔재만 clear-status 발행(다른 prefix·다른 도구는 보존).
+        #[test]
+        fn reconcile_clears_only_own_prefix_orphans() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            let mut runner = ListingRunner::with_keys(&[
+                "lterm._3.model",
+                "lterm._3.cpu",
+                "lterm._9.model",
+                "claude_code",
+            ]);
+            sink.reconcile_orphans_with_runner(&mut runner);
+            assert_eq!(
+                runner.commands,
+                vec![
+                    CmuxCommand::ClearStatus {
+                        key: "lterm._3.model".to_string()
+                    },
+                    CmuxCommand::ClearStatus {
+                        key: "lterm._3.cpu".to_string()
+                    },
+                ]
+            );
+        }
+
+        /// 재조정: list-status 실패(stale ref) → best-effort 생략(clear 미발행, 패닉 없음).
+        #[test]
+        fn reconcile_skips_when_list_status_fails() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            let mut runner = ListingRunner::failing_list();
+            sink.reconcile_orphans_with_runner(&mut runner);
+            assert!(runner.commands.is_empty());
+        }
+
+        /// 재조정: cmux 부재 → list-status 조회 없이 즉시 반환.
+        #[test]
+        fn reconcile_noop_when_cmux_unavailable() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = false;
+            // reconcile_orphans(공개 진입)는 cmux_available=false면 list-runner를 만들지 않는다.
+            sink.reconcile_orphans();
+            // applied/healthy 불변 확인(부작용 없음).
+            assert!(sink.applied.is_empty());
+            assert!(sink.healthy);
         }
     }
 }

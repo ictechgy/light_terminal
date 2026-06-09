@@ -3121,10 +3121,10 @@ fn attach_with_presence_and_cue(
     // DECSTBM 동작 보존. sink_enabled=true면 구조적으로 in_grid=false가 보장된다(R8).
     let in_grid = compute_in_grid(status_backend, presence_policy, sink_enabled);
     // cmux pill sink가 켜지면 attach 시점 1회 워크스페이스 컨텍스트를 확보한다(설계 §4.2,
-    // UUID 우선·stored 우선). 본 청크(C4)는 식별 함수+호출까지만 — 실제 sink 연결(C6)이
-    // 이 컨텍스트를 받기 전까지는 보유만 한다. sink가 꺼져 있으면 `cmux identify`를 호출하지
-    // 않아 비-cmux 환경의 불필요한 서브프로세스 스폰을 피한다.
-    let _cmux_status_context = sink_enabled
+    // UUID 우선·stored 우선). 이 컨텍스트는 아래에서 `CmuxStatusSink::new`로 소비된다.
+    // sink가 꺼져 있으면 `cmux identify`를 호출하지 않아 비-cmux 환경의 불필요한 서브프로세스
+    // 스폰을 피한다. 식별 실패(`None`)면 sink를 만들지 않는다(blackout — 별도 처리 없음).
+    let cmux_status_context = sink_enabled
         .then(|| crate::tmux_compat::cmux_status_identity(target))
         .flatten();
     // 콘텐츠/메타/poll은 in-grid든 sink든 모두 필요하다. StatusBar(enter/refresh)와 DECSTBM
@@ -3141,6 +3141,20 @@ fn attach_with_presence_and_cue(
     } else {
         None
     };
+    // off-grid cmux pill sink(설계 §3.1/§4.3). 식별된 워크스페이스 컨텍스트가 있을 때만 생성하며,
+    // 라이프타임은 attach 함수 스코프에 결박된다(끝에서 `Drop`이 자기 키를 전부 청소 — 누수 1차
+    // 방어). 생성 직후 1회 `reconcile_orphans`로 직전 하드킬/abort 잔재(자기 prefix)를 청소한다
+    // (누수 2차 방어 — list-status 실패 시 best-effort 생략). 키 prefix는 안정적인 canonical
+    // pane id(`status_info.pane_id`)로 만들어 다중 세션 키 충돌을 차단한다.
+    let mut cmux_status_sink = cmux_status_context.map(|context| {
+        let pane_id = status_info
+            .as_ref()
+            .map(|info| info.pane_id.as_str())
+            .unwrap_or(target);
+        let mut sink = crate::tmux_compat::CmuxStatusSink::new(context, pane_id);
+        sink.reconcile_orphans();
+        sink
+    });
     let nested_monitor_enabled = in_grid
         && presence_policy.allows_nested_suspend()
         && status_info
@@ -3460,24 +3474,30 @@ fn attach_with_presence_and_cue(
                 }
             }
 
-            // command-backed status: 새 명령 출력이 도착했고 직전 값과 다르면 status_bar에
-            // 반영하고 metadata와 동일한 redraw 경로로 status row를 다시 그린다. 변화가 없으면
-            // 직전 라인을 유지해 불필요한 redraw를 피한다.
-            if let Some(latest) = apply_pending_status_command(status_command_rx)
-                && status_bar.command_line.as_deref() != Some(latest.as_str())
-            {
-                status_bar.command_line = Some(latest);
-                if row_runtime.can_draw_status() {
-                    status_dirty = true;
-                    if !alt_screen_active
-                        && refresh_status_or_detached(
-                            &mut status_bar,
-                            &mut stdout,
-                            &mut status_dirty,
-                            &mut last_status_refresh,
-                        )?
-                    {
-                        break;
+            // command-backed status: 새 명령 출력(understatus stdout)이 도착하면 두 경로로 분기한다.
+            // - cmux pill sink 활성(`cmux_status_sink`가 Some): off-grid pill 경로다. 출력을
+            //   `sink.apply`로 넘겨 cmux 사이드바 pill만 갱신하고 **StatusBar(`command_line`)와
+            //   DECSTBM redraw(`refresh_status_or_detached`)에는 절대 진입하지 않는다**(설계 §3.1
+            //   in_grid 전용 경로 우회 — Cmux pill 경로는 StatusBar를 건드리지 않는다).
+            // - sink 비활성(None): 기존 in-grid 경로 그대로. 직전 값과 다르면 `command_line`을
+            //   갱신하고 metadata와 동일한 redraw 경로로 status row를 다시 그린다(바이트 불변).
+            if let Some(latest) = apply_pending_status_command(status_command_rx) {
+                if let Some(sink) = cmux_status_sink.as_mut() {
+                    sink.apply(&latest);
+                } else if status_bar.command_line.as_deref() != Some(latest.as_str()) {
+                    status_bar.command_line = Some(latest);
+                    if row_runtime.can_draw_status() {
+                        status_dirty = true;
+                        if !alt_screen_active
+                            && refresh_status_or_detached(
+                                &mut status_bar,
+                                &mut stdout,
+                                &mut status_dirty,
+                                &mut last_status_refresh,
+                            )?
+                        {
+                            break;
+                        }
                     }
                 }
             }
