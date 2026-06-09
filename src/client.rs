@@ -4680,27 +4680,32 @@ fn compute_sink_enabled(
 
 /// `$TMUX`의 socket 필드가 lterm self-provided TMUX인지 판정한다(순수, env 비의존).
 ///
-/// lterm은 tmux-compat 호스트로서 자식에 `TMUX={lterm_socket},{pid},0`
+/// lterm은 tmux-compat 호스트로서 자식에 `TMUX={compat_socket},{pid},0`
 /// (`server::fake_tmux_value`)과 `LTERM_SOCKET={lterm_socket}`(tmux_compat.rs)을 함께 export한다.
-/// 따라서 `$TMUX`의 socket 필드(`,` 앞)가 lterm 소켓 경로(`LTERM_SOCKET` 또는
-/// `paths::socket_path()`)와 일치하면 진짜 외부 tmux가 아니라 lterm 자신이다.
+/// 최신 lterm의 compat socket은 의도적으로 listen하지 않는 fast-fail 경로지만, 과거
+/// lterm은 live daemon socket을 `$TMUX`에 넣었으므로 둘 다 self-provided로 인정한다.
 ///
 /// # 인자
 /// - `tmux_socket_field`: `$TMUX`를 `,`로 가른 첫 필드(socket 경로).
-/// - `lterm_socket_env`: `LTERM_SOCKET` 값(있으면).
-/// - `lterm_socket_path`: `paths::socket_path()` 결과 문자열(있으면, 보조 비교).
+/// - `lterm_socket_env`: legacy self-detection용 `LTERM_SOCKET` 값(있으면).
+/// - `lterm_socket_path`: legacy self-detection용 `paths::socket_path()` 결과 문자열(있으면).
+/// - `tmux_compat_socket_path`: 최신 self-detection용 compat-only socket 문자열(있으면).
 ///
 /// # 반환
-/// socket 필드가 lterm 소켓과 일치하면 `true`(self-provided). 빈 필드는 판정 불가로 `false`.
+/// socket 필드가 lterm live socket(legacy) 또는 compat socket(현재)과 일치하면 `true`.
+/// 빈 필드는 판정 불가로 `false`.
 fn is_self_provided_tmux(
     tmux_socket_field: &str,
     lterm_socket_env: Option<&str>,
     lterm_socket_path: Option<&str>,
+    tmux_compat_socket_path: Option<&str>,
 ) -> bool {
     if tmux_socket_field.is_empty() {
         return false;
     }
-    lterm_socket_env == Some(tmux_socket_field) || lterm_socket_path == Some(tmux_socket_field)
+    lterm_socket_env == Some(tmux_socket_field)
+        || lterm_socket_path == Some(tmux_socket_field)
+        || tmux_compat_socket_path == Some(tmux_socket_field)
 }
 
 /// 진짜 외부 tmux 안에서 실행 중인지 판정한다(lterm self-provided TMUX는 제외).
@@ -4718,10 +4723,14 @@ fn detect_real_tmux() -> bool {
     }
     let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
     let lterm_socket_path = paths::socket_path().ok().map(|p| p.display().to_string());
+    let tmux_compat_socket_path = paths::tmux_compat_socket_path()
+        .ok()
+        .map(|p| p.display().to_string());
     !is_self_provided_tmux(
         socket_field,
         lterm_socket_env.as_deref(),
         lterm_socket_path.as_deref(),
+        tmux_compat_socket_path.as_deref(),
     )
 }
 
@@ -8374,14 +8383,27 @@ mod tests {
     #[test]
     fn self_provided_tmux_matches_lterm_socket_env() {
         let sock = "/run/user/501/lterm.sock";
-        assert!(is_self_provided_tmux(sock, Some(sock), None));
+        assert!(is_self_provided_tmux(sock, Some(sock), None, None));
     }
 
     /// `$TMUX` socket 필드가 paths::socket_path()와 일치해도 self로 식별된다(LTERM_SOCKET 미설정 폴백).
     #[test]
     fn self_provided_tmux_matches_socket_path_fallback() {
         let sock = "/tmp/lterm-runtime/lterm.sock";
-        assert!(is_self_provided_tmux(sock, None, Some(sock)));
+        assert!(is_self_provided_tmux(sock, None, Some(sock), None));
+    }
+
+    /// 최신 lterm의 `$TMUX` socket 필드는 live daemon이 아닌 compat-only fast-fail 경로다.
+    #[test]
+    fn self_provided_tmux_matches_compat_socket_path() {
+        let live_sock = "/run/user/501/lterm.sock";
+        let compat_sock = "/run/user/501/.lterm.sock.tmux-compat";
+        assert!(is_self_provided_tmux(
+            compat_sock,
+            Some(live_sock),
+            Some(live_sock),
+            Some(compat_sock)
+        ));
     }
 
     /// 진짜 외부 tmux(소켓 경로가 lterm과 다름)는 self가 아니다 → real_tmux로 분류되어야 한다.
@@ -8392,17 +8414,23 @@ mod tests {
         assert!(!is_self_provided_tmux(
             real_tmux_sock,
             Some(lterm_sock),
-            Some(lterm_sock)
+            Some(lterm_sock),
+            Some("/run/user/501/.lterm.sock.tmux-compat")
         ));
         // lterm 마커가 전혀 없어도(둘 다 None) 외부 tmux는 self가 아니다.
-        assert!(!is_self_provided_tmux(real_tmux_sock, None, None));
+        assert!(!is_self_provided_tmux(real_tmux_sock, None, None, None));
     }
 
     /// 빈 socket 필드는 판정 불가로 self가 아니다(real_tmux=false로 떨어져 오분류 방지).
     #[test]
     fn empty_tmux_socket_field_is_not_self() {
-        assert!(!is_self_provided_tmux("", Some("/x"), Some("/y")));
-        assert!(!is_self_provided_tmux("", None, None));
+        assert!(!is_self_provided_tmux(
+            "",
+            Some("/x"),
+            Some("/y"),
+            Some("/z")
+        ));
+        assert!(!is_self_provided_tmux("", None, None, None));
     }
 
     // ── select_status_backend 라우팅 매트릭스 (PoC1) ──

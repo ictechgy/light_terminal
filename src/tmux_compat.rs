@@ -3214,6 +3214,7 @@ fn format_replacement<'a>(
     const CLIENT_NAME: &str = "lterm";
     const CLIENT_PID: &str = "";
     const CLIENT_TTY: &str = "";
+    const EXTENDED_KEYS_FORMAT: &str = "xterm";
     const IN_MODE: &str = "0";
     const WINDOW_INDEX: &str = "0";
     const WINDOW_PANES: &str = "1";
@@ -3277,6 +3278,11 @@ fn format_replacement<'a>(
         Some(("#{client_pid}", Cow::Borrowed(CLIENT_PID)))
     } else if rest.starts_with("#{client_tty}") {
         Some(("#{client_tty}", Cow::Borrowed(CLIENT_TTY)))
+    } else if rest.starts_with("#{extended-keys-format}") {
+        Some((
+            "#{extended-keys-format}",
+            Cow::Borrowed(EXTENDED_KEYS_FORMAT),
+        ))
     } else if rest.starts_with("#{window_width}") {
         Some(("#{window_width}", Cow::Owned(info.cols.to_string())))
     } else if rest.starts_with("#{window_height}") {
@@ -4970,6 +4976,11 @@ mod tests {
             "%1 s codex"
         );
         assert_eq!(expand_format("#S:#I #{window_index}", &info), "s:0 0");
+        assert_eq!(
+            expand_format("#{extended-keys-format}", &info),
+            "xterm",
+            "Codex/tmux probes expect a concrete extended key format, not a literal placeholder"
+        );
     }
 
     #[test]

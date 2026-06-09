@@ -3161,7 +3161,7 @@ fn default_shell_command() -> String {
 pub fn fake_tmux_value() -> Result<String> {
     Ok(format!(
         "{},{},0",
-        paths::socket_path()?.display(),
+        paths::tmux_compat_socket_path()?.display(),
         std::process::id()
     ))
 }

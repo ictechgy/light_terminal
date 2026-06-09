@@ -9494,6 +9494,57 @@ fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
 }
 
 #[test]
+fn tmux_mode_shadowed_real_tmux_probe_fast_fails_without_live_socket() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("tmux"),
+        r#"#!/bin/sh
+tmux_socket=${TMUX%%,*}
+printf 'FAKE_TMUX_SOCKET:%s\n' "$tmux_socket"
+printf 'FAKE_LTERM_SOCKET:%s\n' "$LTERM_SOCKET"
+if [ "$tmux_socket" = "$LTERM_SOCKET" ]; then
+  echo BAD_LIVE_SOCKET
+  exit 42
+fi
+exit 1
+"#,
+    )?;
+    let fake_bin = shlex::try_quote(&fake_bin.display().to_string())?.into_owned();
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args([
+            "run",
+            "--tmux",
+            "--no-status",
+            "--",
+            "sh",
+            "-lc",
+            &format!(
+                "export PATH={fake_bin}:$PATH; \
+                 tmux display-message -p '#{{extended-keys-format}}' || true; \
+                 echo SHADOW_AFTER"
+            ),
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("FAKE_TMUX_SOCKET:"), "{stdout:?}");
+    assert!(stdout.contains("FAKE_LTERM_SOCKET:"), "{stdout:?}");
+    assert!(
+        !stdout.contains("BAD_LIVE_SOCKET"),
+        "shadowed real tmux must not see the live lterm daemon socket in TMUX: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("SHADOW_AFTER"),
+        "shadowed real tmux probe should fail fast and let the child continue: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn run_no_tmux_does_not_inject_lterm_tmux_shim() -> TestResult {
     let env = TestEnv::new()?;
     let output = env
@@ -11095,6 +11146,10 @@ fn fish_quote_for_test(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn tmux_socket_field(tmux: &str) -> &str {
+    tmux.split(',').next().unwrap_or("")
+}
+
 fn fish_sourceability_command() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -11142,6 +11197,10 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected_socket = runtime.join("lterm.sock").display().to_string();
+    let expected_tmux_socket = runtime
+        .join(".lterm.sock.tmux-compat")
+        .display()
+        .to_string();
     let expected_shim = data.join("shims").display().to_string();
     let expected_lines = vec![
         format!(
@@ -11157,16 +11216,16 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
     ];
     let lines: Vec<_> = stdout.lines().map(str::to_string).collect();
     assert_eq!(lines.len(), 4, "fish env output should stay four lines");
-    let quoted_socket = fish_quote_for_test(&expected_socket);
+    let quoted_tmux_socket = fish_quote_for_test(&expected_tmux_socket);
     let tmux_prefix = format!(
         "set -gx TMUX {},",
-        quoted_socket
+        quoted_tmux_socket
             .strip_suffix('\'')
             .expect("test quote should end with a single quote")
     );
     assert!(
         lines[1].starts_with(&tmux_prefix) && lines[1].ends_with(",0'"),
-        "fish TMUX line should be quoted socket,pid,0: {:?}",
+        "fish TMUX line should be quoted compat-socket,pid,0: {:?}",
         lines[1]
     );
     assert_eq!(
@@ -11190,10 +11249,16 @@ fn env_outputs_fish_exports_when_requested() -> TestResult {
         let sourced_lines: Vec<_> = fish_stdout.lines().collect();
         assert_eq!(sourced_lines.first(), Some(&expected_socket.as_str()));
         assert!(
-            sourced_lines.get(1).is_some_and(|tmux| tmux
-                .starts_with(&format!("{expected_socket},"))
-                && tmux.ends_with(",0")),
+            sourced_lines
+                .get(1)
+                .is_some_and(|tmux| tmux.starts_with(&format!("{expected_tmux_socket},"))
+                    && tmux.ends_with(",0")),
             "{fish_stdout:?}"
+        );
+        assert_ne!(
+            tmux_socket_field(sourced_lines[1]),
+            expected_socket,
+            "TMUX socket field must not be the live daemon socket"
         );
         assert_eq!(sourced_lines.get(2), Some(&"%0"));
         let expected_path = format!("{expected_shim}:BASE_PATH");
@@ -11281,16 +11346,26 @@ fn env_quotes_generated_paths_for_posix_shell_eval() -> TestResult {
     let eval_stdout = String::from_utf8(eval_output.stdout)?;
     let lines: Vec<_> = eval_stdout.lines().collect();
     let expected_socket = runtime.join("lterm.sock").display().to_string();
+    let expected_tmux_socket = runtime
+        .join(".lterm.sock.tmux-compat")
+        .display()
+        .to_string();
     assert_eq!(
         lines.first(),
         Some(&expected_socket.as_str()),
         "{eval_stdout:?}"
     );
     assert!(
-        lines.get(1).is_some_and(
-            |tmux| tmux.starts_with(&format!("{expected_socket},")) && tmux.ends_with(",0")
-        ),
+        lines
+            .get(1)
+            .is_some_and(|tmux| tmux.starts_with(&format!("{expected_tmux_socket},"))
+                && tmux.ends_with(",0")),
         "{eval_stdout:?}"
+    );
+    assert_ne!(
+        tmux_socket_field(lines[1]),
+        expected_socket,
+        "TMUX socket field must not be the live daemon socket"
     );
     let expected_path = format!("{}:BASE_PATH", data.join("shims").display());
     assert_eq!(

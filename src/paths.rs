@@ -66,6 +66,24 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Socket-shaped marker used only for `$TMUX` compatibility metadata.
+///
+/// lterm children still receive `LTERM_SOCKET` as the live daemon transport
+/// used by the shim. `$TMUX` intentionally points at this non-listening sibling
+/// path so an accidentally resolved real `tmux` binary fails quickly instead of
+/// blocking while trying to speak tmux protocol to the lterm daemon socket.
+pub fn tmux_compat_socket_path() -> Result<PathBuf> {
+    let socket = socket_path()?;
+    let parent = socket
+        .parent()
+        .context("LTERM_SOCKET must include a parent directory")?;
+    let basename = socket
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "lterm.sock".into());
+    Ok(parent.join(format!(".{basename}.tmux-compat")))
+}
+
 pub fn log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("daemon.log"))
 }
@@ -289,7 +307,7 @@ pub(crate) fn current_euid() -> u32 {
 mod tests {
     use super::{
         APP_DIR_NAME, data_dir, ensure_private_dir, record_default_socket_path, runtime_dir,
-        socket_path, validate_socket_parent,
+        socket_path, tmux_compat_socket_path, validate_socket_parent,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -464,6 +482,31 @@ mod tests {
             err.to_string()
                 .contains("LTERM_SOCKET must include a parent directory"),
             "unexpected parentless-path error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn tmux_compat_socket_is_private_sibling_not_live_socket() {
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let _env = reset_path_env();
+        let dir = tempfile::tempdir().expect("temp socket dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("private socket dir");
+        let socket = dir.path().join("lterm.sock");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_SOCKET", &socket);
+        }
+
+        let compat = tmux_compat_socket_path().expect("compat socket path");
+        assert_ne!(
+            compat, socket,
+            "compat socket must not be the live daemon socket"
+        );
+        assert_eq!(compat.parent(), socket.parent());
+        assert_eq!(
+            compat.file_name().and_then(|name| name.to_str()),
+            Some(".lterm.sock.tmux-compat")
         );
     }
 
