@@ -627,6 +627,7 @@ fn run() -> Result<()> {
                     &info.pane_id,
                     status_presence_from_no_status(no_status),
                     AttachStdinEof::KeepAttached,
+                    no_status,
                 )
             }
         }
@@ -652,6 +653,7 @@ fn run() -> Result<()> {
                 &info.pane_id,
                 status_presence_from_no_status(no_status),
                 AttachStdinEof::KeepAttached,
+                no_status,
             )
         }
         Commands::Resume {
@@ -676,6 +678,7 @@ fn run() -> Result<()> {
                 status_presence_for_existing_attach(no_status, &info),
                 AttachStdinEof::Detach,
                 attach_policy,
+                no_status,
             )
         }
         Commands::AttachOrNew {
@@ -707,6 +710,7 @@ fn run() -> Result<()> {
                 status_presence_for_existing_attach(no_status, &info),
                 AttachStdinEof::Detach,
                 attach_policy,
+                no_status,
             )
         }
         Commands::Sessions {
@@ -2521,6 +2525,13 @@ impl AgentLaunchOptions {
         }
     }
 
+    /// 사용자가 `--no-status`를 명시했는지 여부. `status_presence`가 만드는 `RowOff`는
+    /// "agent 기본(show_status=false)"과 "--no-status 명시"를 구분하지 못하므로, cmux pill
+    /// sink 게이트에 전달할 명시적 비활성 신호를 별도로 노출한다(설계 §4.1).
+    fn explicit_no_status(&self) -> bool {
+        self.no_status
+    }
+
     fn status_theme(&self) -> Option<protocol::StatusTheme> {
         self.status_theme
     }
@@ -2960,6 +2971,7 @@ fn run_agent_profile(
                     attach_policy
                         .clone()
                         .context("attach policy should be validated before agent launch")?,
+                    launch.explicit_no_status(),
                 );
             }
             Err(err) if is_session_name_conflict(&err) => {

@@ -2151,11 +2151,14 @@ struct CmuxCommandOutput {
     stderr: LimitedOutput,
 }
 
+/// cmux surface 식별 컨텍스트(surface/workspace/window ref). cmux status pill sink가
+/// 워크스페이스 타깃을 잡으려면 이 컨텍스트가 필요하므로 `pub(crate)`로 노출한다
+/// (`inside_cmux`가 받은 동일 처치, 설계 §4.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CmuxSurfaceContext {
-    surface_ref: String,
-    workspace_ref: Option<String>,
-    window_ref: Option<String>,
+pub(crate) struct CmuxSurfaceContext {
+    pub(crate) surface_ref: String,
+    pub(crate) workspace_ref: Option<String>,
+    pub(crate) window_ref: Option<String>,
 }
 
 struct LimitedOutput {
@@ -2253,18 +2256,35 @@ pub(crate) fn inside_cmux() -> bool {
 }
 
 fn cmux_identify_surface() -> Result<Option<CmuxSurfaceContext>> {
-    cmux_identify_surface_with(find_cmux_surface_context)
+    cmux_identify_surface_with(find_cmux_surface_context, None)
 }
 
 fn cmux_identify_managed_attach_surface() -> Result<Option<CmuxSurfaceContext>> {
-    cmux_identify_surface_with(find_cmux_managed_attach_surface_context)
+    cmux_identify_surface_with(find_cmux_managed_attach_surface_context, None)
 }
 
+/// `cmux identify` 인자 목록을 구성한다(순수 함수, side-effect 없어 테스트 가능).
+///
+/// 항상 `identify --json`을 내고, `id_format`이 `Some(fmt)`면 `--id-format <fmt>`를 덧붙인다.
+fn cmux_identify_args(id_format: Option<&str>) -> Vec<String> {
+    let mut args = vec!["identify".to_string(), "--json".to_string()];
+    if let Some(format) = id_format {
+        args.push("--id-format".to_string());
+        args.push(format.to_string());
+    }
+    args
+}
+
+/// `cmux identify --json [--id-format <fmt>]`을 실행해 `select_surface`로 컨텍스트를 고른다.
+///
+/// `id_format`이 `Some("uuids")`면 positional ref 재번호화 드리프트(R1)를 피하기 위해
+/// UUID 식별자를 요청한다(설계 §4.2/ADR-6). `None`이면 기존 동작(기본 ref 포맷)을 유지한다.
 fn cmux_identify_surface_with(
     select_surface: fn(&serde_json::Value) -> Option<CmuxSurfaceContext>,
+    id_format: Option<&str>,
 ) -> Result<Option<CmuxSurfaceContext>> {
     let mut identify = Command::new("cmux");
-    identify.arg("identify").arg("--json");
+    identify.args(cmux_identify_args(id_format));
     let output = run_cmux_command(&mut identify)?;
     if !output.status.success() {
         return Ok(None);
@@ -2405,6 +2425,38 @@ fn stored_cmux_surface_for_pane_best_effort(pane_id: &str) -> Option<CmuxSurface
             eprintln!(
                 "warning: tmux compat store lookup failed for {}: {}",
                 sanitize::terminal_text(pane_id),
+                sanitize::terminal_text(&err.to_string())
+            );
+            None
+        }
+    }
+}
+
+/// cmux status pill sink가 쓸 워크스페이스 식별 컨텍스트를 attach 시점 1회 확보한다(설계 §4.2).
+///
+/// 우선순위:
+/// 1. **stored split-time 컨텍스트**(`stored_cmux_surface_for_pane`) — split 생성 시점에
+///    포커스 결정적으로 캡처된 값이라 최우선. 있으면 `cmux identify`를 호출하지 않는다.
+/// 2. 없으면 **`cmux identify --json --id-format uuids`의 focused** — attach 순간엔 대상
+///    서피스가 포커스이므로 정당하다. `find_cmux_surface_context`의 stale-`caller` 거부
+///    로직을 그대로 재사용한다(caller만 있고 focused가 없으면 `None`).
+///
+/// UUID 우선 캡처(`--id-format uuids`)로 positional ref 재번호화 드리프트(R1)를 피한다.
+/// env `$CMUX_WORKSPACE_ID`는 stale 위험(R2) 때문에 타깃 식별에 절대 쓰지 않는다.
+///
+/// 반환값: 식별된 컨텍스트, 또는 stored도 identify도 실패하면 `None`(best-effort —
+/// 식별 실패가 호출부를 막지 않게 한다. 실제 sink 미생성/blackout 처리는 후속 청크).
+pub(crate) fn cmux_status_identity(pane_id: &str) -> Option<CmuxSurfaceContext> {
+    // 1. stored split-time 컨텍스트 우선(store 에러는 best-effort로 무시).
+    if let Some(stored) = stored_cmux_surface_for_pane_best_effort(pane_id) {
+        return Some(stored);
+    }
+    // 2. identify 폴백(UUID 우선). identify 실패/비-cmux/파싱 실패는 None으로 안전 저하.
+    match cmux_identify_surface_with(find_cmux_surface_context, Some("uuids")) {
+        Ok(surface) => surface,
+        Err(err) => {
+            eprintln!(
+                "warning: cmux identify for status pill target failed: {}",
                 sanitize::terminal_text(&err.to_string())
             );
             None
@@ -4258,6 +4310,76 @@ mod tests {
         assert_eq!(context.surface_ref, "surface:focused");
         assert_eq!(context.workspace_ref.as_deref(), Some("workspace:focused"));
         assert_eq!(context.window_ref.as_deref(), Some("window:focused"));
+    }
+
+    /// C4-4: stored split-time 컨텍스트가 있으면 `cmux_status_identity`는 그것을 반환하고
+    /// `cmux identify`를 호출하지 않는다(설계 §4.2 AC: identify 미호출). 테스트는 cmux 바이너리
+    /// 없이도 통과해야 하며, stored가 우선되므로 식별 서브프로세스가 돌지 않음이 보장된다.
+    #[test]
+    fn cmux_status_identity_prefers_stored_context_without_identify() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let stored = CmuxSurfaceContext {
+            surface_ref: "surface:uuid-stored".to_string(),
+            workspace_ref: Some("workspace:uuid-stored".to_string()),
+            window_ref: Some("window:uuid-stored".to_string()),
+        };
+        let info = SessionInfo {
+            id: "session-uuid".to_string(),
+            name: "codex".to_string(),
+            pane_id: "%42".to_string(),
+            parent_pane_id: None,
+            parent_session_id: None,
+            command: "codex".to_string(),
+            cwd: "/tmp".to_string(),
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 0,
+            alive: true,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            attached_clients: 0,
+            process_id: None,
+            process_group_id: None,
+            status_theme: None,
+        };
+        remember_pane(&info, Some(&stored)).expect("seed stored cmux surface");
+
+        let resolved = cmux_status_identity("%42").expect("stored context should resolve");
+        assert_eq!(resolved, stored);
+    }
+
+    /// C4-4: identify 폴백은 `find_cmux_surface_context`의 stale-caller 거부를 재사용한다 —
+    /// caller만 있고 focused가 없으면 `None`(설계 §4.2 AC: stale-caller만 → None).
+    #[test]
+    fn cmux_status_identity_fallback_rejects_caller_only_payload() {
+        let caller_only = serde_json::json!({
+            "caller": {
+                "surface_ref": "surface:stale-caller",
+                "workspace_ref": "workspace:stale-caller"
+            }
+        });
+        assert_eq!(find_cmux_surface_context(&caller_only), None);
+    }
+
+    /// C4-4: status 식별 폴백은 `--id-format uuids`로 UUID 우선 캡처한다(설계 §4.2 AC,
+    /// positional ref 드리프트 R1 방지).
+    #[test]
+    fn cmux_status_identity_requests_uuid_id_format() {
+        let args = cmux_identify_args(Some("uuids"));
+        assert_eq!(args, vec!["identify", "--json", "--id-format", "uuids"]);
+        // None이면 기존 동작(추가 인자 없음).
+        assert_eq!(cmux_identify_args(None), vec!["identify", "--json"]);
     }
 
     #[test]
