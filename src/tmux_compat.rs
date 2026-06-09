@@ -3422,6 +3422,912 @@ fn control_key_byte(key: &str) -> Option<u8> {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// cmux status pill sink (설계 §3.2/§4.4 — diff/apply, CLI 경로)
+//
+// understatus가 `--surface-format cmux-status`로 내는 pill JSON 1줄을 받아 직전
+// 적용 상태와 diff한 뒤, 변경분만 `cmux set-status/clear-status/set-progress`로
+// 구동한다. 본 모듈은 sink 자체(파싱·diff·apply·Drop·서킷브레이커)만 담는다 —
+// 소비점(client.rs) 배선은 후속 청크(C6)에서 한다.
+//
+// 본 청크(C5)는 sink 모듈만 구현하고 소비점(client.rs:3421) 배선은 다음 청크(C6)에서
+// 한다. 그때까지 공개 API(`CmuxStatusSink::new`/`apply`/`Drop`)와 그 의존 내부가
+// 비-test 빌드에서 호출되지 않으므로, 모듈 단위 `#![allow(dead_code)]`로 한 곳에서
+// 허용한다(C6 배선 시 호출되면 자연히 사용됨). 단위테스트는 모듈 내부에서 전 경로를
+// 실제로 검증한다.
+//
+// 이 re-export는 C6 소비점(client.rs)이 `crate::tmux_compat::CmuxStatusSink`로 참조할
+// 진입점이다. C6 배선 전까지는 미사용이므로 `allow(unused_imports)`로 둔다.
+#[allow(unused_imports)]
+pub(crate) use cmux_status::CmuxStatusSink;
+
+mod cmux_status {
+    #![allow(dead_code)]
+
+    use super::{CmuxSurfaceContext, Command, client, run_cmux_command, sanitize};
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    /// 연속 cmux 호출 실패가 이 횟수에 도달하면 sink를 비표시(blackout)로 전환한다(설계 §4.4).
+    const CMUX_STATUS_FAILURE_LIMIT: u32 = 3;
+
+    /// understatus가 내는 pill JSON의 최상위 스키마 식별자(설계 §3.3). 이 값이 아니면 no-op.
+    const CMUX_STATUS_SCHEMA: &str = "cmux-status";
+
+    /// understatus(`--surface-format cmux-status`)가 stdout 1줄로 내는 pill 페이로드.
+    ///
+    /// 미상 필드는 무시하고(`serde(default)`로 관대 처리), 역직렬화 실패는 상위 `apply`에서
+    /// no-op으로 흡수한다(설계 §3.3 additive-optional 계약). `key`는 prefix 없는 세그먼트
+    /// id이며, lterm이 `key_prefix`를 앞에 붙인다.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(default)]
+    struct CmuxStatusInput {
+        /// 스키마 식별자. `"cmux-status"`가 아니면 sink는 no-op 처리한다.
+        schema: String,
+        /// 페이로드 버전. 현재는 관대 처리(하드게이트 안 함).
+        #[allow(dead_code)]
+        version: u32,
+        /// pill 목록(model/ctx/cpu/mem 등). 소스 없는 세그먼트는 애초에 빠져 온다.
+        pills: Vec<PillIn>,
+        /// 진행바(ctx) 값. 없으면 진행바 미표시.
+        progress: Option<ProgressIn>,
+    }
+
+    /// 단일 pill의 역직렬화 입력(설계 §3.3 stdout 계약).
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(default)]
+    struct PillIn {
+        /// prefix 없는 세그먼트 id(`model`/`ctx`/`cpu`/`mem`).
+        key: String,
+        /// pill 라벨(선택). cmux pill 텍스트의 접두 라벨.
+        label: Option<String>,
+        /// pill 값 문자열(예 `"ctx 42%"`).
+        value: String,
+        /// pill 색(`#RRGGBB`). 없으면 cmux 기본색.
+        color: Option<String>,
+        /// pill 아이콘명(선택). 미지원명은 cmux가 무시.
+        icon: Option<String>,
+        /// pill 우선순위(높을수록 앞). cmux `--priority`.
+        priority: u8,
+    }
+
+    /// 진행바 입력(설계 §3.3). value는 0.0~1.0.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(default)]
+    struct ProgressIn {
+        /// 진행 비율(0.0~1.0).
+        value: f64,
+        /// 진행바 라벨(선택).
+        label: Option<String>,
+    }
+
+    /// 직전에 적용된 단일 pill 상태(diff 비교용). full key(prefix+id) → 이 값.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PillState {
+        /// pill 값 문자열. 문자열 그대로 비교한다.
+        value: String,
+        /// pill 색(`#RRGGBB`).
+        color: Option<String>,
+        /// pill 아이콘명.
+        icon: Option<String>,
+        /// pill 우선순위.
+        priority: u8,
+        /// pill 라벨.
+        label: Option<String>,
+    }
+
+    /// 직전에 적용된 진행바 상태(diff 비교용).
+    ///
+    /// `value_milli`는 부동소수 직접비교를 피하려고 0.0~1.0 값을 ‰(milli) 정수로 양자화한
+    /// 결과다(설계 §4.4 ctx 양자화). 같은 정수%면 milli도 같아 무변경으로 판정된다.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ProgressState {
+        /// 진행 비율을 ‰ 정수로 양자화한 값(`(value*1000).round() as u32`).
+        value_milli: u32,
+        /// 진행바 라벨.
+        label: Option<String>,
+    }
+
+    /// 0.0~1.0 진행 비율을 ‰ 정수로 양자화한다(부동소수 직접비교 회피, 설계 §4.4).
+    ///
+    /// 음수/NaN/1.0 초과 입력은 [0.0, 1.0]으로 클램프해 정수 범위를 보장한다.
+    fn quantize_progress_milli(value: f64) -> u32 {
+        let clamped = value.clamp(0.0, 1.0);
+        (clamped * 1000.0).round() as u32
+    }
+
+    /// diff가 산출하는 cmux 명령(순수 표현). 실제 실행은 [`CmuxCommandRunner`]가 맡는다.
+    ///
+    /// 명령 실행 경로를 enum으로 분리해 순수 `plan_commands`는 직접 단언하고, `apply`의 실행
+    /// 경로는 테스트 collector mock으로 검증할 수 있게 한다(설계 §4.4 apply 레이어 분리).
+    ///
+    /// `SetProgress.value`가 `f64`라 `Eq`는 파생하지 않는다(diff는 양자화된
+    /// [`ProgressState::value_milli`]로만 비교하므로 `PartialEq`로 충분).
+    #[derive(Debug, Clone, PartialEq)]
+    enum CmuxCommand {
+        /// `cmux set-status <key> <value> [--icon][--color][--priority]`.
+        SetStatus {
+            key: String,
+            value: String,
+            color: Option<String>,
+            icon: Option<String>,
+            priority: u8,
+            label: Option<String>,
+        },
+        /// `cmux clear-status <key>`.
+        ClearStatus { key: String },
+        /// `cmux set-progress <value> [--label]`.
+        SetProgress { value: f64, label: Option<String> },
+        /// `cmux clear-progress`.
+        ClearProgress,
+    }
+
+    /// `applied`/`desired` pill 맵과 진행바 상태를 diff해 결정적 순서의 명령 리스트를 만든다(순수).
+    ///
+    /// 규칙(설계 §4.4):
+    /// - desired에 있고 applied와 다르거나 없음 → `SetStatus`.
+    /// - applied에 있고 desired에 없음 → `ClearStatus`.
+    /// - 무변경 → 생략(유휴 스폰 0).
+    /// - progress: desired Some이고 applied와 milli 다르거나 없음 → `SetProgress`.
+    ///   desired None + applied Some → `ClearProgress`. 무변경 생략.
+    ///
+    /// `BTreeMap` 순회로 명령 순서가 결정적이다(SetStatus/ClearStatus는 키 사전순, progress는
+    /// pill 명령 뒤). 부동소수는 `ProgressState.value_milli`로만 비교한다.
+    fn plan_commands(
+        applied: &BTreeMap<String, PillState>,
+        desired: &BTreeMap<String, PillState>,
+        prog_applied: &Option<ProgressState>,
+        prog_desired: &Option<ProgressState>,
+    ) -> Vec<CmuxCommand> {
+        let mut commands = Vec::new();
+
+        // desired 기준: 신규/변경분 → SetStatus.
+        for (key, state) in desired {
+            if applied.get(key) != Some(state) {
+                commands.push(CmuxCommand::SetStatus {
+                    key: key.clone(),
+                    value: state.value.clone(),
+                    color: state.color.clone(),
+                    icon: state.icon.clone(),
+                    priority: state.priority,
+                    label: state.label.clone(),
+                });
+            }
+        }
+
+        // applied 기준: desired에서 사라진 키 → ClearStatus.
+        for key in applied.keys() {
+            if !desired.contains_key(key) {
+                commands.push(CmuxCommand::ClearStatus { key: key.clone() });
+            }
+        }
+
+        // progress diff(양자화 milli 비교).
+        match (prog_applied, prog_desired) {
+            (_, Some(desired)) if prog_applied.as_ref() != prog_desired.as_ref() => {
+                commands.push(CmuxCommand::SetProgress {
+                    value: desired.value_milli as f64 / 1000.0,
+                    label: desired.label.clone(),
+                });
+            }
+            (Some(_), None) => commands.push(CmuxCommand::ClearProgress),
+            _ => {}
+        }
+
+        commands
+    }
+
+    /// cmux 명령 실행 추상화. 프로덕션은 CLI 서브프로세스로, 테스트는 collector mock으로 주입한다.
+    ///
+    /// `run`은 명령 실행 성공 여부(`true`=성공)만 돌려준다. sink는 이 결과로 서킷브레이커를
+    /// 카운트하고, 성공한 명령만 `applied`에 반영한다(설계 §4.4, 실패분은 다음 tick 재시도).
+    trait CmuxCommandRunner {
+        /// 단일 cmux 명령을 실행한다. 워크스페이스 타깃 인자는 `surface`로 주어진다.
+        /// 반환값: 명령이 성공적으로 적용됐으면 `true`.
+        fn run(&mut self, command: &CmuxCommand, surface: &CmuxSurfaceContext) -> bool;
+    }
+
+    /// set-status류 cmux 명령에 워크스페이스 타깃만 부여하는 신규 인자 빌더(설계 §4.4).
+    ///
+    /// `add_cmux_surface_context_args`(`--surface`/`--window`도 방출)는 set-status가 거부할 수
+    /// 있어 재사용하지 않는다. workspace_ref가 있을 때만 `--workspace <ref>`를 방출한다.
+    fn add_cmux_status_target_args(command: &mut Command, surface: &CmuxSurfaceContext) {
+        if let Some(workspace_ref) = surface.workspace_ref.as_deref() {
+            command.arg("--workspace").arg(workspace_ref);
+        }
+    }
+
+    /// 프로덕션 runner: 각 [`CmuxCommand`]를 실제 `cmux` 서브프로세스로 실행한다(`run_cmux_command` 경유).
+    struct CliCmuxCommandRunner;
+
+    impl CliCmuxCommandRunner {
+        /// `CmuxCommand`를 `cmux` 인자 벡터로 빌드한다(워크스페이스 타깃 포함).
+        fn build_command(command: &CmuxCommand, surface: &CmuxSurfaceContext) -> Command {
+            let mut cmd = Command::new("cmux");
+            match command {
+                CmuxCommand::SetStatus {
+                    key,
+                    value,
+                    color,
+                    icon,
+                    priority,
+                    label,
+                } => {
+                    cmd.arg("set-status").arg(key).arg(value);
+                    if let Some(label) = label {
+                        cmd.arg("--label").arg(label);
+                    }
+                    if let Some(icon) = icon {
+                        cmd.arg("--icon").arg(icon);
+                    }
+                    if let Some(color) = color {
+                        cmd.arg("--color").arg(color);
+                    }
+                    cmd.arg("--priority").arg(priority.to_string());
+                    add_cmux_status_target_args(&mut cmd, surface);
+                }
+                CmuxCommand::ClearStatus { key } => {
+                    cmd.arg("clear-status").arg(key);
+                    add_cmux_status_target_args(&mut cmd, surface);
+                }
+                CmuxCommand::SetProgress { value, label } => {
+                    cmd.arg("set-progress").arg(format!("{value:.3}"));
+                    if let Some(label) = label {
+                        cmd.arg("--label").arg(label);
+                    }
+                    add_cmux_status_target_args(&mut cmd, surface);
+                }
+                CmuxCommand::ClearProgress => {
+                    cmd.arg("clear-progress");
+                    add_cmux_status_target_args(&mut cmd, surface);
+                }
+            }
+            cmd
+        }
+    }
+
+    impl CmuxCommandRunner for CliCmuxCommandRunner {
+        fn run(&mut self, command: &CmuxCommand, surface: &CmuxSurfaceContext) -> bool {
+            let mut cmd = Self::build_command(command, surface);
+            match run_cmux_command(&mut cmd) {
+                Ok(output) => output.status.success(),
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// cmux 네이티브 status pill sink(설계 §3.2). understatus pill JSON을 받아 diff 후 cmux를 구동한다.
+    ///
+    /// 직전 적용 상태(`applied`/`progress_applied`)를 보관해 변경분만 스폰한다(유휴 스폰 0).
+    /// 연속 실패가 [`CMUX_STATUS_FAILURE_LIMIT`]에 도달하면 `healthy=false`로 비표시(blackout)
+    /// 전환한다(설계 §4.4 서킷브레이커). `Drop` 시 자기 키를 전부 청소한다(누수 1차 방어, §4.3).
+    pub(crate) struct CmuxStatusSink {
+        /// attach 시점 1회 캡처한 워크스페이스 컨텍스트(`cmux_status_identity` 결과).
+        workspace: CmuxSurfaceContext,
+        /// pane 스코프 키 prefix(`lterm.<sanitized-pane>.`). 다중 세션 키 충돌 차단.
+        key_prefix: String,
+        /// 직전 적용된 pill 상태(full key → 상태). diff 기준.
+        applied: BTreeMap<String, PillState>,
+        /// 직전 적용된 진행바 상태.
+        progress_applied: Option<ProgressState>,
+        /// 생성 시점 `cmux` 바이너리 존재 여부. false면 모든 명령을 skip한다.
+        cmux_available: bool,
+        /// 연속 실패 카운트. 성공 시 0으로 리셋.
+        consecutive_failures: u32,
+        /// 서킷브레이커 상태. false면 명령을 발행하지 않는다(blackout).
+        healthy: bool,
+    }
+
+    impl CmuxStatusSink {
+        /// sink를 생성한다(설계 §3.2 `new`).
+        ///
+        /// `key_prefix`는 `lterm.<sanitized-pane>.` 형태로, pane id를 [`is_valid_cmux_ref_segment`]
+        /// 통과 문자만 남기게 정규화한다(설계 §6 키 sanitization). `cmux_available`은 생성 시점
+        /// `command_exists("cmux")`로 정한다.
+        pub(crate) fn new(workspace: CmuxSurfaceContext, pane_id: &str) -> Self {
+            let key_prefix = format!("lterm.{}.", sanitize_cmux_pane_segment(pane_id));
+            Self {
+                workspace,
+                key_prefix,
+                applied: BTreeMap::new(),
+                progress_applied: None,
+                cmux_available: client::command_exists("cmux"),
+                consecutive_failures: 0,
+                healthy: true,
+            }
+        }
+
+        /// understatus가 낸 pill JSON 1줄을 적용한다(설계 §3.2/§4.4).
+        ///
+        /// 1. JSON 파싱 실패 또는 schema 불일치 → no-op(구버전 oneline 등 무해 흡수).
+        /// 2. desired 맵 구성(full key=`key_prefix`+pill.key) → `plan_commands`로 diff.
+        /// 3. `healthy && cmux_available`일 때만 각 명령 실행. 성공분만 `applied`/`progress_applied`
+        ///    에 반영하고(실패분은 다음 tick 재시도), 연속 실패가 한계에 도달하면 blackout.
+        pub(crate) fn apply(&mut self, stdout_line: &str) {
+            let mut runner = CliCmuxCommandRunner;
+            self.apply_with_runner(stdout_line, &mut runner);
+        }
+
+        /// [`CmuxStatusSink::apply`]의 runner 주입판(테스트용 collector mock 경로).
+        fn apply_with_runner<R: CmuxCommandRunner>(&mut self, stdout_line: &str, runner: &mut R) {
+            let Ok(input) = serde_json::from_str::<CmuxStatusInput>(stdout_line) else {
+                // 구버전 oneline SGR 등 비-JSON 수신 → 무해 no-op(설계 ADR-4).
+                return;
+            };
+            if input.schema != CMUX_STATUS_SCHEMA {
+                return;
+            }
+
+            let desired = self.build_desired_pills(&input);
+            let progress_desired = build_desired_progress(&input);
+            let commands = plan_commands(
+                &self.applied,
+                &desired,
+                &self.progress_applied,
+                &progress_desired,
+            );
+
+            if commands.is_empty() {
+                return;
+            }
+            if !self.cmux_available || !self.healthy {
+                return;
+            }
+
+            self.run_commands(&commands, &desired, &progress_desired, runner);
+        }
+
+        /// pill 입력을 full-key(`key_prefix`+id) → [`PillState`] 맵으로 변환한다.
+        fn build_desired_pills(&self, input: &CmuxStatusInput) -> BTreeMap<String, PillState> {
+            let mut desired = BTreeMap::new();
+            for pill in &input.pills {
+                if pill.key.is_empty() {
+                    continue;
+                }
+                let full_key = format!("{}{}", self.key_prefix, pill.key);
+                desired.insert(
+                    full_key,
+                    PillState {
+                        value: pill.value.clone(),
+                        color: pill.color.clone(),
+                        icon: pill.icon.clone(),
+                        priority: pill.priority,
+                        label: pill.label.clone(),
+                    },
+                );
+            }
+            desired
+        }
+
+        /// 계획된 명령을 실행하고, 성공분만 적용 상태에 반영하며 서킷브레이커를 갱신한다.
+        fn run_commands<R: CmuxCommandRunner>(
+            &mut self,
+            commands: &[CmuxCommand],
+            desired: &BTreeMap<String, PillState>,
+            progress_desired: &Option<ProgressState>,
+            runner: &mut R,
+        ) {
+            for command in commands {
+                let ok = runner.run(command, &self.workspace);
+                if ok {
+                    self.consecutive_failures = 0;
+                    self.commit_applied(command, desired, progress_desired);
+                } else {
+                    self.record_failure();
+                    if !self.healthy {
+                        // blackout 전환 — 남은 명령은 발행하지 않는다.
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// 성공한 단일 명령을 `applied`/`progress_applied`에 반영한다(실패분은 미반영=재시도).
+        fn commit_applied(
+            &mut self,
+            command: &CmuxCommand,
+            desired: &BTreeMap<String, PillState>,
+            progress_desired: &Option<ProgressState>,
+        ) {
+            match command {
+                CmuxCommand::SetStatus { key, .. } => {
+                    if let Some(state) = desired.get(key) {
+                        self.applied.insert(key.clone(), state.clone());
+                    }
+                }
+                CmuxCommand::ClearStatus { key } => {
+                    self.applied.remove(key);
+                }
+                CmuxCommand::SetProgress { .. } => {
+                    self.progress_applied = progress_desired.clone();
+                }
+                CmuxCommand::ClearProgress => {
+                    self.progress_applied = None;
+                }
+            }
+        }
+
+        /// 연속 실패를 1 증가시키고, 한계 도달 시 blackout(`healthy=false`)으로 전환하며 1회 경고한다.
+        fn record_failure(&mut self) {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.consecutive_failures >= CMUX_STATUS_FAILURE_LIMIT && self.healthy {
+                self.healthy = false;
+                if cmux_status_debug_enabled() {
+                    eprintln!(
+                        "warning: cmux status pill sink disabled after {} consecutive failures; \
+                     pills hidden (blackout) for {}",
+                        CMUX_STATUS_FAILURE_LIMIT,
+                        sanitize::terminal_text(&self.key_prefix)
+                    );
+                }
+            }
+        }
+    }
+
+    impl Drop for CmuxStatusSink {
+        /// 누수 1차 방어(설계 §4.3): 적용된 전 키를 `clear-status`하고, 진행바가 있으면
+        /// `clear-progress`한다. best-effort(`ManagedAttachGuard::drop` 모델) — 실패는 무시한다.
+        /// `cmux_available=false`면 청소할 게 없으므로 skip한다.
+        fn drop(&mut self) {
+            if !self.cmux_available {
+                return;
+            }
+            let mut runner = CliCmuxCommandRunner;
+            self.cleanup_with_runner(&mut runner);
+        }
+    }
+
+    impl CmuxStatusSink {
+        /// [`Drop`]의 runner 주입판(테스트용). 적용 키 전체 clear + progress clear를 발행한다.
+        fn cleanup_with_runner<R: CmuxCommandRunner>(&mut self, runner: &mut R) {
+            let keys: Vec<String> = self.applied.keys().cloned().collect();
+            for key in keys {
+                let _ = runner.run(&CmuxCommand::ClearStatus { key }, &self.workspace);
+            }
+            self.applied.clear();
+            if self.progress_applied.is_some() {
+                let _ = runner.run(&CmuxCommand::ClearProgress, &self.workspace);
+                self.progress_applied = None;
+            }
+        }
+    }
+
+    /// pill JSON의 진행바 입력을 양자화된 [`ProgressState`]로 변환한다(없으면 `None`).
+    fn build_desired_progress(input: &CmuxStatusInput) -> Option<ProgressState> {
+        input.progress.as_ref().map(|progress| ProgressState {
+            value_milli: quantize_progress_milli(progress.value),
+            label: progress.label.clone(),
+        })
+    }
+
+    /// pane id를 cmux 키 세그먼트 안전 문자만 남기게 정규화한다(설계 §6).
+    ///
+    /// [`is_valid_cmux_ref_segment`] 허용 집합(`[A-Za-z0-9_-]`) 외 문자는 `_`로 치환한다.
+    /// 예: pane `"%3"` → `"_3"`. 빈 결과는 `"_"`로 폴백해 키 prefix가 비지 않게 한다.
+    fn sanitize_cmux_pane_segment(pane_id: &str) -> String {
+        let sanitized: String = pane_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    /// 서킷브레이커 경고를 stderr로 낼지 여부(`LTERM_STATUS_DEBUG` 가드). 기본 false(조용히 blackout).
+    fn cmux_status_debug_enabled() -> bool {
+        std::env::var_os("LTERM_STATUS_DEBUG").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            let trimmed = value.trim();
+            !(trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("0")
+                || trimmed.eq_ignore_ascii_case("false")
+                || trimmed.eq_ignore_ascii_case("no")
+                || trimmed.eq_ignore_ascii_case("off"))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        // 키 정규화 단언은 부모 모듈의 cmux ref 검증기를 그대로 재사용한다.
+        use crate::tmux_compat::is_valid_cmux_ref_segment;
+
+        /// 테스트용 명령 collector mock. 실행된 명령을 순서대로 기록하고, 성공/실패를
+        /// 구성 가능하게 한다(서킷브레이커 검증용).
+        struct CollectingRunner {
+            commands: Vec<CmuxCommand>,
+            /// false면 모든 `run`이 실패(서킷브레이커 유발)로 간주된다.
+            succeed: bool,
+        }
+
+        impl CollectingRunner {
+            fn new() -> Self {
+                Self {
+                    commands: Vec::new(),
+                    succeed: true,
+                }
+            }
+
+            fn always_failing() -> Self {
+                Self {
+                    commands: Vec::new(),
+                    succeed: false,
+                }
+            }
+        }
+
+        impl CmuxCommandRunner for CollectingRunner {
+            fn run(&mut self, command: &CmuxCommand, _surface: &CmuxSurfaceContext) -> bool {
+                self.commands.push(command.clone());
+                self.succeed
+            }
+        }
+
+        fn test_surface() -> CmuxSurfaceContext {
+            CmuxSurfaceContext {
+                surface_ref: "surface:uuid-test".to_string(),
+                workspace_ref: Some("workspace:uuid-test".to_string()),
+                window_ref: Some("window:uuid-test".to_string()),
+            }
+        }
+
+        fn pill_state(value: &str) -> PillState {
+            PillState {
+                value: value.to_string(),
+                color: None,
+                icon: None,
+                priority: 50,
+                label: None,
+            }
+        }
+
+        /// AC1: 무변경 → 빈 vec.
+        #[test]
+        fn plan_commands_no_change_is_empty() {
+            let mut map = BTreeMap::new();
+            map.insert("lterm._3.model".to_string(), pill_state("gpt-5.5"));
+            let commands = plan_commands(&map, &map.clone(), &None, &None);
+            assert!(commands.is_empty());
+        }
+
+        /// AC1: 값 변경 → SetStatus.
+        #[test]
+        fn plan_commands_value_change_emits_set_status() {
+            let mut applied = BTreeMap::new();
+            applied.insert("lterm._3.model".to_string(), pill_state("gpt-5.5"));
+            let mut desired = BTreeMap::new();
+            desired.insert("lterm._3.model".to_string(), pill_state("gpt-6"));
+            let commands = plan_commands(&applied, &desired, &None, &None);
+            assert_eq!(
+                commands,
+                vec![CmuxCommand::SetStatus {
+                    key: "lterm._3.model".to_string(),
+                    value: "gpt-6".to_string(),
+                    color: None,
+                    icon: None,
+                    priority: 50,
+                    label: None,
+                }]
+            );
+        }
+
+        /// AC1: 제거 → ClearStatus.
+        #[test]
+        fn plan_commands_removal_emits_clear_status() {
+            let mut applied = BTreeMap::new();
+            applied.insert("lterm._3.ctx".to_string(), pill_state("ctx 42%"));
+            let desired = BTreeMap::new();
+            let commands = plan_commands(&applied, &desired, &None, &None);
+            assert_eq!(
+                commands,
+                vec![CmuxCommand::ClearStatus {
+                    key: "lterm._3.ctx".to_string()
+                }]
+            );
+        }
+
+        /// AC1: 추가 → SetStatus.
+        #[test]
+        fn plan_commands_addition_emits_set_status() {
+            let applied = BTreeMap::new();
+            let mut desired = BTreeMap::new();
+            desired.insert("lterm._3.cpu".to_string(), pill_state("cpu 31%"));
+            let commands = plan_commands(&applied, &desired, &None, &None);
+            assert_eq!(commands.len(), 1);
+            assert!(matches!(
+                commands[0],
+                CmuxCommand::SetStatus { ref key, .. } if key == "lterm._3.cpu"
+            ));
+        }
+
+        /// AC1: 명령 순서 결정적(SetStatus는 키 사전순, ClearStatus 뒤).
+        #[test]
+        fn plan_commands_order_is_deterministic() {
+            let mut applied = BTreeMap::new();
+            applied.insert("lterm._3.zeta".to_string(), pill_state("old"));
+            let mut desired = BTreeMap::new();
+            desired.insert("lterm._3.beta".to_string(), pill_state("b"));
+            desired.insert("lterm._3.alpha".to_string(), pill_state("a"));
+            let commands = plan_commands(&applied, &desired, &None, &None);
+            // alpha, beta(사전순 SetStatus) → zeta(ClearStatus).
+            assert_eq!(commands.len(), 3);
+            assert!(matches!(
+                &commands[0],
+                CmuxCommand::SetStatus { key, .. } if key == "lterm._3.alpha"
+            ));
+            assert!(matches!(
+                &commands[1],
+                CmuxCommand::SetStatus { key, .. } if key == "lterm._3.beta"
+            ));
+            assert!(matches!(
+                &commands[2],
+                CmuxCommand::ClearStatus { key } if key == "lterm._3.zeta"
+            ));
+        }
+
+        /// AC1: progress add/change/clear.
+        #[test]
+        fn plan_commands_progress_add_change_clear() {
+            // add
+            let desired = Some(ProgressState {
+                value_milli: 420,
+                label: Some("ctx 42%".to_string()),
+            });
+            let commands = plan_commands(&BTreeMap::new(), &BTreeMap::new(), &None, &desired);
+            assert_eq!(
+                commands,
+                vec![CmuxCommand::SetProgress {
+                    value: 0.42,
+                    label: Some("ctx 42%".to_string()),
+                }]
+            );
+
+            // change
+            let applied = Some(ProgressState {
+                value_milli: 420,
+                label: Some("ctx 42%".to_string()),
+            });
+            let changed = Some(ProgressState {
+                value_milli: 500,
+                label: Some("ctx 50%".to_string()),
+            });
+            let commands = plan_commands(&BTreeMap::new(), &BTreeMap::new(), &applied, &changed);
+            assert_eq!(
+                commands,
+                vec![CmuxCommand::SetProgress {
+                    value: 0.5,
+                    label: Some("ctx 50%".to_string()),
+                }]
+            );
+
+            // clear
+            let commands = plan_commands(&BTreeMap::new(), &BTreeMap::new(), &applied, &None);
+            assert_eq!(commands, vec![CmuxCommand::ClearProgress]);
+        }
+
+        /// AC2: ctx 양자화 — 같은 정수%(milli 동일)면 progress 명령 미발행.
+        #[test]
+        fn plan_commands_progress_same_milli_is_no_op() {
+            // understatus가 정수%로 보내므로 같은 값 → milli 동일 → 무변경.
+            let applied = Some(ProgressState {
+                value_milli: quantize_progress_milli(0.42),
+                label: Some("ctx 42%".to_string()),
+            });
+            let desired = Some(ProgressState {
+                value_milli: quantize_progress_milli(0.42),
+                label: Some("ctx 42%".to_string()),
+            });
+            let commands = plan_commands(&BTreeMap::new(), &BTreeMap::new(), &applied, &desired);
+            assert!(commands.is_empty());
+        }
+
+        /// AC2: 양자화 경계 — 미세 부동소수 변동도 같은 milli면 무변경.
+        #[test]
+        fn quantize_progress_milli_quantizes_to_permille() {
+            assert_eq!(quantize_progress_milli(0.42), 420);
+            assert_eq!(quantize_progress_milli(0.4204), 420);
+            assert_eq!(quantize_progress_milli(0.4163), 416);
+            // 클램프
+            assert_eq!(quantize_progress_milli(-0.5), 0);
+            assert_eq!(quantize_progress_milli(1.5), 1000);
+        }
+
+        /// AC3: 신규 빌더 — set-status argv에 `--workspace` 有 AND `--surface`/`--window` 無.
+        #[test]
+        fn set_status_command_emits_workspace_only_target() {
+            let surface = test_surface();
+            let command = CmuxCommand::SetStatus {
+                key: "lterm._3.model".to_string(),
+                value: "gpt-5.5".to_string(),
+                color: Some("#7AA2F7".to_string()),
+                icon: Some("sparkles".to_string()),
+                priority: 60,
+                label: None,
+            };
+            let cmd = CliCmuxCommandRunner::build_command(&command, &surface);
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(argv.iter().any(|a| a == "--workspace"));
+            assert!(argv.iter().any(|a| a == "workspace:uuid-test"));
+            assert!(!argv.iter().any(|a| a == "--surface"));
+            assert!(!argv.iter().any(|a| a == "--window"));
+            // set-status 본 인자도 확인.
+            assert_eq!(argv[0], "set-status");
+            assert_eq!(argv[1], "lterm._3.model");
+            assert_eq!(argv[2], "gpt-5.5");
+        }
+
+        /// AC3: workspace_ref 없으면 `--workspace`도 방출 안 함.
+        #[test]
+        fn target_args_omit_workspace_when_absent() {
+            let surface = CmuxSurfaceContext {
+                surface_ref: "surface:x".to_string(),
+                workspace_ref: None,
+                window_ref: None,
+            };
+            let mut cmd = Command::new("cmux");
+            add_cmux_status_target_args(&mut cmd, &surface);
+            assert_eq!(cmd.get_args().count(), 0);
+        }
+
+        /// AC4: apply non-JSON → no-op(applied 불변, 패닉 없음).
+        #[test]
+        fn apply_non_json_is_no_op() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            let mut runner = CollectingRunner::new();
+            sink.apply_with_runner("\x1b[31msome oneline sgr\x1b[0m", &mut runner);
+            assert!(runner.commands.is_empty());
+            assert!(sink.applied.is_empty());
+        }
+
+        /// AC4: schema 불일치 → no-op.
+        #[test]
+        fn apply_wrong_schema_is_no_op() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            let mut runner = CollectingRunner::new();
+            sink.apply_with_runner(
+            r#"{"schema":"other","version":1,"pills":[{"key":"model","value":"x","priority":1}]}"#,
+            &mut runner,
+        );
+            assert!(runner.commands.is_empty());
+            assert!(sink.applied.is_empty());
+        }
+
+        /// AC5: 키 정규화 — pane "%3" → key_prefix가 `is_valid_cmux_ref_segment` 통과.
+        #[test]
+        fn key_prefix_segments_are_valid_cmux_refs() {
+            let sink = CmuxStatusSink::new(test_surface(), "%3");
+            // prefix = "lterm._3." → 각 점-구분 세그먼트가 유효해야 한다.
+            assert_eq!(sink.key_prefix, "lterm._3.");
+            for segment in sink.key_prefix.trim_end_matches('.').split('.') {
+                assert!(
+                    is_valid_cmux_ref_segment(segment),
+                    "segment {segment:?} must be a valid cmux ref"
+                );
+            }
+            // full key의 세그먼트도 유효(pill id append 후).
+            let full = format!("{}model", sink.key_prefix);
+            for segment in full.split('.') {
+                assert!(is_valid_cmux_ref_segment(segment));
+            }
+        }
+
+        /// AC5: sanitize는 비허용 문자를 `_`로 치환, 빈 결과는 `_` 폴백.
+        #[test]
+        fn sanitize_cmux_pane_segment_replaces_disallowed() {
+            assert_eq!(sanitize_cmux_pane_segment("%3"), "_3");
+            assert_eq!(sanitize_cmux_pane_segment("pane.1/x"), "pane_1_x");
+            assert_eq!(sanitize_cmux_pane_segment("ok-id_9"), "ok-id_9");
+            assert_eq!(sanitize_cmux_pane_segment(""), "_");
+            assert_eq!(sanitize_cmux_pane_segment("%%"), "__");
+        }
+
+        /// AC6: Drop → 모든 applied 키 clear-status + clear-progress 발행(collector mock).
+        #[test]
+        fn cleanup_emits_clear_for_all_applied() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            sink.applied
+                .insert("lterm._3.model".to_string(), pill_state("gpt-5.5"));
+            sink.applied
+                .insert("lterm._3.cpu".to_string(), pill_state("cpu 31%"));
+            sink.progress_applied = Some(ProgressState {
+                value_milli: 420,
+                label: None,
+            });
+            let mut runner = CollectingRunner::new();
+            sink.cleanup_with_runner(&mut runner);
+            // 두 clear-status(사전순) + 한 clear-progress.
+            assert_eq!(
+                runner.commands,
+                vec![
+                    CmuxCommand::ClearStatus {
+                        key: "lterm._3.cpu".to_string()
+                    },
+                    CmuxCommand::ClearStatus {
+                        key: "lterm._3.model".to_string()
+                    },
+                    CmuxCommand::ClearProgress,
+                ]
+            );
+            assert!(sink.applied.is_empty());
+            assert!(sink.progress_applied.is_none());
+        }
+
+        /// AC7: 서킷 — 3연속 실패 주입 → healthy=false, 이후 apply 명령 미발행.
+        #[test]
+        fn circuit_breaker_blackouts_after_three_failures() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            // 3개 pill을 desired로 — 전부 실패하면 3연속 실패로 blackout.
+            let payload = r#"{"schema":"cmux-status","version":1,"pills":[
+            {"key":"model","value":"gpt-5.5","priority":60},
+            {"key":"cpu","value":"cpu 31%","priority":100},
+            {"key":"mem","value":"mem 48%","priority":90}
+        ]}"#;
+            let mut runner = CollectingRunner::always_failing();
+            sink.apply_with_runner(payload, &mut runner);
+            // 3번째 실패에서 blackout → 남은 명령 없음(정확히 3개 시도, 전부 실패).
+            assert_eq!(runner.commands.len(), 3);
+            assert!(!sink.healthy);
+            assert!(sink.applied.is_empty());
+
+            // 이후 apply는 healthy=false라 명령 미발행.
+            let mut runner2 = CollectingRunner::new();
+            sink.apply_with_runner(payload, &mut runner2);
+            assert!(runner2.commands.is_empty());
+        }
+
+        /// AC7 보강: 성공 시 연속 실패 카운트 리셋, healthy 유지, 성공분만 applied 반영.
+        #[test]
+        fn successful_apply_commits_state_and_keeps_healthy() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = true;
+            let payload = r##"{"schema":"cmux-status","version":1,
+            "pills":[{"key":"model","value":"gpt-5.5","color":"#7AA2F7","icon":"sparkles","priority":60}],
+            "progress":{"value":0.42,"label":"ctx 42%"}}"##;
+            let mut runner = CollectingRunner::new();
+            sink.apply_with_runner(payload, &mut runner);
+            // set-status(model) + set-progress.
+            assert_eq!(runner.commands.len(), 2);
+            assert!(sink.healthy);
+            assert_eq!(sink.consecutive_failures, 0);
+            assert!(sink.applied.contains_key("lterm._3.model"));
+            assert!(sink.progress_applied.is_some());
+
+            // 재적용(동일 payload) → 무변경 → 명령 0(유휴 스폰 0).
+            let mut runner2 = CollectingRunner::new();
+            sink.apply_with_runner(payload, &mut runner2);
+            assert!(runner2.commands.is_empty());
+        }
+
+        /// 비-cmux 환경(cmux_available=false) → apply 명령 미발행(blackout, 설계 §6).
+        #[test]
+        fn apply_skips_when_cmux_unavailable() {
+            let mut sink = CmuxStatusSink::new(test_surface(), "%3");
+            sink.cmux_available = false;
+            let payload = r#"{"schema":"cmux-status","version":1,"pills":[{"key":"model","value":"x","priority":1}]}"#;
+            let mut runner = CollectingRunner::new();
+            sink.apply_with_runner(payload, &mut runner);
+            assert!(runner.commands.is_empty());
+            assert!(sink.applied.is_empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
