@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "release": "lterm-1.0.22",
+  "release": "lterm-1.0.23",
   "source_of_truth": "docs/contract-manifest.json",
   "policy": {
     "stable_json_requires_schema": true,
