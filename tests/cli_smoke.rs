@@ -7298,6 +7298,35 @@ fn tmux_compat_rejects_omc_invalid_window_targets_without_fallback() -> TestResu
         !marker.exists(),
         "invalid split target must not execute payload"
     );
+    let new_window = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-d",
+            "-P",
+            "-t",
+            "invalid-window-parent:#I",
+            "-n",
+            "invalid-window-child",
+            "sh",
+            "-lc",
+            format!("printf bad > {}", marker.display()).as_str(),
+        ])
+        .output()?;
+    assert!(!new_window.status.success(), "{new_window:?}");
+    assert_stderr_contains(
+        &new_window,
+        "unsupported tmux window target in lterm compat:",
+    );
+    assert_stderr_contains(
+        &new_window,
+        "lterm supports bare session targets and session:0 only",
+    );
+    assert!(
+        !marker.exists(),
+        "invalid new-window target must not execute payload"
+    );
     assert_eq!(
         session_names_json(&env)?,
         before,
@@ -7307,8 +7336,22 @@ fn tmux_compat_rejects_omc_invalid_window_targets_without_fallback() -> TestResu
 }
 
 #[test]
-fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> TestResult {
+fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> TestResult {
     let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("new-window-cmux.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             exit 70\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let marker = env.temp.path().join("new-window-visible-marker.txt");
     let status = env
         .cmd()
         .args([
@@ -7322,12 +7365,15 @@ fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> T
         .status()?;
     assert!(status.success(), "{status:?}");
     wait_for_session_present(&env, "unsupported-window-parent")?;
-    let before = session_names_json(&env)?;
 
     let list = env.cmd().args(["tmux-compat", "list-commands"]).output()?;
     assert!(list.status.success(), "{list:?}");
     let list_stdout = String::from_utf8_lossy(&list.stdout);
-    for unsupported in ["select-window", "new-window", "kill-window"] {
+    assert!(
+        list_stdout.lines().any(|line| line == "new-window"),
+        "new-window should be advertised as a partial compatibility command: {list_stdout:?}"
+    );
+    for unsupported in ["select-window", "kill-window"] {
         assert!(
             !list_stdout.lines().any(|line| line == unsupported),
             "{unsupported} must remain outside the baseline command list: {list_stdout:?}"
@@ -7336,6 +7382,8 @@ fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> T
 
     let new_window = env
         .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
         .args([
             "tmux-compat",
             "new-window",
@@ -7357,19 +7405,115 @@ fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> T
             "sleep 60",
         ])
         .output()?;
-    assert!(!new_window.status.success(), "{new_window:?}");
-    assert_stderr_contains(
-        &new_window,
-        "unsupported tmux command in lterm compat: new-window",
+    assert!(new_window.status.success(), "{new_window:?}");
+    let line = String::from_utf8_lossy(&new_window.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        line.starts_with("unsupported-window-child:0 %"),
+        "new-window should print the requested format using the detached lterm session: {line:?}"
     );
+    wait_for_session_present(&env, "unsupported-window-child")?;
+    let after_detached = session_names_json(&env)?;
+    assert!(
+        after_detached.contains("unsupported-window-child"),
+        "detached new-window should create the named lterm session: {after_detached:?}"
+    );
+    let default_format = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-dP",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-default-format",
+            "sleep 60",
+        ])
+        .output()?;
+    assert!(default_format.status.success(), "{default_format:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&default_format.stdout).trim(),
+        "unsupported-window-default-format:0",
+        "new-window -P without -F should print a tmux-style window target"
+    );
+    assert!(
+        !cmux_log.exists(),
+        "detached new-window must not open a visible cmux split"
+    );
+
+    let visible_marker = shlex::try_quote(&marker.display().to_string())?.into_owned();
+    let non_detached = env
+        .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-P",
+            "-F",
+            "#S:#I #{pane_id}",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-visible-child",
+            "sh",
+            "-lc",
+            &format!("printf bad > {visible_marker}; sleep 60"),
+        ])
+        .output()?;
+    assert!(!non_detached.status.success(), "{non_detached:?}");
     assert_stderr_contains(
-        &new_window,
-        "Run `lterm tmux-compat list-commands` to inspect supported commands",
+        &non_detached,
+        "tmux new-window without -d is not supported by lterm compat",
+    );
+    assert!(
+        !marker.exists(),
+        "non-detached new-window must fail before executing its payload"
+    );
+    assert!(
+        !cmux_log.exists(),
+        "non-detached new-window must fail before opening a visible cmux split"
     );
     assert_eq!(
         session_names_json(&env)?,
-        before,
-        "unsupported new-window must not create sessions"
+        {
+            let mut expected = after_detached.clone();
+            expected.insert("unsupported-window-default-format".to_string());
+            expected
+        },
+        "non-detached new-window must not create fallback helper sessions"
+    );
+
+    let unsupported_option = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-d",
+            "-e",
+            "LTERM_BAD=1",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-env-child",
+            "sh",
+            "-lc",
+            &format!("printf bad > {visible_marker}; sleep 60"),
+        ])
+        .output()?;
+    assert!(
+        !unsupported_option.status.success(),
+        "{unsupported_option:?}"
+    );
+    assert_stderr_contains(
+        &unsupported_option,
+        "unsupported tmux new-window option: -e",
+    );
+    assert!(
+        !marker.exists(),
+        "unsupported new-window options must fail before executing shifted payload tokens"
     );
 
     let kill_window = env
@@ -7392,8 +7536,26 @@ fn tmux_compat_keeps_omc_window_commands_unsupported_without_side_effects() -> T
     );
     assert_eq!(
         session_names_json(&env)?,
-        before,
+        {
+            let mut expected = after_detached.clone();
+            expected.insert("unsupported-window-default-format".to_string());
+            expected
+        },
         "unsupported kill-window must not kill pane/session state"
+    );
+    let cleanup = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "kill-session",
+            "-t",
+            "unsupported-window-child",
+        ])
+        .output()?;
+    assert!(cleanup.status.success(), "{cleanup:?}");
+    assert!(
+        session_names_json(&env)?.contains("unsupported-window-parent"),
+        "parent session should have been preserved throughout the new-window test"
     );
     Ok(())
 }
