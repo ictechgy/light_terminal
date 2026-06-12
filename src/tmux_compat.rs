@@ -287,38 +287,36 @@ fn new_session(args: &[String]) -> Result<i32> {
 }
 
 fn new_window(args: &[String]) -> Result<i32> {
-    let mut detached = false;
-    let mut print = false;
-    let mut format = "#{pane_id}".to_string();
-    let mut target = None;
-    let mut name = None;
-    let mut cwd = None;
+    let mut parsed = NewWindowArgs {
+        format: "#{session_name}:#{window_index}".to_string(),
+        ..NewWindowArgs::default()
+    };
     let mut command = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-d" => {
-                detached = true;
+                parsed.detached = true;
                 i += 1;
             }
             "-P" => {
-                print = true;
+                parsed.print = true;
                 i += 1;
             }
             "-F" => {
-                format = value_for_option(args.get(i + 1).cloned(), "-F")?;
+                parsed.format = value_for_option(args.get(i + 1).cloned(), "-F")?;
                 i += 2;
             }
             "-t" => {
-                target = target_value(args.get(i + 1).cloned(), "-t")?;
+                parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
                 i += 2;
             }
             "-n" => {
-                name = Some(value_for_option(args.get(i + 1).cloned(), "-n")?);
+                parsed.name = Some(value_for_option(args.get(i + 1).cloned(), "-n")?);
                 i += 2;
             }
             "-c" => {
-                cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
+                parsed.cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
             "--" => {
@@ -326,31 +324,8 @@ fn new_window(args: &[String]) -> Result<i32> {
                 break;
             }
             flag if flag.starts_with('-') => {
-                if has_flag_in_arg(flag, 'd') {
-                    detached = true;
-                }
-                if has_flag_in_arg(flag, 'P') {
-                    print = true;
-                }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
-                    format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
-                }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 't', args, i) {
-                    target = target_value(value.or_else(|| args.get(i + 1).cloned()), "-t")?;
-                }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'n', args, i) {
-                    name = Some(value_for_option(
-                        value.or_else(|| args.get(i + 1).cloned()),
-                        "-n",
-                    )?);
-                }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'c', args, i) {
-                    cwd = Some(value_for_option(
-                        value.or_else(|| args.get(i + 1).cloned()),
-                        "-c",
-                    )?);
-                }
-                i += flag_arg_width(flag, args, i);
+                let consumed_next = parse_new_window_short_flags(flag, args, i, &mut parsed)?;
+                i += if consumed_next { 2 } else { 1 };
             }
             _ => {
                 command.extend_from_slice(&args[i..]);
@@ -359,14 +334,14 @@ fn new_window(args: &[String]) -> Result<i32> {
         }
     }
 
-    if !detached {
+    if !parsed.detached {
         bail!(
             "tmux new-window without -d is not supported by lterm compat; \
              refusing to create a visible or hidden window. Use -d for a detached lterm session."
         );
     }
 
-    let target = target.unwrap_or_else(default_target);
+    let target = parsed.target.unwrap_or_else(default_target);
     reject_unsupported_tmux_window_target(&target)?;
     info_for_tmux_target(&target).with_context(|| {
         format!(
@@ -376,12 +351,64 @@ fn new_window(args: &[String]) -> Result<i32> {
     })?;
 
     let command = tmux_shell_command(&command)?;
-    let info = client::new_session(name, command, cwd, HashMap::new(), None, true)?;
+    let info = client::new_session(parsed.name, command, parsed.cwd, HashMap::new(), None, true)?;
     remember_pane(&info, None)?;
-    if print {
-        println!("{}", expand_format(&format, &info));
+    if parsed.print {
+        println!("{}", expand_format(&parsed.format, &info));
     }
     Ok(0)
+}
+
+#[derive(Default)]
+struct NewWindowArgs {
+    detached: bool,
+    print: bool,
+    format: String,
+    target: Option<String>,
+    name: Option<String>,
+    cwd: Option<String>,
+}
+
+fn parse_new_window_short_flags(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    parsed: &mut NewWindowArgs,
+) -> Result<bool> {
+    let Some(cluster) = short_cluster(flag) else {
+        bail!("unsupported tmux new-window option: {flag}");
+    };
+    for (pos, short_flag) in cluster.char_indices() {
+        match short_flag {
+            'd' => parsed.detached = true,
+            'P' => parsed.print = true,
+            // Accepted as no-op placement/reuse hints. lterm's partial
+            // new-window compatibility maps detached windows to standalone
+            // lterm sessions rather than a mutable real-tmux window list.
+            'a' | 'b' | 'k' | 'S' => {}
+            'F' | 't' | 'n' | 'c' => {
+                let rest = &cluster[pos + short_flag.len_utf8()..];
+                let (value, consumed_next) = if rest.is_empty() {
+                    (args.get(i + 1).cloned(), true)
+                } else {
+                    (
+                        Some(rest.strip_prefix('=').unwrap_or(rest).to_string()),
+                        false,
+                    )
+                };
+                match short_flag {
+                    'F' => parsed.format = value_for_option(value, "-F")?,
+                    't' => parsed.target = target_value(value, "-t")?,
+                    'n' => parsed.name = Some(value_for_option(value, "-n")?),
+                    'c' => parsed.cwd = Some(value_for_option(value, "-c")?),
+                    _ => unreachable!("value-taking new-window flag was matched above"),
+                }
+                return Ok(consumed_next);
+            }
+            _ => bail!("unsupported tmux new-window option: -{short_flag}"),
+        }
+    }
+    Ok(false)
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
@@ -3489,7 +3516,7 @@ fn command_usage(command: &str) -> &'static str {
         "load-buffer" => "path",
         "new-session" => "[-d] [-c start-directory] [-s session-name] [shell-command]",
         "new-window" => {
-            "[-dP] [-F format] [-t target-session] [-n window-name] [-c start-directory] [shell-command]"
+            "-d [-P] [-F format] [-t target-session] [-n window-name] [-c start-directory] [shell-command]"
         }
         "paste-buffer" => "[-t target-pane]",
         "refresh-client" => "[-S] [-t target-client]",

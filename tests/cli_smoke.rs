@@ -7365,7 +7365,6 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
         .status()?;
     assert!(status.success(), "{status:?}");
     wait_for_session_present(&env, "unsupported-window-parent")?;
-    let before = session_names_json(&env)?;
 
     let list = env.cmd().args(["tmux-compat", "list-commands"]).output()?;
     assert!(list.status.success(), "{list:?}");
@@ -7420,6 +7419,25 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
         after_detached.contains("unsupported-window-child"),
         "detached new-window should create the named lterm session: {after_detached:?}"
     );
+    let default_format = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-dP",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-default-format",
+            "sleep 60",
+        ])
+        .output()?;
+    assert!(default_format.status.success(), "{default_format:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&default_format.stdout).trim(),
+        "unsupported-window-default-format:0",
+        "new-window -P without -F should print a tmux-style window target"
+    );
     assert!(
         !cmux_log.exists(),
         "detached new-window must not open a visible cmux split"
@@ -7428,6 +7446,8 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
     let visible_marker = shlex::try_quote(&marker.display().to_string())?.into_owned();
     let non_detached = env
         .cmd()
+        .env("CMUX_WORKSPACE_ID", "workspace:1")
+        .env("PATH", &path)
         .args([
             "tmux-compat",
             "new-window",
@@ -7452,10 +7472,48 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
         !marker.exists(),
         "non-detached new-window must fail before executing its payload"
     );
+    assert!(
+        !cmux_log.exists(),
+        "non-detached new-window must fail before opening a visible cmux split"
+    );
     assert_eq!(
         session_names_json(&env)?,
-        after_detached,
+        {
+            let mut expected = after_detached.clone();
+            expected.insert("unsupported-window-default-format".to_string());
+            expected
+        },
         "non-detached new-window must not create fallback helper sessions"
+    );
+
+    let unsupported_option = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-window",
+            "-d",
+            "-e",
+            "LTERM_BAD=1",
+            "-t",
+            "unsupported-window-parent",
+            "-n",
+            "unsupported-window-env-child",
+            "sh",
+            "-lc",
+            &format!("printf bad > {visible_marker}; sleep 60"),
+        ])
+        .output()?;
+    assert!(
+        !unsupported_option.status.success(),
+        "{unsupported_option:?}"
+    );
+    assert_stderr_contains(
+        &unsupported_option,
+        "unsupported tmux new-window option: -e",
+    );
+    assert!(
+        !marker.exists(),
+        "unsupported new-window options must fail before executing shifted payload tokens"
     );
 
     let kill_window = env
@@ -7478,7 +7536,11 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
     );
     assert_eq!(
         session_names_json(&env)?,
-        after_detached,
+        {
+            let mut expected = after_detached.clone();
+            expected.insert("unsupported-window-default-format".to_string());
+            expected
+        },
         "unsupported kill-window must not kill pane/session state"
     );
     let cleanup = env
@@ -7492,7 +7554,7 @@ fn tmux_compat_new_window_is_detached_only_without_visible_side_effects() -> Tes
         .output()?;
     assert!(cleanup.status.success(), "{cleanup:?}");
     assert!(
-        before.contains("unsupported-window-parent"),
+        session_names_json(&env)?.contains("unsupported-window-parent"),
         "parent session should have been preserved throughout the new-window test"
     );
     Ok(())
