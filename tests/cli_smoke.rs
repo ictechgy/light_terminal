@@ -6838,7 +6838,7 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
             "-t",
             "team-window-parent:0",
             "-F",
-            "#{pane_id}:#{pane_dead}:#{pane_pid}",
+            "#{pane_id}:#{pane_dead}:#{pane_pid}:#{history_size}",
         ])
         .output()?;
     assert!(
@@ -6859,8 +6859,8 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
             })?;
         assert_eq!(
             row.len(),
-            3,
-            "pane liveness row should have pane_id:pane_dead:pane_pid: {row:?}"
+            4,
+            "pane liveness row should have pane_id:pane_dead:pane_pid:history_size: {row:?}"
         );
         assert_eq!(
             row[1], "0",
@@ -6870,6 +6870,10 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
             .parse::<u32>()
             .map(|_| ())
             .map_err(|err| format!("pane_pid should be numeric for live panes: {row:?}: {err}"))?;
+        assert_eq!(
+            row[3], "0",
+            "history_size fallback should be numeric zero for synthetic panes: {row:?}"
+        );
     }
     Ok(())
 }
@@ -6899,7 +6903,7 @@ fn tmux_compat_display_message_expands_omc_window_shorthand() -> TestResult {
             "-p",
             "-t",
             "omc-format",
-            "#S:#I #{pane_id} #{pane_dead}",
+            "#S:#I #{pane_id} #{pane_dead} #{history_size}",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
@@ -6914,9 +6918,13 @@ fn tmux_compat_display_message_expands_omc_window_shorthand() -> TestResult {
     let Some(pane_dead) = fields.next() else {
         return Err(format!("missing pane_dead field: {stdout:?}").into());
     };
+    let Some(history_size) = fields.next() else {
+        return Err(format!("missing history_size field: {stdout:?}").into());
+    };
     assert_eq!(session_window, "omc-format:0", "{stdout:?}");
     assert!(pane_id.starts_with('%'), "{stdout:?}");
     assert_eq!(pane_dead, "0", "{stdout:?}");
+    assert_eq!(history_size, "0", "{stdout:?}");
     Ok(())
 }
 
@@ -8771,7 +8779,7 @@ fn tmux_compat_list_windows_reports_pseudo_window_metadata() -> TestResult {
             "-t",
             "window-query",
             "-F",
-            "#{session_name}:#{window_index}:#{window_name}:#{window_id}:#{window_panes}:#{window_active}:#{pane_width}:#{window_width}:#{pane_height}:#{window_height}",
+            "#{session_name}:#{window_index}:#{window_name}:#{window_id}:#{window_panes}:#{window_active}:#{pane_width}:#{window_width}:#{pane_height}:#{window_height}:#{history_size}",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
@@ -8781,7 +8789,7 @@ fn tmux_compat_list_windows_reports_pseudo_window_metadata() -> TestResult {
         .find(|line| line.starts_with("window-query:0:window-query:@"))
         .ok_or_else(|| format!("window-query row missing: {stdout:?}"))?;
     let fields: Vec<_> = row.split(':').collect();
-    assert_eq!(fields.len(), 10, "{row:?}");
+    assert_eq!(fields.len(), 11, "{row:?}");
     let window_id = fields[3]
         .strip_prefix('@')
         .ok_or_else(|| format!("window_id missing @ prefix: {row:?}"))?;
@@ -8793,6 +8801,7 @@ fn tmux_compat_list_windows_reports_pseudo_window_metadata() -> TestResult {
     assert_eq!(fields[8], fields[9], "{row:?}");
     assert!(fields[6].parse::<u16>()? > 0, "{row:?}");
     assert!(fields[8].parse::<u16>()? > 0, "{row:?}");
+    assert_eq!(fields[10], "0", "{row:?}");
     Ok(())
 }
 
