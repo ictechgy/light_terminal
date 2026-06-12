@@ -140,7 +140,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
     let cmd = args[0].as_str();
     let rest = &args[1..];
     match cmd {
-        "-V" | "version" => {
+        "-V" | "--version" | "version" => {
             println!("tmux 3.5a (light-terminal compat)");
             Ok(0)
         }
@@ -153,6 +153,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "list-commands" | "lscm" => list_commands(rest),
         "kill-session" => kill_session(rest),
         "rename-session" | "rename" => rename_session(rest),
+        "new-window" | "neww" => new_window(rest),
         "split-window" | "splitw" => split_window(rest),
         "list-panes" | "lsp" => list_panes(rest),
         "display-message" | "display" => display_message(rest),
@@ -283,6 +284,131 @@ fn new_session(args: &[String]) -> Result<i32> {
         client::attach(&info.name, true, AttachStdinEof::KeepAttached)?;
         Ok(0)
     }
+}
+
+fn new_window(args: &[String]) -> Result<i32> {
+    let mut parsed = NewWindowArgs {
+        format: "#{session_name}:#{window_index}".to_string(),
+        ..NewWindowArgs::default()
+    };
+    let mut command = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-d" => {
+                parsed.detached = true;
+                i += 1;
+            }
+            "-P" => {
+                parsed.print = true;
+                i += 1;
+            }
+            "-F" => {
+                parsed.format = value_for_option(args.get(i + 1).cloned(), "-F")?;
+                i += 2;
+            }
+            "-t" => {
+                parsed.target = target_value(args.get(i + 1).cloned(), "-t")?;
+                i += 2;
+            }
+            "-n" => {
+                parsed.name = Some(value_for_option(args.get(i + 1).cloned(), "-n")?);
+                i += 2;
+            }
+            "-c" => {
+                parsed.cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
+                i += 2;
+            }
+            "--" => {
+                command.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            flag if flag.starts_with('-') => {
+                let consumed_next = parse_new_window_short_flags(flag, args, i, &mut parsed)?;
+                i += if consumed_next { 2 } else { 1 };
+            }
+            _ => {
+                command.extend_from_slice(&args[i..]);
+                break;
+            }
+        }
+    }
+
+    if !parsed.detached {
+        bail!(
+            "tmux new-window without -d is not supported by lterm compat; \
+             refusing to create a visible or hidden window. Use -d for a detached lterm session."
+        );
+    }
+
+    let target = parsed.target.unwrap_or_else(default_target);
+    reject_unsupported_tmux_window_target(&target)?;
+    info_for_tmux_target(&target).with_context(|| {
+        format!(
+            "tmux new-window -t target not found: {}",
+            sanitize::terminal_text(&target)
+        )
+    })?;
+
+    let command = tmux_shell_command(&command)?;
+    let info = client::new_session(parsed.name, command, parsed.cwd, HashMap::new(), None, true)?;
+    remember_pane(&info, None)?;
+    if parsed.print {
+        println!("{}", expand_format(&parsed.format, &info));
+    }
+    Ok(0)
+}
+
+#[derive(Default)]
+struct NewWindowArgs {
+    detached: bool,
+    print: bool,
+    format: String,
+    target: Option<String>,
+    name: Option<String>,
+    cwd: Option<String>,
+}
+
+fn parse_new_window_short_flags(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    parsed: &mut NewWindowArgs,
+) -> Result<bool> {
+    let Some(cluster) = short_cluster(flag) else {
+        bail!("unsupported tmux new-window option: {flag}");
+    };
+    for (pos, short_flag) in cluster.char_indices() {
+        match short_flag {
+            'd' => parsed.detached = true,
+            'P' => parsed.print = true,
+            // Accepted as no-op placement/reuse hints. lterm's partial
+            // new-window compatibility maps detached windows to standalone
+            // lterm sessions rather than a mutable real-tmux window list.
+            'a' | 'b' | 'k' | 'S' => {}
+            'F' | 't' | 'n' | 'c' => {
+                let rest = &cluster[pos + short_flag.len_utf8()..];
+                let (value, consumed_next) = if rest.is_empty() {
+                    (args.get(i + 1).cloned(), true)
+                } else {
+                    (
+                        Some(rest.strip_prefix('=').unwrap_or(rest).to_string()),
+                        false,
+                    )
+                };
+                match short_flag {
+                    'F' => parsed.format = value_for_option(value, "-F")?,
+                    't' => parsed.target = target_value(value, "-t")?,
+                    'n' => parsed.name = Some(value_for_option(value, "-n")?),
+                    'c' => parsed.cwd = Some(value_for_option(value, "-c")?),
+                    _ => unreachable!("value-taking new-window flag was matched above"),
+                }
+                return Ok(consumed_next);
+            }
+            _ => bail!("unsupported tmux new-window option: -{short_flag}"),
+        }
+    }
+    Ok(false)
 }
 
 fn attach_session(args: &[String]) -> Result<i32> {
@@ -615,7 +741,8 @@ fn split_window(args: &[String]) -> Result<i32> {
     // split-window-local value flags that the generic parser does not know.
     const VALUE_FLAGS: &[char] = &['e', 'l', 'p'];
     const BOOLEAN_VALUE_OVERRIDES: &[char] = &['f'];
-    let mut direction = "right";
+    let mut horizontal = true;
+    let mut backward = false;
     let mut print = false;
     let mut format = "#{pane_id}".to_string();
     let mut target = None;
@@ -627,11 +754,15 @@ fn split_window(args: &[String]) -> Result<i32> {
     while i < args.len() {
         match args[i].as_str() {
             "-h" => {
-                direction = "right";
+                horizontal = true;
                 i += 1;
             }
             "-v" => {
-                direction = "down";
+                horizontal = false;
+                i += 1;
+            }
+            "-b" => {
+                backward = true;
                 i += 1;
             }
             "-d" => {
@@ -672,7 +803,7 @@ fn split_window(args: &[String]) -> Result<i32> {
                     VALUE_FLAGS,
                     BOOLEAN_VALUE_OVERRIDES,
                 ) {
-                    direction = "right";
+                    horizontal = true;
                 }
                 if has_flag_in_arg_with_value_flags_and_boolean_overrides(
                     flag,
@@ -680,7 +811,15 @@ fn split_window(args: &[String]) -> Result<i32> {
                     VALUE_FLAGS,
                     BOOLEAN_VALUE_OVERRIDES,
                 ) {
-                    direction = "down";
+                    horizontal = false;
+                }
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'b',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
+                    backward = true;
                 }
                 if has_flag_in_arg_with_value_flags_and_boolean_overrides(
                     flag,
@@ -762,6 +901,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     if is_omx_hud_watch_command(command.as_deref(), &pane_env) {
         detached = true;
     }
+    let direction = split_direction(horizontal, backward);
 
     if let Some(target) = target.as_deref() {
         reject_unsupported_tmux_window_target(target)?;
@@ -809,6 +949,15 @@ fn split_window(args: &[String]) -> Result<i32> {
         println!("{}", expand_format(&format, &info));
     }
     Ok(0)
+}
+
+fn split_direction(horizontal: bool, backward: bool) -> &'static str {
+    match (horizontal, backward) {
+        (true, true) => "left",
+        (true, false) => "right",
+        (false, true) => "up",
+        (false, false) => "down",
+    }
 }
 
 fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
@@ -3215,6 +3364,7 @@ fn format_replacement<'a>(
     const CLIENT_PID: &str = "";
     const CLIENT_TTY: &str = "";
     const EXTENDED_KEYS_FORMAT: &str = "xterm";
+    const HISTORY_SIZE: &str = "0";
     const IN_MODE: &str = "0";
     const WINDOW_INDEX: &str = "0";
     const WINDOW_PANES: &str = "1";
@@ -3255,6 +3405,8 @@ fn format_replacement<'a>(
         ))
     } else if rest.starts_with("#{pane_in_mode}") {
         Some(("#{pane_in_mode}", Cow::Borrowed(IN_MODE)))
+    } else if rest.starts_with("#{history_size}") {
+        Some(("#{history_size}", Cow::Borrowed(HISTORY_SIZE)))
     } else if rest.starts_with("#{window_id}") {
         Some((
             "#{window_id}",
@@ -3348,6 +3500,7 @@ const SUPPORTED_COMMANDS: &[(&str, Option<&str>, &[&str])] = &[
     ("list-windows", Some("lsw"), &[]),
     ("load-buffer", Some("loadb"), &[]),
     ("new-session", Some("new"), &[]),
+    ("new-window", Some("neww"), &[]),
     ("paste-buffer", Some("pasteb"), &[]),
     ("refresh-client", Some("refresh"), &[]),
     ("rename-session", Some("rename"), &[]),
@@ -3388,6 +3541,9 @@ fn command_usage(command: &str) -> &'static str {
         "list-windows" => "[-a] [-F format] [-t target-session]",
         "load-buffer" => "path",
         "new-session" => "[-d] [-c start-directory] [-s session-name] [shell-command]",
+        "new-window" => {
+            "-d [-P] [-F format] [-t target-session] [-n window-name] [-c start-directory] [shell-command]"
+        }
         "paste-buffer" => "[-t target-pane]",
         "refresh-client" => "[-S] [-t target-client]",
         "rename-session" => "[-t target-session] new-name",
@@ -3491,6 +3647,7 @@ mod cmux_status {
     };
     use serde::Deserialize;
     use std::collections::BTreeMap;
+    use std::sync::OnceLock;
 
     /// 연속 cmux 호출 실패가 이 횟수에 도달하면 sink를 비표시(blackout)로 전환한다(설계 §4.4).
     const CMUX_STATUS_FAILURE_LIMIT: u32 = 3;
@@ -3617,6 +3774,52 @@ mod cmux_status {
         commands
     }
 
+    /// cmux status 관련 CLI feature 감지 결과.
+    ///
+    /// 현재 cmux 0.64.x의 `set-status`는 `--label`을 받지 않지만, understatus pill JSON은
+    /// label을 낸다. capability를 `cmux set-status --help`로 비파괴 감지해 지원 버전에서만
+    /// `--label`을 방출하고, 미지원 버전에서는 label 없이 status pill을 적용한다.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct CmuxStatusCapabilities {
+        set_status_label: bool,
+    }
+
+    impl CmuxStatusCapabilities {
+        fn detect() -> Self {
+            Self {
+                set_status_label: detect_cmux_set_status_label_support(),
+            }
+        }
+    }
+
+    static CMUX_STATUS_CAPABILITIES: OnceLock<CmuxStatusCapabilities> = OnceLock::new();
+
+    fn detected_cmux_status_capabilities() -> CmuxStatusCapabilities {
+        *CMUX_STATUS_CAPABILITIES.get_or_init(CmuxStatusCapabilities::detect)
+    }
+
+    fn detect_cmux_set_status_label_support() -> bool {
+        let mut cmd = Command::new("cmux");
+        cmd.args(["set-status", "--help"]);
+        let Ok(output) = run_cmux_command(&mut cmd) else {
+            return false;
+        };
+        let mut help = String::new();
+        help.push_str(&String::from_utf8_lossy(&output.stdout.bytes));
+        help.push('\n');
+        help.push_str(&String::from_utf8_lossy(&output.stderr.bytes));
+        cmux_set_status_help_supports_label(&help)
+    }
+
+    fn cmux_set_status_help_supports_label(help: &str) -> bool {
+        help.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed == "--label"
+                || trimmed.starts_with("--label ")
+                || trimmed.starts_with("--label	")
+        })
+    }
+
     /// cmux 명령 실행 추상화. 프로덕션은 CLI 서브프로세스로, 테스트는 collector mock으로 주입한다.
     ///
     /// `run`은 명령 실행 성공 여부(`true`=성공)만 돌려준다. sink는 이 결과로 서킷브레이커를
@@ -3638,11 +3841,20 @@ mod cmux_status {
     }
 
     /// 프로덕션 runner: 각 [`CmuxCommand`]를 실제 `cmux` 서브프로세스로 실행한다(`run_cmux_command` 경유).
-    struct CliCmuxCommandRunner;
+    struct CliCmuxCommandRunner {
+        capabilities: CmuxStatusCapabilities,
+    }
 
     impl CliCmuxCommandRunner {
-        /// `CmuxCommand`를 `cmux` 인자 벡터로 빌드한다(워크스페이스 타깃 포함).
-        fn build_command(command: &CmuxCommand, surface: &CmuxSurfaceContext) -> Command {
+        fn new(capabilities: CmuxStatusCapabilities) -> Self {
+            Self { capabilities }
+        }
+
+        fn build_command_with_capabilities(
+            command: &CmuxCommand,
+            surface: &CmuxSurfaceContext,
+            capabilities: CmuxStatusCapabilities,
+        ) -> Command {
             let mut cmd = Command::new("cmux");
             match command {
                 CmuxCommand::SetStatus {
@@ -3654,8 +3866,10 @@ mod cmux_status {
                     label,
                 } => {
                     cmd.arg("set-status").arg(key).arg(value);
-                    if let Some(label) = label {
-                        cmd.arg("--label").arg(label);
+                    if capabilities.set_status_label {
+                        if let Some(label) = label {
+                            cmd.arg("--label").arg(label);
+                        }
                     }
                     if let Some(icon) = icon {
                         cmd.arg("--icon").arg(icon);
@@ -3677,7 +3891,8 @@ mod cmux_status {
 
     impl CmuxCommandRunner for CliCmuxCommandRunner {
         fn run(&mut self, command: &CmuxCommand, surface: &CmuxSurfaceContext) -> bool {
-            let mut cmd = Self::build_command(command, surface);
+            let mut cmd =
+                Self::build_command_with_capabilities(command, surface, self.capabilities);
             match run_cmux_command(&mut cmd) {
                 Ok(output) => output.status.success(),
                 Err(_) => false,
@@ -3703,6 +3918,8 @@ mod cmux_status {
         consecutive_failures: u32,
         /// 서킷브레이커 상태. false면 명령을 발행하지 않는다(blackout).
         healthy: bool,
+        /// cmux set-status 인자 capability. 생성 시 비파괴 help 조회로 1회 감지한다.
+        status_capabilities: CmuxStatusCapabilities,
     }
 
     impl CmuxStatusSink {
@@ -3720,13 +3937,20 @@ mod cmux_status {
         /// 짧은 깜빡임(서로의 동일 set-status를 덮어쓰는 정도)으로, 교차 손상이 아니다.
         pub(crate) fn new(workspace: CmuxSurfaceContext, pane_id: &str) -> Self {
             let key_prefix = format!("lterm.{}.", sanitize_cmux_pane_segment(pane_id));
+            let cmux_available = client::command_exists("cmux");
+            let status_capabilities = if cmux_available {
+                detected_cmux_status_capabilities()
+            } else {
+                CmuxStatusCapabilities::default()
+            };
             Self {
                 workspace,
                 key_prefix,
                 applied: BTreeMap::new(),
-                cmux_available: client::command_exists("cmux"),
+                cmux_available,
                 consecutive_failures: 0,
                 healthy: true,
+                status_capabilities,
             }
         }
 
@@ -3740,7 +3964,7 @@ mod cmux_status {
         /// understatus가 보내는 `progress` 필드는 더 이상 처리하지 않는다(미지 필드로 무시).
         /// progress는 워크스페이스 전역 누수 위험으로 제거됐다(Codex HIGH Issue 3, 설계 §4.3).
         pub(crate) fn apply(&mut self, stdout_line: &str) {
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.apply_with_runner(stdout_line, &mut runner);
         }
 
@@ -3864,7 +4088,7 @@ mod cmux_status {
             if !self.cmux_available {
                 return;
             }
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.cleanup_with_runner(&mut runner);
         }
     }
@@ -3898,7 +4122,7 @@ mod cmux_status {
             if !self.cmux_available || !self.healthy {
                 return;
             }
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.reconcile_orphans_with_runner(&mut runner);
         }
 
@@ -4253,7 +4477,11 @@ mod cmux_status {
                 priority: 60,
                 label: None,
             };
-            let cmd = CliCmuxCommandRunner::build_command(&command, &surface);
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities::default(),
+            );
             let argv: Vec<String> = cmd
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -4266,6 +4494,83 @@ mod cmux_status {
             assert_eq!(argv[0], "set-status");
             assert_eq!(argv[1], "lterm._3.model");
             assert_eq!(argv[2], "gpt-5.5");
+        }
+
+        /// G004: cmux set-status --label 미지원 버전에서는 label을 조용히 생략한다.
+        #[test]
+        fn set_status_command_omits_label_when_capability_missing() {
+            let surface = test_surface();
+            let command = CmuxCommand::SetStatus {
+                key: "lterm._3.model".to_string(),
+                value: "gpt-5.5".to_string(),
+                color: None,
+                icon: None,
+                priority: 60,
+                label: Some("model".to_string()),
+            };
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities {
+                    set_status_label: false,
+                },
+            );
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !argv.iter().any(|a| a == "--label"),
+                "cmux 0.64.x rejects set-status --label, so fallback must omit it: {argv:?}"
+            );
+            assert_eq!(argv[0], "set-status");
+            assert_eq!(argv[1], "lterm._3.model");
+            assert_eq!(argv[2], "gpt-5.5");
+        }
+
+        /// G004: future cmux versions that advertise set-status --label keep label output.
+        #[test]
+        fn set_status_command_includes_label_when_capability_supported() {
+            let surface = test_surface();
+            let command = CmuxCommand::SetStatus {
+                key: "lterm._3.model".to_string(),
+                value: "gpt-5.5".to_string(),
+                color: None,
+                icon: None,
+                priority: 60,
+                label: Some("model".to_string()),
+            };
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities {
+                    set_status_label: true,
+                },
+            );
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let label_pos = argv
+                .iter()
+                .position(|a| a == "--label")
+                .expect("supported label capability should emit --label");
+            assert_eq!(argv.get(label_pos + 1).map(String::as_str), Some("model"));
+        }
+
+        /// G004: capability parser는 set-progress의 --label 언급을 set-status 지원으로 오인하지 않는다.
+        #[test]
+        fn set_status_help_parser_detects_only_set_status_label_flag() {
+            assert!(cmux_set_status_help_supports_label(
+                "Flags:\n  --label <text>          Pill label\n  --priority <n>"
+            ));
+            assert!(!cmux_set_status_help_supports_label(
+                "set-progress <0.0-1.0> [--label <text>]\n\
+                 set-status <key> <value> [--priority <n>]"
+            ));
+            assert!(!cmux_set_status_help_supports_label(
+                "Flags:\n  --icon <name>\n  --color <#hex>\n  --priority <n>"
+            ));
         }
 
         /// AC3: workspace_ref 없으면 `--workspace`도 방출 안 함.
@@ -4915,6 +5220,14 @@ mod tests {
     }
 
     #[test]
+    fn split_direction_maps_backward_flag_like_tmux() {
+        assert_eq!(split_direction(true, false), "right");
+        assert_eq!(split_direction(false, false), "down");
+        assert_eq!(split_direction(true, true), "left");
+        assert_eq!(split_direction(false, true), "up");
+    }
+
+    #[test]
     fn wait_for_requires_channel() {
         assert!(
             wait_for(&Vec::new())
@@ -4976,6 +5289,7 @@ mod tests {
             "%1 s codex"
         );
         assert_eq!(expand_format("#S:#I #{window_index}", &info), "s:0 0");
+        assert_eq!(expand_format("#{history_size}", &info), "0");
         assert_eq!(
             expand_format("#{extended-keys-format}", &info),
             "xterm",

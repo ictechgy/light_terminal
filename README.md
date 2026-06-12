@@ -4,14 +4,14 @@
 
 ## TL;DR
 
-- **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI agent tooling. Detach and reattach by name or pane id.
+- **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI-agent tooling. Detach and reattach by name or pane id.
 - **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
-- **How** — `lterm start` to create, `lterm resume` to (re)connect, and `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` as examples of built-in shortcuts for shimmed agent runs. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
-- **Status** — alpha MVP with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
+- **How** — Use `lterm start` to create a session, `lterm resume` to reconnect, and `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` for built-in shimmed agent launchers. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
+- **Status** — Alpha MVP with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
 
-`lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the subset of tmux commands commonly used by terminal-first agent tooling.
+`lterm` is intentionally smaller than tmux. It keeps long-running PTY sessions alive, lets clients detach and reattach at will, forwards terminal escape sequences unchanged, and translates the tmux command subset commonly used by terminal-first agent tooling.
 
 > **Security model:** `lterm` is a same-user convenience daemon, not a sandbox. It rejects cross-user Unix-socket peers and uses owner-only runtime directories, but any process running as your OS user should be considered capable of controlling your sessions.
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
@@ -43,11 +43,11 @@ need:
 
 The project addresses three constraints:
 
-1. **tmux-like persistence and remote access** — sessions run inside a background daemon and can be attached or detached by name or pane id. Remote access is available through `lterm ssh`, provided `lterm` is installed on the remote host.
-2. **cmux compatibility** — when running inside cmux, `lterm` preserves OSC notifications, exposes `lterm notify`, and the tmux shim opens worker panes as native cmux splits when possible.
-3. **AI tooling support** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, and `lterm install-shim` provide a fake `tmux` command and the `TMUX` / `TMUX_PANE` environment variables that agent tools expect.
+1. **tmux-like persistence and remote access** — sessions run inside a background daemon and can be attached or detached by name or pane id. Remote access is available through `lterm ssh` when `lterm` is installed on the remote host.
+2. **cmux compatibility** — inside cmux, `lterm` preserves OSC notifications, exposes `lterm notify`, and opens tmux-shim worker panes as native cmux splits when possible.
+3. **AI tooling support** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, and `lterm install-shim` provide the fake `tmux` command plus the `TMUX` / `TMUX_PANE` environment variables that agent tools expect.
 
-cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and a tmux shim that maps tmux commands into native cmux panes.
+cmux compatibility is grounded in cmux's documented behavior: notifications via `cmux notify` and OSC 777 / OSC 99, a Unix-socket/CLI API for workspaces and splits, and tmux-shim commands that map into native cmux panes.
 
 ## Install
 
@@ -67,9 +67,11 @@ Homebrew and npm both install the `lterm` command on your `PATH`; verify with `l
 
 Prefer an agent-assisted install? Copy the prompt in
 [`docs/agent-install.md`](docs/agent-install.md) into Claude Code, Codex CLI,
-OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, or another terminal coding agent. It asks the agent to detect your
-platform, install `lterm`, verify it with a smoke test, and avoid modifying
-shell startup files without showing you the change.
+OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules,
+Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, or another terminal coding
+agent. It asks the agent to detect your platform, install `lterm`, verify it
+with a smoke test, and avoid modifying shell startup files without showing you
+the change.
 
 For the 1.0 command/output stability boundary, see the
 [public contract](docs/public-contract.md) and its machine-readable
@@ -170,7 +172,7 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
 | Install shell completions | `lterm install-completions --shell bash\|zsh\|fish` | Writes a user-local completion file and prints any activation hint; it does not start the daemon |
-| Install AI CLI statusline badges | `lterm install-ai-statusline` | Installs supported statusline integrations; Claude/OMC gets an `lt:<session>:<pane>` command wrapper, while Codex is reported as unsupported because its TUI does not yet accept custom `LTERM_SESSION` / `LTERM_PANE` statusline items |
+| Install AI CLI statusline badges | `lterm install-ai-statusline` | Installs supported statusline integrations; Claude/OMC gets an `lt:<session>:<pane>` command wrapper, while Codex is reported as skipped because its TUI does not yet accept custom `LTERM_SESSION` / `LTERM_PANE` statusline items |
 | Generate shell completions | `lterm completions bash\|zsh\|fish` | Prints completion scripts only; it does not inspect sessions or start the daemon |
 | Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
@@ -194,7 +196,7 @@ Unicode bidi, format, or zero-width characters inside trusted title/body text.
 
 Compatibility names are subcommands unless shown as a leading flag: `-a` is the legacy shortcut form and must be used as `lterm -a <target>`.
 
-This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime.
+This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime, and `lterm tmux-compat --version` when you only need the compatibility version banner.
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The JSON form also includes optional `agent_name` metadata for sessions launched through an agent profile; non-agent sessions omit that field. The compatibility names `lterm list` and `lterm ls` keep the same text output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. To force the older raw full-terminal resume, use `lterm resume --raw --no-status api` (or compatibility name `lterm attach --raw --no-status api`) or set `LTERM_ATTACH_MODE=raw`; add `LTERM_NO_STATUS=1` or `LTERM_STATUS=0` when only the status line conflicts with the client.
 
@@ -245,9 +247,9 @@ Use the narrowest scope that matches what you want:
 
 | Scope | Example | When to use it |
 | --- | --- | --- |
-| One new session | `lterm start --status-theme green -n api -- npm run dev` | Keep a service or agent session recognizable across future attaches. |
+| New session | `lterm start --status-theme green -n api -- npm run dev` | Keep a service or agent session recognizable across future attaches. |
 | Existing session | `lterm status-theme api amber` | Recolor a running session without restarting its process. |
-| Agent launcher session | `lterm codex --status --status-color cyan -- exec "summarize"` | Give an agent-owned session a persistent color while preserving long-only launcher controls. |
+| Agent launcher session | `lterm codex --status --status-color cyan -- exec "summarize"` | Give an agent-owned session a persistent color while preserving launcher controls. |
 | Attaching client default | `export LTERM_STATUS_THEME=magenta` | Change the default for sessions that do not have their own override. |
 | Plain/minimal clients | `export LTERM_STATUS_STYLE=minimal` | Prefer text-only status on mobile SSH clients or terminals with fragile color mapping. |
 
@@ -364,7 +366,7 @@ lterm codex --mobile --tail 200 --refresh 1s --read-only
 lterm agy --status -- -p "keep lterm status visible"
 ```
 
-Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to the `auto` attach policy. On desktop that means a raw full-terminal attach without the lterm status bar, so their own TUI/status/alternate-screen rendering stays in control. Reattaching those agent sessions later with `lterm resume` or `lterm open` keeps the same row-off default. On Termius-style mobile clients, `auto` uses the normal-screen transcript described above so long agent output can be reviewed with native mobile scrollback. Use `--raw` to force raw attach, `--mobile` to force transcript attach, `--status` to request the lterm status bar on the raw path during direct agent launch, or `--no-status` to suppress it for any raw launch/profile that would otherwise show it. `--status` is intentionally a best-effort override for agent debugging and can still conflict with agent TUIs; `--mobile --status` does not create a raw status row because mobile transcript owns its own UI. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to the `auto` attach policy. On desktop, that means a raw full-terminal attach without the lterm status bar, so the agent's own TUI, status, and alternate-screen rendering stay in control. Reattaching those agent sessions later with `lterm resume` or `lterm open` keeps the same row-off default. On Termius-style mobile clients, `auto` uses the normal-screen transcript described above so long agent output can be reviewed with native mobile scrollback. Use `--raw` to force raw attach, `--mobile` to force transcript attach, `--status` to request the lterm status bar on the raw path during direct agent launch, or `--no-status` to suppress it for any raw launch/profile that would otherwise show it. `--status` is intentionally a best-effort override for agent debugging and can still conflict with agent TUIs; `--mobile --status` does not create a raw status row because mobile transcript owns its own UI. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
 Agent launchers also keep host/application color policy separate from the agent child. Ambient `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` from the client or long-lived daemon are not forwarded to sessions marked with `LTERM_AGENT`, because mobile SSH or host status preferences can otherwise force full-screen agent TUIs into monochrome output. Ordinary non-agent sessions (`lterm start` / `lterm new` / `lterm run`) still preserve those variables for child processes, and lterm's own status style continues to honor `NO_COLOR`.
 
@@ -426,7 +428,7 @@ lterm run -- codex exec "summarize the repository"
 
 Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. This is a compatibility layer, not a second spelling of every `lterm` product command. The shim implements the command subset most AI orchestration scripts rely on:
 
-- **Sessions** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
+- **Sessions** — `new-session`, `new-window`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
 - **Queries** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Panes** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffers / popups** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
@@ -435,6 +437,8 @@ Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. This is a 
 Compatibility notes: lterm models each root session as one pseudo-window
 (`window_index=0`, `window_panes=1`). `client_pid` and `client_tty` expand to
 empty strings because lterm does not expose per-client process or TTY metadata.
+`#{history_size}` currently expands to `0`, which keeps tmux-format consumers
+numeric even though lterm does not expose a tmux-style pane history length yet.
 tmux `-f` filters are intentionally rejected instead of being silently ignored.
 `set-hook` accepts hook set/unset forms used by agent runtimes such as OMX
 `client-resized[...]` handlers, but lterm does not run a tmux hook dispatcher.
@@ -442,20 +446,30 @@ Detached `split-window -d -t <target>` accepts any existing live lterm target,
 matching tmux's cross-pane helper launch behavior inside the same daemon socket;
 the daemon verifies same-OS-user peer credentials before honoring requests, and
 the detached helper is created as a separate lterm session rather than being
-attached into the target pane.
-Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`, alias, support tier, and usage fields, or `--json` for machine-readable rows. Support tiers are `full`, `partial`, and `noop` within lterm's compatibility boundary. Set `LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when an unsupported tmux command reaches the shim.
+attached into the target pane. `split-window -b -h` and `split-window -b -v` map
+to cmux `left` and `up` placements respectively when a visible cmux split is
+created. Detached `new-window -d` / `neww -d` is intentionally partial: it creates
+a standalone lterm helper session, supports tmux-style `-P`/`-F` target printing,
+and rejects attached-window mode instead of silently changing the current pane.
+Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`,
+alias, support tier, and usage fields, or `--json` for machine-readable rows.
+Support tiers are `full`, `partial`, and `noop` within lterm's compatibility
+boundary. Set `LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when
+an unsupported tmux command reaches the shim.
 
 Status-bar redraws use xterm SGR stack controls only on conservatively allowlisted terminal clients (for example xterm/iTerm2/WezTerm identities) to avoid stealing the foreground/background color state of the running TUI. Set `LTERM_STATUS_SGR_STACK=0` to disable `CSI # {` / `CSI # }`; set it to `1` to force the stack after verifying your client supports or safely ignores those private CSI sequences. Kitty, Alacritty, Ghostty, Termius, and generic `TERM=xterm-*` values stay opt-in until their SGR-stack behavior is verified.
+
+When lterm mirrors session identity into cmux understatus pills, it probes `cmux set-status --help` without mutating cmux state. Builds that advertise `--label` receive labeled status rows; older cmux builds keep working because lterm omits the unsupported flag.
 
 ## cmux behavior
 
 When `lterm tmux-compat split-window` detects cmux (via `CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, or a cmux socket), it:
 
 1. Starts a new `lterm` PTY session for the worker command.
-2. Asks cmux to create a native split (`cmux new-split right/down`).
+2. Asks cmux to create a native split (`cmux new-split right/down`, or `left/up` for tmux backward splits).
 3. Sends the compatibility command `lterm attach <pane>` into that split. If a safe absolute executable is supplied through `LTERM_BIN`, lterm uses it; otherwise it falls back to the current executable. The compatibility command keeps cmux panes working even with older builds that predate `resume`.
 
-This gives cmux a real pane to decorate while `lterm` retains scrollback capture and `send-keys` compatibility.
+This gives cmux a real pane to decorate while `lterm` retains scrollback capture, `send-keys` compatibility, and safe status-label fallback behavior across cmux versions.
 
 **Notifications:**
 
@@ -517,7 +531,7 @@ executable or `lterm` on `PATH`. Do not set it from untrusted environment data.
 
 - Session persistence lasts only while the daemon and host are alive — reboot/process-state restore is not implemented.
 - Outside cmux, `split-window` creates additional managed PTY sessions but does not draw a tiled in-terminal UI.
-- This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats or options may need additional shim commands.
+- This is a compatibility subset, not a full tmux server. Scripts using advanced tmux formats, hooks, layouts, or options may need additional shim commands.
 - cmux pane capture is handled through `lterm` sessions, not cmux scrollback APIs.
 - The daemon authenticates local clients via OS peer credentials and owner-only socket paths — there are no per-session ACLs yet.
 - Session shutdown uses verified process-group signaling, so child trees like `shell → OMX → Codex → MCP` are cleaned up together when possible. Processes that intentionally detach into a different session/process group can outlive `lterm close` / `lterm kill`; inspect them with `lterm processes` / `lterm ps` or OS process tools.
@@ -526,8 +540,9 @@ executable or `lterm` on `PATH`. Do not set it from untrusted environment data.
 
 ```bash
 cargo fmt
+cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build --locked
+cargo build --release --locked
 ```
 
 If a system package-manager Rust toolchain fails before Cargo starts (for
