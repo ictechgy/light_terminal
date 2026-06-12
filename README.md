@@ -147,6 +147,7 @@ lterm -a api
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
 | Read sanitized scrollback | `lterm logs api --start=-80 --end=-1` | `capture` |
+| Extract recent URLs from scrollback | `lterm urls api --last` | None |
 | Record raw PTY output for debugging | `lterm trace api --duration 5s --output trace.jsonl` | `record` |
 | Replay a trusted raw PTY trace | `lterm trace-replay trace.jsonl` | `replay-trace` |
 | Open a sanitized scrollback composer for input | `lterm compose api` | `mobile` |
@@ -286,6 +287,7 @@ lterm sessions --children
 lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
+lterm urls api --last
 lterm compose api
 LTERM_MOBILE=1 lterm resume codex-lterm
 lterm resume --raw codex-lterm
@@ -296,9 +298,20 @@ lterm input api 'echo hello' --enter
 
 The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, mobile transcript attach gives phone clients native scrollback for long agent output, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `lterm mobile` is a visible alias for `lterm compose`; separately, the `--mobile` attach flag selects the normal-screen transcript attach path. The compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
 
+`lterm urls <target>` extracts `http://` and `https://` links from the last
+120 sanitized scrollback lines without touching the raw attached PTY stream.
+Default output is `N<TAB>URL`, one link per line; `--last` prints only the
+newest detected URL occurrence for phone-friendly copy/paste, `--json` emits a
+JSON array, and `--tail N` changes the scan range. Empty text modes exit
+successfully with no output, while JSON mode prints `[]`. In mobile transcript
+mode, type `/links` or `/urls` to show the same numbered list locally instead
+of sending that text to the PTY. This is useful for Claude/OAuth login URLs on
+Termius-style mobile SSH clients; for Claude-specific mobile control, Claude
+Code's Remote Control flow can also reduce URL-copy round trips.
+
 For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
 In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
-`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output.
+`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output. Transcript-local commands include `/refresh`, `/raw`, `/links` / `/urls`, and `/exit` / `/quit`; unrecognized lines are sent to the PTY.
 
 **Stop a session:**
 

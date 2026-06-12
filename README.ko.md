@@ -144,6 +144,7 @@ lterm -a api
 | 세션 이름 변경 | `lterm rename api api-renamed` | 없음 |
 | 세션 status theme 설정 | `lterm status-theme api green` | `theme` |
 | 정제된 scrollback 읽기 | `lterm logs api --start=-80 --end=-1` | `capture` |
+| scrollback의 최근 URL 추출 | `lterm urls api --last` | 없음 |
 | 디버깅용 raw PTY 출력 기록 | `lterm trace api --duration 5s --output trace.jsonl` | `record` |
 | 신뢰하는 raw PTY trace 재생 | `lterm trace-replay trace.jsonl` | `replay-trace` |
 | 정제된 scrollback 위에 입력 컴포저 열기 | `lterm compose api` | `mobile` |
@@ -285,6 +286,7 @@ lterm sessions --children
 lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
+lterm urls api --last
 lterm compose api
 LTERM_MOBILE=1 lterm resume codex-lterm
 lterm resume --raw codex-lterm
@@ -295,9 +297,21 @@ lterm input api 'echo hello' --enter
 
 위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다룰 수 있게 해 주는 명령 집합입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
 
+`lterm urls <target>`은 raw attach PTY stream을 건드리지 않고, 마지막 120개
+정제된 scrollback line에서 `http://` / `https://` link를 추출합니다. 기본
+출력은 link마다 `N<TAB>URL` 한 줄이고, `--last`는 휴대폰에서 복사하기 쉽도록
+가장 최근에 감지된 URL 하나만 출력합니다. `--json`은 JSON array를 출력하고,
+`--tail N`으로 scan 범위를 바꿀 수 있습니다. text mode에서 URL이 없으면 성공
+종료하면서 출력하지 않고, JSON mode는 `[]`를 출력합니다. 모바일 transcript
+mode에서는 `/links` 또는 `/urls`를 입력하면 이 numbered list를 로컬로 보여 주며,
+해당 입력은 PTY로 전달되지 않습니다. Claude/OAuth 로그인 URL을 Termius 같은
+모바일 SSH client에서 복사해야 할 때 유용합니다. Claude 전용 모바일 제어가
+목적이라면 Claude Code Remote Control 흐름도 URL 복사 왕복을 줄이는 우회책이
+될 수 있습니다.
+
 자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
 Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
-`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요.
+`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/exit` / `/quit`가 있고, 이외의 줄은 PTY로 전달됩니다.
 
 **세션 종료:**
 

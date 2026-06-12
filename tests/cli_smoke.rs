@@ -11642,6 +11642,94 @@ fn env_quotes_generated_paths_for_posix_shell_eval() -> TestResult {
 }
 
 #[test]
+fn urls_extracts_recent_sanitized_scrollback_links() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "urls",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'A https://a.example/path?x=1#frag.\\nB http://b.example/a(b)!\\nANSI \\033[31mhttps://red.example/ok\\033[0m\\nOSC \\033]52;c;secret\\007https://after-osc.example/done,\\nA2 https://a.example/path?x=1#frag\\nREADY_URLS\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("urls", "READY_URLS")?;
+
+    let output = env.cmd().args(["urls", "urls"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        concat!(
+            "1\thttps://a.example/path?x=1#frag\n",
+            "2\thttp://b.example/a(b)\n",
+            "3\thttps://red.example/ok\n",
+            "4\thttps://after-osc.example/done\n",
+        )
+    );
+    assert!(!stdout.contains("secret"), "{stdout:?}");
+
+    let last = env.cmd().args(["urls", "urls", "--last"]).output()?;
+    assert!(last.status.success(), "{last:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&last.stdout),
+        "https://a.example/path?x=1#frag\n"
+    );
+
+    let json = env.cmd().args(["urls", "urls", "--json"]).output()?;
+    assert!(json.status.success(), "{json:?}");
+    let urls: Vec<String> = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(
+        urls,
+        vec![
+            "https://a.example/path?x=1#frag",
+            "http://b.example/a(b)",
+            "https://red.example/ok",
+            "https://after-osc.example/done",
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn urls_empty_results_are_machine_friendly() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "urls-empty",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'NO_URLS_READY\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("urls-empty", "NO_URLS_READY")?;
+
+    let text = env.cmd().args(["urls", "urls-empty"]).output()?;
+    assert!(text.status.success(), "{text:?}");
+    assert!(text.stdout.is_empty(), "{text:?}");
+
+    let last = env.cmd().args(["urls", "urls-empty", "--last"]).output()?;
+    assert!(last.status.success(), "{last:?}");
+    assert!(last.stdout.is_empty(), "{last:?}");
+
+    let json = env.cmd().args(["urls", "urls-empty", "--json"]).output()?;
+    assert!(json.status.success(), "{json:?}");
+    assert_eq!(String::from_utf8_lossy(&json.stdout), "[]\n");
+    Ok(())
+}
+
+#[test]
 fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
