@@ -140,7 +140,7 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
     let cmd = args[0].as_str();
     let rest = &args[1..];
     match cmd {
-        "-V" | "version" => {
+        "-V" | "--version" | "version" => {
             println!("tmux 3.5a (light-terminal compat)");
             Ok(0)
         }

@@ -7210,6 +7210,28 @@ fn tmux_compat_new_session_prints_omc_detached_target_format() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_reports_version_for_common_aliases() -> TestResult {
+    let env = TestEnv::new()?;
+    for alias in ["-V", "--version", "version"] {
+        let output = env.cmd().args(["tmux-compat", alias]).output()?;
+        assert!(
+            output.status.success(),
+            "tmux compatibility version alias {alias:?} should succeed: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "tmux 3.5a (light-terminal compat)",
+            "tmux compatibility version alias {alias:?} should match the canonical version"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "tmux compatibility version alias {alias:?} should not warn: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_rejects_omc_invalid_window_targets_without_fallback() -> TestResult {
     let env = TestEnv::new()?;
     let marker = env.temp.path().join("invalid-window-target-marker.txt");
