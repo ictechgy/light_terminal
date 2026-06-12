@@ -5002,6 +5002,78 @@ fn tmux_compat_split_window_targets_live_focused_cmux_context() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_split_window_backward_flag_maps_cmux_direction() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-cmux-backward-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-backward-direction.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> {}\n\
+             case \"$1\" in\n\
+               identify) printf '%s\\n' '{{\"focused\":{{\"surface_ref\":\"surface:focused\",\"workspace_ref\":\"workspace:focused\",\"window_ref\":\"window:focused\"}}}}'; exit 0 ;;\n\
+               new-split)\n\
+                 case \"$2\" in\n\
+                   left|up) printf 'OK surface:%s workspace:focused window:focused\\n' \"$2\"; exit 0 ;;\n\
+                   *) printf 'unexpected split direction: %s\\n' \"$*\" >&2; exit 64 ;;\n\
+                 esac ;;\n\
+               send) exit 0 ;;\n\
+               close-surface) exit 0 ;;\n\
+               *) printf 'unexpected command: %s\\n' \"$*\" >&2; exit 66 ;;\n\
+             esac\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let shell = command_path("sh")?.display().to_string();
+
+    for (flags, expected_direction, marker) in [
+        ("-bhPF", "left", "SPLIT_BACKWARD_LEFT_READY"),
+        ("-bvPF", "up", "SPLIT_BACKWARD_UP_READY"),
+    ] {
+        let output = env
+            .cmd()
+            .env("CMUX_WORKSPACE_ID", "workspace:focused")
+            .env("PATH", &path)
+            .args([
+                "tmux-compat",
+                "split-window",
+                flags,
+                "#{pane_id}",
+                shell.as_str(),
+                "-lc",
+                &format!("echo {marker}; sleep 2"),
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "split-window {flags} should map -b to {expected_direction}: {output:?}"
+        );
+        let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(pane.starts_with('%'), "expected pane id, got {pane:?}");
+        let captured = env.capture_until(&pane, marker)?;
+        assert!(captured.contains(marker), "{captured}");
+    }
+
+    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "new-split left --surface surface:focused --workspace workspace:focused --window window:focused --focus true"
+        }),
+        "-b -h should request a left cmux split: {cmux_calls:?}"
+    );
+    assert!(
+        cmux_calls.lines().any(|line| {
+            line == "new-split up --surface surface:focused --workspace workspace:focused --window window:focused --focus true"
+        }),
+        "-b -v should request an up cmux split: {cmux_calls:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn managed_cmux_attach_duplicate_closes_caller_not_focused_surface() -> TestResult {
     let env = TestEnv::new()?;
     let pane = create_sleep_session(&env, "managed-caller-not-focused")?;

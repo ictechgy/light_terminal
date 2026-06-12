@@ -741,7 +741,8 @@ fn split_window(args: &[String]) -> Result<i32> {
     // split-window-local value flags that the generic parser does not know.
     const VALUE_FLAGS: &[char] = &['e', 'l', 'p'];
     const BOOLEAN_VALUE_OVERRIDES: &[char] = &['f'];
-    let mut direction = "right";
+    let mut horizontal = true;
+    let mut backward = false;
     let mut print = false;
     let mut format = "#{pane_id}".to_string();
     let mut target = None;
@@ -753,11 +754,15 @@ fn split_window(args: &[String]) -> Result<i32> {
     while i < args.len() {
         match args[i].as_str() {
             "-h" => {
-                direction = "right";
+                horizontal = true;
                 i += 1;
             }
             "-v" => {
-                direction = "down";
+                horizontal = false;
+                i += 1;
+            }
+            "-b" => {
+                backward = true;
                 i += 1;
             }
             "-d" => {
@@ -798,7 +803,7 @@ fn split_window(args: &[String]) -> Result<i32> {
                     VALUE_FLAGS,
                     BOOLEAN_VALUE_OVERRIDES,
                 ) {
-                    direction = "right";
+                    horizontal = true;
                 }
                 if has_flag_in_arg_with_value_flags_and_boolean_overrides(
                     flag,
@@ -806,7 +811,15 @@ fn split_window(args: &[String]) -> Result<i32> {
                     VALUE_FLAGS,
                     BOOLEAN_VALUE_OVERRIDES,
                 ) {
-                    direction = "down";
+                    horizontal = false;
+                }
+                if has_flag_in_arg_with_value_flags_and_boolean_overrides(
+                    flag,
+                    'b',
+                    VALUE_FLAGS,
+                    BOOLEAN_VALUE_OVERRIDES,
+                ) {
+                    backward = true;
                 }
                 if has_flag_in_arg_with_value_flags_and_boolean_overrides(
                     flag,
@@ -888,6 +901,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     if is_omx_hud_watch_command(command.as_deref(), &pane_env) {
         detached = true;
     }
+    let direction = split_direction(horizontal, backward);
 
     if let Some(target) = target.as_deref() {
         reject_unsupported_tmux_window_target(target)?;
@@ -935,6 +949,15 @@ fn split_window(args: &[String]) -> Result<i32> {
         println!("{}", expand_format(&format, &info));
     }
     Ok(0)
+}
+
+fn split_direction(horizontal: bool, backward: bool) -> &'static str {
+    match (horizontal, backward) {
+        (true, true) => "left",
+        (true, false) => "right",
+        (false, true) => "up",
+        (false, false) => "down",
+    }
 }
 
 fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
@@ -5194,6 +5217,14 @@ mod tests {
             fs::read_to_string(separated).expect("separator popup output"),
             "separator"
         );
+    }
+
+    #[test]
+    fn split_direction_maps_backward_flag_like_tmux() {
+        assert_eq!(split_direction(true, false), "right");
+        assert_eq!(split_direction(false, false), "down");
+        assert_eq!(split_direction(true, true), "left");
+        assert_eq!(split_direction(false, true), "up");
     }
 
     #[test]
