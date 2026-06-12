@@ -3341,6 +3341,7 @@ fn format_replacement<'a>(
     const CLIENT_PID: &str = "";
     const CLIENT_TTY: &str = "";
     const EXTENDED_KEYS_FORMAT: &str = "xterm";
+    const HISTORY_SIZE: &str = "0";
     const IN_MODE: &str = "0";
     const WINDOW_INDEX: &str = "0";
     const WINDOW_PANES: &str = "1";
@@ -3381,6 +3382,8 @@ fn format_replacement<'a>(
         ))
     } else if rest.starts_with("#{pane_in_mode}") {
         Some(("#{pane_in_mode}", Cow::Borrowed(IN_MODE)))
+    } else if rest.starts_with("#{history_size}") {
+        Some(("#{history_size}", Cow::Borrowed(HISTORY_SIZE)))
     } else if rest.starts_with("#{window_id}") {
         Some((
             "#{window_id}",
@@ -5255,6 +5258,7 @@ mod tests {
             "%1 s codex"
         );
         assert_eq!(expand_format("#S:#I #{window_index}", &info), "s:0 0");
+        assert_eq!(expand_format("#{history_size}", &info), "0");
         assert_eq!(
             expand_format("#{extended-keys-format}", &info),
             "xterm",
