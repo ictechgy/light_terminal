@@ -3621,6 +3621,7 @@ mod cmux_status {
     };
     use serde::Deserialize;
     use std::collections::BTreeMap;
+    use std::sync::OnceLock;
 
     /// 연속 cmux 호출 실패가 이 횟수에 도달하면 sink를 비표시(blackout)로 전환한다(설계 §4.4).
     const CMUX_STATUS_FAILURE_LIMIT: u32 = 3;
@@ -3747,6 +3748,52 @@ mod cmux_status {
         commands
     }
 
+    /// cmux status 관련 CLI feature 감지 결과.
+    ///
+    /// 현재 cmux 0.64.x의 `set-status`는 `--label`을 받지 않지만, understatus pill JSON은
+    /// label을 낸다. capability를 `cmux set-status --help`로 비파괴 감지해 지원 버전에서만
+    /// `--label`을 방출하고, 미지원 버전에서는 label 없이 status pill을 적용한다.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct CmuxStatusCapabilities {
+        set_status_label: bool,
+    }
+
+    impl CmuxStatusCapabilities {
+        fn detect() -> Self {
+            Self {
+                set_status_label: detect_cmux_set_status_label_support(),
+            }
+        }
+    }
+
+    static CMUX_STATUS_CAPABILITIES: OnceLock<CmuxStatusCapabilities> = OnceLock::new();
+
+    fn detected_cmux_status_capabilities() -> CmuxStatusCapabilities {
+        *CMUX_STATUS_CAPABILITIES.get_or_init(CmuxStatusCapabilities::detect)
+    }
+
+    fn detect_cmux_set_status_label_support() -> bool {
+        let mut cmd = Command::new("cmux");
+        cmd.args(["set-status", "--help"]);
+        let Ok(output) = run_cmux_command(&mut cmd) else {
+            return false;
+        };
+        let mut help = String::new();
+        help.push_str(&String::from_utf8_lossy(&output.stdout.bytes));
+        help.push('\n');
+        help.push_str(&String::from_utf8_lossy(&output.stderr.bytes));
+        cmux_set_status_help_supports_label(&help)
+    }
+
+    fn cmux_set_status_help_supports_label(help: &str) -> bool {
+        help.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed == "--label"
+                || trimmed.starts_with("--label ")
+                || trimmed.starts_with("--label	")
+        })
+    }
+
     /// cmux 명령 실행 추상화. 프로덕션은 CLI 서브프로세스로, 테스트는 collector mock으로 주입한다.
     ///
     /// `run`은 명령 실행 성공 여부(`true`=성공)만 돌려준다. sink는 이 결과로 서킷브레이커를
@@ -3768,11 +3815,20 @@ mod cmux_status {
     }
 
     /// 프로덕션 runner: 각 [`CmuxCommand`]를 실제 `cmux` 서브프로세스로 실행한다(`run_cmux_command` 경유).
-    struct CliCmuxCommandRunner;
+    struct CliCmuxCommandRunner {
+        capabilities: CmuxStatusCapabilities,
+    }
 
     impl CliCmuxCommandRunner {
-        /// `CmuxCommand`를 `cmux` 인자 벡터로 빌드한다(워크스페이스 타깃 포함).
-        fn build_command(command: &CmuxCommand, surface: &CmuxSurfaceContext) -> Command {
+        fn new(capabilities: CmuxStatusCapabilities) -> Self {
+            Self { capabilities }
+        }
+
+        fn build_command_with_capabilities(
+            command: &CmuxCommand,
+            surface: &CmuxSurfaceContext,
+            capabilities: CmuxStatusCapabilities,
+        ) -> Command {
             let mut cmd = Command::new("cmux");
             match command {
                 CmuxCommand::SetStatus {
@@ -3784,8 +3840,10 @@ mod cmux_status {
                     label,
                 } => {
                     cmd.arg("set-status").arg(key).arg(value);
-                    if let Some(label) = label {
-                        cmd.arg("--label").arg(label);
+                    if capabilities.set_status_label {
+                        if let Some(label) = label {
+                            cmd.arg("--label").arg(label);
+                        }
                     }
                     if let Some(icon) = icon {
                         cmd.arg("--icon").arg(icon);
@@ -3807,7 +3865,8 @@ mod cmux_status {
 
     impl CmuxCommandRunner for CliCmuxCommandRunner {
         fn run(&mut self, command: &CmuxCommand, surface: &CmuxSurfaceContext) -> bool {
-            let mut cmd = Self::build_command(command, surface);
+            let mut cmd =
+                Self::build_command_with_capabilities(command, surface, self.capabilities);
             match run_cmux_command(&mut cmd) {
                 Ok(output) => output.status.success(),
                 Err(_) => false,
@@ -3833,6 +3892,8 @@ mod cmux_status {
         consecutive_failures: u32,
         /// 서킷브레이커 상태. false면 명령을 발행하지 않는다(blackout).
         healthy: bool,
+        /// cmux set-status 인자 capability. 생성 시 비파괴 help 조회로 1회 감지한다.
+        status_capabilities: CmuxStatusCapabilities,
     }
 
     impl CmuxStatusSink {
@@ -3850,13 +3911,20 @@ mod cmux_status {
         /// 짧은 깜빡임(서로의 동일 set-status를 덮어쓰는 정도)으로, 교차 손상이 아니다.
         pub(crate) fn new(workspace: CmuxSurfaceContext, pane_id: &str) -> Self {
             let key_prefix = format!("lterm.{}.", sanitize_cmux_pane_segment(pane_id));
+            let cmux_available = client::command_exists("cmux");
+            let status_capabilities = if cmux_available {
+                detected_cmux_status_capabilities()
+            } else {
+                CmuxStatusCapabilities::default()
+            };
             Self {
                 workspace,
                 key_prefix,
                 applied: BTreeMap::new(),
-                cmux_available: client::command_exists("cmux"),
+                cmux_available,
                 consecutive_failures: 0,
                 healthy: true,
+                status_capabilities,
             }
         }
 
@@ -3870,7 +3938,7 @@ mod cmux_status {
         /// understatus가 보내는 `progress` 필드는 더 이상 처리하지 않는다(미지 필드로 무시).
         /// progress는 워크스페이스 전역 누수 위험으로 제거됐다(Codex HIGH Issue 3, 설계 §4.3).
         pub(crate) fn apply(&mut self, stdout_line: &str) {
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.apply_with_runner(stdout_line, &mut runner);
         }
 
@@ -3994,7 +4062,7 @@ mod cmux_status {
             if !self.cmux_available {
                 return;
             }
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.cleanup_with_runner(&mut runner);
         }
     }
@@ -4028,7 +4096,7 @@ mod cmux_status {
             if !self.cmux_available || !self.healthy {
                 return;
             }
-            let mut runner = CliCmuxCommandRunner;
+            let mut runner = CliCmuxCommandRunner::new(self.status_capabilities);
             self.reconcile_orphans_with_runner(&mut runner);
         }
 
@@ -4383,7 +4451,11 @@ mod cmux_status {
                 priority: 60,
                 label: None,
             };
-            let cmd = CliCmuxCommandRunner::build_command(&command, &surface);
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities::default(),
+            );
             let argv: Vec<String> = cmd
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -4396,6 +4468,83 @@ mod cmux_status {
             assert_eq!(argv[0], "set-status");
             assert_eq!(argv[1], "lterm._3.model");
             assert_eq!(argv[2], "gpt-5.5");
+        }
+
+        /// G004: cmux set-status --label 미지원 버전에서는 label을 조용히 생략한다.
+        #[test]
+        fn set_status_command_omits_label_when_capability_missing() {
+            let surface = test_surface();
+            let command = CmuxCommand::SetStatus {
+                key: "lterm._3.model".to_string(),
+                value: "gpt-5.5".to_string(),
+                color: None,
+                icon: None,
+                priority: 60,
+                label: Some("model".to_string()),
+            };
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities {
+                    set_status_label: false,
+                },
+            );
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !argv.iter().any(|a| a == "--label"),
+                "cmux 0.64.x rejects set-status --label, so fallback must omit it: {argv:?}"
+            );
+            assert_eq!(argv[0], "set-status");
+            assert_eq!(argv[1], "lterm._3.model");
+            assert_eq!(argv[2], "gpt-5.5");
+        }
+
+        /// G004: future cmux versions that advertise set-status --label keep label output.
+        #[test]
+        fn set_status_command_includes_label_when_capability_supported() {
+            let surface = test_surface();
+            let command = CmuxCommand::SetStatus {
+                key: "lterm._3.model".to_string(),
+                value: "gpt-5.5".to_string(),
+                color: None,
+                icon: None,
+                priority: 60,
+                label: Some("model".to_string()),
+            };
+            let cmd = CliCmuxCommandRunner::build_command_with_capabilities(
+                &command,
+                &surface,
+                CmuxStatusCapabilities {
+                    set_status_label: true,
+                },
+            );
+            let argv: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let label_pos = argv
+                .iter()
+                .position(|a| a == "--label")
+                .expect("supported label capability should emit --label");
+            assert_eq!(argv.get(label_pos + 1).map(String::as_str), Some("model"));
+        }
+
+        /// G004: capability parser는 set-progress의 --label 언급을 set-status 지원으로 오인하지 않는다.
+        #[test]
+        fn set_status_help_parser_detects_only_set_status_label_flag() {
+            assert!(cmux_set_status_help_supports_label(
+                "Flags:\n  --label <text>          Pill label\n  --priority <n>"
+            ));
+            assert!(!cmux_set_status_help_supports_label(
+                "set-progress <0.0-1.0> [--label <text>]\n\
+                 set-status <key> <value> [--priority <n>]"
+            ));
+            assert!(!cmux_set_status_help_supports_label(
+                "Flags:\n  --icon <name>\n  --color <#hex>\n  --priority <n>"
+            ));
         }
 
         /// AC3: workspace_ref 없으면 `--workspace`도 방출 안 함.
