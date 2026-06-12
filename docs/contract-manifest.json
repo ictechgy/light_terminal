@@ -298,6 +298,52 @@
       "raw_stream_policy": "sanitized-output-only"
     },
     {
+      "command": "lterm urls",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/urls.schema.json",
+      "tests": [
+        "cargo test --bin lterm urls_parses_flags_and_validates_tail",
+        "cargo test --bin lterm extract_urls_finds_trims_and_deduplicates_recent_links",
+        "cargo test --test cli_smoke urls_extracts_recent_sanitized_scrollback_links",
+        "cargo test --test cli_smoke urls_empty_results_are_machine_friendly"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Urls is a sanitized scrollback report surface. It scans the last --tail sanitized lines, never attaches to or rewrites the raw PTY stream, prints stable numbered text rows by default, emits the newest detected URL for --last, and emits a stable JSON string array for --json. Empty text modes produce no rows; empty JSON mode produces [].",
+      "json_samples": [
+        {
+          "setup": [
+            [
+              "start",
+              "-d",
+              "-n",
+              "schema-urls",
+              "--",
+              "sh",
+              "-lc",
+              "printf 'SCHEMA_URL https://schema.example/ok\\nSCHEMA_URL_READY\\n'; sleep 5"
+            ],
+            [
+              "wait",
+              "schema-urls",
+              "--contains",
+              "SCHEMA_URL_READY",
+              "--timeout",
+              "5s"
+            ]
+          ],
+          "argv": [
+            "urls",
+            "schema-urls",
+            "--json"
+          ]
+        }
+      ]
+    },
+    {
       "command": "lterm trace",
       "aliases": [
         "lterm record"

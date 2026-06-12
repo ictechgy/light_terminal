@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm urls --json output",
+  "type": "array",
+  "items": {
+    "type": "string",
+    "pattern": "^https?://"
+  }
+}
