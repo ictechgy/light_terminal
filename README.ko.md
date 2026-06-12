@@ -109,6 +109,8 @@ lterm install-ai-statusline
 
 ## 빠른 시작
 
+![lterm quick demo](docs/assets/lterm-demo.svg)
+
 **세션을 만들고 바로 attach:**
 
 ```bash
@@ -167,7 +169,7 @@ lterm -a api
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
 | tmux 호환 shell export 출력 | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
 | shell completion 설치 | `lterm install-completions --shell bash\|zsh\|fish` | 사용자 로컬 completion 파일을 쓰고 필요한 활성화 hint를 출력하며 daemon은 시작하지 않음 |
-| AI CLI statusline badge 설치 | `lterm install-ai-statusline` | 지원 statusline 통합을 설치함; Claude/OMC에는 `lt:<session>:<pane>` command wrapper를 넣고, Codex는 아직 `LTERM_SESSION` / `LTERM_PANE`용 custom item을 받지 않으므로 unsupported로 보고하고 config는 건드리지 않음 |
+| AI CLI statusline badge 설치 | `lterm install-ai-statusline` | 지원 statusline 통합을 설치함; Claude/OMC에는 `lt:<session>:<pane>` command wrapper를 넣고, Codex는 아직 `LTERM_SESSION` / `LTERM_PANE`용 custom item을 받지 않으므로 skipped로 보고하고 config는 건드리지 않음 |
 | shell completion 생성 | `lterm completions bash\|zsh\|fish` | completion script만 출력하며 session을 조회하거나 daemon을 시작하지 않음 |
 | cmux-friendly 알림 보내기 | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback은 터미널 제어 문자를 제거하고 Unicode text는 보존 |
 | 원격 호스트에 attach | `lterm ssh user@host main` | 신뢰할 수 있는 host에서만 사용; host-key 확인은 SSH가 처리하고 remote PTY bytes는 정제 없이 전달 |
@@ -198,7 +200,7 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 row status 표시 여부는 attach mode와는 별개입니다. `--attach-mode=auto`는 계속 raw attach와 mobile transcript 중 어느 transport를 쓸지만 결정합니다. raw attach 경로에서 일반 세션은 기본적으로 row status를 유지하고, 내장 agent launcher와 이미 agent 세션으로 식별된 세션에 다시 붙는 `resume` / `open`은 full-height row-off 화면을 기본값으로 사용합니다.
 
-직접 agent launcher를 실행할 때는 terminal이 지원하면 attach 직전에 compact terminal-title cue(`lt:<session>:<pane> · <agent>`)와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 알려진 agent command가 나중에 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
+직접 agent launcher를 실행할 때는 terminal이 지원하면 attach 직전에 compact terminal-title cue(`lt:<session>:<pane> · <agent>`)와 one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner를 표시합니다. row-off로 attach된 동안에는 idle 구간 이후 title cue만 주기적으로 다시 표시하므로, Codex 같은 TUI가 자체 title을 덮어써도 lterm 식별 정보는 유지됩니다. title cue와 banner를 모두 끄려면 `LTERM_AGENT_CUE=0`, terminal-title cue는 유지하고 inline banner만 끄려면 `LTERM_AGENT_BANNER=0`을 설정하세요. row-on shell 세션 안에서 알려진 agent command가 나중에 child process로 실행된 것으로 보이면 lterm은 best-effort로 row를 suspend하고 PTY를 전체 높이로 복원했다가 agent가 끝나면 row를 되돌릴 수 있습니다. process 감지가 애매하면 안전하게 row를 유지합니다. 전역 `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` kill-switch는 CLI status 요청보다 우선합니다.
 
 모든 lterm 세션의 child process에는 `LTERM_SESSION`과 `LTERM_PANE`도 export됩니다. `[lterm:api:%0]` 같은 shell prompt badge를 선호한다면 이 변수를 prompt에 추가하세요. `lterm init --shell zsh|bash|fish`는 shim/completion/AI statusline 단계와 함께 이 reminder를 출력합니다. 자체 statusline/HUD를 제공하는 AI CLI는 lterm의 host-side bottom row에 의존하지 말고 같은 변수를 읽어 그 statusline 안에 badge를 표시하는 편이 좋습니다. 그래야 full-screen agent TUI와 모바일 SSH renderer를 덜 방해합니다. `lterm install-ai-statusline`을 실행하면 지원 통합을 설치합니다. 현재는 Claude/OMC HUD wrapper를 만들어 `lt:<session>:<pane>`를 앞에 붙이고, `~/.claude/settings.json`은 변경 전 backup합니다. Codex는 `~/.codex/config.toml`을 건드리지 않고 skipped로 보고합니다. 현재 Codex status_line item은 built-in만 가능하고, `thread-id`는 Codex 내부 식별자라 lterm 세션 식별자로 쓰기에 부적절하기 때문입니다.
 
@@ -209,6 +211,12 @@ row status 표시 여부는 attach mode와는 별개입니다. `--attach-mode=au
 `lterm status-theme <target> <theme>`(alias: `lterm theme`)은 PTY를 재시작하지 않고 세션별 status bar theme을 저장합니다. pane id를 지정하면 해당 pane이 속한 세션에 적용됩니다. `default`, `clear`, `none`을 쓰면 세션 override를 지우고 attach하는 client의 기본값으로 돌아갑니다. 이미 attach된 client는 detach 후 다시 attach할 때 새 색을 반영합니다. 새 세션은 `lterm start --status-theme green -n api -- npm run dev`(또는 alias `--status-color`)처럼 생성 시점에 같은 metadata를 저장할 수 있습니다.
 
 `lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
+
+`lterm diagnose --bundle`은 issue 보고와 agent handoff를 위한 local-only JSON
+진단 bundle을 출력합니다. `doctor` 데이터와 redact된 환경 변수 presence flag를
+포함하고, 기존 daemon에 접근 가능한 경우에 한해 세션 metadata와 process row를
+함께 담습니다. 이 명령은 daemon을 시작하지 않으며, 기본적으로 raw PTY bytes나
+scrollback은 포함하지 않습니다.
 
 `lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text입니다. 즉 terminal control은 제거하고 한국어, CJK, emoji 같은 UTF-8 text는 보존합니다. attach된 PTY stream은 raw 그대로 유지됩니다.
 

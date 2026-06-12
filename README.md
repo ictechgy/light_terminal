@@ -172,7 +172,7 @@ Agent and shim utilities are also product CLI commands, not tmux aliases:
 | Install the `tmux` compatibility shim | `lterm install-shim` | Creates a shim that forwards to `lterm tmux-compat` |
 | Print shell exports for tmux compatibility | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | Emits trusted shell setup that prepends the shim dir to `$PATH` |
 | Install shell completions | `lterm install-completions --shell bash\|zsh\|fish` | Writes a user-local completion file and prints any activation hint; it does not start the daemon |
-| Install AI CLI statusline badges | `lterm install-ai-statusline` | Installs supported statusline integrations; Claude/OMC gets an `lt:<session>:<pane>` command wrapper, while Codex is reported as unsupported because its TUI does not yet accept custom `LTERM_SESSION` / `LTERM_PANE` statusline items |
+| Install AI CLI statusline badges | `lterm install-ai-statusline` | Installs supported statusline integrations; Claude/OMC gets an `lt:<session>:<pane>` command wrapper, while Codex is reported as skipped because its TUI does not yet accept custom `LTERM_SESSION` / `LTERM_PANE` statusline items |
 | Generate shell completions | `lterm completions bash\|zsh\|fish` | Prints completion scripts only; it does not inspect sessions or start the daemon |
 | Send a cmux-friendly notification | `lterm notify --title 'Done' --body 'Tests passed'` | OSC 777 fallback strips terminal controls while preserving Unicode text |
 | Attach to a remote host | `lterm ssh user@host main` | Use trusted hosts; SSH handles host-key checks, and remote PTY bytes pass through without sanitization |
