@@ -4,14 +4,14 @@
 
 ## TL;DR
 
-- **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이지만, 기능 범위를 더 작게 좁힌 도구. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
+- **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이지만, 기능 범위를 더 작게 좁힌 도구입니다. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
 - **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속합니다. shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` 같은 내장 단축 명령을 사용할 수 있습니다. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
-- **상태** — 1.0 명령/출력 호환성 경계를 문서화한 alpha MVP입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스, escape-sequence sanitizer, 완전한 tmux 대체품 모두 아닙니다.**
+- **상태** — 1.0 명령/출력 호환성 경계를 문서화한 alpha MVP입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도, escape-sequence sanitizer도, 완전한 tmux 대체품도 아닙니다.**
 
 ---
 
-`lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, terminal-first agent 도구가 자주 사용하는 tmux 명령 일부를 호환 shim으로 제공합니다.
+`lterm`은 tmux 전체를 대체하려는 도구가 아닙니다. 오래 실행되는 PTY 세션을 유지하고, 클라이언트가 자유롭게 detach/reattach할 수 있게 하며, 터미널 escape sequence는 그대로 통과시키고, terminal-first agent 도구가 자주 사용하는 tmux 명령 subset을 호환 shim으로 제공합니다.
 
 > **보안 모델:** `lterm`은 같은 OS 사용자 안에서 쓰는 편의용 데몬이며 샌드박스가 아닙니다. 다른 사용자의 Unix socket 접근은 거부하고 런타임 디렉터리는 소유자 전용 권한으로 만들지만, 같은 OS 사용자 권한으로 실행되는 프로세스는 세션을 제어할 수 있다고 보아야 합니다.
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
@@ -43,10 +43,10 @@ agent가 보통 필요로 하는 더 작은 기능 범위에 집중합니다.
 다음 세 가지 요구를 충족하는 것이 목표입니다.
 
 1. **tmux와 비슷한 세션 지속성과 원격 접속** — 세션은 백그라운드 데몬에서 실행되며, 이름이나 pane id로 attach/detach할 수 있습니다. 원격 호스트에 `lterm`이 설치되어 있다면 `lterm ssh`로 접속할 수 있습니다.
-2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, tmux shim은 가능한 경우 worker pane을 cmux native split으로 엽니다.
+2. **cmux 호환성** — cmux 안에서 실행할 때는 OSC 알림을 그대로 통과시키고 `lterm notify`를 제공하며, 가능한 경우 tmux-shim worker pane을 cmux native split으로 엽니다.
 3. **AI 도구 지원** — `lterm agent <profile>`, `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc`, `lterm install-shim`은 tmux를 전제하는 agent 도구를 위해 tmux를 흉내 내는 `tmux` 명령과 `TMUX` / `TMUX_PANE` 환경 변수를 제공합니다.
 
-cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux 명령을 cmux native pane으로 매핑하는 tmux shim 모델을 문서화하고 있습니다.
+cmux 호환 동작은 cmux가 문서화한 기능을 따릅니다. cmux는 `cmux notify`와 OSC 777 / OSC 99 알림, workspace/split을 위한 Unix socket·CLI API, 그리고 tmux-shim 명령을 cmux native pane으로 매핑하는 모델을 문서화하고 있습니다.
 
 ## 설치
 
@@ -65,9 +65,11 @@ npm install -g @ictechgy/lterm
 Homebrew와 npm 모두 `PATH`에 `lterm` 명령을 설치합니다. `lterm --version`으로 확인하세요.
 
 수동 설치가 번거롭다면 [`docs/agent-install.ko.md`](docs/agent-install.ko.md)의
-프롬프트를 Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI 같은 terminal coding agent에
-붙여 넣으세요. Agent가 platform을 감지하고, `lterm`을 설치하고, smoke test로
-검증하며, shell startup file을 바꿔야 할 때는 먼저 diff를 보여주도록 안내합니다.
+프롬프트를 Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent,
+Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI
+같은 terminal coding agent에 붙여 넣으세요. Agent가 platform을 감지하고,
+`lterm`을 설치하고, smoke test로 검증하며, shell startup file을 바꿔야 할
+때는 먼저 diff를 보여주도록 안내합니다.
 
 1.0 명령/출력 안정성 경계는 [public contract](docs/public-contract.md)와
 machine-readable [contract manifest](docs/contract-manifest.json)를 참고하세요.
@@ -190,7 +192,7 @@ escape 처리가 여기에 포함됩니다. 직접 `ssh`하듯 신뢰할 수 있
 
 호환 이름은 flag 형태로 표시된 경우(`-a`)를 제외하면 모두 subcommand입니다. `-a`는 기존 shortcut 형태라 `lterm -a <target>`처럼 사용해야 합니다.
 
-이 표는 사람과 agent가 직접 쓰는 제품 CLI 명령 모음입니다. `lterm tmux-compat ...`는 이미 tmux 명령을 사용하는 스크립트를 위한 별도 shim namespace이며, 모든 제품 명령에 tmux 호환 이름이 있는 것은 아닙니다. 런타임에 지원되는 shim subset은 `lterm tmux-compat list-commands`로 확인하세요.
+이 표는 사람과 agent가 직접 쓰는 제품 CLI 명령 모음입니다. `lterm tmux-compat ...`는 이미 tmux 명령을 사용하는 스크립트를 위한 별도 shim namespace이며, 모든 제품 명령에 tmux 호환 이름이 있는 것은 아닙니다. 런타임에 지원되는 shim subset은 `lterm tmux-compat list-commands` 또는 `lterm tmux-compat --version`으로 확인하세요.
 
 `lterm sessions`는 기본적으로 하위 pane을 숨기고, 기존 첫 5개 tab-separated 열(`name`, `pane`, `alive`, `cwd`, `command`)을 유지한 뒤 attach 상태(`attached` / `detached`)와 parent pane(`-` 또는 pane id)을 뒤에 붙입니다. JSON 출력에는 agent profile로 띄운 세션에 한해 `agent_name` metadata가 추가되고, 일반 세션에는 이 field가 생략됩니다. 호환 이름인 `lterm list`와 `lterm ls`도 같은 text 출력 형식을 유지합니다. attach된 클라이언트는 아래쪽 한 줄에 status bar를 표시하고, PTY는 그 줄을 제외한 영역으로 resize됩니다. 예전처럼 전체 터미널을 raw 모드로 강제하려면 `lterm resume --raw --no-status api`(호환 이름: `lterm attach --raw --no-status api`)를 쓰거나 `LTERM_ATTACH_MODE=raw`를 설정하세요. status line만 충돌하는 클라이언트라면 `LTERM_NO_STATUS=1`(또는 같은 의미의 `LTERM_STATUS=0`)만 설정해도 됩니다.
 
@@ -416,7 +418,7 @@ lterm run -- codex exec "저장소를 요약해줘"
 
 이 세션 안에서는 `tmux`가 `lterm tmux-compat` shim으로 해석됩니다. 이 shim은 호환 계층이지 모든 `lterm` 제품 명령의 두 번째 철자가 아닙니다. 현재 shim은 AI orchestration 스크립트가 자주 사용하는 다음 명령 subset을 구현합니다.
 
-- **세션** — `new-session`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
+- **세션** — `new-session`, `new-window`, `attach-session`, `has-session`, `list-sessions`, `rename-session`, `kill-session`
 - **조회** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Pane** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffer / popup** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
@@ -425,19 +427,26 @@ lterm run -- codex exec "저장소를 요약해줘"
 호환성 참고: lterm은 각 root session을 하나의 pseudo-window로 모델링합니다
 (`window_index=0`, `window_panes=1`). lterm은 client별 process/TTY metadata를
 노출하지 않기 때문에 `client_pid`와 `client_tty`는 빈 문자열로 확장됩니다.
+`#{history_size}`는 현재 `0`으로 확장됩니다. lterm이 tmux식 pane history 길이를
+아직 노출하지 않더라도 tmux format 소비자가 numeric 값을 받도록 하기 위한
+명시적인 호환 동작입니다. tmux `-f` filter는 조용히 무시하지 않고 의도적으로
+거부합니다.
 `set-hook`은 OMX `client-resized[...]` handler처럼 agent runtime이 쓰는 hook
 등록/해제 형태를 받아들이지만, lterm이 tmux hook dispatcher를 실행하지는 않습니다.
 Detached `split-window -d -t <target>`은 같은 daemon socket 안에서 기존 live lterm
 target이면 현재 pane이 아니어도 허용합니다. 이는 tmux의 cross-pane helper launch
 동작을 맞추기 위한 것이며, daemon은 요청 처리 전에 같은 OS 사용자 peer credential을
 검증합니다. detached helper는 target pane 안에 붙지 않고 별도 lterm session으로
-생성됩니다.
+생성됩니다. `split-window -b -h`와 `split-window -b -v`는 visible cmux split을
+만들 때 각각 cmux `left`, `up` placement로 매핑됩니다. Detached `new-window -d` /
+`neww -d`는 의도적으로 partial 지원입니다. standalone lterm helper session을
+만들고, tmux 스타일 `-P`/`-F` target 출력을 지원하며, attached-window mode는
+현재 pane을 조용히 바꾸는 대신 거부합니다.
 `lterm tmux-compat list-commands --verbose`는 `command`, alias, support tier,
 usage를 tab-separated로 출력하고, `--json`은 machine-readable row를 출력합니다.
 Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`
 중 하나입니다. `LTERM_DEBUG_TMUX=1`을 설정하면 지원하지 않는 tmux command가
 shim에 도달했을 때 opt-in stderr diagnostic row를 출력합니다.
-tmux `-f` filter는 조용히 무시하지 않고 의도적으로 거부합니다.
 
 Status bar redraw는 보수적으로 allowlist된 terminal client(예: xterm/iTerm2/WezTerm
 identity)에서만 xterm SGR stack control을 사용해 실행 중인 TUI의
@@ -447,15 +456,19 @@ foreground/background color state를 빼앗지 않도록 합니다.
 Kitty, Alacritty, Ghostty, Termius, generic `TERM=xterm-*` 값은 SGR-stack 동작이
 검증될 때까지 opt-in 경로로 둡니다.
 
+lterm이 session identity를 cmux understatus pill로 미러링할 때는 `cmux set-status --help`를
+비파괴적으로 probe합니다. `--label`을 advertise하는 build에는 label 있는 status row를
+보내고, 구버전 cmux에는 지원하지 않는 flag를 생략해 계속 동작하게 합니다.
+
 ## cmux 동작
 
 `lterm tmux-compat split-window`가 cmux 환경(`CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, 또는 cmux socket)을 감지하면 다음 순서로 동작합니다.
 
 1. worker 명령을 위한 새 `lterm` PTY 세션을 시작합니다.
-2. cmux에 native split 생성을 요청합니다 (`cmux new-split right/down`).
+2. cmux에 native split 생성을 요청합니다 (`cmux new-split right/down`, tmux backward split은 `left/up`).
 3. 생성된 split에는 호환 명령인 `lterm attach <pane>`을 보냅니다. 안전한 absolute executable이 `LTERM_BIN`으로 지정되어 있으면 그 값을 사용하고, 아니면 현재 executable로 fallback합니다. 이 호환 명령 덕분에 `resume`을 모르는 구버전 build에서도 cmux pane이 계속 동작합니다.
 
-이렇게 하면 실제 pane은 cmux가 그리고, scrollback capture와 `send-keys` 호환은 `lterm`이 유지합니다.
+이렇게 하면 실제 pane은 cmux가 그리고, scrollback capture, `send-keys` 호환, cmux 버전별 status-label fallback은 `lterm`이 유지합니다.
 
 **알림:**
 
@@ -518,7 +531,7 @@ override로 인정합니다. 유효하지 않은 값은 무시하고 현재 exec
 
 - 세션 지속성은 데몬과 호스트가 동작 중일 때만 유지됩니다. 재부팅 후 프로세스 상태 복원은 아직 구현하지 않았습니다.
 - cmux 밖에서 `split-window`는 추가 managed PTY 세션을 만들지만, 터미널 안에 tiled UI를 직접 그리지는 않습니다.
-- 이 프로젝트는 완전한 tmux server가 아니라 호환 subset만 제공합니다. 고급 tmux format/option을 사용하는 스크립트는 shim 명령 추가가 필요할 수 있습니다.
+- 이 프로젝트는 완전한 tmux server가 아니라 호환 subset만 제공합니다. 고급 tmux format, hook, layout, option을 사용하는 스크립트는 shim 명령 추가가 필요할 수 있습니다.
 - cmux pane capture는 cmux scrollback API가 아니라 `lterm` 세션을 통해 처리합니다.
 - 데몬은 로컬 클라이언트를 OS peer credential과 소유자 전용 socket 경로로 인증합니다. 세션별 ACL은 아직 없습니다.
 - 세션 종료는 verified process-group signaling을 사용하므로 `shell → OMX → Codex → MCP` 같은 child tree는 가능한 한 함께 정리됩니다. 의도적으로 다른 session/process group으로 detach한 프로세스는 `lterm close` / `lterm kill` 이후에도 살아 있을 수 있으니, `lterm processes` / `lterm ps`나 OS process 도구로 확인하세요.
@@ -527,8 +540,9 @@ override로 인정합니다. 유효하지 않은 값은 무시하고 현재 exec
 
 ```bash
 cargo fmt
+cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build --locked
+cargo build --release --locked
 ```
 
 시스템 패키지 매니저로 설치한 Rust toolchain이 Cargo 시작 전에 실패한다면
