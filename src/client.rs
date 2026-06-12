@@ -14,6 +14,7 @@ use crossterm::{cursor, execute, queue, terminal};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -533,6 +534,113 @@ pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Resu
         start,
         end,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlExtraction {
+    pub urls: Vec<String>,
+    pub last: Option<String>,
+}
+
+pub fn capture_urls(target: &str, tail: usize) -> Result<UrlExtraction> {
+    let tail_start = compose_tail_start(tail)?;
+    let capture = capture_range(target, Some(tail_start), None)?;
+    Ok(extract_urls(&capture))
+}
+
+pub fn extract_urls(text: &str) -> UrlExtraction {
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    let mut last = None;
+    let mut offset = 0;
+
+    while let Some(start) = find_next_url_scheme(text, offset) {
+        let mut end = text.len();
+        for (relative, ch) in text[start..].char_indices() {
+            if relative == 0 {
+                continue;
+            }
+            if is_url_terminator(ch) {
+                end = start + relative;
+                break;
+            }
+        }
+
+        let candidate = trim_url_candidate(&text[start..end]);
+        if url_has_scheme_body(candidate) {
+            let url = candidate.to_string();
+            last = Some(url.clone());
+            if seen.insert(url.clone()) {
+                urls.push(url);
+            }
+        }
+        offset = if end > start { end } else { start + 1 };
+    }
+
+    UrlExtraction { urls, last }
+}
+
+pub fn write_numbered_urls(urls: &[String], stdout: &mut impl Write) -> Result<()> {
+    for (index, url) in urls.iter().enumerate() {
+        writeln!(stdout, "{}\t{}", index + 1, sanitize::terminal_text(url))
+            .context("write extracted url")?;
+    }
+    Ok(())
+}
+
+fn find_next_url_scheme(text: &str, offset: usize) -> Option<usize> {
+    let rest = text.get(offset..)?;
+    match (rest.find("http://"), rest.find("https://")) {
+        (Some(http), Some(https)) => Some(offset + http.min(https)),
+        (Some(http), None) => Some(offset + http),
+        (None, Some(https)) => Some(offset + https),
+        (None, None) => None,
+    }
+}
+
+fn is_url_terminator(ch: char) -> bool {
+    ch.is_control() || ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`')
+}
+
+fn trim_url_candidate(candidate: &str) -> &str {
+    let mut end = candidate.len();
+    while end > 0 {
+        let current = &candidate[..end];
+        let Some(ch) = current.chars().next_back() else {
+            break;
+        };
+        let trim = matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
+            || unmatched_closing_delimiter(current, ch);
+        if !trim {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    &candidate[..end]
+}
+
+fn unmatched_closing_delimiter(value: &str, ch: char) -> bool {
+    match ch {
+        ')' => {
+            value.chars().filter(|c| *c == ')').count()
+                > value.chars().filter(|c| *c == '(').count()
+        }
+        ']' => {
+            value.chars().filter(|c| *c == ']').count()
+                > value.chars().filter(|c| *c == '[').count()
+        }
+        '}' => {
+            value.chars().filter(|c| *c == '}').count()
+                > value.chars().filter(|c| *c == '{').count()
+        }
+        _ => false,
+    }
+}
+
+fn url_has_scheme_body(url: &str) -> bool {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .is_some_and(|body| !body.is_empty())
 }
 
 #[derive(Serialize)]
@@ -2386,6 +2494,10 @@ fn run_interactive_mobile_transcript(
                         )
                         .context("write raw attach hint")?;
                     }
+                    "/links" | "/urls" => {
+                        let capture = capture_range(target, Some(tail_start), None)?;
+                        write_mobile_transcript_urls(&capture, &mut stdout)?;
+                    }
                     _ => {
                         send(target, compose_commit_bytes(input, options.append_enter))?;
                         let capture = capture_range(target, Some(tail_start), None)?;
@@ -2418,6 +2530,11 @@ fn write_mobile_transcript_prompt(stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}> ").context("write mobile prompt")?;
     stdout.flush().context("flush mobile prompt")?;
     Ok(())
+}
+
+fn write_mobile_transcript_urls(capture: &str, stdout: &mut impl Write) -> Result<()> {
+    let extraction = extract_urls(capture);
+    write_numbered_urls(&extraction.urls, stdout)
 }
 
 fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
@@ -6161,7 +6278,7 @@ mod tests {
         compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
         compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
         dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, format_status_line,
+        ensure_trace_force_target_private, extract_urls, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, is_self_provided_tmux,
         keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
@@ -6175,6 +6292,7 @@ mod tests {
         status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
         trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
+        write_mobile_transcript_urls,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -6187,6 +6305,56 @@ mod tests {
         assert_eq!(compose_commit_bytes("", true), b"\r");
         assert_eq!(compose_commit_bytes("hello", true), b"hello\r");
         assert_eq!(compose_commit_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn extract_urls_finds_trims_and_deduplicates_recent_links() {
+        let extraction = extract_urls(
+            "open https://example.com/path?q=1#frag.\n\
+             again https://example.com/path?q=1#frag and http://host.test/a(b)!\n\
+             quoted \"https://quoted.example/path\" <https://angle.example/x> `http://tick.test`",
+        );
+
+        assert_eq!(
+            extraction.urls,
+            vec![
+                "https://example.com/path?q=1#frag",
+                "http://host.test/a(b)",
+                "https://quoted.example/path",
+                "https://angle.example/x",
+                "http://tick.test",
+            ]
+        );
+        assert_eq!(extraction.last.as_deref(), Some("http://tick.test"));
+    }
+
+    #[test]
+    fn extract_urls_last_uses_most_recent_occurrence_before_deduplication() {
+        let extraction = extract_urls("https://a.test https://b.test https://a.test");
+        assert_eq!(extraction.urls, vec!["https://a.test", "https://b.test"]);
+        assert_eq!(extraction.last.as_deref(), Some("https://a.test"));
+    }
+
+    #[test]
+    fn extract_urls_handles_empty_and_non_url_scheme_bodies() {
+        let extraction = extract_urls("no links http:// https://");
+        assert!(extraction.urls.is_empty());
+        assert!(extraction.last.is_none());
+    }
+
+    #[test]
+    fn mobile_transcript_urls_reuses_numbered_url_output_without_remote_send() {
+        let mut out = Vec::new();
+        write_mobile_transcript_urls(
+            "login at https://claude.ai/login then visit https://example.test/done.",
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "1\thttps://claude.ai/login\n2\thttps://example.test/done\n"
+        );
     }
 
     #[test]

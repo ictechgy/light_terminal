@@ -239,6 +239,20 @@ enum Commands {
         #[arg(short = 'E', long, allow_hyphen_values = true)]
         end: Option<i32>,
     },
+    /// Extract recent URLs from sanitized scrollback.
+    Urls {
+        /// Session or pane target to scan.
+        target: String,
+        /// Number of sanitized scrollback lines to scan.
+        #[arg(long, default_value = "120", value_parser = parse_compose_tail_arg)]
+        tail: usize,
+        /// Print only the newest detected URL occurrence.
+        #[arg(long)]
+        last: bool,
+        /// Emit URLs as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Record raw PTY output chunks from a session to a local JSONL trace file.
     #[command(visible_alias = "record")]
     Trace {
@@ -810,6 +824,29 @@ fn run() -> Result<()> {
                 client::capture(&target, start)?
             };
             print!("{output}");
+            Ok(())
+        }
+        Commands::Urls {
+            target,
+            tail,
+            last,
+            json,
+        } => {
+            let extraction = client::capture_urls(&target, tail)?;
+            let urls = if last {
+                extraction.last.into_iter().collect::<Vec<_>>()
+            } else {
+                extraction.urls
+            };
+            if json {
+                println!("{}", serde_json::to_string(&urls)?);
+            } else if last {
+                if let Some(url) = urls.first() {
+                    println!("{}", sanitize::terminal_text(url));
+                }
+            } else {
+                client::write_numbered_urls(&urls, &mut std::io::stdout())?;
+            }
             Ok(())
         }
         Commands::Trace {
@@ -3658,6 +3695,36 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn urls_parses_flags_and_validates_tail() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "urls",
+            "claude-lterm",
+            "--tail",
+            "25",
+            "--last",
+            "--json",
+        ])
+        .expect("urls flags should parse");
+        let Commands::Urls {
+            target,
+            tail,
+            last,
+            json,
+        } = cli.command
+        else {
+            panic!("expected urls command");
+        };
+        assert_eq!(target, "claude-lterm");
+        assert_eq!(tail, 25);
+        assert!(last);
+        assert!(json);
+
+        assert!(Cli::try_parse_from(["lterm", "urls", "main", "--tail", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "urls", "main", "--tail", "2147483648"]).is_err());
     }
 
     #[test]
