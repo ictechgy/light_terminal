@@ -301,13 +301,21 @@ The generic aliases above are meant for day-to-day agent-terminal use: `sessions
 `lterm urls <target>` extracts `http://` and `https://` links from the last
 120 sanitized scrollback lines without touching the raw attached PTY stream.
 Default output is `N<TAB>URL`, one link per line; `--last` prints only the
-newest detected URL occurrence for phone-friendly copy/paste, `--json` emits a
+newest valid URL occurrence for phone-friendly copy/paste, `--json` emits a
 JSON array, and `--tail N` changes the scan range. Empty text modes exit
-successfully with no output, while JSON mode prints `[]`. In mobile transcript
-mode, type `/links` or `/urls` to show the same numbered list locally instead
-of sending that text to the PTY. This is useful for Claude/OAuth login URLs on
-Termius-style mobile SSH clients; for Claude-specific mobile control, Claude
-Code's Remote Control flow can also reduce URL-copy round trips.
+successfully with no output, while JSON mode prints `[]`. Extraction is bounded
+to 256 unique ASCII URL tokens and skips raw URL candidates longer than 4096
+bytes instead of truncating them. In mobile transcript mode, type `/links` or
+`/urls` to show the same numbered list locally instead of sending that text to
+the PTY. This is useful for Claude/OAuth login URLs on Termius-style mobile SSH
+clients; for Claude-specific mobile control, Claude Code's Remote Control flow
+can also reduce URL-copy round trips.
+
+Treat extracted links as untrusted terminal output. A malicious program can
+print phishing URLs, and OAuth, magic-login, or device-code links may carry
+short-lived secrets. Open only links you expect, avoid pasting them into shared
+logs or chat, and prefer `--last` only when you know the newest link is the one
+you intend to use.
 
 For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
 In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.

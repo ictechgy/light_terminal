@@ -300,14 +300,21 @@ lterm input api 'echo hello' --enter
 `lterm urls <target>`은 raw attach PTY stream을 건드리지 않고, 마지막 120개
 정제된 scrollback line에서 `http://` / `https://` link를 추출합니다. 기본
 출력은 link마다 `N<TAB>URL` 한 줄이고, `--last`는 휴대폰에서 복사하기 쉽도록
-가장 최근에 감지된 URL 하나만 출력합니다. `--json`은 JSON array를 출력하고,
+가장 최근의 유효한 URL 하나만 출력합니다. `--json`은 JSON array를 출력하고,
 `--tail N`으로 scan 범위를 바꿀 수 있습니다. text mode에서 URL이 없으면 성공
-종료하면서 출력하지 않고, JSON mode는 `[]`를 출력합니다. 모바일 transcript
-mode에서는 `/links` 또는 `/urls`를 입력하면 이 numbered list를 로컬로 보여 주며,
-해당 입력은 PTY로 전달되지 않습니다. Claude/OAuth 로그인 URL을 Termius 같은
-모바일 SSH client에서 복사해야 할 때 유용합니다. Claude 전용 모바일 제어가
-목적이라면 Claude Code Remote Control 흐름도 URL 복사 왕복을 줄이는 우회책이
-될 수 있습니다.
+종료하면서 출력하지 않고, JSON mode는 `[]`를 출력합니다. 추출은 unique ASCII
+URL token 256개로 제한되며, 4096 byte를 넘는 raw URL candidate는 잘라 내지
+않고 건너뜁니다. 모바일 transcript mode에서는 `/links` 또는 `/urls`를 입력하면
+이 numbered list를 로컬로 보여 주며, 해당 입력은 PTY로 전달되지 않습니다.
+Claude/OAuth 로그인 URL을 Termius 같은 모바일 SSH client에서 복사해야 할 때
+유용합니다. Claude 전용 모바일 제어가 목적이라면 Claude Code Remote Control
+흐름도 URL 복사 왕복을 줄이는 우회책이 될 수 있습니다.
+
+추출된 link는 신뢰할 수 없는 terminal output으로 취급하세요. 악성 프로그램은
+피싱 URL을 출력할 수 있고, OAuth, magic-login, device-code link에는 짧게 살아
+있는 secret이 포함될 수 있습니다. 예상한 link만 열고, 공유 로그나 채팅에
+그대로 붙여넣지 말고, `--last`는 최신 link가 의도한 대상임을 알고 있을 때만
+사용하는 것이 안전합니다.
 
 자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
 Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
