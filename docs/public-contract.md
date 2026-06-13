@@ -168,7 +168,7 @@ occurrence in the captured tail even when it is a duplicate or appears after the
 256-row unique-list cap; `--last --json` reports `[]` or a one-element array.
 Empty text modes produce no rows, and empty JSON mode produces `[]`. Extracted
 URLs are untrusted terminal output: producers can print phishing links, and
-authentication URLs may contain short-lived bearer material. Automation should
+authentication URLs may carry short-lived login credentials. Automation should
 handle URL rows as sensitive data, avoid logging them verbatim by default, and
 prefer `--last` only when the newest valid link is known to be the intended one.
 
