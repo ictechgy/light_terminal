@@ -139,7 +139,7 @@ or raw output stream.
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
 | `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
-| `lterm urls` | none | `stable` | `stable` recent URL rows as `N<TAB>URL`; `--last` emits only the newest detected URL | `stable` | `sanitized-output-only` |
+| `lterm urls` | none | `stable` | `stable` recent URL rows as `N<TAB>URL`; `--last` emits only the newest valid URL | `stable` string array; `--last --json` emits `[]` or a one-element array | `sanitized-output-only` |
 | `lterm trace` | `lterm record` | `explicit-raw-unsafe` | none; writes a private local JSONL trace file capped by --max-bytes | `best-effort` JSONL events with hex-encoded raw PTY output chunks | `raw-transparent` |
 | `lterm trace-replay` | `lterm replay-trace` | `explicit-raw-unsafe` | `best-effort` raw bytes decoded from an explicit local trace file; `--timing` can preserve inter-chunk delays | none | `raw-transparent` |
 | `lterm trace-info` | none | `best-effort` | `best-effort` raw-free metadata summary for a local trace file | `best-effort` raw-free metadata summary | `sanitized-output-only` |
@@ -152,6 +152,21 @@ or raw output stream.
 | `lterm diagnose --bundle` | none | `best-effort` | none | `best-effort` local diagnostic bundle; does not start the daemon and excludes raw PTY bytes/scrollback by default | `sanitized-output-only` |
 | `lterm daemon` | none | `internal` | none | none | `not-applicable` |
 | `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
+
+### `lterm urls` stable extraction semantics
+
+`lterm urls` is a sanitized scrollback report. It scans only the last `--tail`
+sanitized lines and never attaches to, rewrites, or forwards data into the raw
+PTY stream. Extraction matches `http://` and `https://` schemes
+ASCII-case-insensitively while preserving the original URL text in output. The
+numbered text rows and `--json` array use the same extracted URL set: first-seen
+exact-text deduplicated unique ASCII URL tokens capped at 256 rows, complete raw URL
+candidates longer than 4096 bytes are skipped before trimming rather than
+truncated, and whitespace/control-bearing or non-ASCII URL tokens are
+excluded. `--last` reports the newest valid within-length URL
+occurrence in the captured tail even when it is a duplicate or appears after the
+256-row unique-list cap; `--last --json` reports `[]` or a one-element array.
+Empty text modes produce no rows, and empty JSON mode produces `[]`.
 
 ## Utility and integration surface
 

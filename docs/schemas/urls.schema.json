@@ -2,8 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "lterm urls --json output",
   "type": "array",
+  "maxItems": 256,
+  "uniqueItems": true,
   "items": {
     "type": "string",
-    "pattern": "^https?://"
+    "minLength": 8,
+    "maxLength": 4096,
+    "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[!-~]+$"
   }
 }
