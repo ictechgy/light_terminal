@@ -314,7 +314,8 @@
         "cargo test --bin lterm extract_urls_skips_raw_candidates_over_length_before_trimming",
         "cargo test --bin lterm extract_urls_caps_unique_rows_but_keeps_newest_valid_last",
         "cargo test --test cli_smoke urls_extracts_recent_sanitized_scrollback_links",
-        "cargo test --test cli_smoke urls_empty_results_are_machine_friendly"
+        "cargo test --test cli_smoke urls_empty_results_are_machine_friendly",
+        "python3 scripts/check_url_contract_policy.py --self-test"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
