@@ -536,6 +536,9 @@ pub fn capture_range(target: &str, start: Option<i32>, end: Option<i32>) -> Resu
     })
 }
 
+const MAX_EXTRACTED_URLS: usize = 256;
+const MAX_EXTRACTED_URL_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlExtraction {
     pub urls: Vec<String>,
@@ -567,10 +570,10 @@ pub fn extract_urls(text: &str) -> UrlExtraction {
         }
 
         let candidate = trim_url_candidate(&text[start..end]);
-        if url_has_scheme_body(candidate) {
+        if url_is_extractable(candidate) {
             let url = candidate.to_string();
             last = Some(url.clone());
-            if seen.insert(url.clone()) {
+            if urls.len() < MAX_EXTRACTED_URLS && seen.insert(url.clone()) {
                 urls.push(url);
             }
         }
@@ -589,13 +592,23 @@ pub fn write_numbered_urls(urls: &[String], stdout: &mut impl Write) -> Result<(
 }
 
 fn find_next_url_scheme(text: &str, offset: usize) -> Option<usize> {
-    let rest = text.get(offset..)?;
-    match (rest.find("http://"), rest.find("https://")) {
-        (Some(http), Some(https)) => Some(offset + http.min(https)),
-        (Some(http), None) => Some(offset + http),
-        (None, Some(https)) => Some(offset + https),
-        (None, None) => None,
+    let bytes = text.as_bytes();
+    let mut index = offset.min(bytes.len());
+    while index < bytes.len() {
+        if ascii_starts_with_ignore_case(bytes, index, b"http://")
+            || ascii_starts_with_ignore_case(bytes, index, b"https://")
+        {
+            return Some(index);
+        }
+        index += 1;
     }
+    None
+}
+
+fn ascii_starts_with_ignore_case(value: &[u8], offset: usize, needle: &[u8]) -> bool {
+    value
+        .get(offset..offset.saturating_add(needle.len()))
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 fn is_url_terminator(ch: char) -> bool {
@@ -604,43 +617,86 @@ fn is_url_terminator(ch: char) -> bool {
 
 fn trim_url_candidate(candidate: &str) -> &str {
     let mut end = candidate.len();
+    let mut delimiters = DelimiterCounts::scan(candidate);
     while end > 0 {
         let current = &candidate[..end];
         let Some(ch) = current.chars().next_back() else {
             break;
         };
-        let trim = matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
-            || unmatched_closing_delimiter(current, ch);
+        let trim =
+            matches!(ch, '.' | ',' | ';' | ':' | '!' | '?') || delimiters.unmatched_closing(ch);
         if !trim {
             break;
         }
+        delimiters.remove(ch);
         end -= ch.len_utf8();
     }
     &candidate[..end]
 }
 
-fn unmatched_closing_delimiter(value: &str, ch: char) -> bool {
-    match ch {
-        ')' => {
-            value.chars().filter(|c| *c == ')').count()
-                > value.chars().filter(|c| *c == '(').count()
+#[derive(Debug, Default)]
+struct DelimiterCounts {
+    open_parens: usize,
+    close_parens: usize,
+    open_brackets: usize,
+    close_brackets: usize,
+    open_braces: usize,
+    close_braces: usize,
+}
+
+impl DelimiterCounts {
+    fn scan(value: &str) -> Self {
+        let mut counts = Self::default();
+        for ch in value.chars() {
+            match ch {
+                '(' => counts.open_parens += 1,
+                ')' => counts.close_parens += 1,
+                '[' => counts.open_brackets += 1,
+                ']' => counts.close_brackets += 1,
+                '{' => counts.open_braces += 1,
+                '}' => counts.close_braces += 1,
+                _ => {}
+            }
         }
-        ']' => {
-            value.chars().filter(|c| *c == ']').count()
-                > value.chars().filter(|c| *c == '[').count()
+        counts
+    }
+
+    fn unmatched_closing(&self, ch: char) -> bool {
+        match ch {
+            ')' => self.close_parens > self.open_parens,
+            ']' => self.close_brackets > self.open_brackets,
+            '}' => self.close_braces > self.open_braces,
+            _ => false,
         }
-        '}' => {
-            value.chars().filter(|c| *c == '}').count()
-                > value.chars().filter(|c| *c == '{').count()
+    }
+
+    fn remove(&mut self, ch: char) {
+        match ch {
+            '(' => self.open_parens = self.open_parens.saturating_sub(1),
+            ')' => self.close_parens = self.close_parens.saturating_sub(1),
+            '[' => self.open_brackets = self.open_brackets.saturating_sub(1),
+            ']' => self.close_brackets = self.close_brackets.saturating_sub(1),
+            '{' => self.open_braces = self.open_braces.saturating_sub(1),
+            '}' => self.close_braces = self.close_braces.saturating_sub(1),
+            _ => {}
         }
-        _ => false,
     }
 }
 
+fn url_is_extractable(url: &str) -> bool {
+    url.len() <= MAX_EXTRACTED_URL_BYTES && url_has_scheme_body(url)
+}
+
 fn url_has_scheme_body(url: &str) -> bool {
-    url.strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .is_some_and(|body| !body.is_empty())
+    let bytes = url.as_bytes();
+    let scheme_len = if ascii_starts_with_ignore_case(bytes, 0, b"http://") {
+        "http://".len()
+    } else if ascii_starts_with_ignore_case(bytes, 0, b"https://") {
+        "https://".len()
+    } else {
+        return false;
+    };
+    bytes.len() > scheme_len
 }
 
 #[derive(Serialize)]
@@ -6263,21 +6319,21 @@ mod tests {
         AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
-        KeyboardProtocolRestoreState, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
-        MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector,
-        NestedAgentTransition, ProcessInfo, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
-        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
-        StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
-        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
-        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
-        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
-        compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
+        MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
+        MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector, NestedAgentTransition, ProcessInfo,
+        ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
+        STATUS_PAYLOAD_CWD_CAP, StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot,
+        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
+        StatusTheme, SurfaceKind, TerminalOutputTracker, agent_name_from_command,
+        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
+        anyhow_error_is_broken_pipe, apply_pending_status_command, attach_pty_rows,
+        build_status_payload, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled, current_unix_ms,
+        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_urls, format_status_line,
         forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
         hex_encode, hex_encoded_len, interruptible_sleep, is_self_provided_tmux,
@@ -6340,6 +6396,74 @@ mod tests {
         let extraction = extract_urls("no links http:// https://");
         assert!(extraction.urls.is_empty());
         assert!(extraction.last.is_none());
+    }
+
+    #[test]
+    fn extract_urls_matches_schemes_case_insensitively_and_preserves_text() {
+        let extraction = extract_urls("go HTTP://Upper.Example/path then HtTpS://Mixed.Example/ok");
+        assert_eq!(
+            extraction.urls,
+            vec!["HTTP://Upper.Example/path", "HtTpS://Mixed.Example/ok"]
+        );
+        assert_eq!(extraction.last.as_deref(), Some("HtTpS://Mixed.Example/ok"));
+    }
+
+    #[test]
+    fn extract_urls_trims_trailing_delimiters_without_recounting_each_suffix() {
+        let noisy_suffix = ")".repeat(512);
+        let input = format!("https://example.test/a(b){noisy_suffix} https://done.test/ok");
+        let extraction = extract_urls(&input);
+        assert_eq!(
+            extraction.urls,
+            vec!["https://example.test/a(b)", "https://done.test/ok"]
+        );
+        assert_eq!(extraction.last.as_deref(), Some("https://done.test/ok"));
+    }
+
+    #[test]
+    fn extract_urls_skips_over_length_tokens_without_truncating() {
+        let long_url = format!(
+            "https://example.test/{}",
+            "a".repeat(MAX_EXTRACTED_URL_BYTES)
+        );
+        let extraction = extract_urls(&format!("{long_url} https://ok.test/done"));
+        assert_eq!(extraction.urls, vec!["https://ok.test/done"]);
+        assert_eq!(extraction.last.as_deref(), Some("https://ok.test/done"));
+        assert!(
+            !extraction
+                .urls
+                .iter()
+                .any(|url| url.starts_with(&long_url[..128]))
+        );
+    }
+
+    #[test]
+    fn extract_urls_caps_unique_rows_but_keeps_newest_valid_last() {
+        let mut input = String::new();
+        for index in 0..(MAX_EXTRACTED_URLS + 5) {
+            input.push_str(&format!("https://u{index}.example/path "));
+        }
+
+        let extraction = extract_urls(&input);
+        assert_eq!(extraction.urls.len(), MAX_EXTRACTED_URLS);
+        assert_eq!(
+            extraction.urls.first().map(String::as_str),
+            Some("https://u0.example/path")
+        );
+        assert_eq!(
+            extraction.urls.last().map(String::as_str),
+            Some("https://u255.example/path")
+        );
+        assert_eq!(
+            extraction.last.as_deref(),
+            Some("https://u260.example/path")
+        );
+        assert!(
+            !extraction
+                .urls
+                .iter()
+                .any(|url| url == "https://u256.example/path")
+        );
     }
 
     #[test]

@@ -254,6 +254,8 @@ def validate_value(
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             errors.append(f"{path}: expected at least {schema['minItems']} items, got {len(value)}")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path}: expected at most {schema['maxItems']} items, got {len(value)}")
         items = schema.get("items")
         if items is not None:
             for idx, item in enumerate(value):
@@ -261,6 +263,8 @@ def validate_value(
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
             errors.append(f"{path}: expected length at least {schema['minLength']}, got {len(value)}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append(f"{path}: expected length at most {schema['maxLength']}, got {len(value)}")
         if "pattern" in schema:
             pattern = schema["pattern"]
             if not isinstance(pattern, str):

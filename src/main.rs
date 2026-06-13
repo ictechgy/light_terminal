@@ -833,11 +833,7 @@ fn run() -> Result<()> {
             json,
         } => {
             let extraction = client::capture_urls(&target, tail)?;
-            let urls = if last {
-                extraction.last.into_iter().collect::<Vec<_>>()
-            } else {
-                extraction.urls
-            };
+            let urls = select_url_output(extraction, last);
             if json {
                 println!("{}", serde_json::to_string(&urls)?);
             } else if last {
@@ -1014,6 +1010,14 @@ fn run() -> Result<()> {
             target,
             ssh_args,
         } => ssh_attach(&host, &target, ssh_args),
+    }
+}
+
+fn select_url_output(extraction: client::UrlExtraction, last: bool) -> Vec<String> {
+    if last {
+        extraction.last.into_iter().collect()
+    } else {
+        extraction.urls
     }
 }
 
@@ -3695,6 +3699,36 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn urls_last_json_selection_is_zero_or_one_item_after_unique_cap() {
+        let mut urls = Vec::new();
+        for index in 0..256 {
+            urls.push(format!("https://u{index}.example/path"));
+        }
+        let selected = select_url_output(
+            client::UrlExtraction {
+                urls,
+                last: Some("https://u260.example/path".to_string()),
+            },
+            true,
+        );
+        assert_eq!(selected, vec!["https://u260.example/path"]);
+        assert_eq!(
+            serde_json::to_string(&selected).unwrap(),
+            r#"["https://u260.example/path"]"#
+        );
+
+        let selected = select_url_output(
+            client::UrlExtraction {
+                urls: Vec::new(),
+                last: None,
+            },
+            true,
+        );
+        assert!(selected.is_empty());
+        assert_eq!(serde_json::to_string(&selected).unwrap(), "[]");
     }
 
     #[test]

@@ -305,14 +305,19 @@
       "schema_path": "docs/schemas/urls.schema.json",
       "tests": [
         "cargo test --bin lterm urls_parses_flags_and_validates_tail",
+        "cargo test --bin lterm urls_last_json_selection_is_zero_or_one_item_after_unique_cap",
         "cargo test --bin lterm extract_urls_finds_trims_and_deduplicates_recent_links",
+        "cargo test --bin lterm extract_urls_trims_trailing_delimiters_without_recounting_each_suffix",
+        "cargo test --bin lterm extract_urls_matches_schemes_case_insensitively_and_preserves_text",
+        "cargo test --bin lterm extract_urls_skips_over_length_tokens_without_truncating",
+        "cargo test --bin lterm extract_urls_caps_unique_rows_but_keeps_newest_valid_last",
         "cargo test --test cli_smoke urls_extracts_recent_sanitized_scrollback_links",
         "cargo test --test cli_smoke urls_empty_results_are_machine_friendly"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Urls is a sanitized scrollback report surface. It scans the last --tail sanitized lines, never attaches to or rewrites the raw PTY stream, prints stable numbered text rows by default, emits the newest detected URL for --last, and emits a stable JSON string array for --json. Empty text modes produce no rows; empty JSON mode produces [].",
+      "stability_scope": "Urls is a sanitized scrollback report surface. It scans the last --tail sanitized lines, never attaches to or rewrites the raw PTY stream, prints stable numbered text rows by default, and emits a stable JSON string array for --json. Extraction matches http:// and https:// schemes ASCII-case-insensitively while preserving the original URL text. Text and JSON consume the same extracted URL set: first-seen exact-text deduplicated URLs capped at 256 rows, complete URL tokens longer than 4096 bytes skipped instead of truncated, and whitespace/control-bearing tokens excluded. --last emits the newest valid within-length URL occurrence in the captured tail, even if that occurrence is a duplicate or appears after the 256-row unique-list cap; --last --json emits [] or a one-element array. Empty text modes produce no rows; empty JSON mode produces [].",
       "json_samples": [
         {
           "setup": [
