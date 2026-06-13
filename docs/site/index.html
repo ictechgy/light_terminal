@@ -342,11 +342,11 @@
           <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible terminal session daemon for Claude Code, Codex CLI,
-            Gemini CLI, OpenCode, cmux, and other terminal-first agent workflows.
+            Gemini CLI, OpenCode, and other terminal-first agent workflows — including agents running inside cmux.
           </p>
           <p class="lead" data-lang="ko">
-            Claude Code, Codex CLI, Gemini CLI, OpenCode, cmux 같은 터미널 기반 AI 에이전트 워크플로를 위해
-            만든 가벼운 tmux 호환 세션 데몬입니다.
+            Claude Code, Codex CLI, Gemini CLI, OpenCode 같은 터미널 기반 AI 에이전트 워크플로(그리고 이를
+            cmux 안에서 실행하는 경우)를 위해 만든 가벼운 tmux 호환 세션 데몬입니다.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#install" data-lang="en">Install lterm</a>
@@ -508,8 +508,12 @@
               <tr data-lang="ko"><td>세션 열기 또는 생성</td><td><code>lterm open main</code></td><td><code>attach-or-new</code></td></tr>
               <tr data-lang="en"><td>Resume a session</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
               <tr data-lang="ko"><td>기존 세션에 다시 연결</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
-              <tr data-lang="en"><td>Read sanitized scrollback</td><td><code>lterm logs api --start=-80</code></td><td><code>capture</code></td></tr>
-              <tr data-lang="ko"><td>정제된 scrollback 확인</td><td><code>lterm logs api --start=-80</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="en"><td>Review an agent session in mobile scrollback</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td>Force with <code>--mobile</code>; force raw with <code>--raw</code></td></tr>
+              <tr data-lang="ko"><td>모바일 scrollback에서 agent 세션 확인</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td><code>--mobile</code>로 강제; 기존 raw attach는 <code>--raw</code></td></tr>
+              <tr data-lang="en"><td>Read sanitized scrollback</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="ko"><td>정제된 scrollback 확인</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="en"><td>Extract recent URLs</td><td><code>lterm urls api --last</code></td><td>none</td></tr>
+              <tr data-lang="ko"><td>최근 URL 추출</td><td><code>lterm urls api --last</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Wait for a marker or exit</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>none</td></tr>
               <tr data-lang="ko"><td>마커가 나오거나 종료될 때까지 대기</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Notify on completion</td><td><code>lterm watch api --exit --notify</code></td><td>none</td></tr>
@@ -544,8 +548,12 @@
             <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
           </div>
           <div class="callout">
+            <p data-lang="en"><strong>Extracted URLs are untrusted.</strong> <code>lterm urls</code> helps copy terminal links on small screens, but extracted URLs may include phishing links or short-lived auth/login credentials. It reports at most 256 unique ASCII URL tokens and skips raw candidates over 4096 bytes; in mobile transcript mode, the <code>/links</code> and <code>/urls</code> commands stay local-only. <code>--last</code> prints only the newest valid link, so use it only when you know that link is the one you want.</p>
+            <p data-lang="ko"><strong>추출된 URL은 신뢰할 수 없습니다.</strong> <code>lterm urls</code>는 작은 화면에서 터미널 링크를 복사할 때 유용하지만, 추출된 URL에는 phishing link나 짧게 살아 있는 인증/login credential이 포함될 수 있습니다. 최대 256개의 unique ASCII URL token만 보고하고, 4096 byte를 넘는 raw candidate는 건너뛰며, mobile transcript의 <code>/links</code> / <code>/urls</code> 명령은 로컬에서만 처리됩니다. <code>--last</code>는 최신 valid link 하나만 출력하므로, 그 링크가 원하는 링크임을 알 때만 사용하세요.</p>
+          </div>
+          <div class="callout">
             <p data-lang="en"><strong>Agent TUI colors stay independent.</strong> Agent launchers do not forward ambient <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, or <code>CLICOLOR_FORCE</code> from the client or daemon, while ordinary sessions preserve those variables.</p>
-            <p data-lang="ko"><strong>Agent TUI 색상은 분리해 다룹니다.</strong> agent launcher는 클라이언트나 daemon의 ambient <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, <code>CLICOLOR_FORCE</code>를 agent child에 전달하지 않고, 일반 세션은 이 변수들을 그대로 보존합니다.</p>
+            <p data-lang="ko"><strong>Agent TUI 색상은 분리해 다룹니다.</strong> agent launcher는 클라이언트나 데몬에 설정된 <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, <code>CLICOLOR_FORCE</code> 환경값을 agent child process에 전달하지 않고, 일반 세션은 이 변수들을 그대로 보존합니다.</p>
           </div>
         </div>
       </div>

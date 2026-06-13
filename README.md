@@ -141,7 +141,7 @@ lterm -a api
 | Run a command with tmux compatibility enabled | `lterm run -- codex exec "summarize"` | None (`--no-tmux` opts out) |
 | Open or create a session | `lterm open main` | `attach-or-new` |
 | Resume an existing session | `lterm resume api` | `attach`, `a`, `-a` |
-| Review an agent session from mobile scrollback | `LTERM_MOBILE=1 lterm resume codex-lterm` | Force with `--mobile`; bypass with `--raw` |
+| Review an agent session in mobile scrollback | `LTERM_MOBILE=1 lterm resume codex-lterm` | Force with `--mobile`; force raw with `--raw` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
@@ -366,7 +366,7 @@ lterm gemini -- -p "summarize this repo"  # Gemini CLI also accepts -p
 lterm agents
 ```
 
-These are thin profile aliases for:
+These are thin profile aliases — for example:
 
 ```bash
 lterm agent claude
@@ -478,7 +478,7 @@ Support tiers are `full`, `partial`, and `noop` within lterm's compatibility
 boundary. Set `LTERM_DEBUG_TMUX=1` to emit an opt-in stderr diagnostic row when
 an unsupported tmux command reaches the shim.
 
-Status-bar redraws use xterm SGR stack controls only on conservatively allowlisted terminal clients (for example xterm/iTerm2/WezTerm identities) to avoid stealing the foreground/background color state of the running TUI. Set `LTERM_STATUS_SGR_STACK=0` to disable `CSI # {` / `CSI # }`; set it to `1` to force the stack after verifying your client supports or safely ignores those private CSI sequences. Kitty, Alacritty, Ghostty, Termius, and generic `TERM=xterm-*` values stay opt-in until their SGR-stack behavior is verified.
+Status bar redraws use xterm SGR stack controls only on conservatively allowlisted terminal clients (for example xterm/iTerm2/WezTerm identities) to avoid stealing the foreground/background color state of the running TUI. Set `LTERM_STATUS_SGR_STACK=0` to disable `CSI # {` / `CSI # }`; set it to `1` to force the stack after verifying your client supports or safely ignores those private CSI sequences. Kitty, Alacritty, Ghostty, Termius, and generic `TERM=xterm-*` values stay opt-in until their SGR-stack behavior is verified.
 
 When lterm mirrors session identity into cmux understatus pills, it probes `cmux set-status --help` without mutating cmux state. Builds that advertise `--label` receive labeled status rows; older cmux builds keep working because lterm omits the unsupported flag.
 
