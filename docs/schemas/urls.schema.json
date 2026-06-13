@@ -3,6 +3,7 @@
   "title": "lterm urls --json output",
   "type": "array",
   "maxItems": 256,
+  "uniqueItems": true,
   "items": {
     "type": "string",
     "minLength": 8,

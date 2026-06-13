@@ -160,7 +160,7 @@ sanitized lines and never attaches to, rewrites, or forwards data into the raw
 PTY stream. Extraction matches `http://` and `https://` schemes
 ASCII-case-insensitively while preserving the original URL text in output. The
 numbered text rows and `--json` array use the same extracted URL set: first-seen
-exact-text deduplicated ASCII URL tokens capped at 256 rows, complete raw URL
+exact-text deduplicated unique ASCII URL tokens capped at 256 rows, complete raw URL
 candidates longer than 4096 bytes are skipped before trimming rather than
 truncated, and whitespace/control-bearing or non-ASCII URL tokens are
 excluded. `--last` reports the newest valid within-length URL

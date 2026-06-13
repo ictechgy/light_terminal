@@ -256,6 +256,17 @@ def validate_value(
             errors.append(f"{path}: expected at least {schema['minItems']} items, got {len(value)}")
         if "maxItems" in schema and len(value) > schema["maxItems"]:
             errors.append(f"{path}: expected at most {schema['maxItems']} items, got {len(value)}")
+        if schema.get("uniqueItems") is True:
+            seen_items: set[str] = set()
+            for idx, item in enumerate(value):
+                try:
+                    fingerprint = json.dumps(item, sort_keys=True, separators=(",", ":"))
+                except TypeError:
+                    fingerprint = repr(item)
+                if fingerprint in seen_items:
+                    errors.append(f"{path}[{idx}]: duplicate item violates uniqueItems")
+                    break
+                seen_items.add(fingerprint)
         items = schema.get("items")
         if items is not None:
             for idx, item in enumerate(value):
