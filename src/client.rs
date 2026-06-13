@@ -569,7 +569,12 @@ pub fn extract_urls(text: &str) -> UrlExtraction {
             }
         }
 
-        let candidate = trim_url_candidate(&text[start..end]);
+        let raw_candidate = &text[start..end];
+        if raw_candidate.len() > MAX_EXTRACTED_URL_BYTES {
+            offset = if end > start { end } else { start + 1 };
+            continue;
+        }
+        let candidate = trim_url_candidate(raw_candidate);
         if url_is_extractable(candidate) {
             let url = candidate.to_string();
             last = Some(url.clone());
@@ -684,7 +689,7 @@ impl DelimiterCounts {
 }
 
 fn url_is_extractable(url: &str) -> bool {
-    url.len() <= MAX_EXTRACTED_URL_BYTES && url_has_scheme_body(url)
+    url.is_ascii() && url.len() <= MAX_EXTRACTED_URL_BYTES && url_has_scheme_body(url)
 }
 
 fn url_has_scheme_body(url: &str) -> bool {
@@ -6435,6 +6440,24 @@ mod tests {
                 .iter()
                 .any(|url| url.starts_with(&long_url[..128]))
         );
+    }
+
+    #[test]
+    fn extract_urls_skips_raw_candidates_over_length_before_trimming() {
+        let candidate = format!(
+            "https://example.test/ok{}",
+            ")".repeat(MAX_EXTRACTED_URL_BYTES)
+        );
+        let extraction = extract_urls(&format!("{candidate} https://ok.test/done"));
+        assert_eq!(extraction.urls, vec!["https://ok.test/done"]);
+        assert_eq!(extraction.last.as_deref(), Some("https://ok.test/done"));
+    }
+
+    #[test]
+    fn extract_urls_skips_non_ascii_tokens_to_keep_schema_byte_caps_standard() {
+        let extraction = extract_urls("https://example.test/é https://ok.test/ascii");
+        assert_eq!(extraction.urls, vec!["https://ok.test/ascii"]);
+        assert_eq!(extraction.last.as_deref(), Some("https://ok.test/ascii"));
     }
 
     #[test]
