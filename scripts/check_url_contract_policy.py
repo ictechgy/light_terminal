@@ -41,14 +41,18 @@ def read(path: Path) -> str:
 
 
 def rust_usize_const(source: str, name: str) -> int:
+    integer_literal = r"(0[xX][0-9A-Fa-f_]+|0[oO][0-7_]+|0[bB][01_]+|[0-9][0-9_]*)"
     pattern = re.compile(
-        rf"^\s*(?:pub\s+)?const\s+{re.escape(name)}\s*:\s*usize\s*=\s*([0-9][0-9_]*)(?:usize)?\s*;",
+        rf"^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+{re.escape(name)}\s*:\s*usize\s*=\s*{integer_literal}(?:usize)?\s*;",
         re.MULTILINE,
     )
     match = pattern.search(source)
     if not match:
         raise ValueError(f"missing Rust usize const {name}")
-    return int(match.group(1).replace("_", ""))
+    literal = match.group(1).replace("_", "")
+    if literal.lower().startswith(("0x", "0o", "0b")):
+        return int(literal, 0)
+    return int(literal, 10)
 
 
 def require(condition: bool, message: str, errors: list[str]) -> None:
@@ -60,13 +64,21 @@ def normalized(value: str) -> str:
     return " ".join(value.split())
 
 
+def exact_number_text_pattern(value: str) -> re.Pattern[str]:
+    parts: list[str] = []
+    last = 0
+    for match in re.finditer(r"\d+", value):
+        parts.append(re.escape(value[last : match.start()]))
+        parts.append(rf"(?<!\d){re.escape(match.group(0))}(?!\d)")
+        last = match.end()
+    parts.append(re.escape(value[last:]))
+    return re.compile("".join(parts))
+
+
 def require_text(text: str, needle: str, label: str, errors: list[str]) -> None:
     haystack = normalized(text)
     expected = normalized(needle)
-    if expected[:1].isdigit():
-        found = re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", haystack) is not None
-    else:
-        found = expected in haystack
+    found = exact_number_text_pattern(expected).search(haystack) is not None if any(char.isdigit() for char in expected) else expected in haystack
     require(found, f"{label}: missing {needle!r}", errors)
 
 
@@ -277,9 +289,10 @@ def run_self_test() -> int:
         failures.extend(assert_self_test_case("missing README warning", missing_readme_warning, "untrusted terminal output"))
 
         rust_literal_formats = root / "rust-literal-formats"
-        write_fixture(rust_literal_formats)
+        write_fixture(rust_literal_formats, max_urls=17, max_bytes=4096)
         (rust_literal_formats / "src" / "client.rs").write_text(
-            "const MAX_EXTRACTED_URLS: usize = 1_7usize;\nconst MAX_EXTRACTED_URL_BYTES: usize = 9_9_usize;\n",
+            "pub(crate) const MAX_EXTRACTED_URLS: usize = 1_7usize;\n"
+            "pub(super) const MAX_EXTRACTED_URL_BYTES: usize = 0x1_000usize;\n",
             encoding="utf-8",
         )
         failures.extend(assert_self_test_case("rust literal formats", rust_literal_formats))
