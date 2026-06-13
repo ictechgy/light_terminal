@@ -41,11 +41,14 @@ def read(path: Path) -> str:
 
 
 def rust_usize_const(source: str, name: str) -> int:
-    pattern = re.compile(rf"^\s*(?:pub\s+)?const\s+{re.escape(name)}\s*:\s*usize\s*=\s*(\d+)\s*;", re.MULTILINE)
+    pattern = re.compile(
+        rf"^\s*(?:pub\s+)?const\s+{re.escape(name)}\s*:\s*usize\s*=\s*([0-9][0-9_]*)(?:usize)?\s*;",
+        re.MULTILINE,
+    )
     match = pattern.search(source)
     if not match:
         raise ValueError(f"missing Rust usize const {name}")
-    return int(match.group(1))
+    return int(match.group(1).replace("_", ""))
 
 
 def require(condition: bool, message: str, errors: list[str]) -> None:
@@ -58,7 +61,13 @@ def normalized(value: str) -> str:
 
 
 def require_text(text: str, needle: str, label: str, errors: list[str]) -> None:
-    require(normalized(needle) in normalized(text), f"{label}: missing {needle!r}", errors)
+    haystack = normalized(text)
+    expected = normalized(needle)
+    if expected[:1].isdigit():
+        found = re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", haystack) is not None
+    else:
+        found = expected in haystack
+    require(found, f"{label}: missing {needle!r}", errors)
 
 
 def find_manifest_entry(manifest: dict, command: str) -> dict:
@@ -266,6 +275,23 @@ def run_self_test() -> int:
         write_fixture(missing_readme_warning)
         (missing_readme_warning / "README.md").write_text("No warning here.\n", encoding="utf-8")
         failures.extend(assert_self_test_case("missing README warning", missing_readme_warning, "untrusted terminal output"))
+
+        rust_literal_formats = root / "rust-literal-formats"
+        write_fixture(rust_literal_formats)
+        (rust_literal_formats / "src" / "client.rs").write_text(
+            "const MAX_EXTRACTED_URLS: usize = 1_7usize;\nconst MAX_EXTRACTED_URL_BYTES: usize = 9_9_usize;\n",
+            encoding="utf-8",
+        )
+        failures.extend(assert_self_test_case("rust literal formats", rust_literal_formats))
+
+        numeric_substring_drift = root / "numeric-substring-drift"
+        write_fixture(numeric_substring_drift, max_urls=9, max_bytes=99)
+        (numeric_substring_drift / "README.md").write_text(
+            "`lterm urls` returns 19 unique ASCII URL tokens and skips tokens over 199 bytes. "
+            "Treat extracted links as untrusted terminal output.\n",
+            encoding="utf-8",
+        )
+        failures.extend(assert_self_test_case("numeric substring drift", numeric_substring_drift, "99 bytes"))
 
     if failures:
         print("FAIL URL contract policy self-test:", file=sys.stderr)

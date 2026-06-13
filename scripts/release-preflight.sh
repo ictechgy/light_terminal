@@ -172,6 +172,7 @@ fi
 run python3 scripts/validate_contract_manifest.py docs/contract-manifest.json
 run node scripts/validate_npm_packages.mjs
 run python3 scripts/validate_json_schemas.py --manifest docs/contract-manifest.json --schema-dir docs/schemas --lterm-bin "$LTERM_BIN"
+run python3 scripts/check_url_contract_policy.py --self-test
 run python3 scripts/check_url_contract_policy.py
 LTERM_BIN="$LTERM_BIN" run python3 scripts/check_contract_examples.py --manifest docs/contract-manifest.json README.md docs/public-contract.md
 run python3 scripts/check_contract_drift.py --self-test
