@@ -70,9 +70,13 @@ only generic SSH variables such as `SSH_TTY` and `TERM=xterm-256color` stay on
 the raw path unless the user explicitly opts into mobile transcript mode.
 Scripts that need deterministic behavior should use explicit flags/env. The
 transcript surface is non-attached: it displays sanitized capture output, sends
-input through the existing `input` / `send` path, does not enter alternate
+unrecognized input through the existing `input` / `send` path, handles local
+commands such as `/refresh`, `/raw`, `/links`, `/urls`, `/exit`, and `/quit`
+without forwarding those command lines to the PTY, does not enter alternate
 screen, does not increment attached-client counts, and does not resize PTY
-geometry. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
+geometry. `/links` and `/urls` reuse the URL extraction surface locally and print
+`No URLs found in current transcript.` when the current sanitized transcript has
+no links. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
 lterm-owned text so stale host terminal colors do not leak into sanitized
 scrollback; that reset is not captured PTY payload and does not relax capture
 sanitization. `--raw` / `LTERM_ATTACH_MODE=raw`
