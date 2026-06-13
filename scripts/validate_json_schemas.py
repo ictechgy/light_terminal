@@ -265,6 +265,10 @@ def validate_value(
             errors.append(f"{path}: expected length at least {schema['minLength']}, got {len(value)}")
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append(f"{path}: expected length at most {schema['maxLength']}, got {len(value)}")
+        if "x-maxUtf8Bytes" in schema and len(value.encode("utf-8")) > schema["x-maxUtf8Bytes"]:
+            errors.append(
+                f"{path}: expected UTF-8 length at most {schema['x-maxUtf8Bytes']} bytes, got {len(value.encode('utf-8'))}"
+            )
         if "pattern" in schema:
             pattern = schema["pattern"]
             if not isinstance(pattern, str):
