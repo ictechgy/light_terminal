@@ -168,7 +168,7 @@ lterm -a api
 | profile 기반 agent 세션 실행 | `lterm agent claude -- --help` | sibling shortcuts: `lterm claude`, `lterm codex`, `lterm opencode`, `lterm copilot`, `lterm cursor-agent`, `lterm agy`, `lterm jules`, `lterm kiro`, `lterm aider`, `lterm goose`, `lterm amp`, `lterm crush`, `lterm kimi`, `lterm qwen`, `lterm gemini`, `lterm omx`, `lterm omc` |
 | 사용 가능한 agent profile 확인 | `lterm agents --json` | 실행 시점의 `PATH` 사용 가능 여부 확인 |
 | `tmux` 호환 shim 설치 | `lterm install-shim` | `lterm tmux-compat`으로 전달하는 shim 생성 |
-| tmux 호환 shell export 출력 | `eval "$(lterm env)"` (`lterm env --shell fish \| source` for fish) | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
+| tmux 호환 shell export 출력 | `eval "$(lterm env)"` (fish는 `lterm env --shell fish \| source`) | shim dir을 `$PATH` 앞에 추가하는 신뢰된 `export` 행 출력 |
 | shell completion 설치 | `lterm install-completions --shell bash\|zsh\|fish` | 사용자 로컬 completion 파일을 쓰고 필요한 활성화 hint를 출력하며 daemon은 시작하지 않음 |
 | AI CLI statusline badge 설치 | `lterm install-ai-statusline` | 지원 statusline 통합을 설치함; Claude/OMC에는 `lt:<session>:<pane>` command wrapper를 넣고, Codex는 아직 `LTERM_SESSION` / `LTERM_PANE`용 custom item을 받지 않으므로 skipped로 보고하고 config는 건드리지 않음 |
 | shell completion 생성 | `lterm completions bash\|zsh\|fish` | completion script만 출력하며 session을 조회하거나 daemon을 시작하지 않음 |
@@ -278,7 +278,7 @@ child 애플리케이션이 `CSI u` enhancement sequence로 Kitty keyboard proto
 
 **세션 확인 및 제어:**
 
-`--children`는 관리되는 자식 pane을 포함하고, `--all`은 기본 목록에서 숨겨지는 세션까지 포함합니다.
+`--children`는 관리되는 하위 pane을 포함하고, `--all`은 기본 목록에서 숨겨지는 세션까지 포함합니다.
 
 ```bash
 lterm sessions
@@ -328,17 +328,17 @@ lterm close api
 
 `kill`은 `close`의 visible compatibility alias입니다. 두 이름 모두 같은 session/pane 종료 경로를 사용합니다.
 
-**daemon 명시 실행 (고급):**
+**데몬 명시 실행 (고급):**
 
 ```bash
-# 일반 client 명령은 필요할 때 daemon을 시작합니다. supervisor/debugging 용도로 직접 실행하세요.
+# 일반 client 명령은 필요할 때 데몬을 시작합니다. supervisor/debugging 용도로 직접 실행하세요.
 lterm daemon
 ```
 
-**daemon과 그 daemon이 소유한 모든 세션 종료:**
+**데몬과 그 데몬이 소유한 모든 세션 종료:**
 
 ```bash
-# 단일 세션 close가 아니라 daemon-wide 종료입니다.
+# 단일 세션 close가 아니라 데몬 전체 종료입니다.
 lterm shutdown
 ```
 
@@ -433,6 +433,7 @@ lterm omx --madmax --xhigh
 
 ```bash
 lterm omc team
+# 여기서 테스트한 OMC 빌드는 --xhigh를 거부합니다.
 # 설치된 `omc --help`에 --xhigh가 보이지 않는다면 --xhigh 없이 --madmax만 사용하세요.
 lterm omc --madmax
 ```
@@ -525,7 +526,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 ## 구조
 
-- **Daemon** — 사용자별 Unix socket 하나를 `$XDG_RUNTIME_DIR` 아래에 만들고, 없으면 `/tmp` 아래 소유자 전용 fallback 경로를 사용합니다.
+- **데몬** — 사용자별 Unix socket 하나를 `$XDG_RUNTIME_DIR` 아래에 만들고, 없으면 `/tmp` 아래 소유자 전용 fallback 경로를 사용합니다.
 - **PTY 세션** — `portable-pty`로 실행하며 ring-buffer scrollback을 유지합니다.
 - **Attach protocol** — CLI가 Unix socket으로 JSON을 보낸 뒤, 선택적으로 로컬 상태 바를 위해 아래쪽 한 줄을 예약하고 PTY byte stream을 전달합니다.
 - **tmux shim** — `tmux`라는 작은 shell script가 명령을 `lterm tmux-compat`으로 넘깁니다.
