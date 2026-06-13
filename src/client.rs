@@ -2540,30 +2540,20 @@ fn run_interactive_mobile_transcript(
         match input_rx.recv_timeout(refresh) {
             Ok(Ok(Some(input))) => {
                 let input = trim_line_endings(&input);
-                match input {
-                    "/exit" | "/quit" => return Ok(()),
-                    "/refresh" => {
-                        let capture = capture_range(target, Some(tail_start), None)?;
-                        last_capture.clear();
-                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
-                    }
-                    "/raw" => {
-                        writeln!(
-                            stdout,
-                            "{MOBILE_TRANSCRIPT_SGR_RESET}raw attach: {}",
-                            raw_attach_command_hint(target)?
-                        )
-                        .context("write raw attach hint")?;
-                    }
-                    "/links" | "/urls" => {
-                        let capture = capture_range(target, Some(tail_start), None)?;
-                        write_mobile_transcript_urls(&capture, &mut stdout)?;
-                    }
-                    _ => {
-                        send(target, compose_commit_bytes(input, options.append_enter))?;
-                        let capture = capture_range(target, Some(tail_start), None)?;
-                        write_mobile_transcript_update(&mut last_capture, &capture, &mut stdout)?;
-                    }
+                if !handle_mobile_transcript_input(
+                    input,
+                    MobileTranscriptInputContext {
+                        target,
+                        tail_start,
+                        append_enter: options.append_enter,
+                    },
+                    &mut last_capture,
+                    &mut stdout,
+                    capture_range,
+                    send,
+                    raw_attach_command_hint,
+                )? {
+                    return Ok(());
                 }
                 writeln!(stdout).context("separate mobile prompt")?;
                 write_mobile_transcript_prompt(&mut stdout)?;
@@ -2587,6 +2577,62 @@ fn run_interactive_mobile_transcript(
     }
 }
 
+#[derive(Clone, Copy)]
+struct MobileTranscriptInputContext<'a> {
+    target: &'a str,
+    tail_start: i32,
+    append_enter: bool,
+}
+
+fn handle_mobile_transcript_input<C, S, R, W>(
+    input: &str,
+    context: MobileTranscriptInputContext<'_>,
+    last_capture: &mut String,
+    stdout: &mut W,
+    mut capture: C,
+    mut send_input: S,
+    mut raw_hint: R,
+) -> Result<bool>
+where
+    C: FnMut(&str, Option<i32>, Option<i32>) -> Result<String>,
+    S: FnMut(&str, Vec<u8>) -> Result<()>,
+    R: FnMut(&str) -> Result<String>,
+    W: Write,
+{
+    match input {
+        "/exit" | "/quit" => Ok(false),
+        "/refresh" => {
+            let capture = capture(context.target, Some(context.tail_start), None)?;
+            last_capture.clear();
+            write_mobile_transcript_update(last_capture, &capture, stdout)?;
+            Ok(true)
+        }
+        "/raw" => {
+            writeln!(
+                stdout,
+                "{MOBILE_TRANSCRIPT_SGR_RESET}raw attach: {}",
+                raw_hint(context.target)?
+            )
+            .context("write raw attach hint")?;
+            Ok(true)
+        }
+        "/links" | "/urls" => {
+            let capture = capture(context.target, Some(context.tail_start), None)?;
+            write_mobile_transcript_urls(&capture, stdout)?;
+            Ok(true)
+        }
+        _ => {
+            send_input(
+                context.target,
+                compose_commit_bytes(input, context.append_enter),
+            )?;
+            let capture = capture(context.target, Some(context.tail_start), None)?;
+            write_mobile_transcript_update(last_capture, &capture, stdout)?;
+            Ok(true)
+        }
+    }
+}
+
 fn write_mobile_transcript_prompt(stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}> ").context("write mobile prompt")?;
     stdout.flush().context("flush mobile prompt")?;
@@ -2595,6 +2641,14 @@ fn write_mobile_transcript_prompt(stdout: &mut impl Write) -> Result<()> {
 
 fn write_mobile_transcript_urls(capture: &str, stdout: &mut impl Write) -> Result<()> {
     let extraction = extract_urls(capture);
+    if extraction.urls.is_empty() {
+        writeln!(
+            stdout,
+            "{MOBILE_TRANSCRIPT_SGR_RESET}No URLs found in current transcript."
+        )
+        .context("write empty mobile transcript urls message")?;
+        return Ok(());
+    }
     write_numbered_urls(&extraction.urls, stdout)
 }
 
@@ -6326,24 +6380,25 @@ mod tests {
         AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
         KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
         MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
-        MOBILE_TRANSCRIPT_SGR_RESET, NestedAgentDetector, NestedAgentTransition, ProcessInfo,
-        ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
-        STATUS_PAYLOAD_CWD_CAP, StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, SurfaceKind, TerminalOutputTracker, agent_name_from_command,
-        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
-        anyhow_error_is_broken_pipe, apply_pending_status_command, attach_pty_rows,
-        build_status_payload, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled, current_unix_ms,
-        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
+        NestedAgentDetector, NestedAgentTransition, ProcessInfo, ResizeTickOutcome,
+        STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP,
+        StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
+        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
+        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
+        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
+        compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
+        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_urls, format_status_line,
-        forward_pty_output_frame_or_detached, handle_resize_tick, heartbeat_due, hex_decode,
-        hex_encode, hex_encoded_len, interruptible_sleep, is_self_provided_tmux,
-        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
-        mobile_client_detected, mobile_transcript_capture_changed,
+        forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
+        heartbeat_due, hex_decode, hex_encode, hex_encoded_len, interruptible_sleep,
+        is_self_provided_tmux, keyboard_protocol_restore_bytes, likely_agent_session,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_command_bool, parse_status_command_interval, parse_status_style,
@@ -6502,6 +6557,70 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "1\thttps://claude.ai/login\n2\thttps://example.test/done\n"
         );
+    }
+
+    #[test]
+    fn mobile_transcript_urls_reports_empty_results_locally() {
+        let mut out = Vec::new();
+        write_mobile_transcript_urls("no links here", &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{MOBILE_TRANSCRIPT_SGR_RESET}No URLs found in current transcript.\n")
+        );
+    }
+
+    #[test]
+    fn mobile_transcript_url_commands_are_local_only() {
+        for command in ["/links", "/urls"] {
+            let options = MobileTranscriptOptions {
+                tail: 80,
+                refresh: Duration::from_millis(500),
+                read_only: false,
+                append_enter: true,
+                banner: false,
+            };
+            let mut last_capture = "prior capture".to_string();
+            let mut out = Vec::new();
+            let mut sent_payloads = Vec::new();
+            let mut capture_calls = 0;
+
+            let keep_running = handle_mobile_transcript_input(
+                command,
+                MobileTranscriptInputContext {
+                    target: "api",
+                    tail_start: -80,
+                    append_enter: options.append_enter,
+                },
+                &mut last_capture,
+                &mut out,
+                |target, start, end| {
+                    capture_calls += 1;
+                    assert_eq!(target, "api");
+                    assert_eq!(start, Some(-80));
+                    assert_eq!(end, None);
+                    Ok("copy https://login.example/device".to_string())
+                },
+                |target, data| {
+                    sent_payloads.push((target.to_string(), data));
+                    Ok(())
+                },
+                |target| Ok(format!("lterm attach --raw -- {target}")),
+            )
+            .unwrap();
+
+            assert!(keep_running);
+            assert_eq!(capture_calls, 1, "{command} must capture locally once");
+            assert!(
+                sent_payloads.is_empty(),
+                "{command} must not be forwarded to the PTY: {sent_payloads:?}"
+            );
+            assert_eq!(last_capture, "prior capture");
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "1\thttps://login.example/device\n"
+            );
+        }
     }
 
     #[test]

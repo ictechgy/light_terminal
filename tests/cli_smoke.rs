@@ -11654,7 +11654,7 @@ fn urls_extracts_recent_sanitized_scrollback_links() -> TestResult {
             "--",
             "sh",
             "-lc",
-            "printf 'A https://a.example/path?x=1#frag.\\nB http://b.example/a(b)!\\nANSI \\033[31mhttps://red.example/ok\\033[0m\\nOSC \\033]52;c;secret\\007https://after-osc.example/done,\\nA2 https://a.example/path?x=1#frag\\nREADY_URLS\\n'; sleep 2",
+            "printf 'A https://a.example/path?x=1#frag.\\nB http://b.example/a(b)!\\nANSI \\033[31mhttps://red.example/ok\\033[0m\\nOSC \\033]52;c;secret\\007https://after-osc.example/done,\\nA2 https://a.example/path?x=1#frag\\nREADY_URLS\\n'; while :; do sleep 60; done",
         ])
         .status()?;
     assert!(status.success());
@@ -11709,7 +11709,7 @@ fn urls_empty_results_are_machine_friendly() -> TestResult {
             "--",
             "sh",
             "-lc",
-            "printf 'NO_URLS_READY\\n'; sleep 2",
+            "printf 'NO_URLS_READY\\n'; while :; do sleep 60; done",
         ])
         .status()?;
     assert!(status.success());

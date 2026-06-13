@@ -318,7 +318,7 @@ Claude/OAuth 로그인 URL을 Termius 같은 모바일 SSH client에서 복사�
 
 자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
 Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
-`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/exit` / `/quit`가 있고, 이외의 줄은 PTY로 전달됩니다.
+`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/exit` / `/quit`가 있고, `/links`와 `/urls`는 로컬에서만 처리되어 PTY로 전달되지 않습니다. link가 없으면 `No URLs found in current transcript.`를 출력하며, 이외의 줄은 PTY로 전달됩니다.
 
 **세션 종료:**
 
