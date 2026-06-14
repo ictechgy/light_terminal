@@ -3384,6 +3384,15 @@ fn ping_socket(socket: &Path) -> Result<bool> {
     Ok(response.ok)
 }
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "linux",
+    test
+))]
 fn verify_peer_uid(peer_uid: u32, expected_uid: u32) -> Result<()> {
     if peer_uid != expected_uid {
         bail!("peer uid {peer_uid} does not match daemon uid {expected_uid}");
