@@ -435,11 +435,21 @@ lterm codex --mobile --tail 200 --refresh 1s --read-only
 lterm agy --status -- -p "lterm status를 유지해줘"
 ```
 
+[`mat`](https://github.com/ictechgy/multi-account-tool)도 사용한다면, 지원되는 launcher에서 separator 앞에 `--mat-profile`(canonical) 또는 `--profile`(짧은 UX alias)을 붙여 child command를 일시 profile swap으로 감쌀 수 있습니다.
+
+```bash
+lterm claude --profile work -- --help
+lterm codex --mat-profile personal -- exec "이 저장소를 요약해줘"
+lterm claude --profile work -- --profile native
+```
+
+이 기능은 lterm session command를 `mat exec <cli> <profile> -- <agent-binary> ...`로 만듭니다. 따라서 mat가 그 세션 안에서 agent child를 실행하기 전에 설정된 account material로 swap한 뒤 원복합니다. 이는 lterm 자체 credential isolation이 아니며, mat의 temporal swap/restore/freshness/per-CLI lock 한계를 그대로 따릅니다. mat wrapper는 mat가 지원하는 built-in allowlist(`claude`, `codex`, `opencode`, `aider`, `goose`, `crush`, `gemini`, `kimi`, `qwen`)에만 의도적으로 열려 있습니다. `agy`, Copilot, Cursor Agent, Jules, Kiro, Amp, OMX/OMC, custom profile, configured profile처럼 blocked/unsupported인 agent는 command resolution 전에 `--mat-profile` / `--profile`을 거부합니다. 현재 지원 계약은 `mat support <cli>`로 확인하세요. Claude 자체 `--profile`처럼 agent-native option을 넘길 때는 두 번째 `--` 뒤에 두어야 lterm이 mat profile selector로 해석하지 않습니다.
+
 Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. 이후 해당 agent 세션을 `lterm resume` 또는 `lterm open`으로 다시 붙을 때도 같은 row-off 기본값을 유지합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 직접 agent launch의 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
 Agent launcher는 색상 관련 환경 변수도 host 쪽과 agent child 쪽을 분리해 다룹니다. lterm은 클라이언트나 장기 실행 daemon에 설정된 `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`를 `LTERM_AGENT` metadata가 있는 세션으로는 전달하지 않습니다. 모바일 SSH renderer나 host status 설정이 full-screen agent TUI를 의도치 않게 monochrome 출력으로 고정할 수 있기 때문입니다. 일반 non-agent 세션(`lterm start` / `lterm new` / `lterm run`)은 이 변수들을 계속 child process에 보존하며, lterm 자체 status style도 `NO_COLOR`를 계속 존중합니다.
 
-launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`, `--attach-mode`, `--raw`, `--mobile`, `--tail`, `--refresh`, `--read-only`)입니다. 이 옵션들은 `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용됩니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
+launcher 제어 옵션은 agent의 흔한 short flag(`-c` 등)를 빼앗지 않도록 long-only(`--name`, `--cwd`, `--mat-profile` / `--profile`, `--detach`, `--status`, `--no-status`, `--status-theme`, `--status-color`, `--attach-mode`, `--raw`, `--mobile`, `--tail`, `--refresh`, `--read-only`)입니다. 이 옵션들은 `claude`, `codex`, `opencode`, `copilot`, `cursor-agent`, `agy`, `kiro`, `jules`, `aider`, `goose`, `amp`, `crush`, `kimi`, `qwen`, `gemini`, `omx`, `omc`, `agent <profile>`에 동일하게 적용되지만, `--mat-profile` / `--profile`은 위 mat-supported allowlist에서만 성공합니다. 해당 agent 세션이 이후 attach에서도 특정 lterm status 색을 유지하게 하려면 `--status-theme` / `--status-color`를 사용하세요.
 `--detach`는 각 field의 control character와 Unicode line/paragraph separator를 공백으로 바꾼 `name<TAB>pane<TAB>command`를 출력하며, 나중에 `lterm resume <name>` 또는 호환 이름 `lterm attach <name>`으로 다시 붙으면 됩니다. detach record에는 `--cwd`가 포함되지 않으므로 나중에 필요하면 session을 조회하세요.
 명시한 `--name`은 lterm의 일반 session-name 문법을 따르고 사용 중이지 않아야 합니다. 충돌 시 자동 suffix를 붙이지 않고 conflict error로 실패합니다.
 이름에는 ASCII 문자/숫자와 `.`, `_`, `-`만 사용할 수 있고, `-` 또는 `%`로 시작할 수 없으며, 숫자만으로 이뤄질 수 없고, UUID처럼 보이면 안 되고, 128바이트를 넘을 수 없습니다.
