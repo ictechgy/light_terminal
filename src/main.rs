@@ -253,6 +253,19 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Search recent sanitized scrollback for literal matching lines.
+    Search {
+        /// Session or pane target to scan.
+        target: String,
+        /// Case-sensitive literal query to find.
+        query: String,
+        /// Number of sanitized scrollback lines to scan.
+        #[arg(long, default_value = "120", value_parser = parse_compose_tail_arg)]
+        tail: usize,
+        /// Emit matching lines as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Record raw PTY output chunks from a session to a local JSONL trace file.
     #[command(visible_alias = "record")]
     Trace {
@@ -842,6 +855,20 @@ fn run() -> Result<()> {
                 }
             } else {
                 client::write_numbered_urls(&urls, &mut std::io::stdout())?;
+            }
+            Ok(())
+        }
+        Commands::Search {
+            target,
+            query,
+            tail,
+            json,
+        } => {
+            let matches = client::capture_search_matches(&target, tail, &query)?;
+            if json {
+                println!("{}", serde_json::to_string(&matches)?);
+            } else {
+                client::write_numbered_search_matches(&matches, &mut std::io::stdout())?;
             }
             Ok(())
         }
@@ -3759,6 +3786,39 @@ mod tests {
 
         assert!(Cli::try_parse_from(["lterm", "urls", "main", "--tail", "0"]).is_err());
         assert!(Cli::try_parse_from(["lterm", "urls", "main", "--tail", "2147483648"]).is_err());
+    }
+
+    #[test]
+    fn search_parses_flags_and_validates_tail() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "search",
+            "claude-lterm",
+            "needle",
+            "--tail",
+            "25",
+            "--json",
+        ])
+        .expect("search flags should parse");
+        let Commands::Search {
+            target,
+            query,
+            tail,
+            json,
+        } = cli.command
+        else {
+            panic!("expected search command");
+        };
+        assert_eq!(target, "claude-lterm");
+        assert_eq!(query, "needle");
+        assert_eq!(tail, 25);
+        assert!(json);
+
+        assert!(Cli::try_parse_from(["lterm", "search", "main", "needle", "--tail", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lterm", "search", "main", "needle", "--tail", "2147483648"])
+                .is_err()
+        );
     }
 
     #[test]

@@ -11730,6 +11730,85 @@ fn urls_empty_results_are_machine_friendly() -> TestResult {
 }
 
 #[test]
+fn search_extracts_recent_sanitized_scrollback_matches() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "search",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'alpha needle\\nbeta\\nOSC \\033]52;c;secret\\007gamma needle\\nNEEDLE uppercase\\nREADY_SEARCH\\n'; while :; do sleep 60; done",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("search", "READY_SEARCH")?;
+
+    let output = env.cmd().args(["search", "search", "needle"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "1\talpha needle\n2\tOSC gamma needle\n");
+    assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    assert!(!stdout.contains("secret"), "{stdout:?}");
+
+    let json = env
+        .cmd()
+        .args(["search", "search", "needle", "--json"])
+        .output()?;
+    assert!(json.status.success(), "{json:?}");
+    let matches: Vec<String> = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(matches, vec!["alpha needle", "OSC gamma needle"]);
+
+    let tail = env
+        .cmd()
+        .args(["search", "search", "needle", "--tail", "1"])
+        .output()?;
+    assert!(tail.status.success(), "{tail:?}");
+    assert!(tail.stdout.is_empty(), "{tail:?}");
+    Ok(())
+}
+
+#[test]
+fn search_empty_results_are_machine_friendly() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "search-empty",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'NO_SEARCH_READY\\n'; while :; do sleep 60; done",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("search-empty", "NO_SEARCH_READY")?;
+
+    let text = env
+        .cmd()
+        .args(["search", "search-empty", "needle"])
+        .output()?;
+    assert!(text.status.success(), "{text:?}");
+    assert!(text.stdout.is_empty(), "{text:?}");
+
+    let json = env
+        .cmd()
+        .args(["search", "search-empty", "needle", "--json"])
+        .output()?;
+    assert!(json.status.success(), "{json:?}");
+    let matches: Vec<String> = serde_json::from_slice(&json.stdout)?;
+    assert_eq!(matches, Vec::<String>::new());
+    Ok(())
+}
+
+#[test]
 fn tmux_capture_without_print_is_silent_and_saves_buffer() -> TestResult {
     let env = TestEnv::new()?;
     let status = env

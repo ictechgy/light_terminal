@@ -1,0 +1,9 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://ictechgy.github.io/light_terminal/schemas/search.schema.json",
+    "title": "lterm search output",
+    "type": "array",
+    "items": {
+        "type": "string"
+    }
+}

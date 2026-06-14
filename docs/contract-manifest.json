@@ -352,6 +352,57 @@
       ]
     },
     {
+      "command": "lterm search",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/search.schema.json",
+      "tests": [
+        "cargo test --bin lterm search_parses_flags_and_validates_tail",
+        "cargo test --bin lterm extract_search_matches_finds_case_sensitive_sanitized_lines_in_order",
+        "cargo test --bin lterm extract_search_matches_strips_terminal_control_payloads",
+        "cargo test --bin lterm write_numbered_search_matches_uses_one_based_rows",
+        "cargo test --bin lterm mobile_transcript_grep_command_is_local_only",
+        "cargo test --bin lterm mobile_transcript_grep_reports_usage_and_empty_results_locally",
+        "cargo test --test cli_smoke search_extracts_recent_sanitized_scrollback_matches",
+        "cargo test --test cli_smoke search_empty_results_are_machine_friendly"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Search is a sanitized scrollback report surface. It scans the last --tail sanitized lines, defaults to --tail 120, never attaches to or rewrites the raw PTY stream, and performs case-sensitive literal line matching. Text output is stable 1-based numbered rows as N<TAB>LINE in capture order. --json emits the same matching sanitized line strings as a JSON array. Empty text mode produces no rows; empty JSON mode produces []. Matching lines are untrusted terminal output and are sanitized before matching and rendering.",
+      "json_samples": [
+        {
+          "setup": [
+            [
+              "start",
+              "-d",
+              "-n",
+              "schema-search",
+              "--",
+              "sh",
+              "-lc",
+              "printf 'SCHEMA_SEARCH needle\\nSCHEMA_SEARCH_READY\\n'; sleep 5"
+            ],
+            [
+              "wait",
+              "schema-search",
+              "--contains",
+              "SCHEMA_SEARCH_READY",
+              "--timeout",
+              "5s"
+            ]
+          ],
+          "argv": [
+            "search",
+            "schema-search",
+            "needle",
+            "--json"
+          ]
+        }
+      ]
+    },
+    {
       "command": "lterm trace",
       "aliases": [
         "lterm record"

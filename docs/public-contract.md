@@ -71,12 +71,14 @@ the raw path unless the user explicitly opts into mobile transcript mode.
 Scripts that need deterministic behavior should use explicit flags/env. The
 transcript surface is non-attached: it displays sanitized capture output, sends
 unrecognized input through the existing `input` / `send` path, handles local
-commands such as `/refresh`, `/raw`, `/links`, `/urls`, `/exit`, and `/quit`
+commands such as `/refresh`, `/raw`, `/links`, `/urls`, `/grep QUERY`, `/exit`, and `/quit`
 without forwarding those command lines to the PTY, does not enter alternate
 screen, does not increment attached-client counts, and does not resize PTY
 geometry. `/links` and `/urls` reuse the URL extraction surface locally and print
 `No URLs found in current transcript.` when the current sanitized transcript has
-no links. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
+no links. `/grep QUERY` reuses the search surface locally and prints
+`No matches found in current transcript.` when the current sanitized transcript
+has no matching lines. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
 lterm-owned text so stale host terminal colors do not leak into sanitized
 scrollback; that reset is not captured PTY payload and does not relax capture
 sanitization. `--raw` / `LTERM_ATTACH_MODE=raw`
@@ -144,6 +146,7 @@ or raw output stream.
 | `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm urls` | none | `stable` | `stable` recent URL rows as `N<TAB>URL`; `--last` emits only the newest valid URL | `stable` string array; `--last --json` emits `[]` or a one-element array | `sanitized-output-only` |
+| `lterm search` | none | `stable` | `stable` matching rows as `N<TAB>LINE` with 1-based numbering | `stable` string array of matching sanitized lines | `sanitized-output-only` |
 | `lterm trace` | `lterm record` | `explicit-raw-unsafe` | none; writes a private local JSONL trace file capped by --max-bytes | `best-effort` JSONL events with hex-encoded raw PTY output chunks | `raw-transparent` |
 | `lterm trace-replay` | `lterm replay-trace` | `explicit-raw-unsafe` | `best-effort` raw bytes decoded from an explicit local trace file; `--timing` can preserve inter-chunk delays | none | `raw-transparent` |
 | `lterm trace-info` | none | `best-effort` | `best-effort` raw-free metadata summary for a local trace file | `best-effort` raw-free metadata summary | `sanitized-output-only` |
@@ -175,6 +178,18 @@ URLs are untrusted terminal output: producers can print phishing links, and
 authentication URLs may carry short-lived login credentials. Automation should
 handle URL rows as sensitive data, avoid logging them verbatim by default, and
 prefer `--last` only when the newest valid link is known to be the intended one.
+
+### `lterm search` stable scrollback search semantics
+
+`lterm search <target> QUERY` is a sanitized scrollback report. It scans the
+last `--tail` sanitized lines (default: 120), never attaches to, rewrites, or
+forwards data into the raw PTY stream, and matches `QUERY` as a case-sensitive
+literal substring on each sanitized line. Default text output is stable
+1-based numbered rows as `N<TAB>LINE` in capture order. `--json` emits the same
+matching sanitized line strings as a JSON array. Empty text mode produces no
+rows, and empty JSON mode produces `[]`. Matching lines are still untrusted
+terminal output, so automation should treat them as data from the remote
+process, not as commands or safe markup.
 
 ## Utility and integration surface
 
