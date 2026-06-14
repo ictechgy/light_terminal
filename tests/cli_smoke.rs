@@ -1709,7 +1709,7 @@ fn doctor_reports_daemon_version_and_paths() -> TestResult {
         "{text_stdout}"
     );
     assert!(
-        text_stdout.contains("tmux_compat_shadowed_real_tmux\t"),
+        text_stdout.contains("tmux_compat_lterm_shim_shadowed_by_real_tmux\t"),
         "{text_stdout}"
     );
     Ok(())
@@ -9876,7 +9876,7 @@ fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
 }
 
 #[test]
-fn tmux_mode_shadowed_real_tmux_probe_fast_fails_without_live_socket() -> TestResult {
+fn tmux_mode_lterm_shim_precedence_probe_fast_fails_without_live_socket() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
     std::fs::create_dir(&fake_bin)?;

@@ -279,7 +279,7 @@ entirely. The schema lives at
   "shim_dir": "/Users/<you>/.local/share/light-terminal/shims",
   "tmux_shim_path": "/Users/<you>/.local/share/light-terminal/shims/tmux",
   "tmux_shim_exists": true,
-  "shim_dir_in_path": false,
+  "shim_dir_in_path": true,
   "tmux_compat": {
     "supported_command_count": 33,
     "full_command_count": 10,
@@ -287,10 +287,10 @@ entirely. The schema lives at
     "noop_command_count": 8,
     "known_gap_count": 12,
     "tmux_shim_exists": true,
-    "shim_dir_in_path": false,
+    "shim_dir_in_path": true,
     "path_tmux_resolves_to_lterm_shim": false,
     "lterm_shim_precedes_other_tmux": false,
-    "shadowed_real_tmux": true
+    "lterm_shim_shadowed_by_real_tmux": true
   }
 }
 ```
@@ -303,10 +303,13 @@ healthy daemon omits `reason`. Older daemons that predate `daemon_uid` /
 error.
 
 The `tmux_compat` object is a local compatibility measurement summary. Counts
-come from lterm's documented `tmux-compat list-commands` metadata, and
-`shadowed_real_tmux` / PATH-order fields are booleans derived from local PATH
-ordering. `doctor` and `inspect` do not run arbitrary real `tmux` commands for
-this summary, and do not include raw PTY bytes or scrollback.
+come from lterm's documented `tmux-compat list-commands` metadata. PATH-order
+fields are boolean/null indicators derived from executable `tmux` candidates on
+local `PATH`; null means the relevant lterm shim ordering could not be
+determined without exposing paths. `lterm_shim_shadowed_by_real_tmux=true`
+means an executable non-lterm `tmux` appears before the lterm shim. `doctor` and
+`inspect` do not run arbitrary real `tmux` commands for this summary, and do not
+include raw PTY bytes or scrollback.
 
 ## Non-blocking P1 surfaces
 

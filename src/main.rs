@@ -1790,7 +1790,7 @@ struct TmuxCompatDiagnosticSummary {
     shim_dir_in_path: bool,
     path_tmux_resolves_to_lterm_shim: Option<bool>,
     lterm_shim_precedes_other_tmux: Option<bool>,
-    shadowed_real_tmux: Option<bool>,
+    lterm_shim_shadowed_by_real_tmux: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2053,10 +2053,10 @@ fn print_doctor_report(json: bool) -> Result<()> {
             report.tmux_compat.noop_command_count
         );
         println!(
-            "tmux_compat_shadowed_real_tmux\t{}",
+            "tmux_compat_lterm_shim_shadowed_by_real_tmux\t{}",
             report
                 .tmux_compat
-                .shadowed_real_tmux
+                .lterm_shim_shadowed_by_real_tmux
                 .map_or("-", |value| if value { "yes" } else { "no" })
         );
     }
@@ -2114,7 +2114,7 @@ fn print_diagnose_bundle() -> Result<()> {
                 "environment section reports presence flags for sensitive lterm/tmux/cmux variables",
                 "filesystem paths are summarized instead of emitted as full absolute paths",
                 "session/process command fields keep only the executable basename plus an argument-redaction marker",
-                "tmux compatibility diagnostics are derived from local lterm metadata and PATH-order booleans; no real tmux commands are executed",
+                "tmux compatibility diagnostics are derived from local lterm metadata and PATH-order boolean/null indicators; no real tmux commands are executed",
                 "no raw terminal scrollback or PTY bytes are included",
             ],
         },
@@ -2178,7 +2178,7 @@ fn build_tmux_compat_summary(
     tmux_shim_exists: bool,
 ) -> TmuxCompatDiagnosticSummary {
     let counts = tmux_compat::command_support_counts();
-    let shadow = tmux_path_shadow_summary(shim_dir, tmux_shim_path);
+    let shadow = tmux_path_shadow_summary(tmux_shim_path);
     TmuxCompatDiagnosticSummary {
         supported_command_count: counts.supported_command_count,
         full_command_count: counts.full_command_count,
@@ -2189,7 +2189,7 @@ fn build_tmux_compat_summary(
         shim_dir_in_path: path_contains_dir(shim_dir),
         path_tmux_resolves_to_lterm_shim: shadow.path_tmux_resolves_to_lterm_shim,
         lterm_shim_precedes_other_tmux: shadow.lterm_shim_precedes_other_tmux,
-        shadowed_real_tmux: shadow.shadowed_real_tmux,
+        lterm_shim_shadowed_by_real_tmux: shadow.lterm_shim_shadowed_by_real_tmux,
     }
 }
 
@@ -2197,25 +2197,28 @@ fn build_tmux_compat_summary(
 struct TmuxPathShadowSummary {
     path_tmux_resolves_to_lterm_shim: Option<bool>,
     lterm_shim_precedes_other_tmux: Option<bool>,
-    shadowed_real_tmux: Option<bool>,
+    lterm_shim_shadowed_by_real_tmux: Option<bool>,
 }
 
-fn tmux_path_shadow_summary(shim_dir: &Path, tmux_shim_path: &Path) -> TmuxPathShadowSummary {
+fn tmux_path_shadow_summary(tmux_shim_path: &Path) -> TmuxPathShadowSummary {
     let Some(path) = std::env::var_os("PATH") else {
         return TmuxPathShadowSummary::default();
     };
     let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    let shim_index = entries.iter().position(|entry| entry == shim_dir);
     let mut first_tmux_index = None;
     let mut first_tmux_is_lterm_shim = None;
+    let mut first_lterm_shim_index = None;
     let mut first_other_tmux_index = None;
 
     for (index, entry) in entries.iter().enumerate() {
         let candidate = entry.join("tmux");
-        if !candidate.is_file() {
+        if !is_executable_file(&candidate) {
             continue;
         }
         let is_lterm_shim = same_path_best_effort(&candidate, tmux_shim_path);
+        if is_lterm_shim && first_lterm_shim_index.is_none() {
+            first_lterm_shim_index = Some(index);
+        }
         if first_tmux_index.is_none() {
             first_tmux_index = Some(index);
             first_tmux_is_lterm_shim = Some(is_lterm_shim);
@@ -2225,23 +2228,40 @@ fn tmux_path_shadow_summary(shim_dir: &Path, tmux_shim_path: &Path) -> TmuxPathS
         }
     }
 
-    let lterm_shim_precedes_other_tmux = match (shim_index, first_other_tmux_index) {
+    let lterm_shim_precedes_other_tmux = match (first_lterm_shim_index, first_other_tmux_index) {
         (Some(shim), Some(other)) => Some(shim < other),
         (Some(_), None) => Some(true),
-        (None, Some(_)) => Some(false),
+        (None, Some(_)) => None,
         (None, None) => None,
     };
-    let shadowed_real_tmux = match (shim_index, first_other_tmux_index) {
+    let lterm_shim_shadowed_by_real_tmux = match (first_lterm_shim_index, first_other_tmux_index) {
         (Some(shim), Some(other)) => Some(other < shim),
         (Some(_), None) => Some(false),
-        (None, Some(_)) => Some(true),
+        (None, Some(_)) => None,
         (None, None) => None,
     };
 
     TmuxPathShadowSummary {
         path_tmux_resolves_to_lterm_shim: first_tmux_is_lterm_shim,
         lterm_shim_precedes_other_tmux,
-        shadowed_real_tmux,
+        lterm_shim_shadowed_by_real_tmux,
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -3541,8 +3561,8 @@ mod tests {
         let real_dir = temp.path().join("real");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
         std::fs::create_dir_all(&real_dir).expect("create real dir");
-        std::fs::write(shim_dir.join("tmux"), "#!/bin/sh\n").expect("write shim tmux");
-        std::fs::write(real_dir.join("tmux"), "#!/bin/sh\n").expect("write real tmux");
+        write_executable_script(&shim_dir.join("tmux"), "#!/bin/sh\n").expect("write shim tmux");
+        write_executable_script(&real_dir.join("tmux"), "#!/bin/sh\n").expect("write real tmux");
 
         unsafe {
             std::env::set_var(
@@ -3550,10 +3570,10 @@ mod tests {
                 std::env::join_paths([real_dir.as_path(), shim_dir.as_path()]).expect("join path"),
             );
         }
-        let shadow = tmux_path_shadow_summary(&shim_dir, &shim_dir.join("tmux"));
+        let shadow = tmux_path_shadow_summary(&shim_dir.join("tmux"));
         assert_eq!(shadow.path_tmux_resolves_to_lterm_shim, Some(false));
         assert_eq!(shadow.lterm_shim_precedes_other_tmux, Some(false));
-        assert_eq!(shadow.shadowed_real_tmux, Some(true));
+        assert_eq!(shadow.lterm_shim_shadowed_by_real_tmux, Some(true));
 
         unsafe {
             std::env::set_var(
@@ -3561,10 +3581,38 @@ mod tests {
                 std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).expect("join path"),
             );
         }
-        let preferred = tmux_path_shadow_summary(&shim_dir, &shim_dir.join("tmux"));
+        let preferred = tmux_path_shadow_summary(&shim_dir.join("tmux"));
         assert_eq!(preferred.path_tmux_resolves_to_lterm_shim, Some(true));
         assert_eq!(preferred.lterm_shim_precedes_other_tmux, Some(true));
-        assert_eq!(preferred.shadowed_real_tmux, Some(false));
+        assert_eq!(preferred.lterm_shim_shadowed_by_real_tmux, Some(false));
+    }
+
+    #[test]
+    fn tmux_path_shadow_summary_ignores_non_executable_tmux_candidates() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = EnvGuard::capture(&["PATH"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shim_dir = temp.path().join("shim");
+        let non_executable_dir = temp.path().join("non-executable");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::create_dir_all(&non_executable_dir).expect("create non-executable dir");
+        write_executable_script(&shim_dir.join("tmux"), "#!/bin/sh\n").expect("write shim tmux");
+        std::fs::write(non_executable_dir.join("tmux"), "#!/bin/sh\n")
+            .expect("write non-executable tmux");
+
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([non_executable_dir.as_path(), shim_dir.as_path()])
+                    .expect("join path"),
+            );
+        }
+        let summary = tmux_path_shadow_summary(&shim_dir.join("tmux"));
+        assert_eq!(summary.path_tmux_resolves_to_lterm_shim, Some(true));
+        assert_eq!(summary.lterm_shim_precedes_other_tmux, Some(true));
+        assert_eq!(summary.lterm_shim_shadowed_by_real_tmux, Some(false));
     }
 
     #[test]

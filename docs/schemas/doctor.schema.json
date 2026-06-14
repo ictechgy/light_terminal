@@ -19,8 +19,7 @@
     "shim_dir",
     "tmux_shim_path",
     "tmux_shim_exists",
-    "shim_dir_in_path",
-    "tmux_compat"
+    "shim_dir_in_path"
   ],
   "properties": {
     "client_version": {
@@ -140,7 +139,7 @@
         "shim_dir_in_path",
         "path_tmux_resolves_to_lterm_shim",
         "lterm_shim_precedes_other_tmux",
-        "shadowed_real_tmux"
+        "lterm_shim_shadowed_by_real_tmux"
       ],
       "properties": {
         "supported_command_count": {
@@ -181,7 +180,7 @@
             "null"
           ]
         },
-        "shadowed_real_tmux": {
+        "lterm_shim_shadowed_by_real_tmux": {
           "type": [
             "boolean",
             "null"
