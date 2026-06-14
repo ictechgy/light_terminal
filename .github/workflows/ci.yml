@@ -42,11 +42,53 @@ jobs:
           python3 scripts/test_quad_brainstorming_json_schemas.py
           python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
       - name: Release build
         run: cargo build --release --locked
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_AUDIT_VERSION: 0.22.1
+      CARGO_AUDIT_RUNNER_IMAGE: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+      - name: Restore cargo-audit install cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_AUDIT_RUNNER_IMAGE }}-${{ env.CARGO_AUDIT_VERSION }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --force
+      - name: Verify cargo-audit version
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(cargo audit --version)"
+          case "$actual" in
+            *" $CARGO_AUDIT_VERSION") ;;
+            *)
+              echo "::error::cargo-audit version mismatch: expected $CARGO_AUDIT_VERSION, got $actual" >&2
+              exit 1
+              ;;
+          esac
+          printf '%s\n' "$actual"
+      - name: Audit locked dependency graph
+        run: |
+          cargo audit
 
   contract-manifest-validate:
     name: contract-manifest-validate
@@ -131,7 +173,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run v0.1.4 compatibility matrix
-        run: cargo test --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
+        run: cargo test --locked --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
 
   soak-release-gate:
     name: soak-release-gate
@@ -146,4 +188,4 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run 15-minute soak profile
-        run: LTERM_SOAK_DURATION=900 LTERM_SOAK_SESSIONS=16 cargo test --test soak -- --ignored --nocapture --test-threads=1
+        run: LTERM_SOAK_DURATION=900 LTERM_SOAK_SESSIONS=16 cargo test --locked --test soak -- --ignored --nocapture --test-threads=1
