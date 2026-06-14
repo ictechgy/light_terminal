@@ -599,7 +599,7 @@
       "examples": [
         "lterm doctor --json"
       ],
-      "stability_scope": "Doctor JSON includes stable daemon/shim/version/path fields plus an additive tmux_compat object containing local command coverage counts and PATH-order boolean/null indicators only; it does not run arbitrary real tmux commands and does not include raw PTY bytes or scrollback."
+      "stability_scope": "Doctor JSON includes stable daemon/shim/version/path fields plus an additive optional tmux_compat object emitted by current builds, containing local command coverage counts and PATH-order boolean/null indicators only; the schema keeps tmux_compat optional so older stable doctor outputs still validate during mixed-version upgrades. It does not run arbitrary real tmux commands and does not include raw PTY bytes or scrollback."
     },
     {
       "command": "lterm diagnose --bundle",

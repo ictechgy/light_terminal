@@ -187,7 +187,8 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "Optional additive compatibility summary: current lterm builds emit this object, but the stable schema keeps it optional so older doctor outputs still validate during mixed-version upgrades."
     }
   },
   "additionalProperties": false

@@ -302,12 +302,14 @@ healthy daemon omits `reason`. Older daemons that predate `daemon_uid` /
 `started_at_unix_secs` simply omit those fields; their absence is not an
 error.
 
-The `tmux_compat` object is a local compatibility measurement summary. Counts
-come from lterm's documented `tmux-compat list-commands` metadata. PATH-order
-fields are boolean/null indicators derived from executable `tmux` candidates on
-local `PATH`; null means the relevant lterm shim ordering could not be
-determined without exposing paths. `lterm_shim_shadowed_by_real_tmux=true`
-means an executable non-lterm `tmux` appears before the lterm shim. `doctor` and
+The `tmux_compat` object is a local compatibility measurement summary. Current
+builds emit it, but the stable schema keeps it optional/additive so older doctor
+outputs still validate during mixed-version upgrades. Counts come from lterm's
+documented `tmux-compat list-commands` metadata. PATH-order fields are
+boolean/null indicators derived from executable `tmux` candidates on local
+`PATH`; null means the relevant lterm shim ordering could not be determined
+without exposing paths. `lterm_shim_shadowed_by_real_tmux=true` means an
+executable non-lterm `tmux` appears before the lterm shim. `doctor` and
 `inspect` do not run arbitrary real `tmux` commands for this summary, and do not
 include raw PTY bytes or scrollback.
 
