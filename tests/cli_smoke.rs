@@ -13643,7 +13643,7 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
             "raw-bytes",
             "--",
             "sh",
-            "-lc",
+            "-c",
             concat!(
                 "printf 'READY_RAW\\n'; ",
                 "while IFS= read -r line; do ",
@@ -13683,9 +13683,24 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
         "raw attach must preserve DCS/ST bytes: {:?}",
         String::from_utf8_lossy(&raw)
     );
+    let raw_start =
+        find_subsequence(&raw, b"RAW_START").expect("raw output should include RAW_START");
+    let csi = find_subsequence(&raw, b"\x1b[31mRED\x1b[0m").expect("raw output should include CSI");
+    let osc =
+        find_subsequence(&raw, b"\x1b]52;c;RAW_SECRET\x07").expect("raw output should include OSC");
+    let dcs =
+        find_subsequence(&raw, b"\x1bPqDCS_RAW\x1b\\").expect("raw output should include DCS");
+    let raw_end = find_subsequence(&raw, b"RAW_END").expect("raw output should include RAW_END");
+    assert!(
+        raw_start < csi && csi < osc && osc < dcs && dcs < raw_end,
+        "raw attach must preserve payload order: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
 
     let captured = env.capture_until("raw-bytes", "RAW_END")?;
     assert!(captured.contains("RED"), "{captured:?}");
+    // Sanitized capture/list-style surfaces must drop active control-sequence
+    // payloads, not merely erase the ESC byte and leave sensitive contents.
     assert!(
         !captured.contains('\x1b'),
         "sanitized capture should still strip escapes: {captured:?}"
@@ -13693,6 +13708,14 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
     assert!(
         !captured.contains("RAW_SECRET"),
         "sanitized capture should still strip OSC payloads: {captured:?}"
+    );
+    assert!(
+        !captured.contains("DCS_RAW"),
+        "sanitized capture should still strip DCS payloads: {captured:?}"
+    );
+    assert!(
+        !captured.contains('\x07'),
+        "sanitized capture should still strip BEL controls: {captured:?}"
     );
 
     drop(stream);
