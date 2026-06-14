@@ -70,12 +70,9 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git
-            ~/.cargo/audit-install-target
           key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_AUDIT_RUNNER_IMAGE }}-${{ env.CARGO_AUDIT_VERSION }}
       - name: Install cargo-audit
-        run: |
-          CARGO_TARGET_DIR="$HOME/.cargo/audit-install-target" \
-            cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --force
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --force
       - name: Verify cargo-audit version
         shell: bash
         run: |

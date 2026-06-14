@@ -15,9 +15,9 @@ security- and release-sensitive even when they are routine patch/minor updates.
   touch PTYs, sockets, shell commands, credentials, or terminal escape parsing as
   design-review items.
 - PR CI runs a freshly installed, version-checked `cargo audit` against the
-  locked dependency graph and caches only Cargo install artifacts by runner
-  image/architecture to keep the gate reproducible without trusting a restored
-  audit executable. Before tagging a release, also run
+  locked dependency graph and caches only Cargo registry/git download artifacts
+  by runner image/architecture to avoid trusting restored audit executables or
+  compiled objects. Before tagging a release, also run
   `scripts/release-preflight.sh --require-audit` so the audit tool path/version
   and result are captured with the release evidence. If an advisory is
   intentionally deferred, record the affected crate, reachable code path,
