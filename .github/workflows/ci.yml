@@ -51,6 +51,8 @@ jobs:
   cargo-audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    env:
+      CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Install stable Rust
@@ -60,8 +62,15 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           cargo --version
+      - name: Restore cargo-audit binary cache
+        id: cargo-audit-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
       - name: Audit locked dependency graph
         run: |
           cargo audit --version

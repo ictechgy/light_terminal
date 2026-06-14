@@ -14,11 +14,13 @@ security- and release-sensitive even when they are routine patch/minor updates.
 - Treat major-version updates, new crates, build-script changes, and crates that
   touch PTYs, sockets, shell commands, credentials, or terminal escape parsing as
   design-review items.
-- PR CI runs `cargo audit` against the locked dependency graph. Before tagging a
-  release, also run `scripts/release-preflight.sh --require-audit` so the audit
-  tool path/version and result are captured with the release evidence. If an
-  advisory is intentionally deferred, record the affected crate, reachable code
-  path, impact, mitigation, and follow-up owner in release evidence.
+- PR CI runs a version-pinned `cargo audit` against the locked dependency graph
+  and caches the audit binary to keep the gate reproducible without adding a
+  large source-build cost to every run. Before tagging a release, also run
+  `scripts/release-preflight.sh --require-audit` so the audit tool path/version
+  and result are captured with the release evidence. If an advisory is
+  intentionally deferred, record the affected crate, reachable code path,
+  impact, mitigation, and follow-up owner in release evidence.
 - npm wrapper/platform package versions must match `Cargo.toml`; platform
   binaries should be built from the same reviewed source revision.
 
