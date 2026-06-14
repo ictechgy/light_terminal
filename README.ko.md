@@ -154,6 +154,7 @@ lterm -a api
 | 세션 종료 | `lterm close api` | `kill` |
 | 데몬과 shim 상태 진단 | `lterm doctor --json` | `status` |
 | redacted 로컬 진단 bundle 수집 | `lterm diagnose --bundle` | 없음 |
+| redacted 로컬 진단 inspect | `lterm inspect --json` | 없음 |
 | 로컬 설정 단계 미리 보기 | `lterm init --shell zsh` | 없음 |
 | 지원되는 AI CLI statusline badge 설치 | `lterm install-ai-statusline` | 없음 |
 | shell completion 설치 | `lterm install-completions --shell zsh` | 없음 |
@@ -211,13 +212,15 @@ row status 표시 여부는 attach mode와는 별개입니다. `--attach-mode=au
 
 `lterm status-theme <target> <theme>`(alias: `lterm theme`)은 PTY를 재시작하지 않고 세션별 status bar theme을 저장합니다. pane id를 지정하면 해당 pane이 속한 세션에 적용됩니다. `default`, `clear`, `none`을 쓰면 세션 override를 지우고 attach하는 client의 기본값으로 돌아갑니다. 이미 attach된 client는 detach 후 다시 attach할 때 새 색을 반영합니다. 새 세션은 `lterm start --status-theme green -n api -- npm run dev`(또는 alias `--status-color`)처럼 생성 시점에 같은 metadata를 저장할 수 있습니다.
 
-`lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
+`lterm doctor`(호환 이름: `lterm status`)는 client/daemon version, protocol 호환성, runtime/data/socket/shim path, shim directory가 `PATH`에 있는지, count/boolean-only `tmux_compat` summary 등을 보고합니다. 이 명령은 daemon을 시작하지 않습니다. 현재 socket에서 호환 daemon이 응답하지 않으면 `daemon_reachable=no` / `false`로 표시됩니다. 일반 client 동작 중 접근 가능한 daemon이 다른 lterm 또는 protocol version을 보고하면 stderr에 경고를 출력하며, 보통 binary upgrade 뒤 예전 daemon이 살아 있는 상황을 뜻합니다.
 
 `lterm diagnose --bundle`은 issue 보고와 agent handoff를 위한 local-only JSON
 진단 bundle을 출력합니다. `doctor` 데이터와 redact된 환경 변수 presence flag를
 포함하고, 기존 daemon에 접근 가능한 경우에 한해 세션 metadata와 process row를
 함께 담습니다. 이 명령은 daemon을 시작하지 않으며, 기본적으로 raw PTY bytes나
-scrollback은 포함하지 않습니다.
+scrollback은 포함하지 않습니다. inspect-style JSON entrypoint가 필요한 도구는
+같은 redacted bundle을 출력하는 `lterm inspect --json`을 사용할 수 있으며,
+`--json`이 필수입니다.
 
 `lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text입니다. 즉 terminal control은 제거하고 한국어, CJK, emoji 같은 UTF-8 text는 보존합니다. attach된 PTY stream은 raw 그대로 유지됩니다.
 

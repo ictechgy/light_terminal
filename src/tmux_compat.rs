@@ -64,6 +64,22 @@ struct CapturePaneArgs {
     end: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CommandSupportCounts {
+    pub supported_command_count: usize,
+    pub full_command_count: usize,
+    pub partial_command_count: usize,
+    pub noop_command_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct CommandCoverage {
+    pub name: &'static str,
+    pub alias: &'static str,
+    pub aliases: &'static [&'static str],
+    pub support: &'static str,
+}
+
 pub fn ensure_shim() -> Result<PathBuf> {
     let shim_dir = paths::shim_dir()?;
     let tmux_path = shim_dir.join("tmux");
@@ -3469,6 +3485,54 @@ fn command_support_tier(command: &str) -> &'static str {
     }
 }
 
+pub fn command_support_counts() -> CommandSupportCounts {
+    let mut counts = CommandSupportCounts {
+        supported_command_count: SUPPORTED_COMMANDS.len(),
+        full_command_count: 0,
+        partial_command_count: 0,
+        noop_command_count: 0,
+    };
+    for (command, _, _) in SUPPORTED_COMMANDS {
+        match command_support_tier(command) {
+            "full" => counts.full_command_count += 1,
+            "partial" => counts.partial_command_count += 1,
+            "noop" => counts.noop_command_count += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+pub fn command_coverage() -> Vec<CommandCoverage> {
+    SUPPORTED_COMMANDS
+        .iter()
+        .copied()
+        .map(|(command, alias, aliases)| CommandCoverage {
+            name: command,
+            alias: alias.unwrap_or_default(),
+            aliases,
+            support: command_support_tier(command),
+        })
+        .collect()
+}
+
+pub fn known_unsupported_common_commands() -> &'static [&'static str] {
+    &[
+        "choose-tree",
+        "command-prompt",
+        "confirm-before",
+        "display-menu",
+        "find-window",
+        "join-pane",
+        "move-pane",
+        "new-window -ad",
+        "pipe-pane",
+        "respawn-pane",
+        "swap-pane",
+        "switch-client",
+    ]
+}
+
 fn debug_unsupported_command(command: &str, args: &[String]) {
     if !std::env::var("LTERM_DEBUG_TMUX").is_ok_and(|value| {
         matches!(
@@ -4961,6 +5025,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn command_support_counts_match_public_coverage_rows() {
+        let counts = command_support_counts();
+        let coverage = command_coverage();
+        assert_eq!(counts.supported_command_count, coverage.len());
+        assert_eq!(
+            counts.supported_command_count,
+            counts.full_command_count + counts.partial_command_count + counts.noop_command_count
+        );
+        assert!(counts.full_command_count > 0, "{counts:?}");
+        assert!(counts.partial_command_count > 0, "{counts:?}");
+        assert!(counts.noop_command_count > 0, "{counts:?}");
+        assert!(
+            coverage
+                .iter()
+                .any(|command| command.name == "list-commands" && command.support == "full")
+        );
+        assert!(known_unsupported_common_commands().contains(&"join-pane"));
     }
 
     #[test]
