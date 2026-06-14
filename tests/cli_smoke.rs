@@ -70,7 +70,12 @@ impl TestEnv {
                     }
                     Ok(PollStatus::Pending(format!("last capture: {captured}")))
                 } else {
-                    Ok(PollStatus::Pending(format!("last output: {output:?}")))
+                    Ok(PollStatus::Pending(format!(
+                        "status={:?}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
                 }
             },
         )
@@ -126,19 +131,48 @@ enum PollStatus<T> {
     Pending(String),
 }
 
-fn poll_until<T, F>(
+enum PollUntilError {
+    Timeout(String),
+    Check(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for PollUntilError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(message) => f.write_str(message),
+            Self::Check(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Debug for PollUntilError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for PollUntilError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Timeout(_) => None,
+            Self::Check(err) => Some(err.as_ref()),
+        }
+    }
+}
+
+fn poll_until_result<T, F>(
     timeout: Duration,
     interval: Duration,
     label: &str,
     mut check: F,
-) -> TestResult<T>
+) -> Result<T, PollUntilError>
 where
     F: FnMut() -> TestResult<PollStatus<T>>,
 {
     let deadline = Instant::now() + timeout;
     let mut last: String;
     loop {
-        match check()? {
+        match check().map_err(PollUntilError::Check)? {
             PollStatus::Ready(value) => return Ok(value),
             PollStatus::Pending(detail) => last = detail,
         }
@@ -148,7 +182,16 @@ where
         }
         thread::sleep(interval.min(deadline.saturating_duration_since(now)));
     }
-    Err(format!("timed out waiting for {label} after {timeout:?}; last={last}").into())
+    Err(PollUntilError::Timeout(format!(
+        "timed out waiting for {label} after {timeout:?}; last={last}"
+    )))
+}
+
+fn poll_until<T, F>(timeout: Duration, interval: Duration, label: &str, check: F) -> TestResult<T>
+where
+    F: FnMut() -> TestResult<PollStatus<T>>,
+{
+    poll_until_result(timeout, interval, label, check).map_err(|err| err.into())
 }
 
 struct ChildCleanup {
@@ -240,25 +283,29 @@ fn wait_for_child_output(
     timeout: Duration,
     label: &str,
 ) -> TestResult<std::process::Output> {
-    let wait_result = poll_until(timeout, Duration::from_millis(25), label, || {
+    let wait_result = poll_until_result(timeout, Duration::from_millis(25), label, || {
         if child.child_mut()?.try_wait()?.is_some() {
             Ok(PollStatus::Ready(()))
         } else {
             Ok(PollStatus::Pending("still running".to_string()))
         }
     });
-    if let Err(wait_error) = wait_result {
-        let Some(mut process) = child.child.take() else {
-            return Err(format!("{label} already reaped before timeout collection").into());
-        };
-        let _ = process.kill();
-        let output = process.wait_with_output()?;
-        return Err(format!(
-            "{wait_error}; stdout={:?}; stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+    match wait_result {
+        Ok(()) => {}
+        Err(PollUntilError::Check(err)) => return Err(err),
+        Err(PollUntilError::Timeout(wait_error)) => {
+            let Some(mut process) = child.child.take() else {
+                return Err(format!("{label} already reaped before timeout collection").into());
+            };
+            let _ = process.kill();
+            let output = process.wait_with_output()?;
+            return Err(format!(
+                "{wait_error}; stdout={:?}; stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
     }
 
     let process = child.child.take().ok_or("child already reaped")?;
