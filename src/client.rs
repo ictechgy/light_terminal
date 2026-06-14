@@ -3141,6 +3141,7 @@ fn build_process_tree_from_rows(
         by_parent.entry(process.ppid).or_default().push(process);
     }
     for children in by_parent.values_mut() {
+        // Keep process reports deterministic across ps and HashMap iteration order.
         children.sort_by_key(|p| p.pid);
     }
 
@@ -3213,6 +3214,7 @@ impl<'a> ProcessTreeBuilder<'a> {
             .values()
             .filter(|row| row.pgid == process_group_id && !self.seen.contains(&row.pid))
             .collect();
+        // Same-pgid escapees are collected from a HashMap; sort for stable reports.
         rows.sort_by_key(|row| row.pid);
         for row in rows {
             if !self.seen.insert(row.pid) {
@@ -6613,7 +6615,7 @@ mod tests {
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
         format_status_line, forward_pty_output_frame_or_detached, handle_mobile_transcript_input,
         handle_resize_tick, heartbeat_due, hex_decode, hex_encode, hex_encoded_len,
-        interruptible_sleep, is_self_provided_tmux, json_pretty, keyboard_protocol_restore_bytes,
+        interruptible_sleep, is_self_provided_tmux, keyboard_protocol_restore_bytes,
         likely_agent_session, matches_env_bool, mobile_client_detected,
         mobile_transcript_capture_changed, mobile_transcript_grep_query,
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
@@ -8250,6 +8252,7 @@ mod tests {
                 sample_process_row(120, 100, 700, "child-b"),
                 sample_process_row(140, 999, 701, "other-group"),
                 sample_process_row(100, 1, 700, "root-shell"),
+                sample_process_row(150, 110, 700, "grandchild"),
                 sample_process_row(115, 999, 700, "escaped-a"),
                 sample_process_row(110, 100, 700, "child-a"),
             ],
@@ -8274,6 +8277,7 @@ mod tests {
             vec![
                 (100, 0, false, "main", "%7", "root-shell"),
                 (110, 1, false, "main", "%7", "child-a"),
+                (150, 2, false, "main", "%7", "grandchild"),
                 (120, 1, false, "main", "%7", "child-b"),
                 (115, 1, true, "main", "%7", "escaped-a"),
                 (130, 1, true, "main", "%7", "escaped-b"),
@@ -8281,18 +8285,25 @@ mod tests {
             "synthetic process rows should deterministically separate descendants from same-pgid escaped rows"
         );
 
-        let report = json_pretty(&processes);
+        let report = serde_json::to_value(&processes).expect("process report serializes");
+        let rows = report.as_array().expect("process report is a JSON array");
         assert!(
-            report.contains("\"orphan\": true"),
-            "JSON reporting must expose orphan classification: {report}"
+            rows.iter().any(|row| {
+                row.get("orphan").and_then(serde_json::Value::as_bool) == Some(true)
+                    && row
+                        .get("process_group_id")
+                        .and_then(serde_json::Value::as_i64)
+                        == Some(700)
+            }),
+            "JSON reporting must expose orphan classification and process group: {report:?}"
         );
         assert!(
-            report.contains("\"process_group_id\": 700"),
-            "JSON reporting must retain the process group used for orphan diagnosis: {report}"
-        );
-        assert!(
-            !report.contains("other-group"),
-            "unrelated process groups must stay out of the report: {report}"
+            rows.iter().all(|row| {
+                row.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|command| command != "other-group")
+            }),
+            "unrelated process groups must stay out of the report: {report:?}"
         );
     }
 
