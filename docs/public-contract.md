@@ -161,6 +161,7 @@ or raw output stream.
 | `lterm close` | `lterm kill` | `stable` | none | none | `not-applicable` |
 | `lterm doctor` | `lterm status` | `stable` | `stable` key/value rows | `stable` | `sanitized-output-only` |
 | `lterm diagnose --bundle` | none | `best-effort` | none | `best-effort` local diagnostic bundle; does not start the daemon and excludes raw PTY bytes/scrollback by default | `sanitized-output-only` |
+| `lterm inspect --json` | none | `best-effort` | none | `best-effort` alias for the redacted local diagnostic bundle; requires `--json` | `sanitized-output-only` |
 | `lterm daemon` | none | `internal` | none | none | `not-applicable` |
 | `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
 
@@ -242,6 +243,7 @@ kept side-effect-light so CI can run them with isolated `LTERM_RUNTIME_DIR` and
 lterm install-shim
 lterm sessions --json
 lterm doctor --json
+lterm inspect --json
 lterm shutdown
 lterm notify --title 'Task complete' --body 'All checks passed'
 lterm agents --json
@@ -277,7 +279,19 @@ entirely. The schema lives at
   "shim_dir": "/Users/<you>/.local/share/light-terminal/shims",
   "tmux_shim_path": "/Users/<you>/.local/share/light-terminal/shims/tmux",
   "tmux_shim_exists": true,
-  "shim_dir_in_path": false
+  "shim_dir_in_path": true,
+  "tmux_compat": {
+    "supported_command_count": 33,
+    "full_command_count": 10,
+    "partial_command_count": 15,
+    "noop_command_count": 8,
+    "known_gap_count": 12,
+    "tmux_shim_exists": true,
+    "shim_dir_in_path": true,
+    "path_tmux_resolves_to_lterm_shim": false,
+    "lterm_shim_precedes_other_tmux": false,
+    "lterm_shim_shadowed_by_real_tmux": true
+  }
 }
 ```
 
@@ -287,6 +301,17 @@ is not reachable. It usually auto-starts on the next \`lterm\` command; run
 healthy daemon omits `reason`. Older daemons that predate `daemon_uid` /
 `started_at_unix_secs` simply omit those fields; their absence is not an
 error.
+
+The `tmux_compat` object is a local compatibility measurement summary. Current
+builds emit it, but the stable schema keeps it optional/additive so older doctor
+outputs still validate during mixed-version upgrades. Counts come from lterm's
+documented `tmux-compat list-commands` metadata. PATH-order fields are
+boolean/null indicators derived from executable `tmux` candidates on local
+`PATH`; null means the relevant lterm shim ordering could not be determined
+without exposing paths. `lterm_shim_shadowed_by_real_tmux=true` means an
+executable non-lterm `tmux` appears before the lterm shim. `doctor` and
+`inspect` do not run arbitrary real `tmux` commands for this summary, and do not
+include raw PTY bytes or scrollback.
 
 ## Non-blocking P1 surfaces
 

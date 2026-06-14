@@ -157,6 +157,7 @@ lterm -a api
 | Stop a session | `lterm close api` | `kill` |
 | Diagnose daemon and shim state | `lterm doctor --json` | `status` |
 | Collect a redacted local diagnostic bundle | `lterm diagnose --bundle` | None |
+| Inspect redacted local diagnostics | `lterm inspect --json` | None |
 | Preview local setup steps | `lterm init --shell zsh` | None |
 | Install supported AI CLI statusline badges | `lterm install-ai-statusline` | None |
 | Install shell completions | `lterm install-completions --shell zsh` | None |
@@ -211,13 +212,14 @@ Every lterm session also exports `LTERM_SESSION` and `LTERM_PANE` inside the chi
 
 `lterm status-theme <target> <theme>` (alias: `lterm theme`) stores a per-session status bar theme without restarting the PTY; pane ids resolve to their session. Use `default`, `clear`, or `none` to remove the session override and return to the attaching client's default. Already-attached clients keep their current status color until they detach and reattach. New sessions can set the same metadata at creation time with `lterm start --status-theme green -n api -- npm run dev` (or alias `--status-color`).
 
-`lterm doctor` (compatibility name: `lterm status`) reports client/daemon versions, protocol compatibility, runtime/data/socket/shim paths, and whether the shim directory is on `PATH`. It does not start the daemon; `daemon_reachable=no` / `false` means no compatible daemon answered on the current socket. Normal client operations warn on stderr when a reachable daemon reports a different lterm or protocol version, which usually means an old daemon survived a binary upgrade.
+`lterm doctor` (compatibility name: `lterm status`) reports client/daemon versions, protocol compatibility, runtime/data/socket/shim paths, whether the shim directory is on `PATH`, and a count plus boolean/null `tmux_compat` summary. Current builds emit `tmux_compat`, but the stable schema keeps it additive/optional so older doctor outputs still validate during mixed-version upgrades. It does not start the daemon; `daemon_reachable=no` / `false` means no compatible daemon answered on the current socket. Normal client operations warn on stderr when a reachable daemon reports a different lterm or protocol version, which usually means an old daemon survived a binary upgrade.
 
 `lterm diagnose --bundle` prints a local-only JSON diagnostic bundle for issues
 and agent handoffs. It includes `doctor` data, redacted environment presence
 flags, and — only when an existing daemon is reachable — session metadata plus
 process rows. It does not start the daemon and does not include raw PTY bytes or
-scrollback by default.
+scrollback by default. `lterm inspect --json` prints the same redacted bundle for
+tools that expect an inspect-style JSON entrypoint; it requires `--json`.
 
 `lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text: terminal controls are removed, while UTF-8 text such as Korean, CJK, and emoji is preserved. Attached PTY streams remain raw.
 

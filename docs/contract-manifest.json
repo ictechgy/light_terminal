@@ -588,14 +588,18 @@
       "json_output_stability": "stable",
       "schema_path": "docs/schemas/doctor.schema.json",
       "tests": [
-        "cargo test --test cli_smoke doctor_reports_daemon_version_and_paths"
+        "cargo test --test cli_smoke doctor_reports_daemon_version_and_paths",
+        "cargo test --bin lterm command_support_counts_match_public_coverage_rows",
+        "cargo test --bin lterm tmux_path_shadow_summary_reports_booleans_without_paths",
+        "cargo test --bin lterm inspect_requires_json_and_reuses_diagnostic_bundle_command"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
       "raw_stream_policy": "sanitized-output-only",
       "examples": [
         "lterm doctor --json"
-      ]
+      ],
+      "stability_scope": "Doctor JSON includes stable daemon/shim/version/path fields plus an additive optional tmux_compat object emitted by current builds, containing local command coverage counts and PATH-order boolean/null indicators only; the schema keeps tmux_compat optional so older stable doctor outputs still validate during mixed-version upgrades. It does not run arbitrary real tmux commands and does not include raw PTY bytes or scrollback."
     },
     {
       "command": "lterm diagnose --bundle",
@@ -604,12 +608,32 @@
       "json_output_stability": "best-effort",
       "schema_path": null,
       "tests": [
-        "cargo test --test cli_smoke diagnose_bundle_collects_redacted_local_state_without_starting_daemon"
+        "cargo test --test cli_smoke diagnose_bundle_collects_redacted_local_state_without_starting_daemon",
+        "cargo test --test cli_smoke inspect_json_matches_redacted_diagnostic_bundle_shape",
+        "cargo test --bin lterm command_support_counts_match_public_coverage_rows"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "best-effort",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Local-only redacted diagnostic bundle for issue reports and handoffs. It excludes raw PTY bytes and scrollback by default, does not auto-start the daemon, and may evolve fields before being promoted to a stable JSON schema."
+      "stability_scope": "Local-only redacted diagnostic bundle for issue reports and handoffs. It excludes raw PTY bytes and scrollback by default, does not auto-start the daemon, includes tmux compatibility data derived from local lterm metadata/PATH booleans without running arbitrary real tmux commands, and may evolve fields before being promoted to a stable JSON schema."
+    },
+    {
+      "command": "lterm inspect --json",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "best-effort",
+      "schema_path": null,
+      "tests": [
+        "cargo test --bin lterm inspect_requires_json_and_reuses_diagnostic_bundle_command",
+        "cargo test --test cli_smoke inspect_json_matches_redacted_diagnostic_bundle_shape"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "best-effort",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Inspect is an inspect-style JSON entrypoint for the same local-only redacted diagnostic bundle as diagnose --bundle. It requires --json, does not auto-start the daemon, excludes raw PTY bytes and scrollback by default, and may evolve fields before stable schema promotion.",
+      "examples": [
+        "lterm inspect --json"
+      ]
     },
     {
       "command": "lterm daemon",

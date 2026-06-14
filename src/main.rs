@@ -195,6 +195,12 @@ enum Commands {
         #[arg(long)]
         bundle: bool,
     },
+    /// Inspect redacted local diagnostics as JSON.
+    Inspect {
+        /// Print the redacted local diagnostic bundle as JSON.
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// Close a session or pane.
     #[command(name = "close", visible_alias = "kill")]
     Close {
@@ -804,6 +810,7 @@ fn run() -> Result<()> {
         }
         Commands::Doctor { json } => print_doctor_report(json),
         Commands::Diagnose { bundle: _ } => print_diagnose_bundle(),
+        Commands::Inspect { json: _ } => print_diagnose_bundle(),
         Commands::Close { target } => client::kill(&target),
         Commands::Rename { target, name } => {
             let info = client::rename_session(&target, &name)?;
@@ -1709,6 +1716,7 @@ struct DoctorReport {
     tmux_shim_path: String,
     tmux_shim_exists: bool,
     shim_dir_in_path: bool,
+    tmux_compat: TmuxCompatDiagnosticSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -1754,6 +1762,7 @@ struct DiagnosticDoctor {
     tmux_shim_path: DiagnosticPathSummary,
     tmux_shim_exists: bool,
     shim_dir_in_path: bool,
+    tmux_compat: TmuxCompatDiagnosticSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -1768,6 +1777,28 @@ struct DiagnosticEnvironment {
     lterm_pane_set: bool,
     lterm_parent_token_set: bool,
     path_contains_shim_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TmuxCompatDiagnosticSummary {
+    supported_command_count: usize,
+    full_command_count: usize,
+    partial_command_count: usize,
+    noop_command_count: usize,
+    known_gap_count: usize,
+    tmux_shim_exists: bool,
+    shim_dir_in_path: bool,
+    path_tmux_resolves_to_lterm_shim: Option<bool>,
+    lterm_shim_precedes_other_tmux: Option<bool>,
+    lterm_shim_shadowed_by_real_tmux: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticTmuxCompat {
+    #[serde(flatten)]
+    summary: TmuxCompatDiagnosticSummary,
+    commands: Vec<tmux_compat::CommandCoverage>,
+    known_unsupported_common_commands: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1815,6 +1846,7 @@ struct DiagnosticBundle {
     privacy: DiagnosticPrivacy,
     doctor: DiagnosticDoctor,
     environment: DiagnosticEnvironment,
+    tmux_compat: DiagnosticTmuxCompat,
     sessions: Option<Vec<DiagnosticSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
@@ -1860,6 +1892,8 @@ fn build_doctor_report() -> Result<DoctorReport> {
     });
     let daemon_shutting_down = daemon.as_ref().map(|status| status.shutting_down);
     let tmux_shim_exists = tmux_shim_path.is_file();
+    let shim_dir_in_path = path_contains_dir(&shim_dir);
+    let tmux_compat = build_tmux_compat_summary(&shim_dir, &tmux_shim_path, tmux_shim_exists);
     // 비정상 상태 단일 요약. 우선순위: unreachable → shutdown → version mismatch
     // → status RPC 실패(reachable이지만 daemon_error) → shim missing.
     // daemon_error 분기는 quad-review 합의 fix: socket은 reachable이지만 Status가
@@ -1913,7 +1947,8 @@ fn build_doctor_report() -> Result<DoctorReport> {
         shim_dir: shim_dir.display().to_string(),
         tmux_shim_path: tmux_shim_path.display().to_string(),
         tmux_shim_exists,
-        shim_dir_in_path: path_contains_dir(&shim_dir),
+        shim_dir_in_path,
+        tmux_compat,
     })
 }
 
@@ -2001,6 +2036,29 @@ fn print_doctor_report(json: bool) -> Result<()> {
         );
         println!("tmux_shim_exists\t{}", yes_no(report.tmux_shim_exists));
         println!("shim_dir_in_path\t{}", yes_no(report.shim_dir_in_path));
+        println!(
+            "tmux_compat_supported_command_count\t{}",
+            report.tmux_compat.supported_command_count
+        );
+        println!(
+            "tmux_compat_full_command_count\t{}",
+            report.tmux_compat.full_command_count
+        );
+        println!(
+            "tmux_compat_partial_command_count\t{}",
+            report.tmux_compat.partial_command_count
+        );
+        println!(
+            "tmux_compat_noop_command_count\t{}",
+            report.tmux_compat.noop_command_count
+        );
+        println!(
+            "tmux_compat_lterm_shim_shadowed_by_real_tmux\t{}",
+            report
+                .tmux_compat
+                .lterm_shim_shadowed_by_real_tmux
+                .map_or("-", |value| if value { "yes" } else { "no" })
+        );
     }
     Ok(())
 }
@@ -2056,11 +2114,13 @@ fn print_diagnose_bundle() -> Result<()> {
                 "environment section reports presence flags for sensitive lterm/tmux/cmux variables",
                 "filesystem paths are summarized instead of emitted as full absolute paths",
                 "session/process command fields keep only the executable basename plus an argument-redaction marker",
+                "tmux compatibility diagnostics are derived from local lterm metadata and PATH-order boolean/null indicators; no real tmux commands are executed",
                 "no raw terminal scrollback or PTY bytes are included",
             ],
         },
         doctor: redact_doctor_report(&doctor),
         environment,
+        tmux_compat: build_diagnostic_tmux_compat(&doctor.tmux_compat),
         sessions,
         sessions_error,
         processes,
@@ -2103,6 +2163,118 @@ fn diagnostic_environment(doctor: &DoctorReport) -> DiagnosticEnvironment {
     }
 }
 
+fn build_diagnostic_tmux_compat(summary: &TmuxCompatDiagnosticSummary) -> DiagnosticTmuxCompat {
+    DiagnosticTmuxCompat {
+        summary: summary.clone(),
+        commands: tmux_compat::command_coverage(),
+        known_unsupported_common_commands: tmux_compat::known_unsupported_common_commands()
+            .to_vec(),
+    }
+}
+
+fn build_tmux_compat_summary(
+    shim_dir: &Path,
+    tmux_shim_path: &Path,
+    tmux_shim_exists: bool,
+) -> TmuxCompatDiagnosticSummary {
+    let counts = tmux_compat::command_support_counts();
+    let shadow = tmux_path_shadow_summary(tmux_shim_path);
+    TmuxCompatDiagnosticSummary {
+        supported_command_count: counts.supported_command_count,
+        full_command_count: counts.full_command_count,
+        partial_command_count: counts.partial_command_count,
+        noop_command_count: counts.noop_command_count,
+        known_gap_count: tmux_compat::known_unsupported_common_commands().len(),
+        tmux_shim_exists,
+        shim_dir_in_path: path_contains_dir(shim_dir),
+        path_tmux_resolves_to_lterm_shim: shadow.path_tmux_resolves_to_lterm_shim,
+        lterm_shim_precedes_other_tmux: shadow.lterm_shim_precedes_other_tmux,
+        lterm_shim_shadowed_by_real_tmux: shadow.lterm_shim_shadowed_by_real_tmux,
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TmuxPathShadowSummary {
+    path_tmux_resolves_to_lterm_shim: Option<bool>,
+    lterm_shim_precedes_other_tmux: Option<bool>,
+    lterm_shim_shadowed_by_real_tmux: Option<bool>,
+}
+
+fn tmux_path_shadow_summary(tmux_shim_path: &Path) -> TmuxPathShadowSummary {
+    let Some(path) = std::env::var_os("PATH") else {
+        return TmuxPathShadowSummary::default();
+    };
+    let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    let mut first_tmux_index = None;
+    let mut first_tmux_is_lterm_shim = None;
+    let mut first_lterm_shim_index = None;
+    let mut first_other_tmux_index = None;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let candidate = entry.join("tmux");
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        let is_lterm_shim = same_path_best_effort(&candidate, tmux_shim_path);
+        if is_lterm_shim && first_lterm_shim_index.is_none() {
+            first_lterm_shim_index = Some(index);
+        }
+        if first_tmux_index.is_none() {
+            first_tmux_index = Some(index);
+            first_tmux_is_lterm_shim = Some(is_lterm_shim);
+        }
+        if !is_lterm_shim && first_other_tmux_index.is_none() {
+            first_other_tmux_index = Some(index);
+        }
+    }
+
+    let lterm_shim_precedes_other_tmux = match (first_lterm_shim_index, first_other_tmux_index) {
+        (Some(shim), Some(other)) => Some(shim < other),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => None,
+        (None, None) => None,
+    };
+    let lterm_shim_shadowed_by_real_tmux = match (first_lterm_shim_index, first_other_tmux_index) {
+        (Some(shim), Some(other)) => Some(other < shim),
+        (Some(_), None) => Some(false),
+        (None, Some(_)) => None,
+        (None, None) => None,
+    };
+
+    TmuxPathShadowSummary {
+        path_tmux_resolves_to_lterm_shim: first_tmux_is_lterm_shim,
+        lterm_shim_precedes_other_tmux,
+        lterm_shim_shadowed_by_real_tmux,
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn same_path_best_effort(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn redact_doctor_report(report: &DoctorReport) -> DiagnosticDoctor {
     DiagnosticDoctor {
         client_version: report.client_version,
@@ -2126,6 +2298,7 @@ fn redact_doctor_report(report: &DoctorReport) -> DiagnosticDoctor {
         tmux_shim_path: diagnostic_path_summary(Path::new(&report.tmux_shim_path)),
         tmux_shim_exists: report.tmux_shim_exists,
         shim_dir_in_path: report.shim_dir_in_path,
+        tmux_compat: report.tmux_compat.clone(),
     }
 }
 
@@ -3375,6 +3548,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tmux_path_shadow_summary_reports_booleans_without_paths() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = EnvGuard::capture(&["PATH"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shim_dir = temp.path().join("shim");
+        let real_dir = temp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+        write_executable_script(&shim_dir.join("tmux"), "#!/bin/sh\n").expect("write shim tmux");
+        write_executable_script(&real_dir.join("tmux"), "#!/bin/sh\n").expect("write real tmux");
+
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([real_dir.as_path(), shim_dir.as_path()]).expect("join path"),
+            );
+        }
+        let shadow = tmux_path_shadow_summary(&shim_dir.join("tmux"));
+        assert_eq!(shadow.path_tmux_resolves_to_lterm_shim, Some(false));
+        assert_eq!(shadow.lterm_shim_precedes_other_tmux, Some(false));
+        assert_eq!(shadow.lterm_shim_shadowed_by_real_tmux, Some(true));
+
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([shim_dir.as_path(), real_dir.as_path()]).expect("join path"),
+            );
+        }
+        let preferred = tmux_path_shadow_summary(&shim_dir.join("tmux"));
+        assert_eq!(preferred.path_tmux_resolves_to_lterm_shim, Some(true));
+        assert_eq!(preferred.lterm_shim_precedes_other_tmux, Some(true));
+        assert_eq!(preferred.lterm_shim_shadowed_by_real_tmux, Some(false));
+    }
+
+    #[test]
+    fn tmux_path_shadow_summary_ignores_non_executable_tmux_candidates() {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = EnvGuard::capture(&["PATH"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shim_dir = temp.path().join("shim");
+        let non_executable_dir = temp.path().join("non-executable");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::create_dir_all(&non_executable_dir).expect("create non-executable dir");
+        write_executable_script(&shim_dir.join("tmux"), "#!/bin/sh\n").expect("write shim tmux");
+        std::fs::write(non_executable_dir.join("tmux"), "#!/bin/sh\n")
+            .expect("write non-executable tmux");
+
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                std::env::join_paths([non_executable_dir.as_path(), shim_dir.as_path()])
+                    .expect("join path"),
+            );
+        }
+        let summary = tmux_path_shadow_summary(&shim_dir.join("tmux"));
+        assert_eq!(summary.path_tmux_resolves_to_lterm_shim, Some(true));
+        assert_eq!(summary.lterm_shim_precedes_other_tmux, Some(true));
+        assert_eq!(summary.lterm_shim_shadowed_by_real_tmux, Some(false));
+    }
+
+    #[test]
+    fn inspect_requires_json_and_reuses_diagnostic_bundle_command() {
+        assert!(Cli::try_parse_from(["lterm", "inspect"]).is_err());
+        let cli = Cli::try_parse_from(["lterm", "inspect", "--json"])
+            .expect("inspect --json should parse");
+        let Commands::Inspect { json } = cli.command else {
+            panic!("expected inspect command");
+        };
+        assert!(json);
     }
 
     #[test]

@@ -1640,6 +1640,28 @@ fn doctor_reports_daemon_version_and_paths() -> TestResult {
             .is_some_and(|path| path.contains("lterm.sock")),
         "{initial_report:?}"
     );
+    let initial_compat = initial_report
+        .get("tmux_compat")
+        .and_then(|v| v.as_object())
+        .ok_or("doctor JSON must include tmux_compat object")?;
+    let supported = initial_compat
+        .get("supported_command_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("tmux_compat.supported_command_count must be present")?;
+    let full = initial_compat
+        .get("full_command_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("tmux_compat.full_command_count must be present")?;
+    let partial = initial_compat
+        .get("partial_command_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("tmux_compat.partial_command_count must be present")?;
+    let noop = initial_compat
+        .get("noop_command_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("tmux_compat.noop_command_count must be present")?;
+    assert_eq!(supported, full + partial + noop, "{initial_report:?}");
+    assert!(supported > 0, "{initial_report:?}");
 
     let status = env
         .cmd()
@@ -1678,6 +1700,17 @@ fn doctor_reports_daemon_version_and_paths() -> TestResult {
             .and_then(|v| v.as_u64())
             .is_some_and(|count| count >= 1),
         "{report:?}"
+    );
+    let text = env.cmd().args(["doctor"]).output()?;
+    assert!(text.status.success(), "{text:?}");
+    let text_stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text_stdout.contains("tmux_compat_supported_command_count\t"),
+        "{text_stdout}"
+    );
+    assert!(
+        text_stdout.contains("tmux_compat_lterm_shim_shadowed_by_real_tmux\t"),
+        "{text_stdout}"
     );
     Ok(())
 }
@@ -2374,6 +2407,28 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
         cold_bundle.get("sessions").is_some_and(|v| v.is_null()),
         "cold bundle should skip sessions without daemon auto-start: {cold_bundle:?}"
     );
+    let cold_compat = cold_bundle
+        .get("tmux_compat")
+        .and_then(|v| v.as_object())
+        .ok_or("cold diagnose bundle must include tmux_compat object")?;
+    let cold_supported = cold_compat
+        .get("supported_command_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("cold tmux_compat supported count missing")?;
+    assert!(
+        cold_compat
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .is_some_and(|commands| commands.len() as u64 == cold_supported),
+        "cold tmux_compat commands should match count: {cold_bundle:?}"
+    );
+    assert!(
+        cold_compat
+            .get("known_unsupported_common_commands")
+            .and_then(|v| v.as_array())
+            .is_some_and(|commands| commands.iter().any(|command| command == "join-pane")),
+        "cold tmux_compat should include advisory gap hints: {cold_bundle:?}"
+    );
 
     let secret = "DIAGNOSE_SECRET_SHOULD_NOT_LEAK_7519";
     let diagnose_command = format!("echo DIAGNOSE_READY; echo {secret}; sleep 30");
@@ -2443,6 +2498,67 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
     assert!(
         live_bundle.get("processes").is_some_and(|v| v.is_array()),
         "live diagnose bundle should include process rows: {live_bundle:?}"
+    );
+    assert!(
+        live_bundle
+            .pointer("/tmux_compat/supported_command_count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count == cold_supported),
+        "live diagnose bundle should include same local tmux compat count: {live_bundle:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn inspect_json_matches_redacted_diagnostic_bundle_shape() -> TestResult {
+    let env = TestEnv::new()?;
+
+    let missing_json = env.cmd().arg("inspect").output()?;
+    assert!(!missing_json.status.success(), "{missing_json:?}");
+
+    let output = env.cmd().args(["inspect", "--json"]).output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let bundle: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        bundle
+            .pointer("/doctor/daemon_reachable")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "cold inspect should not auto-start daemon: {bundle:?}"
+    );
+    assert_eq!(
+        bundle
+            .pointer("/privacy/raw_pty_streams_included")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "inspect bundle must not include raw PTY bytes: {bundle:?}"
+    );
+    assert!(
+        bundle
+            .pointer("/privacy/notes")
+            .and_then(|v| v.as_array())
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("no real tmux commands are executed")))),
+        "inspect privacy notes should describe safe tmux compatibility measurement: {bundle:?}"
+    );
+    assert!(
+        bundle
+            .pointer("/tmux_compat/supported_command_count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|count| count > 0),
+        "inspect bundle should include tmux compatibility summary: {bundle:?}"
+    );
+    assert!(
+        bundle
+            .pointer("/tmux_compat/commands")
+            .and_then(|v| v.as_array())
+            .is_some_and(|commands| commands.iter().any(|command| command
+                .get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|name| name == "list-commands"))),
+        "inspect bundle should include local tmux command coverage data: {bundle:?}"
     );
     Ok(())
 }
@@ -3603,6 +3719,7 @@ fn help_describes_daemon_lifecycle_commands() -> TestResult {
     for (command, expected) in [
         ("daemon", "Run the background PTY session daemon"),
         ("doctor", "Diagnose daemon, shim, and version state"),
+        ("inspect", "Inspect redacted local diagnostics as JSON"),
         ("status", "Diagnose daemon, shim, and version state"),
         ("shutdown", "Stop the daemon and all sessions"),
     ] {
@@ -9759,7 +9876,7 @@ fn tmux_mode_keeps_lterm_shim_ahead_of_existing_tmux() -> TestResult {
 }
 
 #[test]
-fn tmux_mode_shadowed_real_tmux_probe_fast_fails_without_live_socket() -> TestResult {
+fn tmux_mode_lterm_shim_precedence_probe_fast_fails_without_live_socket() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
     std::fs::create_dir(&fake_bin)?;
