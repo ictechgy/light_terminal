@@ -222,6 +222,8 @@ scrollback은 포함하지 않습니다. inspect-style JSON entrypoint가 필요
 같은 redacted bundle을 출력하는 `lterm inspect --json`을 사용할 수 있으며,
 `--json`이 필수입니다.
 
+Opt-in local footprint 측정은 `python3 scripts/footprint_benchmark.py --quick --json target/footprint-baseline.json --markdown target/footprint-baseline.md`로 실행합니다. 격리된 lterm-vs-tmux 측정 방법과 해석 caveat는 [`docs/footprint-benchmark.md`](docs/footprint-benchmark.md)를 참고하세요.
+
 `lterm logs <target>`은 `--start` / `-S`와 `--end` / `-E` line offset을 받습니다. 0 이상의 값은 absolute scrollback line index이고, 음수 값은 현재 scrollback line count에서 뒤로 셉니다. `--end`는 inclusive라 `lterm logs api -S0 -E0`은 첫 번째 줄만 capture합니다. Capture 출력은 계속 정제된 text입니다. 즉 terminal control은 제거하고 한국어, CJK, emoji 같은 UTF-8 text는 보존합니다. attach된 PTY stream은 raw 그대로 유지됩니다.
 
 `lterm trace <target> --duration 5s --output trace.jsonl`은 timestamp와
