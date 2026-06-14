@@ -108,7 +108,7 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
                         continue;
                     }
                 }
-                state = if byte == b'\\' {
+                state = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
@@ -295,7 +295,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                         continue;
                     }
                 }
-                state = if byte == b'\\' {
+                state = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
@@ -569,6 +569,14 @@ mod tests {
     }
 
     #[test]
+    fn terminal_capture_handles_csi_utf8_and_stringesc_raw_st() {
+        assert_eq!(terminal_capture("A\x1b[1ÜmX".as_bytes()), "AX");
+        assert_eq!(terminal_capture("A\x1b[1\u{009c}X".as_bytes()), "AX");
+        assert_eq!(terminal_capture(b"A\x1b]secret\x1b\x9cB"), "AB");
+        assert_eq!(terminal_capture(b"A\x1bPqsecret\x1b\x9cB"), "AB");
+    }
+
+    #[test]
     fn terminal_text_strips_escape_payloads_and_line_controls() {
         let text = terminal_text(
             "LIST_VISIBLE_\x1b]52;c;LIST_SECRET\x07\x1bPqLIST_DCS\x1b\\_AFTER\tNEXT\nROW",
@@ -706,6 +714,26 @@ mod tests {
 
         let dcs = sanitize_status_command_line("a\x1bPqÜsecret\x1b\\b".as_bytes(), true);
         assert_eq!(dcs, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_handles_csi_utf8_and_stringesc_raw_st() {
+        assert_eq!(
+            sanitize_status_command_line("a\x1b[1Ümb".as_bytes(), true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line("a\x1b[1\u{009c}b".as_bytes(), true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line(b"a\x1b]secret\x1b\x9cb", true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line(b"a\x1bPqsecret\x1b\x9cb", true),
+            "ab"
+        );
     }
 
     #[test]
