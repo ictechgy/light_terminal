@@ -2755,6 +2755,7 @@ struct AgentProfile {
     binary: String,
     session_base: String,
     show_status: bool,
+    mat_cli: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2799,6 +2800,13 @@ struct AgentLaunchOptions {
     /// Working directory for the agent process.
     #[arg(long)]
     cwd: Option<String>,
+    /// Run through `mat exec <cli> <profile> -- ...` using this mat profile (alias: --profile).
+    #[arg(
+        long = "mat-profile",
+        visible_alias = "profile",
+        value_name = "PROFILE"
+    )]
+    mat_profile: Option<String>,
     /// Create the agent session without attaching to it.
     #[arg(long, conflicts_with_all = ["status", "no_status", "attach_mode", "raw", "mobile", "tail", "refresh", "read_only"])]
     detach: bool,
@@ -2838,6 +2846,10 @@ impl AgentLaunchOptions {
 
     fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    fn mat_profile(&self) -> Option<&str> {
+        self.mat_profile.as_deref()
     }
 
     fn detach(&self) -> bool {
@@ -2919,102 +2931,119 @@ impl AgentProfile {
                 binary: "claude".to_string(),
                 session_base: "claude-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("claude".to_string()),
             },
             "codex" => Self {
                 name: name.to_string(),
                 binary: "codex".to_string(),
                 session_base: "codex-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("codex".to_string()),
             },
             "opencode" => Self {
                 name: name.to_string(),
                 binary: "opencode".to_string(),
                 session_base: "opencode-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("opencode".to_string()),
             },
             "copilot" => Self {
                 name: name.to_string(),
                 binary: "copilot".to_string(),
                 session_base: "copilot-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "cursor-agent" => Self {
                 name: name.to_string(),
                 binary: "cursor-agent".to_string(),
                 session_base: "cursor-agent-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "agy" => Self {
                 name: name.to_string(),
                 binary: "agy".to_string(),
                 session_base: "agy-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "jules" => Self {
                 name: name.to_string(),
                 binary: "jules".to_string(),
                 session_base: "jules-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "kiro" => Self {
                 name: name.to_string(),
                 binary: "kiro-cli".to_string(),
                 session_base: "kiro-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "aider" => Self {
                 name: name.to_string(),
                 binary: "aider".to_string(),
                 session_base: "aider-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("aider".to_string()),
             },
             "goose" => Self {
                 name: name.to_string(),
                 binary: "goose".to_string(),
                 session_base: "goose-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("goose".to_string()),
             },
             "amp" => Self {
                 name: name.to_string(),
                 binary: "amp".to_string(),
                 session_base: "amp-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "crush" => Self {
                 name: name.to_string(),
                 binary: "crush".to_string(),
                 session_base: "crush-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("crush".to_string()),
             },
             "gemini" => Self {
                 name: name.to_string(),
                 binary: "gemini".to_string(),
                 session_base: "gemini-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("gemini".to_string()),
             },
             "kimi" => Self {
                 name: name.to_string(),
                 binary: "kimi".to_string(),
                 session_base: "kimi-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("kimi".to_string()),
             },
             "qwen" => Self {
                 name: name.to_string(),
                 binary: "qwen".to_string(),
                 session_base: "qwen-lterm".to_string(),
                 show_status: false,
+                mat_cli: Some("qwen".to_string()),
             },
             "omx" => Self {
                 name: name.to_string(),
                 binary: "omx".to_string(),
                 session_base: "omx-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             "omc" => Self {
                 name: name.to_string(),
                 binary: "omc".to_string(),
                 session_base: "omc-lterm".to_string(),
                 show_status: false,
+                mat_cli: None,
             },
             _ => unreachable!("unknown built-in agent profile: {name}"),
         }
@@ -3046,6 +3075,7 @@ impl AgentProfile {
                     binary: custom.to_string(),
                     session_base: format!("{custom}-lterm"),
                     show_status: true,
+                    mat_cli: None,
                 })
             }
         }
@@ -3235,7 +3265,66 @@ fn configured_agent_profile(
         binary,
         session_base,
         show_status: profile.status_default,
+        mat_cli: None,
     })
+}
+
+fn validate_mat_profile_name(profile: &str) -> Result<()> {
+    if profile.trim().is_empty() {
+        bail!("mat profile cannot be empty");
+    }
+    if profile != profile.trim() {
+        bail!("mat profile cannot have leading or trailing whitespace");
+    }
+    if profile.starts_with('-') {
+        bail!("mat profile cannot start with '-'");
+    }
+    if profile.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        bail!("mat profile cannot contain control characters");
+    }
+    Ok(())
+}
+
+fn path_to_command_string(path: &Path, label: &str) -> Result<String> {
+    path.to_str()
+        .with_context(|| format!("{label} resolved to a non-UTF-8 path"))
+        .map(str::to_string)
+}
+
+fn agent_command_argv(
+    profile: &AgentProfile,
+    binary_path: &Path,
+    mat_path: Option<&Path>,
+    mat_profile: Option<&str>,
+    args: &[String],
+) -> Result<Vec<String>> {
+    let binary = path_to_command_string(binary_path, &profile.binary)?;
+    let Some(mat_profile) = mat_profile else {
+        let mut cmd = Vec::with_capacity(args.len() + 1);
+        cmd.push(binary);
+        cmd.extend(args.iter().cloned());
+        return Ok(cmd);
+    };
+
+    let mat_cli = profile.mat_cli.as_deref().with_context(|| {
+        format!(
+            "mat profile wrapping is unsupported for agent {}; omit --mat-profile/--profile or use a mat-supported launcher",
+            sanitize::terminal_text(&profile.name)
+        )
+    })?;
+    let mat = path_to_command_string(
+        mat_path.context("mat path is required when --mat-profile/--profile is set")?,
+        "mat",
+    )?;
+    let mut cmd = Vec::with_capacity(args.len() + 6);
+    cmd.push(mat);
+    cmd.push("exec".to_string());
+    cmd.push(mat_cli.to_string());
+    cmd.push(mat_profile.to_string());
+    cmd.push("--".to_string());
+    cmd.push(binary);
+    cmd.extend(args.iter().cloned());
+    Ok(cmd)
 }
 
 fn run_agent_profile(
@@ -3248,6 +3337,15 @@ fn run_agent_profile(
     }
     if let Some(cwd) = launch.cwd() {
         validate_agent_cwd(cwd)?;
+    }
+    if let Some(mat_profile) = launch.mat_profile() {
+        validate_mat_profile_name(mat_profile)?;
+        if profile.mat_cli.is_none() {
+            bail!(
+                "mat profile wrapping is unsupported for agent {}; omit --mat-profile/--profile or use a mat-supported launcher",
+                sanitize::terminal_text(&profile.name)
+            );
+        }
     }
     if args.first().is_some_and(|arg| arg == "--") {
         args.remove(0);
@@ -3266,15 +3364,22 @@ fn run_agent_profile(
     }
     let binary_path = client::find_command(&profile.binary)
         .with_context(|| format!("{} not found in PATH", profile.binary))?;
+    let mat_path = if launch.mat_profile().is_some() {
+        Some(
+            client::find_command("mat")
+                .context("mat not found in PATH; install mat or omit --mat-profile/--profile")?,
+        )
+    } else {
+        None
+    };
     tmux_compat::ensure_shim()?;
-    let mut cmd = Vec::with_capacity(args.len() + 1);
-    cmd.push(
-        binary_path
-            .to_str()
-            .with_context(|| format!("{} resolved to a non-UTF-8 path", profile.binary))?
-            .to_string(),
-    );
-    cmd.extend(args);
+    let cmd = agent_command_argv(
+        &profile,
+        &binary_path,
+        mat_path.as_deref(),
+        launch.mat_profile(),
+        &args,
+    )?;
     let command = client::shell_join(&cmd)?;
     let mut last_conflict = None;
     let explicit_session_name = launch.session_name().map(str::to_string);
@@ -4311,29 +4416,42 @@ mod tests {
 
     #[test]
     fn known_agent_profiles_define_terminal_policy() {
-        for (name, binary, session_base, show_status) in [
-            ("claude", "claude", "claude-lterm", false),
-            ("codex", "codex", "codex-lterm", false),
-            ("opencode", "opencode", "opencode-lterm", false),
-            ("copilot", "copilot", "copilot-lterm", false),
-            ("cursor-agent", "cursor-agent", "cursor-agent-lterm", false),
-            ("agy", "agy", "agy-lterm", false),
-            ("jules", "jules", "jules-lterm", false),
-            ("kiro", "kiro-cli", "kiro-lterm", false),
-            ("aider", "aider", "aider-lterm", false),
-            ("goose", "goose", "goose-lterm", false),
-            ("amp", "amp", "amp-lterm", false),
-            ("crush", "crush", "crush-lterm", false),
-            ("gemini", "gemini", "gemini-lterm", false),
-            ("kimi", "kimi", "kimi-lterm", false),
-            ("qwen", "qwen", "qwen-lterm", false),
-            ("omx", "omx", "omx-lterm", false),
-            ("omc", "omc", "omc-lterm", false),
+        for (name, binary, session_base, show_status, mat_cli) in [
+            ("claude", "claude", "claude-lterm", false, Some("claude")),
+            ("codex", "codex", "codex-lterm", false, Some("codex")),
+            (
+                "opencode",
+                "opencode",
+                "opencode-lterm",
+                false,
+                Some("opencode"),
+            ),
+            ("copilot", "copilot", "copilot-lterm", false, None),
+            (
+                "cursor-agent",
+                "cursor-agent",
+                "cursor-agent-lterm",
+                false,
+                None,
+            ),
+            ("agy", "agy", "agy-lterm", false, None),
+            ("jules", "jules", "jules-lterm", false, None),
+            ("kiro", "kiro-cli", "kiro-lterm", false, None),
+            ("aider", "aider", "aider-lterm", false, Some("aider")),
+            ("goose", "goose", "goose-lterm", false, Some("goose")),
+            ("amp", "amp", "amp-lterm", false, None),
+            ("crush", "crush", "crush-lterm", false, Some("crush")),
+            ("gemini", "gemini", "gemini-lterm", false, Some("gemini")),
+            ("kimi", "kimi", "kimi-lterm", false, Some("kimi")),
+            ("qwen", "qwen", "qwen-lterm", false, Some("qwen")),
+            ("omx", "omx", "omx-lterm", false, None),
+            ("omc", "omc", "omc-lterm", false, None),
         ] {
             let profile = AgentProfile::resolve(name).expect("built-in profile");
             assert_eq!(profile.binary, binary, "{name}");
             assert_eq!(profile.session_base, session_base, "{name}");
             assert_eq!(profile.show_status, show_status, "{name}");
+            assert_eq!(profile.mat_cli.as_deref(), mat_cli, "{name}");
         }
     }
 
@@ -4427,10 +4545,12 @@ mod tests {
         assert_eq!(profiles[0].binary, "codex");
         assert_eq!(profiles[0].session_base, "repo-review-session");
         assert!(!profiles[0].show_status);
+        assert_eq!(profiles[0].mat_cli, None);
         assert_eq!(profiles[1].name, "helper");
         assert_eq!(profiles[1].binary, "helper");
         assert_eq!(profiles[1].session_base, "helper-lterm");
         assert!(profiles[1].show_status);
+        assert_eq!(profiles[1].mat_cli, None);
 
         let infos =
             selected_agent_profile_infos(None, vec!["codex".to_string(), "my-agent".to_string()])
@@ -4482,6 +4602,7 @@ mod tests {
         assert_eq!(profile.binary, "my-agent");
         assert_eq!(profile.session_base, "my-agent-lterm");
         assert!(profile.show_status);
+        assert_eq!(profile.mat_cli, None);
     }
 
     #[test]
@@ -4606,6 +4727,137 @@ mod tests {
             }
             other => panic!("expected agent command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_launch_options_parse_mat_profile_alias_before_separator() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "claude",
+            "--profile",
+            "work",
+            "--",
+            "--profile",
+            "native",
+        ])
+        .expect("mat profile alias should parse before forwarded args");
+        match cli.command {
+            Commands::Claude { launch, args } => {
+                assert_eq!(launch.mat_profile(), Some("work"));
+                assert_eq!(args, vec!["--profile", "native"]);
+            }
+            other => panic!("expected claude command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "agent",
+            "codex",
+            "--mat-profile",
+            "personal",
+            "--",
+            "--profile",
+            "native",
+        ])
+        .expect("canonical mat profile flag should parse for generic agents");
+        match cli.command {
+            Commands::Agent {
+                profile,
+                launch,
+                args,
+                ..
+            } => {
+                assert_eq!(profile, "codex");
+                assert_eq!(launch.mat_profile(), Some("personal"));
+                assert_eq!(args, vec!["--profile", "native"]);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_launch_help_documents_mat_profile_flag_and_alias() {
+        let mut cmd = Cli::command();
+        let claude = cmd
+            .find_subcommand_mut("claude")
+            .expect("claude subcommand");
+        let help = claude.render_long_help().to_string();
+        assert!(help.contains("--mat-profile <PROFILE>"), "{help}");
+        assert!(help.contains("[aliases: --profile]"), "{help}");
+    }
+
+    #[test]
+    fn mat_profile_names_are_validated_before_wrap() {
+        assert!(validate_mat_profile_name("work").is_ok());
+        assert!(validate_mat_profile_name("work profile").is_ok());
+        assert!(validate_mat_profile_name("").is_err());
+        assert!(validate_mat_profile_name("   ").is_err());
+        assert!(validate_mat_profile_name(" work").is_err());
+        assert!(validate_mat_profile_name("work ").is_err());
+        assert!(validate_mat_profile_name("-work").is_err());
+        assert!(validate_mat_profile_name("work\nnext").is_err());
+        assert!(validate_mat_profile_name("work\0next").is_err());
+    }
+
+    #[test]
+    fn mat_profile_wrapper_builds_temporal_exec_argv() {
+        let profile = AgentProfile::known("claude");
+        let forwarded_args = vec!["--profile".to_string(), "native".to_string()];
+
+        let plain = agent_command_argv(
+            &profile,
+            Path::new("/bin/claude"),
+            None,
+            None,
+            &forwarded_args,
+        )
+        .expect("plain argv");
+        assert_eq!(
+            plain,
+            vec![
+                "/bin/claude".to_string(),
+                "--profile".to_string(),
+                "native".to_string()
+            ]
+        );
+
+        let wrapped = agent_command_argv(
+            &profile,
+            Path::new("/bin/claude"),
+            Some(Path::new("/usr/local/bin/mat")),
+            Some("work"),
+            &forwarded_args,
+        )
+        .expect("wrapped argv");
+        assert_eq!(
+            wrapped,
+            vec![
+                "/usr/local/bin/mat".to_string(),
+                "exec".to_string(),
+                "claude".to_string(),
+                "work".to_string(),
+                "--".to_string(),
+                "/bin/claude".to_string(),
+                "--profile".to_string(),
+                "native".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn mat_profile_wrapper_rejects_unsupported_agents_before_shell_command() {
+        let agy = AgentProfile::known("agy");
+        let err = agent_command_argv(
+            &agy,
+            Path::new("/bin/agy"),
+            Some(Path::new("/usr/local/bin/mat")),
+            Some("work"),
+            &[],
+        )
+        .expect_err("unsupported mat profile wrapper");
+        let message = err.to_string();
+        assert!(message.contains("unsupported for agent agy"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message:?}");
     }
 
     #[test]
