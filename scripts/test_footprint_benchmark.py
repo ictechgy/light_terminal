@@ -31,6 +31,30 @@ def kill_fake_daemons(tmp_path: Path) -> None:
             pass
 
 
+def fake_daemon_pids(tmp_path: Path) -> list[int]:
+    pid_file = tmp_path / "fake-lterm-daemons.pid"
+    if not pid_file.exists():
+        return []
+    pids: list[int] = []
+    for line in pid_file.read_text(encoding="utf-8").splitlines():
+        try:
+            pids.append(int(line))
+        except ValueError:
+            pass
+    return pids
+
+
+def assert_fake_daemons_gone(testcase: unittest.TestCase, tmp_path: Path) -> None:
+    for pid in fake_daemon_pids(tmp_path):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        testcase.fail(f"fake daemon still running after harness cleanup: pid {pid}")
+
+
 def command_names_from_log(log_path: Path) -> list[str]:
     names: list[str] = []
     for line in log_path.read_text(encoding="utf-8").splitlines():
@@ -140,6 +164,7 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
             finally:
                 kill_fake_daemons(tmp_path)
             self.assertEqual(code, 0)
+            assert_fake_daemons_gone(self, tmp_path)
             report = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertEqual(report["schema_version"], fb.SCHEMA_VERSION)
             self.assertEqual(report["results"]["lterm"]["status"], "ok")
@@ -178,6 +203,7 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
             finally:
                 kill_fake_daemons(tmp_path)
             self.assertEqual(code, 0)
+            assert_fake_daemons_gone(self, tmp_path)
             report = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertIn("daemon_ready_ms", report["results"]["tmux"]["metrics"])
             steps = report["results"]["tmux"]["metrics"]["omx_style_workflow_ms"]["iterations"][0]["steps"]
@@ -214,7 +240,7 @@ def write_fake_lterm(tmp_path: Path) -> Path:
             daemon_pids_path = {str(daemon_pids)!r}
             argv = sys.argv[1:]
             def marker_from_command(command):
-                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                marker = 'BROKEN_FAKE_MARKER'
                 if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
                     match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
                     if match:
@@ -262,7 +288,7 @@ def write_fake_lterm(tmp_path: Path) -> Path:
                     with open(state_path, encoding='utf-8') as state_fh:
                         print(state_fh.read())
                 except FileNotFoundError:
-                    print('LTERM_FOOTPRINT_MARKER_fake')
+                    print('BROKEN_FAKE_MARKER')
                 raise SystemExit(0)
             if argv[:2] == ['tmux-compat', 'kill-pane'] or argv[:2] == ['tmux-compat', 'kill-session']:
                 raise SystemExit(0)
@@ -289,7 +315,7 @@ def write_fake_tmux(tmp_path: Path) -> Path:
             state_path = {str(state)!r}
             argv = sys.argv[1:]
             def marker_from_command(command):
-                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                marker = 'BROKEN_FAKE_MARKER'
                 if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
                     match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
                     if match:
@@ -302,7 +328,7 @@ def write_fake_tmux(tmp_path: Path) -> Path:
                 fh.write(json.dumps({{'argv': argv}}, sort_keys=True) + '\\n')
 
             def marker_from_command(command):
-                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                marker = 'BROKEN_FAKE_MARKER'
                 if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
                     match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
                     if match:
@@ -340,7 +366,7 @@ def write_fake_tmux(tmp_path: Path) -> Path:
                     with open(state_path, encoding='utf-8') as state_fh:
                         print(state_fh.read())
                 except FileNotFoundError:
-                    print('LTERM_FOOTPRINT_MARKER_fake')
+                    print('BROKEN_FAKE_MARKER')
                 raise SystemExit(0)
             if argv and argv[0] in ('kill-pane', 'kill-session', 'kill-server'):
                 raise SystemExit(0)
@@ -348,7 +374,7 @@ def write_fake_tmux(tmp_path: Path) -> Path:
             raise SystemExit(1)
 
             def marker_from_command(command):
-                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                marker = 'BROKEN_FAKE_MARKER'
                 if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
                     match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
                     if match:
