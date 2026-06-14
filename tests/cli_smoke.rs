@@ -2432,8 +2432,12 @@ fn install_completions_sanitizes_error_paths() -> TestResult {
         "stderr should preserve useful error context: {stderr:?}"
     );
     assert!(
-        stderr.contains("bad]0;owned"),
+        stderr.contains("bad"),
         "stderr should retain readable sanitized path text: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("owned"),
+        "stderr should strip OSC payload text from sanitized paths: {stderr:?}"
     );
     Ok(())
 }
