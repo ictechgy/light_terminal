@@ -13634,10 +13634,9 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
     let env = TestEnv::new()?;
     let socket = socket_path_for(&env);
     let payload_path = env.temp.path().join("raw-attach-payload.bin");
-    std::fs::write(
-        &payload_path,
-        b"\x1b[31mRED\x1b[0m\x1b]52;c;RAW_SECRET\x07\x1bPqDCS_RAW\x1b\\",
-    )?;
+    let expected_payload =
+        b"\x1b[31mRED\x1b[0m\x1b]52;c;RAW_SECRET\x07\x1bPqDCS_RAW\x1b\\\0\xff\x80BIN";
+    std::fs::write(&payload_path, expected_payload)?;
 
     let status = env
         .cmd()
@@ -13657,7 +13656,7 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
                 "printf 'RAW_START'; ",
                 "cat \"$payload\"; ",
                 "printf 'RAW_END\\n'; ",
-                "break; ",
+                "while :; do sleep 60; done; ",
                 "fi; ",
                 "done"
             ),
@@ -13703,11 +13702,18 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
         "raw attach must preserve payload order: {:?}",
         String::from_utf8_lossy(&raw)
     );
+    let payload_start = raw_start + b"RAW_START".len();
+    assert_eq!(
+        &raw[payload_start..raw_end],
+        expected_payload,
+        "raw attach must preserve the exact marker-delimited payload bytes: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
 
     let captured = env.capture_until("raw-bytes", "RAW_END")?;
     assert!(captured.contains("RED"), "{captured:?}");
-    // Sanitized capture/list-style surfaces must drop active control-sequence
-    // payloads, not merely erase the ESC byte and leave sensitive contents.
+    // Sanitized capture surfaces must drop active control-sequence payloads,
+    // not merely erase the ESC byte and leave sensitive contents.
     assert!(
         !captured.contains('\x1b'),
         "sanitized capture should still strip escapes: {captured:?}"
@@ -13725,31 +13731,70 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
         "sanitized capture should still strip BEL controls: {captured:?}"
     );
 
+    let kill = env.cmd().args(["kill", "raw-bytes"]).status()?;
+    assert!(kill.success(), "raw-bytes session should be killable");
+
+    drop(stream);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn sessions_list_sanitizes_control_sequence_metadata() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let metadata_arg = "LIST_VISIBLE_\x1b]52;c;LIST_SECRET\x07\x1bPqLIST_DCS\x1b\\_AFTER";
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "list-meta",
+            "--",
+            "sh",
+            "-c",
+            "printf 'READY_LIST_META\\n'; while :; do sleep 60; done",
+            "list-meta-script",
+        ])
+        .arg(metadata_arg)
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+    env.capture_until("list-meta", "READY_LIST_META")?;
+
     let list = env.cmd().arg("sessions").output()?;
     assert!(list.status.success(), "{list:?}");
     let list_stdout = String::from_utf8_lossy(&list.stdout);
-    let raw_row = list_row(&list_stdout, "raw-bytes").ok_or_else(|| {
-        format!("raw-bytes should remain visible in sessions list: {list_stdout:?}")
-    })?;
-    let raw_row = raw_row.join("\t");
+    let row = list_row(&list_stdout, "list-meta")
+        .ok_or_else(|| {
+            format!("list-meta should remain visible in sessions list: {list_stdout:?}")
+        })?
+        .join("\t");
     assert!(
-        !raw_row.contains('\x1b'),
-        "sessions list should sanitize escapes in metadata: {raw_row:?}"
+        row.contains("LIST_VISIBLE_") && row.contains("_AFTER"),
+        "sessions list test must be non-vacuous and include sanitized metadata arg: {row:?}"
     );
     assert!(
-        !raw_row.contains('\x07'),
-        "sessions list should sanitize BEL controls in metadata: {raw_row:?}"
+        !row.contains('\x1b'),
+        "sessions list should sanitize escapes in metadata: {row:?}"
     );
     assert!(
-        !raw_row.contains("RAW_SECRET"),
-        "sessions list should not expose raw OSC payload contents: {raw_row:?}"
+        !row.contains('\x07'),
+        "sessions list should sanitize BEL controls in metadata: {row:?}"
     );
     assert!(
-        !raw_row.contains("DCS_RAW"),
-        "sessions list should not expose raw DCS payload contents: {raw_row:?}"
+        !row.contains("LIST_SECRET"),
+        "sessions list should strip OSC payload contents from metadata: {row:?}"
+    );
+    assert!(
+        !row.contains("LIST_DCS"),
+        "sessions list should strip DCS payload contents from metadata: {row:?}"
     );
 
-    drop(stream);
+    let kill = env.cmd().args(["kill", "list-meta"]).status()?;
+    assert!(kill.success(), "list-meta session should be killable");
     Ok(())
 }
 

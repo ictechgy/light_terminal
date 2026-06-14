@@ -14,7 +14,7 @@ pub fn osc_field(value: &str) -> String {
 }
 
 pub fn terminal_text(value: &str) -> String {
-    strip_controls(value)
+    strip_controls(&terminal_capture(value.as_bytes()))
 }
 
 pub fn terminal_capture(bytes: &[u8]) -> String {
@@ -483,6 +483,18 @@ mod tests {
         assert_eq!(terminal_capture(b"A\x1b[31\x18B"), "AB");
         assert_eq!(terminal_capture(b"A\x1b]title\x1bXsecret\x07B"), "AB");
         assert_eq!(terminal_capture(b"A\x90secret\x1b\\B"), "AB");
+    }
+
+    #[test]
+    fn terminal_text_strips_escape_payloads_and_line_controls() {
+        let text = terminal_text(
+            "LIST_VISIBLE_\x1b]52;c;LIST_SECRET\x07\x1bPqLIST_DCS\x1b\\_AFTER\tNEXT\nROW",
+        );
+        assert_eq!(text, "LIST_VISIBLE__AFTERNEXTROW");
+        assert!(!text.contains("LIST_SECRET"));
+        assert!(!text.contains("LIST_DCS"));
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\x07'));
     }
 
     #[test]
