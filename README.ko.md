@@ -7,7 +7,7 @@
 - **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이지만, 기능 범위를 더 작게 좁힌 도구입니다. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
 - **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속합니다. shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` 같은 내장 단축 명령을 사용할 수 있습니다. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
-- **상태** — 1.0 명령/출력 호환성 경계를 문서화한 alpha MVP입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도, escape-sequence sanitizer도, 완전한 tmux 대체품도 아닙니다.**
+- **상태** — 문서화된 1.0 명령/출력 호환성 경계를 따르는 1.x CLI입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도, escape-sequence sanitizer도, 완전한 tmux 대체품도 아닙니다.**
 
 ---
 
@@ -305,52 +305,69 @@ lterm input api 'echo hello' --enter
 
 위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다룰 수 있게 해 주는 명령 집합입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `reconnect`는 SSH 재접속 뒤 마지막으로 선택했던 로컬 lterm 세션을 다시 엽니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
 
-`lterm reconnect [fallback]`는 마지막으로 선택한 세션을 가리키는 private
-pointer만 저장합니다(`session_id`, pane id, 사용자가 정한 session name,
-timestamp). 다음 실행에서는 이 pointer를 사용하고, pointer가 없거나 깨졌거나 오래되어
-더 이상 맞지 않으면 `fallback`(기본값: `main`)으로 `lterm open`과 같은
-attach-or-create 동작을 수행합니다. session name에는 secret을 넣지 마세요.
-`reconnect`도 raw attach를 할 수 있으므로, 휴대폰 SSH client에서 정제된
-normal-screen transcript를 원하면 `--mobile`을 사용하세요. 모바일 SSH 로그인
-profile snippet을 미리 보려면
-`lterm init --mobile-reconnect --shell zsh`(또는 `bash`, `fish`, `posix`)를
-실행하세요. `--shell`을 생략하면 `$SHELL`에서 감지합니다. 이 snippet은 자동
-설치되지 않습니다. 검토한 뒤 직접 복사하고, 되돌리려면 복사한 block을 삭제하거나
-`LTERM_RECONNECT_DISABLE=1`을 설정하세요.
+`lterm reconnect [fallback]`는 마지막으로 선택한 세션을 가리키는 비공개
+최소 pointer(`session_id`, pane id, 사용자가 붙인 session name, timestamp)만
+저장하고, 다음 실행 때 그 pointer를 사용합니다. pointer가 없거나 손상됐거나
+오래되어 더 이상 맞지 않으면 `fallback`(기본값: `main`)으로 돌아가며,
+동작은 `lterm open`과 같은 attach-or-create 방식입니다.
 
-`lterm urls <target>`은 raw attach PTY stream을 건드리지 않고, 마지막 120개
-정제된 scrollback line에서 `http://` / `https://` link를 추출합니다. 기본
-출력은 link마다 `N<TAB>URL` 한 줄이고, `--last`는 휴대폰에서 복사하기 쉽도록
-가장 최근의 유효한 URL 하나만 출력합니다. `--json`은 JSON array를 출력하고,
-`--tail N`으로 scan 범위를 바꿀 수 있습니다. text mode에서 URL이 없으면 성공
-종료하면서 출력하지 않고, JSON mode는 `[]`를 출력합니다. 추출은 unique ASCII
-URL token 256개로 제한되며, 4096 byte를 넘는 raw URL candidate는 잘라 내지
-않고 건너뜁니다. 모바일 transcript mode에서는 `/links` 또는 `/urls`를 입력하면
-이 numbered list를 로컬로 보여 주며, 해당 입력은 PTY로 전달되지 않습니다.
-Claude/OAuth 로그인 URL을 Termius 같은 모바일 SSH client에서 복사해야 할 때
-유용합니다. Claude 전용 모바일 제어가 목적이라면 Claude Code Remote Control
-흐름도 URL 복사 왕복을 줄이는 우회책이 될 수 있습니다.
+세션 이름에는 secret을 넣지 마세요. `reconnect`도 raw attach가 가능하므로,
+휴대폰 SSH client에서 정제된 normal-screen transcript를 원하면 `--mobile`을
+함께 사용하세요. 모바일 SSH 로그인용 optional snippet은
+`lterm init --mobile-reconnect --shell zsh`(`bash`, `fish`, `posix`도 가능)로
+미리 볼 수 있고, `--shell`을 생략하면 `$SHELL`에서 감지합니다. snippet은
+자동 설치되지 않습니다. 검토한 뒤 직접 복사하고, 되돌릴 때는 복사한 block을
+삭제하거나 `LTERM_RECONNECT_DISABLE=1`로 건너뛰세요.
 
-추출된 link는 신뢰할 수 없는 terminal output으로 취급하세요. 악성 프로그램은
-피싱 URL을 출력할 수 있고, OAuth, magic-login, device-code link에는 짧게 살아
-있는 secret이 포함될 수 있습니다. 예상한 link만 열고, 공유 로그나 채팅에
-그대로 붙여넣지 말고, `--last`는 최신 link가 의도한 대상임을 알고 있을 때만
-사용하는 것이 안전합니다.
+`lterm urls <target>`는 raw attach PTY stream을 건드리지 않고, 마지막
+120줄의 정제된 scrollback에서 `http://`와 `https://` link를 추출합니다.
+기본 출력은 link마다 한 줄씩 `N<TAB>URL`입니다. 최신 유효 URL만 보려면
+`--last`, JSON 배열이 필요하면 `--json`, 검색 범위를 바꾸려면 `--tail N`을
+사용하세요. text mode에서 link가 없으면 성공 종료하며 아무것도 출력하지 않고,
+JSON mode에서는 `[]`를 출력합니다. URL 추출은 unique ASCII URL token 256개로
+제한되며, 4096 byte를 넘는 raw candidate는 자르지 않고 건너뜁니다.
 
-`lterm search <target> QUERY`는 raw attach PTY stream을 건드리지 않고, 마지막
-120개 정제된 scrollback line에서 대소문자를 구분하는 literal match line을
-찾습니다. 기본 출력은 1부터 시작하는 `N<TAB>LINE` 형식이고, `--json`은 같은
-정제된 matching line의 JSON array를 출력합니다. `--tail N`으로 scan 범위를
-바꿀 수 있으며, text mode에서 match가 없으면 성공 종료하면서 출력하지 않고,
-빈 `QUERY`는 거부합니다. 모바일 transcript mode에서는 `/grep QUERY`를 입력하면
-active transcript tail window에서 matching line을 로컬로 보여 주며, 해당 입력은
-PTY로 전달되지 않습니다. query 없이 `/grep`만 입력하면 `Usage: /grep QUERY`를
-출력하고, match가 없으면
+mobile transcript mode에서는 `/links` 또는 `/urls`를 입력하면 같은 번호 목록을
+PTY로 보내지 않고 로컬에서 보여 줍니다. Termius 계열 모바일 SSH client에서
+Claude/OAuth login URL을 복사할 때 유용하며, Claude 전용 모바일
+제어에는 Claude Code Remote Control flow가 URL 복사 왕복을 줄여 줄 수도
+있습니다. 추출된 link는 신뢰할 수 없는 터미널 출력으로 취급하세요. 악성
+프로그램이 피싱 URL을 출력할 수 있고, OAuth/magic-login/device-code link는
+짧게 살아 있는 secret을 포함할 수 있습니다. 예상한 link만 열고, 공유 로그나
+채팅에 붙여 넣지 말며, `--last`는 최신 link가 원하는 link임을 알 때만
+사용하세요.
+
+`lterm search <target> QUERY`는 raw attach PTY stream을 건드리지 않고,
+마지막 120줄의 정제된 scrollback에서 대소문자를 구분하는 literal match를
+찾습니다. 기본 출력은 1부터 시작하는 번호를 붙인 `N<TAB>LINE`입니다. `--json`은
+같은 정제된 match를 JSON 배열로 출력하고, `--tail N`은 검색 범위를
+바꿉니다. text mode에서 match가 없으면 성공 종료하며 아무것도 출력하지 않고,
+빈 `QUERY`는 거부합니다. mobile transcript mode에서는 `/grep QUERY`를 입력해
+active transcript tail window의 match를 PTY로 보내지 않고 로컬에서 볼 수
+있습니다. query 없는 `/grep`은 `Usage: /grep QUERY`를 출력하고, match가 없으면
 `No matches found in current transcript.`를 출력합니다.
 
-자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
-Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
-`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/grep QUERY`, `/exit` / `/quit`가 있고, `/links`, `/urls`, `/grep`은 로컬에서만 처리되어 PTY로 전달되지 않습니다. link가 없으면 `No URLs found in current transcript.`를 출력하고, `/grep`은 active transcript `--tail` window를 사용하며 query가 없으면 `Usage: /grep QUERY`를 출력합니다. `/grep` match가 없으면 `No matches found in current transcript.`를 출력하며, 이외의 줄은 PTY로 전달됩니다.
+자동화와 테스트에서 `lterm compose api --once --message 'hello'`는 정제된
+capture/send cycle을 한 번 수행합니다. `logs`와 같은 session-or-pane target
+모델로 마지막 `--tail`줄(기본값: 80)의 정제된 output을 캡처한 뒤, 기본적으로
+Enter(`\r`)를 덧붙여 `lterm input --enter`와 같은 방식으로 보냅니다. 정확한
+message byte만 보내려면 `--no-enter`를 추가하세요. `compose` / `mobile`은 attach
+client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
+
+interactive compose에서는 `--refresh`(기본값: 500ms), local input, resize event에
+맞춰 view를 갱신합니다. Enter는 현재 input buffer를 commit하며, 빈 buffer도
+commit 대상입니다. 기본적으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로
+전달하지 않고 local composer를 종료합니다.
+
+`lterm compose api --transcript`는 mobile auto attach와 같은 normal-screen
+transcript UI를 엽니다. alternate-screen composer 없이 정제된 scrollback과
+간단한 line input만 쓰고 싶을 때 사용하고, 출력만 보려면 `--read-only`를
+추가하세요. transcript-local command는 `/refresh`, `/raw`, `/links` / `/urls`,
+`/grep QUERY`, `/exit` / `/quit`입니다. `/links`, `/urls`, `/grep`은 로컬에서만
+처리되고 PTY로 전달되지 않습니다. link가 없으면 `No URLs found in current
+transcript.`를 출력하고, query 없는 `/grep`은 `Usage: /grep QUERY`, match가
+없으면 `No matches found in current transcript.`를 출력합니다. 알 수 없는 줄은
+PTY로 전송됩니다.
 
 **세션 종료:**
 
@@ -577,7 +594,7 @@ lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 
 **터미널 출력은 그대로 전달됩니다.** `lterm resume`(호환 이름: `lterm attach`)은 full-screen 터미널 프로그램과 cmux/OSC 알림이 정상 동작하도록 PTY byte를 그대로 통과시킵니다. 로컬 상태 바는 클라이언트 쪽 표시 요소일 뿐이며, 완전한 raw 모드 터미널이 필요하면 `--no-status`를 사용하세요. nested agent row suspension은 host-side geometry/status 관리일 뿐 attach된 PTY byte를 정제하거나 다시 쓰지 않습니다. 신뢰할 수 없는 child 프로그램은 tmux/screen에서와 마찬가지로 attach된 터미널에 escape sequence를 출력할 수 있습니다. **`lterm`을 escape-sequence sanitizer나 sandbox로 사용하지 마세요.**
 
-**Capture 출력은 표시/로깅 전에 terminal control sequence를 제거합니다.** `lterm logs`(호환 이름: `lterm capture`), `lterm compose`(alias: `lterm mobile`), `tmux capture-pane`은 captured scrollback을 출력할 때 raw 또는 UTF-8 encoded C1 control을 포함한 터미널 제어 시퀀스를 제거합니다. 정상 UTF-8 text인 한국어, CJK, emoji는 보존합니다. 그래도 scrollback text는 신뢰할 수 없는 프로그램 출력일 수 있으므로 사람이나 agent에게 넘기기 전에 확인하세요. `compose`는 attach가 아닌 view에서 기존 input/send 경로로 텍스트를 commit하며, raw attached PTY stream을 변환하지 않습니다.
+**Capture와 report 출력은 표시/로깅 전에 terminal control sequence를 제거합니다.** `lterm logs`(호환 이름: `lterm capture`), `lterm compose`(alias: `lterm mobile`), `lterm search`, `lterm urls`, 진단 출력, `tmux capture-pane`은 scrollback에서 나온 text를 출력하기 전에 raw 또는 UTF-8 encoded C1 control을 포함한 터미널 제어 시퀀스를 제거합니다. 정상 UTF-8 text인 한국어, CJK, emoji는 보존합니다. 그래도 scrollback text는 신뢰할 수 없는 프로그램 출력일 수 있으므로 사람이나 agent에게 넘기기 전에 확인하세요. `compose`는 attach가 아닌 view에서 기존 input/send 경로로 텍스트를 commit하며, raw attach PTY stream을 변환하지 않습니다.
 
 **프로세스 가시성.** `lterm processes [session]`(호환 이름: `lterm ps [session]`)은 process-group id와 함께 각 세션 child 아래의 process tree를 보여 줍니다. `--orphans`를 추가하면 기록된 session root의 descendant가 아니지만 같은 process group에 남아 있는 row도 함께 보여 주므로, Codex/OMX/MCP subprocess가 누적되어 메모리 누수처럼 커지기 전에 확인할 수 있습니다. 시스템 `ps`는 절대 경로로 호출하며, 형식이 잘못된 process row는 추측하지 않고 건너뜁니다.
 
