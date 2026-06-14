@@ -331,7 +331,7 @@ mobile transcript mode에서는 `/links` 또는 `/urls`를 입력하면 같은 �
 PTY로 보내지 않고 로컬에서 보여 줍니다. Termius 계열 모바일 SSH client에서
 Claude/OAuth login URL을 복사할 때 유용하며, Claude 전용 모바일
 제어에는 Claude Code Remote Control flow가 URL 복사 왕복을 줄여 줄 수도
-있습니다. 추출된 link는 신뢰할 수 없는 터미널 출력으로 취급하세요. 악성
+있습니다. 추출된 link는 신뢰할 수 없는 terminal output으로 취급하세요. 악성
 프로그램이 피싱 URL을 출력할 수 있고, OAuth/magic-login/device-code link는
 짧게 살아 있는 secret을 포함할 수 있습니다. 예상한 link만 열고, 공유 로그나
 채팅에 붙여 넣지 말며, `--last`는 최신 link가 원하는 link임을 알 때만
