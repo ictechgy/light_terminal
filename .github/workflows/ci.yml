@@ -42,11 +42,30 @@ jobs:
           python3 scripts/test_quad_brainstorming_json_schemas.py
           python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
       - name: Release build
         run: cargo build --release --locked
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit locked dependency graph
+        run: |
+          cargo audit --version
+          cargo audit
 
   contract-manifest-validate:
     name: contract-manifest-validate
@@ -131,7 +150,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run v0.1.4 compatibility matrix
-        run: cargo test --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
+        run: cargo test --locked --test upgrade_matrix -- --include-ignored --nocapture --test-threads=1
 
   soak-release-gate:
     name: soak-release-gate
@@ -146,4 +165,4 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run 15-minute soak profile
-        run: LTERM_SOAK_DURATION=900 LTERM_SOAK_SESSIONS=16 cargo test --test soak -- --ignored --nocapture --test-threads=1
+        run: LTERM_SOAK_DURATION=900 LTERM_SOAK_SESSIONS=16 cargo test --locked --test soak -- --ignored --nocapture --test-threads=1
