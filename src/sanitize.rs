@@ -561,12 +561,9 @@ mod tests {
 
     #[test]
     fn terminal_capture_does_not_treat_utf8_continuation_as_c1_st() {
-        assert_eq!(
-            terminal_capture("A\x1b]52;c;亚SECRET\x07B".as_bytes()),
-            "AB"
-        );
-        assert_eq!(terminal_capture("A\x1bPq亚SECRET\x1b\\B".as_bytes()), "AB");
-        let text = terminal_text("SAFE_\x1b]52;c;亚LIST_SECRET\x07_AFTER");
+        assert_eq!(terminal_capture("A\x1b]52;c;ÜSECRET\x07B".as_bytes()), "AB");
+        assert_eq!(terminal_capture("A\x1bPqÜSECRET\x1b\\B".as_bytes()), "AB");
+        let text = terminal_text("SAFE_\x1b]52;c;ÜLIST_SECRET\x07_AFTER");
         assert_eq!(text, "SAFE__AFTER");
         assert!(!text.contains("LIST_SECRET"));
     }
@@ -704,10 +701,10 @@ mod tests {
 
     #[test]
     fn sanitize_status_command_line_does_not_treat_utf8_continuation_as_c1_st() {
-        let out = sanitize_status_command_line("a\x1b]52;c;亚secret\x07b".as_bytes(), true);
+        let out = sanitize_status_command_line("a\x1b]52;c;Üsecret\x07b".as_bytes(), true);
         assert_eq!(out, "ab");
 
-        let dcs = sanitize_status_command_line("a\x1bPq亚secret\x1b\\b".as_bytes(), true);
+        let dcs = sanitize_status_command_line("a\x1bPqÜsecret\x1b\\b".as_bytes(), true);
         assert_eq!(dcs, "ab");
     }
 
