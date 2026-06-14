@@ -287,6 +287,7 @@ lterm sessions --all
 lterm processes api --orphans
 lterm logs api --start=-80 --end=-1
 lterm urls api --last
+lterm search api 'build failed'
 lterm compose api
 LTERM_MOBILE=1 lterm resume codex-lterm
 lterm resume --raw codex-lterm
@@ -316,9 +317,20 @@ Claude/OAuth 로그인 URL을 Termius 같은 모바일 SSH client에서 복사�
 그대로 붙여넣지 말고, `--last`는 최신 link가 의도한 대상임을 알고 있을 때만
 사용하는 것이 안전합니다.
 
+`lterm search <target> QUERY`는 raw attach PTY stream을 건드리지 않고, 마지막
+120개 정제된 scrollback line에서 대소문자를 구분하는 literal match line을
+찾습니다. 기본 출력은 1부터 시작하는 `N<TAB>LINE` 형식이고, `--json`은 같은
+정제된 matching line의 JSON array를 출력합니다. `--tail N`으로 scan 범위를
+바꿀 수 있으며, text mode에서 match가 없으면 성공 종료하면서 출력하지 않고,
+빈 `QUERY`는 거부합니다. 모바일 transcript mode에서는 `/grep QUERY`를 입력하면
+active transcript tail window에서 matching line을 로컬로 보여 주며, 해당 입력은
+PTY로 전달되지 않습니다. query 없이 `/grep`만 입력하면 `Usage: /grep QUERY`를
+출력하고, match가 없으면
+`No matches found in current transcript.`를 출력합니다.
+
 자동화와 테스트에는 `lterm compose api --once --message 'hello'`를 사용하면 한 번의 정제된 capture/send 사이클을 실행합니다. `logs`와 같은 session-or-pane target 모델에서 마지막 `--tail` 정제 라인(기본값: 80)을 capture한 뒤, 기본으로 Enter(`\r`)를 붙여 `lterm input --enter`와 맞추며, `--no-enter`를 추가하면 message byte만 정확히 보냅니다. `compose` / `mobile`은 attach client가 아니며 attached-client 수나 PTY geometry를 바꾸지 않습니다.
 Interactive compose 화면은 `--refresh`(기본값: 500ms), 로컬 입력, 터미널 resize 이벤트마다 갱신됩니다. Enter를 누르면 현재 입력 buffer를 commit하고(빈 buffer도 commit됨), 위 one-shot 규칙처럼 기본으로 `\r`을 덧붙입니다. Ctrl-C, Ctrl-D, Esc는 PTY로 전달하지 않고 로컬 composer를 종료합니다.
-`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/exit` / `/quit`가 있고, `/links`와 `/urls`는 로컬에서만 처리되어 PTY로 전달되지 않습니다. link가 없으면 `No URLs found in current transcript.`를 출력하며, 이외의 줄은 PTY로 전달됩니다.
+`lterm compose api --transcript`를 사용하면 모바일 auto attach가 쓰는 것과 같은 normal-screen transcript UI를 직접 열 수 있습니다. alternate-screen composer 없이 정제된 scrollback과 간단한 line input만 쓰고 싶을 때 적합합니다. 출력만 보고 싶으면 `--read-only`를 추가하세요. Transcript-local command에는 `/refresh`, `/raw`, `/links` / `/urls`, `/grep QUERY`, `/exit` / `/quit`가 있고, `/links`, `/urls`, `/grep`은 로컬에서만 처리되어 PTY로 전달되지 않습니다. link가 없으면 `No URLs found in current transcript.`를 출력하고, `/grep`은 active transcript `--tail` window를 사용하며 query가 없으면 `Usage: /grep QUERY`를 출력합니다. `/grep` match가 없으면 `No matches found in current transcript.`를 출력하며, 이외의 줄은 PTY로 전달됩니다.
 
 **세션 종료:**
 

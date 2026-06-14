@@ -551,6 +551,35 @@ pub fn capture_urls(target: &str, tail: usize) -> Result<UrlExtraction> {
     Ok(extract_urls(&capture))
 }
 
+pub fn capture_search_matches(target: &str, tail: usize, query: &str) -> Result<Vec<String>> {
+    if query.is_empty() {
+        bail!("search query cannot be empty");
+    }
+    let tail_start = compose_tail_start(tail)?;
+    let capture = capture_range(target, Some(tail_start), None)?;
+    Ok(extract_search_matches(&capture, query))
+}
+
+pub fn extract_search_matches(text: &str, query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let sanitized = sanitize::terminal_capture(text.as_bytes());
+    sanitized
+        .lines()
+        .filter(|line| line.contains(query))
+        .map(sanitize::terminal_text)
+        .collect()
+}
+
+pub fn write_numbered_search_matches(matches: &[String], stdout: &mut impl Write) -> Result<()> {
+    for (index, line) in matches.iter().enumerate() {
+        writeln!(stdout, "{}\t{}", index + 1, sanitize::terminal_text(line))
+            .context("write search match")?;
+    }
+    Ok(())
+}
+
 pub fn extract_urls(text: &str) -> UrlExtraction {
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
@@ -2599,6 +2628,17 @@ where
     R: FnMut(&str) -> Result<String>,
     W: Write,
 {
+    if let Some(query) = mobile_transcript_grep_query(input) {
+        if query.is_empty() {
+            writeln!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}Usage: /grep QUERY")
+                .context("write mobile transcript grep usage")?;
+            return Ok(true);
+        }
+        let capture = capture(context.target, Some(context.tail_start), None)?;
+        write_mobile_transcript_search(&capture, query, stdout)?;
+        return Ok(true);
+    }
+
     match input {
         "/exit" | "/quit" => Ok(false),
         "/refresh" => {
@@ -2633,6 +2673,22 @@ where
     }
 }
 
+fn mobile_transcript_grep_query(input: &str) -> Option<&str> {
+    if input == "/grep" {
+        return Some("");
+    }
+    let rest = input.strip_prefix("/grep")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_whitespace())
+    {
+        Some(rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace()))
+    } else {
+        None
+    }
+}
+
 fn write_mobile_transcript_prompt(stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}> ").context("write mobile prompt")?;
     stdout.flush().context("flush mobile prompt")?;
@@ -2650,6 +2706,23 @@ fn write_mobile_transcript_urls(capture: &str, stdout: &mut impl Write) -> Resul
         return Ok(());
     }
     write_numbered_urls(&extraction.urls, stdout)
+}
+
+fn write_mobile_transcript_search(
+    capture: &str,
+    query: &str,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let matches = extract_search_matches(capture, query);
+    if matches.is_empty() {
+        writeln!(
+            stdout,
+            "{MOBILE_TRANSCRIPT_SGR_RESET}No matches found in current transcript."
+        )
+        .context("write empty mobile transcript search message")?;
+        return Ok(());
+    }
+    write_numbered_search_matches(&matches, stdout)
 }
 
 fn mobile_transcript_capture_changed(previous: &str, next: &str) -> bool {
@@ -6394,11 +6467,12 @@ mod tests {
         compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
         compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
         dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, extract_urls, format_status_line,
-        forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
-        heartbeat_due, hex_decode, hex_encode, hex_encoded_len, interruptible_sleep,
-        is_self_provided_tmux, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        ensure_trace_force_target_private, extract_search_matches, extract_urls,
+        format_status_line, forward_pty_output_frame_or_detached, handle_mobile_transcript_input,
+        handle_resize_tick, heartbeat_due, hex_decode, hex_encode, hex_encoded_len,
+        interruptible_sleep, is_self_provided_tmux, keyboard_protocol_restore_bytes,
+        likely_agent_session, matches_env_bool, mobile_client_detected,
+        mobile_transcript_capture_changed, mobile_transcript_grep_query,
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_command_bool, parse_status_command_interval, parse_status_style,
@@ -6408,7 +6482,7 @@ mod tests {
         status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
         trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
-        write_mobile_transcript_urls,
+        write_mobile_transcript_urls, write_numbered_search_matches,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -6545,6 +6619,48 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_matches_finds_case_sensitive_sanitized_lines_in_order() {
+        let matches = extract_search_matches(
+            "alpha needle\nNEEDLE uppercase\n\x1b[31mred needle\x1b[0m\nneedle again\n",
+            "needle",
+        );
+        assert_eq!(
+            matches,
+            vec![
+                "alpha needle".to_string(),
+                "red needle".to_string(),
+                "needle again".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_search_matches_strips_terminal_control_payloads() {
+        let matches = extract_search_matches(
+            "safe needle \x1b]52;c;secret\x07after\nansi \x1b[31mneedle\x1b[0m done\n",
+            "needle",
+        );
+        assert_eq!(
+            matches,
+            vec![
+                "safe needle after".to_string(),
+                "ansi needle done".to_string(),
+            ]
+        );
+        let rendered = matches.join("\n");
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
+        assert!(!rendered.contains("secret"), "{rendered:?}");
+    }
+
+    #[test]
+    fn write_numbered_search_matches_uses_one_based_rows() {
+        let mut out = Vec::new();
+        write_numbered_search_matches(&["first".to_string(), "second".to_string()], &mut out)
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "1\tfirst\n2\tsecond\n");
+    }
+
+    #[test]
     fn mobile_transcript_urls_reuses_numbered_url_output_without_remote_send() {
         let mut out = Vec::new();
         write_mobile_transcript_urls(
@@ -6620,6 +6736,157 @@ mod tests {
                 String::from_utf8(out).unwrap(),
                 "1\thttps://login.example/device\n"
             );
+        }
+    }
+
+    #[test]
+    fn mobile_transcript_grep_command_is_local_only() {
+        let options = MobileTranscriptOptions {
+            tail: 80,
+            refresh: Duration::from_millis(500),
+            read_only: false,
+            append_enter: true,
+            banner: false,
+        };
+        let mut last_capture = "prior capture".to_string();
+        let mut out = Vec::new();
+        let mut sent_payloads = Vec::new();
+        let mut capture_calls = 0;
+
+        let keep_running = handle_mobile_transcript_input(
+            "/grep needle",
+            MobileTranscriptInputContext {
+                target: "api",
+                tail_start: -80,
+                append_enter: options.append_enter,
+            },
+            &mut last_capture,
+            &mut out,
+            |target, start, end| {
+                capture_calls += 1;
+                assert_eq!(target, "api");
+                assert_eq!(start, Some(-80));
+                assert_eq!(end, None);
+                Ok("one needle\nno match\ntwo needle\n".to_string())
+            },
+            |target, data| {
+                sent_payloads.push((target.to_string(), data));
+                Ok(())
+            },
+            |target| Ok(format!("lterm attach --raw -- {target}")),
+        )
+        .unwrap();
+
+        assert!(keep_running);
+        assert_eq!(capture_calls, 1);
+        assert!(
+            sent_payloads.is_empty(),
+            "/grep must not be forwarded to the PTY: {sent_payloads:?}"
+        );
+        assert_eq!(last_capture, "prior capture");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "1\tone needle\n2\ttwo needle\n"
+        );
+    }
+
+    #[test]
+    fn mobile_transcript_grep_query_keeps_literal_query_after_separator() {
+        assert_eq!(mobile_transcript_grep_query("/grep"), Some(""));
+        assert_eq!(mobile_transcript_grep_query("/grep needle"), Some("needle"));
+        assert_eq!(
+            mobile_transcript_grep_query("/grep   needle  "),
+            Some("needle  ")
+        );
+        assert_eq!(mobile_transcript_grep_query("/grepneedle"), None);
+    }
+
+    #[test]
+    fn mobile_transcript_grep_preserves_trailing_query_space() {
+        let mut last_capture = "prior capture".to_string();
+        let mut out = Vec::new();
+        let mut sent_payloads = Vec::new();
+
+        let keep_running = handle_mobile_transcript_input(
+            "/grep   needle  ",
+            MobileTranscriptInputContext {
+                target: "api",
+                tail_start: -80,
+                append_enter: true,
+            },
+            &mut last_capture,
+            &mut out,
+            |target, start, end| {
+                assert_eq!(target, "api");
+                assert_eq!(start, Some(-80));
+                assert_eq!(end, None);
+                Ok("one needle  \ntwo needle\n".to_string())
+            },
+            |target, data| {
+                sent_payloads.push((target.to_string(), data));
+                Ok(())
+            },
+            |target| Ok(format!("lterm attach --raw -- {target}")),
+        )
+        .unwrap();
+
+        assert!(keep_running);
+        assert!(sent_payloads.is_empty());
+        assert_eq!(last_capture, "prior capture");
+        assert_eq!(String::from_utf8(out).unwrap(), "1\tone needle  \n");
+    }
+
+    #[test]
+    fn mobile_transcript_grep_reports_usage_and_empty_results_locally() {
+        for (command, expected, expected_capture_calls) in [
+            (
+                "/grep",
+                format!("{MOBILE_TRANSCRIPT_SGR_RESET}Usage: /grep QUERY\n"),
+                0,
+            ),
+            (
+                "/grep missing",
+                format!("{MOBILE_TRANSCRIPT_SGR_RESET}No matches found in current transcript.\n"),
+                1,
+            ),
+        ] {
+            let mut last_capture = "prior capture".to_string();
+            let mut out = Vec::new();
+            let mut sent_payloads = Vec::new();
+            let mut capture_calls = 0;
+
+            let keep_running = handle_mobile_transcript_input(
+                command,
+                MobileTranscriptInputContext {
+                    target: "api",
+                    tail_start: -80,
+                    append_enter: true,
+                },
+                &mut last_capture,
+                &mut out,
+                |target, start, end| {
+                    capture_calls += 1;
+                    assert_eq!(target, "api");
+                    assert_eq!(start, Some(-80));
+                    assert_eq!(end, None);
+                    Ok("one needle\n".to_string())
+                },
+                |target, data| {
+                    sent_payloads.push((target.to_string(), data));
+                    Ok(())
+                },
+                |target| Ok(format!("lterm attach --raw -- {target}")),
+            )
+            .unwrap();
+
+            assert!(keep_running);
+            assert_eq!(capture_calls, expected_capture_calls, "{command}");
+            assert!(
+                sent_payloads.is_empty(),
+                "{command} must not be forwarded to the PTY: {sent_payloads:?}"
+            );
+            assert_eq!(last_capture, "prior capture");
+            assert_eq!(String::from_utf8(out).unwrap(), expected);
         }
     }
 
