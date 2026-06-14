@@ -2,7 +2,7 @@ class Lterm < Formula
   desc "Lightweight tmux-compatible terminal session daemon"
   homepage "https://github.com/ictechgy/light_terminal"
   url "https://github.com/ictechgy/light_terminal/archive/refs/tags/v1.0.25.tar.gz"
-  sha256 "e53a7ee83304dd16f6c3b18eed58573ae64357706f32d0181230d5328895c043"
+  sha256 "99a5bbd5fba411c5ee31b3ec8bdf429808b3e46d76233295cabfed37bb35c36b"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/ictechgy/light_terminal.git", branch: "main"
 
