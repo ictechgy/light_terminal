@@ -7985,7 +7985,7 @@ mod tests {
             .and_then(|value| value.strip_suffix('\x07'))
             .expect("title wrapper");
         assert!(
-            title_inner.contains("lt:repo]0;bad:%0next · codexagent"),
+            title_inner.contains("lt:repo:%0next · codexagent"),
             "title cue should retain readable sanitized text: {title:?}"
         );
         assert!(
@@ -8004,7 +8004,7 @@ mod tests {
         let banner = String::from_utf8(banner).expect("banner cue is utf8");
 
         assert!(
-            banner.contains("[lterm] repo]0;bad %0next · codexagent"),
+            banner.contains("[lterm] repo %0next · codexagent"),
             "banner should show lterm/session/pane/agent identity: {banner:?}"
         );
         assert!(
@@ -8948,7 +8948,7 @@ mod tests {
             !rendered.contains('\u{1b}'),
             "summary text must sanitize terminal controls: {rendered:?}"
         );
-        assert!(rendered.contains("path\t/tmp/trace[31m.jsonl\n"));
+        assert!(rendered.contains("path\t/tmp/trace.jsonl\n"));
         assert!(rendered.contains("format\tlterm-trace-jsonl\n"));
         assert!(rendered.contains("client_protocol_version\t3\n"));
         assert!(rendered.contains("event_count\t3\n"));

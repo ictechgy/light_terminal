@@ -14,7 +14,7 @@ pub fn osc_field(value: &str) -> String {
 }
 
 pub fn terminal_text(value: &str) -> String {
-    strip_controls(value)
+    strip_controls(&terminal_capture(value.as_bytes()))
 }
 
 pub fn terminal_capture(bytes: &[u8]) -> String {
@@ -61,19 +61,54 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
                 _ => state = EscapeState::Ground,
             },
             EscapeState::Csi => match byte {
+                byte if byte >= 0x80 => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        if ch == '\u{009c}' {
+                            state = EscapeState::Ground;
+                        }
+                        index += len;
+                        continue;
+                    }
+                    if byte == 0x9c {
+                        state = EscapeState::Ground;
+                    }
+                }
                 0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::Esc,
                 byte if (0x40..=0x7e).contains(&byte) => state = EscapeState::Ground,
                 _ => {}
             },
             EscapeState::String => match byte {
+                byte if byte >= 0x80 => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        if ch == '\u{009c}' {
+                            state = EscapeState::Ground;
+                        }
+                        index += len;
+                        continue;
+                    }
+                    if byte == 0x9c {
+                        state = EscapeState::Ground;
+                    }
+                }
                 0x18 | 0x1a => state = EscapeState::Ground,
                 0x07 | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::StringEsc,
                 _ => {}
             },
             EscapeState::StringEsc => {
-                state = if byte == b'\\' {
+                if byte >= 0x80 {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        state = if ch == '\u{009c}' {
+                            EscapeState::Ground
+                        } else {
+                            EscapeState::String
+                        };
+                        index += len;
+                        continue;
+                    }
+                }
+                state = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
@@ -181,6 +216,22 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 _ => state = EscapeState::Ground,
             },
             EscapeState::Csi => match byte {
+                byte if byte >= 0x80 => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        if ch == '\u{009c}' {
+                            state = EscapeState::Ground;
+                        } else {
+                            csi_valid = false;
+                        }
+                        index += len;
+                        continue;
+                    }
+                    if byte == 0x9c {
+                        state = EscapeState::Ground;
+                    } else {
+                        csi_valid = false;
+                    }
+                }
                 // CAN/SUB/ST: 시퀀스 중단 후 폐기.
                 0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
                 // 중간 ESC는 재동기화.
@@ -215,13 +266,36 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 _ => csi_valid = false,
             },
             EscapeState::String => match byte {
+                byte if byte >= 0x80 => {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        if ch == '\u{009c}' {
+                            state = EscapeState::Ground;
+                        }
+                        index += len;
+                        continue;
+                    }
+                    if byte == 0x9c {
+                        state = EscapeState::Ground;
+                    }
+                }
                 0x18 | 0x1a => state = EscapeState::Ground,
                 0x07 | 0x9c => state = EscapeState::Ground,
                 0x1b => state = EscapeState::StringEsc,
                 _ => {}
             },
             EscapeState::StringEsc => {
-                state = if byte == b'\\' {
+                if byte >= 0x80 {
+                    if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
+                        state = if ch == '\u{009c}' {
+                            EscapeState::Ground
+                        } else {
+                            EscapeState::String
+                        };
+                        index += len;
+                        continue;
+                    }
+                }
+                state = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
@@ -486,6 +560,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_capture_does_not_treat_utf8_continuation_as_c1_st() {
+        assert_eq!(terminal_capture("A\x1b]52;c;ÜSECRET\x07B".as_bytes()), "AB");
+        assert_eq!(terminal_capture("A\x1bPqÜSECRET\x1b\\B".as_bytes()), "AB");
+        let text = terminal_text("SAFE_\x1b]52;c;ÜLIST_SECRET\x07_AFTER");
+        assert_eq!(text, "SAFE__AFTER");
+        assert!(!text.contains("LIST_SECRET"));
+    }
+
+    #[test]
+    fn terminal_capture_handles_csi_utf8_and_stringesc_raw_st() {
+        assert_eq!(terminal_capture("A\x1b[1ÜmX".as_bytes()), "AX");
+        assert_eq!(terminal_capture("A\x1b[1\u{009c}X".as_bytes()), "AX");
+        assert_eq!(terminal_capture(b"A\x1b]secret\x1b\x9cB"), "AB");
+        assert_eq!(terminal_capture(b"A\x1bPqsecret\x1b\x9cB"), "AB");
+    }
+
+    #[test]
+    fn terminal_text_strips_escape_payloads_and_line_controls() {
+        let text = terminal_text(
+            "LIST_VISIBLE_\x1b]52;c;LIST_SECRET\x07\x1bPqLIST_DCS\x1b\\_AFTER\tNEXT\nROW",
+        );
+        assert_eq!(text, "LIST_VISIBLE__AFTERNEXTROW");
+        assert!(!text.contains("LIST_SECRET"));
+        assert!(!text.contains("LIST_DCS"));
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains('\x07'));
+    }
+
+    #[test]
     fn terminal_capture_replaces_incomplete_or_invalid_utf8() {
         assert_eq!(terminal_capture(&[b'A', 0xe2]), "A�");
         assert_eq!(terminal_capture(&[b'A', 0xf5, b'B']), "A�B");
@@ -602,6 +705,35 @@ mod tests {
         let out = sanitize_status_command_line(b"a\x1b]52;c;secret\x07b", true);
         assert_eq!(out, "ab");
         assert!(!out.contains("secret"));
+    }
+
+    #[test]
+    fn sanitize_status_command_line_does_not_treat_utf8_continuation_as_c1_st() {
+        let out = sanitize_status_command_line("a\x1b]52;c;Üsecret\x07b".as_bytes(), true);
+        assert_eq!(out, "ab");
+
+        let dcs = sanitize_status_command_line("a\x1bPqÜsecret\x1b\\b".as_bytes(), true);
+        assert_eq!(dcs, "ab");
+    }
+
+    #[test]
+    fn sanitize_status_command_line_handles_csi_utf8_and_stringesc_raw_st() {
+        assert_eq!(
+            sanitize_status_command_line("a\x1b[1Ümb".as_bytes(), true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line("a\x1b[1\u{009c}b".as_bytes(), true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line(b"a\x1b]secret\x1b\x9cb", true),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_status_command_line(b"a\x1bPqsecret\x1b\x9cb", true),
+            "ab"
+        );
     }
 
     #[test]
