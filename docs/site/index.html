@@ -342,7 +342,7 @@
           <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible session daemon for Claude Code, Codex CLI,
-            Gemini CLI, OpenCode, and other terminal-first agent workflows — including mobile SSH and cmux panes.
+            Gemini CLI, OpenCode, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes.
           </p>
           <p class="lead" data-lang="ko">
             Claude Code, Codex CLI, Gemini CLI, OpenCode 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
@@ -365,7 +365,7 @@
 <span class="ok">created</span> codex  %0
 
 <span class="prompt">$</span> lterm logs codex --start=-20
-<span class="muted">정제된 scrollback for review</span>
+<span class="muted">sanitized scrollback for review</span>
 
 <span class="prompt">$</span> lterm resume codex
 <span class="ok">reattached</span> without restarting the agent</pre>
@@ -465,7 +465,7 @@
           </div>
           <div class="step">
             <div>
-              <h3 data-lang="en">Read 정제된 scrollback</h3>
+              <h3 data-lang="en">Read sanitized scrollback</h3>
               <h3 data-lang="ko">정제된 scrollback 확인</h3>
               <pre>lterm logs api --start=-80 --end=-1</pre>
               <p data-lang="en">Good for agents and scripts because terminal controls are stripped from report output.</p>
@@ -512,11 +512,11 @@
               <tr data-lang="ko"><td>마지막으로 선택한 세션에 재접속</td><td><code>lterm reconnect --mobile</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Review an agent session in mobile scrollback</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td>Force with <code>--mobile</code>; force raw with <code>--raw</code></td></tr>
               <tr data-lang="ko"><td>모바일 scrollback에서 agent 세션 확인</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td><code>--mobile</code>로 강제; 기존 raw attach는 <code>--raw</code></td></tr>
-              <tr data-lang="en"><td>Read 정제된 scrollback</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="en"><td>Read sanitized scrollback</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
               <tr data-lang="ko"><td>정제된 scrollback 확인</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
               <tr data-lang="en"><td>Extract recent URLs</td><td><code>lterm urls api --last</code></td><td>none</td></tr>
               <tr data-lang="ko"><td>최근 URL 추출</td><td><code>lterm urls api --last</code></td><td>없음</td></tr>
-              <tr data-lang="en"><td>Search 정제된 scrollback</td><td><code>lterm search api 'build failed'</code></td><td>Use <code>/grep QUERY</code> in mobile transcript mode</td></tr>
+              <tr data-lang="en"><td>Search sanitized scrollback</td><td><code>lterm search api 'build failed'</code></td><td>Use <code>/grep QUERY</code> in mobile transcript mode</td></tr>
               <tr data-lang="ko"><td>정제된 scrollback 검색</td><td><code>lterm search api 'build failed'</code></td><td>모바일 transcript에서는 <code>/grep QUERY</code></td></tr>
               <tr data-lang="en"><td>Wait for a marker or exit</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>none</td></tr>
               <tr data-lang="ko"><td>마커가 나오거나 종료될 때까지 대기</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>없음</td></tr>
@@ -527,7 +527,7 @@
               <tr data-lang="en"><td>Diagnose local state</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="ko"><td>로컬 상태 진단</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="en"><td>Inspect redacted diagnostics</td><td><code>lterm inspect --json</code></td><td>same bundle as <code>diagnose --bundle</code></td></tr>
-              <tr data-lang="ko"><td>redacted 진단 inspect</td><td><code>lterm inspect --json</code></td><td><code>diagnose --bundle</code>과 같은 bundle</td></tr>
+              <tr data-lang="ko"><td>redacted 진단 확인</td><td><code>lterm inspect --json</code></td><td><code>diagnose --bundle</code>과 같은 bundle</td></tr>
             </tbody>
           </table>
         </div>
@@ -554,8 +554,8 @@
             <p data-lang="ko"><strong>모바일 재접속은 명시적입니다.</strong> <code>lterm reconnect --mobile</code>은 비공개 최소 pointer로 마지막으로 선택한 로컬 lterm 세션을 다시 열고, pointer가 없거나 손상됐거나 오래되어 더 이상 맞지 않으면 <code>main</code>으로 fallback합니다. 되돌릴 수 있는 SSH 로그인 snippet은 <code>lterm init --mobile-reconnect --shell zsh</code>로 미리 볼 수 있고, <code>--shell</code>을 생략하면 <code>$SHELL</code>에서 감지합니다. lterm은 shell startup file을 자동 수정하지 않으며, 복사한 snippet은 <code>LTERM_RECONNECT_DISABLE=1</code>로 건너뜁니다.</p>
           </div>
           <div class="callout">
-            <p data-lang="en"><strong>Reports are sanitized.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, diagnostics, and notification fallback paths strip terminal controls while preserving valid UTF-8 text.</p>
-            <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
+            <p data-lang="en"><strong>Reports are sanitized.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, <code>urls</code>, diagnostics, and notification fallback paths strip terminal controls while preserving valid UTF-8 text.</p>
+            <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, <code>urls</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
           </div>
           <div class="callout">
             <p data-lang="en"><strong>Extracted URLs are untrusted.</strong> <code>lterm urls</code> helps copy terminal links on small screens, but extracted URLs may include phishing links or short-lived auth/login credentials. It reports at most 256 unique ASCII URL tokens and skips raw candidates over 4096 bytes; in mobile transcript mode, <code>/links</code> and <code>/urls</code> stay local-only. <code>--last</code> prints only the newest valid link, so use it only when you know that link is the one you want.</p>
