@@ -167,7 +167,18 @@ struct SessionHandle {
 #[test]
 #[ignore = "manual/release-gate soak; set LTERM_SOAK_DURATION and LTERM_SOAK_SESSIONS"]
 fn release_gate_soak_profile() -> TestResult {
-    let profile = SoakProfile::from_env()?;
+    run_soak_profile(SoakProfile::from_env()?)
+}
+
+#[test]
+fn short_automated_soak_profile() -> TestResult {
+    run_soak_profile(SoakProfile {
+        duration: Duration::from_secs(1),
+        sessions: 2,
+    })
+}
+
+fn run_soak_profile(profile: SoakProfile) -> TestResult {
     let env = TestEnv::new()?;
     let mut sessions = Vec::with_capacity(profile.sessions);
 
