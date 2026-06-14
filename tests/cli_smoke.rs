@@ -136,13 +136,17 @@ where
     F: FnMut() -> TestResult<PollStatus<T>>,
 {
     let deadline = Instant::now() + timeout;
-    let mut last = String::from("<not polled>");
-    while Instant::now() < deadline {
+    let mut last: String;
+    loop {
         match check()? {
             PollStatus::Ready(value) => return Ok(value),
             PollStatus::Pending(detail) => last = detail,
         }
-        thread::sleep(interval);
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        thread::sleep(interval.min(deadline.saturating_duration_since(now)));
     }
     Err(format!("timed out waiting for {label} after {timeout:?}; last={last}").into())
 }
