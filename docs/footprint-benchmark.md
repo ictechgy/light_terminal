@@ -80,8 +80,14 @@ Top-level keys are stable for automation:
       "metrics": {
         "daemon_ready_ms": { "status": "ok", "samples": [12.3] },
         "first_session_ms": { "status": "ok", "samples": [15.6] },
-        "rss_kib": { "idle_daemon": { "rss_kib": 1234 } },
-        "omx_style_workflow_ms": { "status": "ok", "iterations": [] }
+        "rss_kib": {
+          "idle_daemon": { "status": "ok", "rss_kib": 1234, "rss_reason": null },
+          "one_active_session": { "status": "skipped", "rss_kib": null, "rss_reason": "ps returned no RSS output" }
+        },
+        "omx_style_workflow_ms": {
+          "status": "ok",
+          "iterations": [{ "status": "ok", "elapsed_ms": 42.0, "steps": [] }]
+        }
       }
     },
     "tmux": { "status": "skipped" }

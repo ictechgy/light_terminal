@@ -64,7 +64,7 @@ def elapsed_since_ms(start_ms: float) -> float:
     return monotonic_ms() - start_ms
 
 
-def percentile_summary(samples: Sequence[float | int]) -> dict[str, Any]:
+def numeric_summary(samples: Sequence[float | int]) -> dict[str, Any]:
     """Return stable min/median/max/count summary for numeric samples."""
     numeric = [float(sample) for sample in samples]
     if not numeric:
@@ -82,7 +82,7 @@ def metric_ok(samples: Sequence[float | int], unit: str = "ms", **extra: Any) ->
         "status": "ok",
         "unit": unit,
         "samples": list(samples),
-        "summary": percentile_summary(samples),
+        "summary": numeric_summary(samples),
         **extra,
     }
 
@@ -92,7 +92,7 @@ def metric_skipped(reason: str, unit: str = "ms", **extra: Any) -> dict[str, Any
         "status": "skipped",
         "unit": unit,
         "samples": [],
-        "summary": percentile_summary([]),
+        "summary": numeric_summary([]),
         "reason": reason,
         **extra,
     }
@@ -103,7 +103,7 @@ def metric_error(reason: str, unit: str = "ms", **extra: Any) -> dict[str, Any]:
         "status": "error",
         "unit": unit,
         "samples": [],
-        "summary": percentile_summary([]),
+        "summary": numeric_summary([]),
         "reason": reason,
         **extra,
     }
@@ -290,8 +290,8 @@ class ProcessHandle:
 def spawn_lterm_daemon(ctx: ToolContext, lterm_bin: str) -> ProcessHandle:
     proc = subprocess.Popen(
         [lterm_bin, "daemon"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         text=True,
         env=ctx.env,
         start_new_session=True,
@@ -354,9 +354,13 @@ def start_tmux_server_and_measure(ctx: ToolContext, tmux_bin: str) -> tuple[dict
         lambda: run_command(tmux_command(ctx, tmux_bin, ["kill-server"]), env=ctx.env, timeout=ctx.config.timeout),
     )
     start = monotonic_ms()
-    result = run_command(tmux_command(ctx, tmux_bin, ["start-server"]), env=ctx.env, timeout=ctx.config.timeout)
+    result = run_command(
+        tmux_command(ctx, tmux_bin, ["start-server", ";", "set-option", "-g", "exit-empty", "off"]),
+        env=ctx.env,
+        timeout=ctx.config.timeout,
+    )
     if not result.ok:
-        return metric_skipped(f"tmux start-server failed: {short_result(result)}"), None
+        return metric_skipped(f"tmux start-server/exit-empty setup failed: {short_result(result)}"), None
     pid = poll_tmux_pid(ctx, tmux_bin)
     if pid is None:
         return metric_skipped("tmux server started but display-message -p '#{pid}' did not expose a PID"), None
@@ -493,65 +497,72 @@ def benchmark_first_session(
 
 def benchmark_lterm_rss(config: BenchmarkConfig, lterm_bin: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
     ctx = ToolContext("lterm", config)
+    rss_metrics: dict[str, Any]
     try:
         ready, pid = start_lterm_daemon_and_measure(ctx, lterm_bin)
         if ready["status"] != "ok" or pid is None:
-            return {"idle_daemon": rss_result(None, ready.get("reason", "daemon not ready"))}, ctx.finish()
-        idle, idle_reason = read_rss_kib(pid)
-        one_session = f"footprint-one-{ctx.run_id}"
-        one = lterm_start_session(ctx, lterm_bin, one_session)
-        if not one.ok:
-            one_rss = rss_result(None, f"one active session failed: {short_result(one)}")
+            rss_metrics = {"idle_daemon": rss_result(None, ready.get("reason", "daemon not ready"))}
         else:
-            value, reason = read_rss_kib(pid)
-            one_rss = rss_result(value, reason)
-        for index in range(config.sessions):
-            result = lterm_start_session(ctx, lterm_bin, f"footprint-many-{ctx.run_id}-{index}")
-            if not result.ok:
-                many_rss = rss_result(None, f"multiple sessions failed at {index}: {short_result(result)}")
-                break
-        else:
-            value, reason = read_rss_kib(pid)
-            many_rss = rss_result(value, reason)
-        return {
-            "idle_daemon": rss_result(idle, idle_reason),
-            "one_active_session": one_rss,
-            "multiple_sessions": {**many_rss, "session_count": config.sessions},
-        }, ctx.finish()
+            idle, idle_reason = read_rss_kib(pid)
+            one_session = f"footprint-one-{ctx.run_id}"
+            one = lterm_start_session(ctx, lterm_bin, one_session)
+            if not one.ok:
+                one_rss = rss_result(None, f"one active session failed: {short_result(one)}")
+                many_rss = rss_result(None, "multiple sessions skipped because one active session failed")
+            else:
+                value, reason = read_rss_kib(pid)
+                one_rss = rss_result(value, reason)
+                for index in range(1, config.sessions):
+                    result = lterm_start_session(ctx, lterm_bin, f"footprint-many-{ctx.run_id}-{index}")
+                    if not result.ok:
+                        many_rss = rss_result(None, f"multiple sessions failed at {index}: {short_result(result)}")
+                        break
+                else:
+                    value, reason = read_rss_kib(pid)
+                    many_rss = rss_result(value, reason)
+            rss_metrics = {
+                "idle_daemon": rss_result(idle, idle_reason),
+                "one_active_session": one_rss,
+                "multiple_sessions": {**many_rss, "session_count": config.sessions},
+            }
     finally:
-        # If returned before finish due to unexpected exception, make a best-effort cleanup.
-        ctx.finish()
+        cleanup = ctx.finish()
+    return rss_metrics, cleanup
 
 
 def benchmark_tmux_rss(config: BenchmarkConfig, tmux_bin: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
     ctx = ToolContext("tmux", config)
+    rss_metrics: dict[str, Any]
     try:
-        ctx.add_cleanup("tmux-kill-server", lambda: run_command(tmux_command(ctx, tmux_bin, ["kill-server"]), env=ctx.env, timeout=config.timeout))
-        session = f"footprint-rss-{ctx.run_id}"
-        first = tmux_new_session(ctx, tmux_bin, session)
-        if not first.ok:
-            return {"idle_daemon": rss_result(None, f"tmux new-session failed: {short_result(first)}")}, ctx.finish()
-        pid = poll_tmux_pid(ctx, tmux_bin)
-        if pid is None:
-            return {"idle_daemon": rss_result(None, "tmux PID probe failed")}, ctx.finish()
-        idle, idle_reason = read_rss_kib(pid)
-        value, reason = read_rss_kib(pid)
-        one_rss = rss_result(value, reason)
-        for index in range(1, config.sessions + 1):
-            result = tmux_new_session(ctx, tmux_bin, f"footprint-many-{ctx.run_id}-{index}")
-            if not result.ok:
-                many_rss = rss_result(None, f"multiple sessions failed at {index}: {short_result(result)}")
-                break
+        ready, pid = start_tmux_server_and_measure(ctx, tmux_bin)
+        if ready["status"] != "ok" or pid is None:
+            rss_metrics = {"idle_daemon": rss_result(None, ready.get("reason", "tmux PID probe failed"))}
         else:
-            value, reason = read_rss_kib(pid)
-            many_rss = rss_result(value, reason)
-        return {
-            "idle_daemon": rss_result(idle, idle_reason),
-            "one_active_session": one_rss,
-            "multiple_sessions": {**many_rss, "session_count": config.sessions},
-        }, ctx.finish()
+            idle, idle_reason = read_rss_kib(pid)
+            session = f"footprint-rss-{ctx.run_id}"
+            first = tmux_new_session(ctx, tmux_bin, session)
+            if not first.ok:
+                one_rss = rss_result(None, f"tmux new-session failed: {short_result(first)}")
+                many_rss = rss_result(None, "multiple sessions skipped because one active session failed")
+            else:
+                value, reason = read_rss_kib(pid)
+                one_rss = rss_result(value, reason)
+                for index in range(1, config.sessions):
+                    result = tmux_new_session(ctx, tmux_bin, f"footprint-many-{ctx.run_id}-{index}")
+                    if not result.ok:
+                        many_rss = rss_result(None, f"multiple sessions failed at {index}: {short_result(result)}")
+                        break
+                else:
+                    value, reason = read_rss_kib(pid)
+                    many_rss = rss_result(value, reason)
+            rss_metrics = {
+                "idle_daemon": rss_result(idle, idle_reason),
+                "one_active_session": one_rss,
+                "multiple_sessions": {**many_rss, "session_count": config.sessions},
+            }
     finally:
-        ctx.finish()
+        cleanup = ctx.finish()
+    return rss_metrics, cleanup
 
 
 def assert_no_ai_cli(argv: Sequence[str]) -> None:
@@ -592,6 +603,7 @@ def argv_preview(argv: Sequence[str]) -> list[str]:
 
 def workflow_lterm_iteration(ctx: ToolContext, lterm_bin: str, marker: str) -> dict[str, Any]:
     controller = f"footprint-controller-{ctx.run_id}"
+    expected_output = f"{marker}_EXECUTED"
     steps: list[dict[str, Any]] = []
     ctx.add_cleanup("lterm-shutdown", lambda: run_command([lterm_bin, "shutdown"], env=ctx.env, timeout=ctx.config.timeout))
     steps.append(
@@ -639,7 +651,15 @@ def workflow_lterm_iteration(ctx: ToolContext, lterm_bin: str, marker: str) -> d
     steps.append(
         run_checked_step(
             "send_marker",
-            [lterm_bin, "tmux-compat", "send-keys", "-t", helper_pane, f"printf {marker}", "C-m"],
+            [
+                lterm_bin,
+                "tmux-compat",
+                "send-keys",
+                "-t",
+                helper_pane,
+                f"printf '%s%s\\n' '{marker}_' 'EXECUTED'",
+                "C-m",
+            ],
             env=ctx.env,
             timeout=ctx.config.timeout,
         )
@@ -648,7 +668,7 @@ def workflow_lterm_iteration(ctx: ToolContext, lterm_bin: str, marker: str) -> d
         [lterm_bin, "tmux-compat", "capture-pane", "-p", "-t", helper_pane],
         env=ctx.env,
         timeout=ctx.config.timeout,
-        marker=marker,
+        marker=expected_output,
     )
     steps.append({"step": "capture_marker", **capture})
     steps.append(
@@ -672,6 +692,7 @@ def workflow_lterm_iteration(ctx: ToolContext, lterm_bin: str, marker: str) -> d
 
 def workflow_tmux_iteration(ctx: ToolContext, tmux_bin: str, marker: str) -> dict[str, Any]:
     controller = f"footprint-controller-{ctx.run_id}"
+    expected_output = f"{marker}_EXECUTED"
     steps: list[dict[str, Any]] = []
     ctx.add_cleanup("tmux-kill-server", lambda: run_command(tmux_command(ctx, tmux_bin, ["kill-server"]), env=ctx.env, timeout=ctx.config.timeout))
     steps.append(
@@ -712,7 +733,11 @@ def workflow_tmux_iteration(ctx: ToolContext, tmux_bin: str, marker: str) -> dic
     steps.append(
         run_checked_step(
             "send_marker",
-            tmux_command(ctx, tmux_bin, ["send-keys", "-t", helper_pane, f"printf {marker}", "C-m"]),
+            tmux_command(
+                ctx,
+                tmux_bin,
+                ["send-keys", "-t", helper_pane, f"printf '%s%s\\n' '{marker}_' 'EXECUTED'", "C-m"],
+            ),
             env=ctx.env,
             timeout=ctx.config.timeout,
         )
@@ -721,7 +746,7 @@ def workflow_tmux_iteration(ctx: ToolContext, tmux_bin: str, marker: str) -> dic
         tmux_command(ctx, tmux_bin, ["capture-pane", "-p", "-t", helper_pane]),
         env=ctx.env,
         timeout=ctx.config.timeout,
-        marker=marker,
+        marker=expected_output,
     )
     steps.append({"step": "capture_marker", **capture})
     steps.append(

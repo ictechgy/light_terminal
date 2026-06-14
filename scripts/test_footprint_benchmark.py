@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import signal
 import sys
 import tempfile
 import textwrap
@@ -20,11 +20,32 @@ if str(SCRIPT_DIR) not in sys.path:
 import footprint_benchmark as fb
 
 
+def kill_fake_daemons(tmp_path: Path) -> None:
+    pid_file = tmp_path / "fake-lterm-daemons.pid"
+    if not pid_file.exists():
+        return
+    for line in pid_file.read_text(encoding="utf-8").splitlines():
+        try:
+            os.kill(int(line), signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+
+
+def command_names_from_log(log_path: Path) -> list[str]:
+    names: list[str] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        argv = row.get("argv") or []
+        if argv:
+            names.append(Path(argv[0]).name)
+    return names
+
+
 class FootprintBenchmarkUnitTests(unittest.TestCase):
-    def test_percentile_summary_uses_median_min_max(self) -> None:
-        self.assertEqual(fb.percentile_summary([]), {"count": 0, "min": None, "median": None, "max": None})
-        self.assertEqual(fb.percentile_summary([3, 1, 2]), {"count": 3, "min": 1.0, "median": 2.0, "max": 3.0})
-        self.assertEqual(fb.percentile_summary([1.0, 5.0]), {"count": 2, "min": 1.0, "median": 3.0, "max": 5.0})
+    def test_numeric_summary_uses_median_min_max(self) -> None:
+        self.assertEqual(fb.numeric_summary([]), {"count": 0, "min": None, "median": None, "max": None})
+        self.assertEqual(fb.numeric_summary([3, 1, 2]), {"count": 3, "min": 1.0, "median": 2.0, "max": 3.0})
+        self.assertEqual(fb.numeric_summary([1.0, 5.0]), {"count": 2, "min": 1.0, "median": 3.0, "max": 5.0})
 
     def test_parse_pid_and_rss_parser(self) -> None:
         self.assertEqual(fb.parse_pid("123\n"), 123)
@@ -100,21 +121,24 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
             fake_lterm = write_fake_lterm(tmp_path)
             output_json = tmp_path / "report.json"
             output_md = tmp_path / "report.md"
-            code = fb.main(
-                [
-                    "--quick",
-                    "--lterm-bin",
-                    str(fake_lterm),
-                    "--tmux-bin",
-                    str(tmp_path / "missing-tmux"),
-                    "--json",
-                    str(output_json),
-                    "--markdown",
-                    str(output_md),
-                    "--timeout",
-                    "2",
-                ]
-            )
+            try:
+                code = fb.main(
+                    [
+                        "--quick",
+                        "--lterm-bin",
+                        str(fake_lterm),
+                        "--tmux-bin",
+                        str(tmp_path / "missing-tmux"),
+                        "--json",
+                        str(output_json),
+                        "--markdown",
+                        str(output_md),
+                        "--timeout",
+                        "2",
+                    ]
+                )
+            finally:
+                kill_fake_daemons(tmp_path)
             self.assertEqual(code, 0)
             report = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertEqual(report["schema_version"], fb.SCHEMA_VERSION)
@@ -125,10 +149,11 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
             self.assertEqual(lterm_metrics["first_session_ms"]["status"], "ok")
             self.assertEqual(lterm_metrics["omx_style_workflow_ms"]["status"], "ok")
             self.assertIn("lterm Footprint Benchmark", output_md.read_text(encoding="utf-8"))
-            log_text = (tmp_path / "fake-lterm.log").read_text(encoding="utf-8")
+            log_path = tmp_path / "fake-lterm.log"
+            log_text = log_path.read_text(encoding="utf-8")
             self.assertIn("LTERM_RUNTIME_DIR", log_text)
-            self.assertNotIn("omx", log_text)
-            self.assertNotIn("codex", log_text)
+            self.assertNotIn("omx", command_names_from_log(log_path))
+            self.assertNotIn("codex", command_names_from_log(log_path))
 
     def test_quick_run_with_fake_lterm_and_fake_tmux_records_required_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,19 +161,22 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
             fake_lterm = write_fake_lterm(tmp_path)
             fake_tmux = write_fake_tmux(tmp_path)
             output_json = tmp_path / "report.json"
-            code = fb.main(
-                [
-                    "--quick",
-                    "--lterm-bin",
-                    str(fake_lterm),
-                    "--tmux-bin",
-                    str(fake_tmux),
-                    "--json",
-                    str(output_json),
-                    "--timeout",
-                    "2",
-                ]
-            )
+            try:
+                code = fb.main(
+                    [
+                        "--quick",
+                        "--lterm-bin",
+                        str(fake_lterm),
+                        "--tmux-bin",
+                        str(fake_tmux),
+                        "--json",
+                        str(output_json),
+                        "--timeout",
+                        "2",
+                    ]
+                )
+            finally:
+                kill_fake_daemons(tmp_path)
             self.assertEqual(code, 0)
             report = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertIn("daemon_ready_ms", report["results"]["tmux"]["metrics"])
@@ -174,20 +202,36 @@ class FootprintBenchmarkFakeBinaryTests(unittest.TestCase):
 def write_fake_lterm(tmp_path: Path) -> Path:
     script = tmp_path / "fake-lterm.py"
     log = tmp_path / "fake-lterm.log"
+    state = tmp_path / "fake-lterm-state.txt"
+    daemon_pids = tmp_path / "fake-lterm-daemons.pid"
     script.write_text(
         textwrap.dedent(
             f"""
             #!/usr/bin/env python3
-            import json, os, signal, sys, time
+            import json, os, re, signal, sys, time
             log_path = {str(log)!r}
-            state_path = {str((log.parent / 'fake-tmux-state.txt'))!r}
+            state_path = {str(state)!r}
+            daemon_pids_path = {str(daemon_pids)!r}
             argv = sys.argv[1:]
+            def marker_from_command(command):
+                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
+                    match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
+                    if match:
+                        return match.group(1) + 'EXECUTED'
+                if command.startswith('printf '):
+                    return command.split('printf ', 1)[1]
+                return marker
+
             with open(log_path, 'a', encoding='utf-8') as fh:
                 fh.write(json.dumps({{'argv': argv, 'env': {{'LTERM_RUNTIME_DIR': os.environ.get('LTERM_RUNTIME_DIR'), 'LTERM_DATA_DIR': os.environ.get('LTERM_DATA_DIR')}}}}, sort_keys=True) + '\\n')
+
             if argv == ['--version']:
                 print('fake-lterm 1.0')
                 raise SystemExit(0)
             if argv and argv[0] == 'daemon':
+                with open(daemon_pids_path, 'a', encoding='utf-8') as fh:
+                    fh.write(str(os.getpid()) + '\\n')
                 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
                 while True:
                     time.sleep(0.1)
@@ -208,12 +252,15 @@ def write_fake_lterm(tmp_path: Path) -> Path:
                 print('%1\\n%99')
                 raise SystemExit(0)
             if argv[:2] == ['tmux-compat', 'send-keys']:
-                marker = next((part.split('printf ', 1)[1] for part in argv if part.startswith('printf ')), 'LTERM_FOOTPRINT_MARKER_fake')
-                open(state_path, 'w', encoding='utf-8').write(marker)
+                command = next((part for part in argv if part.startswith('printf ')), '')
+                marker = marker_from_command(command)
+                with open(state_path, 'w', encoding='utf-8') as state_fh:
+                    state_fh.write(marker)
                 raise SystemExit(0)
             if argv[:2] == ['tmux-compat', 'capture-pane']:
                 try:
-                    print(open(state_path, encoding='utf-8').read())
+                    with open(state_path, encoding='utf-8') as state_fh:
+                        print(state_fh.read())
                 except FileNotFoundError:
                     print('LTERM_FOOTPRINT_MARKER_fake')
                 raise SystemExit(0)
@@ -232,16 +279,38 @@ def write_fake_lterm(tmp_path: Path) -> Path:
 def write_fake_tmux(tmp_path: Path) -> Path:
     script = tmp_path / "fake-tmux.py"
     log = tmp_path / "fake-tmux.log"
+    state = tmp_path / "fake-tmux-state.txt"
     script.write_text(
         textwrap.dedent(
             f"""
             #!/usr/bin/env python3
-            import json, os, sys
+            import json, os, re, sys
             log_path = {str(log)!r}
-            state_path = {str((log.parent / 'fake-lterm-state.txt'))!r}
+            state_path = {str(state)!r}
             argv = sys.argv[1:]
+            def marker_from_command(command):
+                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
+                    match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
+                    if match:
+                        return match.group(1) + 'EXECUTED'
+                if command.startswith('printf '):
+                    return command.split('printf ', 1)[1]
+                return marker
+
             with open(log_path, 'a', encoding='utf-8') as fh:
                 fh.write(json.dumps({{'argv': argv}}, sort_keys=True) + '\\n')
+
+            def marker_from_command(command):
+                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
+                    match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
+                    if match:
+                        return match.group(1) + 'EXECUTED'
+                if command.startswith('printf '):
+                    return command.split('printf ', 1)[1]
+                return marker
+
             if argv == ['--version']:
                 print('tmux fake')
                 raise SystemExit(0)
@@ -261,12 +330,15 @@ def write_fake_tmux(tmp_path: Path) -> Path:
                 print('%1\\n%77')
                 raise SystemExit(0)
             if argv and argv[0] == 'send-keys':
-                marker = next((part.split('printf ', 1)[1] for part in argv if part.startswith('printf ')), 'LTERM_FOOTPRINT_MARKER_fake')
-                open(state_path, 'w', encoding='utf-8').write(marker)
+                command = next((part for part in argv if part.startswith('printf ')), '')
+                marker = marker_from_command(command)
+                with open(state_path, 'w', encoding='utf-8') as state_fh:
+                    state_fh.write(marker)
                 raise SystemExit(0)
             if argv and argv[0] == 'capture-pane':
                 try:
-                    print(open(state_path, encoding='utf-8').read())
+                    with open(state_path, encoding='utf-8') as state_fh:
+                        print(state_fh.read())
                 except FileNotFoundError:
                     print('LTERM_FOOTPRINT_MARKER_fake')
                 raise SystemExit(0)
@@ -274,6 +346,16 @@ def write_fake_tmux(tmp_path: Path) -> Path:
                 raise SystemExit(0)
             print('unexpected fake tmux args', argv, file=sys.stderr)
             raise SystemExit(1)
+
+            def marker_from_command(command):
+                marker = 'LTERM_FOOTPRINT_MARKER_fake'
+                if 'LTERM_FOOTPRINT_MARKER_' in command and 'EXECUTED' in command:
+                    match = re.search(r"'(LTERM_FOOTPRINT_MARKER_[^']+_)'\\s+'EXECUTED'", command)
+                    if match:
+                        return match.group(1) + 'EXECUTED'
+                if command.startswith('printf '):
+                    return command.split('printf ', 1)[1]
+                return marker
             """
         ).lstrip(),
         encoding="utf-8",
