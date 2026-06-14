@@ -307,14 +307,16 @@ lterm input api 'echo hello' --enter
 
 `lterm reconnect [fallback]`는 마지막으로 선택한 세션을 가리키는 private
 pointer만 저장합니다(`session_id`, pane id, 사용자가 정한 session name,
-timestamp). 다음 실행에서는 이 세션을 다시 열고, pointer가 없거나 깨졌거나 오래되어
+timestamp). 다음 실행에서는 이 pointer를 사용하고, pointer가 없거나 깨졌거나 오래되어
 더 이상 맞지 않으면 `fallback`(기본값: `main`)으로 `lterm open`과 같은
-attach-or-create 동작을 수행합니다. `reconnect`도 raw attach를 할 수 있으므로,
-휴대폰 SSH client에서 정제된 normal-screen transcript를 원하면 `--mobile`을
-사용하세요. 모바일 SSH 로그인 profile snippet을 미리 보려면
+attach-or-create 동작을 수행합니다. session name에는 secret을 넣지 마세요.
+`reconnect`도 raw attach를 할 수 있으므로, 휴대폰 SSH client에서 정제된
+normal-screen transcript를 원하면 `--mobile`을 사용하세요. 모바일 SSH 로그인
+profile snippet을 미리 보려면
 `lterm init --mobile-reconnect --shell zsh`(또는 `bash`, `fish`, `posix`)를
-실행하세요. 이 snippet은 자동 설치되지 않습니다. 검토한 뒤 직접 복사하고, 되돌리려면
-복사한 block을 삭제하거나 `LTERM_RECONNECT_DISABLE=1`을 설정하세요.
+실행하세요. `--shell`을 생략하면 `$SHELL`에서 감지합니다. 이 snippet은 자동
+설치되지 않습니다. 검토한 뒤 직접 복사하고, 되돌리려면 복사한 block을 삭제하거나
+`LTERM_RECONNECT_DISABLE=1`을 설정하세요.
 
 `lterm urls <target>`은 raw attach PTY stream을 건드리지 않고, 마지막 120개
 정제된 scrollback line에서 `http://` / `https://` link를 추출합니다. 기본

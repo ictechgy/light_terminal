@@ -39,10 +39,10 @@ they fundamentally change the assumptions listed under each item.
 - **Why rejected.** Attached PTY streams (`lterm resume`, `attach`, `a`, `-a`,
   `lterm reconnect`, attached `start`, `run`, agent launchers, `lterm ssh`) are
   intentionally raw so shells, full-screen TUIs, OSC notifications, bracketed
-  paste, Kitty keyboard mode, and cmux passthrough keep working. Inserting a sanitizer in
-  the attach path would break interactive terminal behavior and would create
-  a false sense of safety. The 1.0 public contract names this surface
-  `explicit-raw-unsafe`.
+  paste, Kitty keyboard mode, and cmux passthrough keep working. Inserting a
+  sanitizer in the attach path would break interactive terminal behavior and
+  would create a false sense of safety. The 1.0 public contract names this
+  surface `explicit-raw-unsafe`.
 - **Alternative.** Sanitization belongs to non-attached report surfaces only:
   `logs`, `capture`, `sessions`, `processes`, `doctor`, `status`, `wait`,
   `watch`, `agents`, tmux-compat listings, notification fallbacks, and

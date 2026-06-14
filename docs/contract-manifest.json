@@ -210,7 +210,9 @@
         "cargo test --bin lterm reconnect_state_best_effort_read_ignores_missing_corrupt_and_unknown_schema",
         "cargo test --bin lterm reconnect_state_write_failure_is_best_effort",
         "cargo test --test cli_smoke reconnect_resumes_last_selected_session_in_mobile_transcript",
-        "cargo test --test cli_smoke reconnect_falls_back_to_main_when_state_is_missing_or_stale"
+        "cargo test --test cli_smoke reconnect_falls_back_to_main_when_state_is_missing_or_stale",
+        "cargo test --test cli_smoke reconnect_read_only_never_creates_missing_fallback",
+        "cargo test --test cli_smoke reconnect_ignores_live_pane_or_name_when_session_id_mismatches"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "explicit-raw-unsafe",
@@ -241,7 +243,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "Reconnect is a mixed attach surface: last-session-pointer is a private best-effort local target-selection hint stored under the user-private lterm data dir and must not include command lines, cwd, scrollback, URLs, hostnames, or secrets; stale, corrupt, or missing pointers fall back to the explicit fallback target. raw-pty-stream remains transparent after target selection; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface."
+      "stability_scope": "Reconnect is a mixed attach surface: last-session-pointer is a private best-effort local target-selection hint stored under the user-private lterm data dir. It stores only session_id, pane_id, the user-provided session_name, and a timestamp; it must not include derived command lines, cwd, scrollback, URLs, host metadata, or secrets. Users should not put secrets in session names. Stale, corrupt, or missing pointers fall back to the explicit fallback target, defaulting to main when omitted. raw-pty-stream remains transparent after target selection; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; --read-only never creates a missing fallback target."
     },
     {
       "command": "lterm sessions",
@@ -324,7 +326,7 @@
       "docs_owner": "README.md",
       "classification": "best-effort",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Init is a no-touch setup preview for humans. It prints recommended commands and optional reversible mobile reconnect profile snippets, and must not modify shell startup files or daemon state."
+      "stability_scope": "Init is a no-touch setup preview for humans. It prints recommended commands and optional reversible mobile reconnect profile snippets guarded by LTERM_RECONNECT_DISABLE=1, and must not modify shell startup files or daemon state."
     },
     {
       "command": "lterm logs",

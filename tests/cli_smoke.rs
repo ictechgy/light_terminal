@@ -4020,6 +4020,112 @@ fn reconnect_falls_back_to_main_when_state_is_missing_or_stale() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn reconnect_read_only_never_creates_missing_fallback() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for args in [
+        vec!["reconnect", "readonly-missing", "--read-only"],
+        vec![
+            "reconnect",
+            "readonly-mobile-missing",
+            "--mobile",
+            "--read-only",
+        ],
+    ] {
+        let output = env.cmd().stdin(Stdio::null()).args(&args).output()?;
+        assert!(
+            !output.status.success(),
+            "read-only reconnect should fail instead of creating a missing fallback for {args:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--read-only requires an existing reconnect or fallback target"),
+            "read-only reconnect should explain that it needs an existing target for {args:?}: {stderr}"
+        );
+    }
+
+    let names = session_names_json(&env)?;
+    assert!(
+        !names.contains("readonly-missing") && !names.contains("readonly-mobile-missing"),
+        "read-only reconnect must not create missing fallback sessions: {names:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn reconnect_ignores_live_pane_or_name_when_session_id_mismatches() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (name, marker) in [
+        ("main", "MAIN_ID_MISMATCH_READY"),
+        ("reconnect-reused", "REUSED_ID_MISMATCH_READY"),
+    ] {
+        let status = env
+            .cmd()
+            .args([
+                "start",
+                "--detach",
+                "--name",
+                name,
+                "--",
+                "sh",
+                "-lc",
+                &format!("printf '{marker}\\n'; sleep 30"),
+            ])
+            .status()?;
+        assert!(status.success(), "failed to create {name}");
+        env.capture_until(name, marker)?;
+    }
+    let _main_cleanup = SessionCleanup::new(&env, "main");
+    let _reused_cleanup = SessionCleanup::new(&env, "reconnect-reused");
+
+    let rows = session_rows_json(&env, true)?;
+    let reused_pane = rows
+        .iter()
+        .find(|row| row.name == "reconnect-reused")
+        .ok_or_else(|| format!("missing reconnect-reused row: {rows:?}"))?
+        .pane_id
+        .clone();
+    let state_path = env.temp.path().join("data").join("reconnect-state.json");
+    std::fs::create_dir_all(
+        state_path
+            .parent()
+            .ok_or("missing reconnect state parent")?,
+    )?;
+    std::fs::write(
+        &state_path,
+        format!(
+            "{{\"schema_version\":1,\"session_id\":\"stale-session-id\",\"pane_id\":\"{reused_pane}\",\"session_name\":\"reconnect-reused\",\"recorded_at_unix_ms\":1}}\n"
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&state_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&state_path, perms)?;
+    }
+
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["reconnect", "--mobile", "--tail", "20"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target=main") && stdout.contains("MAIN_ID_MISMATCH_READY"),
+        "id-mismatched reconnect state should fall back to main:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("REUSED_ID_MISMATCH_READY"),
+        "reconnect must not attach a live pane/name whose session_id differs from the stored pointer:\n{stdout}"
+    );
+
+    Ok(())
+}
+
 fn normalize_help(help: &str) -> String {
     // Clap wraps help at terminal-dependent widths; collapse whitespace so the
     // smoke contract checks wording rather than a particular render width.

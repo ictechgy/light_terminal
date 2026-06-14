@@ -306,15 +306,17 @@ lterm input api 'echo hello' --enter
 The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, mobile transcript attach gives phone clients native scrollback for long agent output, `reconnect` resumes the last selected local lterm session after an SSH reconnect, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `lterm mobile` is a visible alias for `lterm compose`; separately, the `--mobile` attach flag selects the normal-screen transcript attach path. The compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
 
 `lterm reconnect [fallback]` records only a private pointer to the last selected
-session (`session_id`, pane id, user-chosen session name, and timestamp) and
-then resumes it on the next run. Missing, corrupt, or stale pointers fall back
+session (`session_id`, pane id, user-chosen session name, and timestamp), then
+uses that pointer on the next run. Missing, corrupt, or stale pointers fall back
 to `fallback` (default: `main`) using the same attach-or-create behavior as
-`lterm open`. Because `reconnect` can still raw-attach, use `--mobile` on phone
-SSH clients when you want the sanitized normal-screen transcript instead of the
-raw PTY stream. To preview an optional profile snippet for mobile SSH logins,
+`lterm open`. Do not put secrets in session names. Because `reconnect` can
+still raw-attach, use `--mobile` on phone SSH clients when you want the
+sanitized normal-screen transcript instead of the raw PTY stream. To preview an
+optional profile snippet for mobile SSH logins,
 run `lterm init --mobile-reconnect --shell zsh` (or `bash`, `fish`, `posix`).
-The snippet is not installed automatically: copy it only after review, remove
-the copied block to undo it, or set `LTERM_RECONNECT_DISABLE=1` to skip it.
+You can omit `--shell` to detect from `$SHELL`. The snippet is not installed
+automatically: copy it only after review, remove the copied block to undo it, or
+set `LTERM_RECONNECT_DISABLE=1` to skip it.
 
 `lterm urls <target>` extracts `http://` and `https://` links from the last
 120 sanitized scrollback lines without touching the raw attached PTY stream.

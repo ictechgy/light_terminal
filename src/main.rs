@@ -788,11 +788,9 @@ fn run() -> Result<()> {
         } => {
             let attach_policy =
                 attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
-            let info = if attach_policy.transcript.read_only
-                && matches!(attach_policy.mode, AttachMode::Auto)
-            {
+            let info = if attach_policy.transcript.read_only {
                 client::reconnect_existing_or_fallback_info(&fallback)
-                    .context("--read-only in auto attach mode requires a mobile reconnect target")?
+                    .context("--read-only requires an existing reconnect or fallback target")?
             } else {
                 client::reconnect_or_new(&fallback)?
             };
