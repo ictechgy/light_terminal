@@ -63,15 +63,19 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           cargo --version
-      - name: Restore cargo-audit binary cache
-        id: cargo-audit-cache
+      - name: Restore cargo-audit install cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ~/.cargo/bin/cargo-audit
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            ~/.cargo/audit-install-target
           key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_AUDIT_RUNNER_IMAGE }}-${{ env.CARGO_AUDIT_VERSION }}
       - name: Install cargo-audit
-        if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+        run: |
+          CARGO_TARGET_DIR="$HOME/.cargo/audit-install-target" \
+            cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --force
       - name: Verify cargo-audit version
         shell: bash
         run: |
