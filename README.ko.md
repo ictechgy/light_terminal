@@ -655,6 +655,7 @@ PATH="$HOME/.cargo/bin:$PATH" scripts/release-preflight.sh --allow-occupied-skip
 scripts/dependency-minor-dry-run.sh
 ```
 
+기본 `cargo test` suite에는 짧은 automated soak smoke profile이 포함됩니다.
 `scripts/release-preflight.sh`의 `--run-soak`은 manual release-gate soak
 profile에서만 사용하세요. Tagging 또는 publishing 전에 release, toolchain
 provenance, audit, contract, dependency, soak evidence를 남길 때는

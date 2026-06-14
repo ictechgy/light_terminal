@@ -167,7 +167,22 @@ struct SessionHandle {
 #[test]
 #[ignore = "manual/release-gate soak; set LTERM_SOAK_DURATION and LTERM_SOAK_SESSIONS"]
 fn release_gate_soak_profile() -> TestResult {
-    let profile = SoakProfile::from_env()?;
+    run_soak_profile(SoakProfile::from_env()?)
+}
+
+#[test]
+fn short_automated_soak_profile() -> TestResult {
+    // Keep the default-suite smoke profile short, but rely on
+    // `exercise_active_sessions` to perform at least one echo/wait/log/process
+    // assertion per session even if the wall-clock window is compressed on a
+    // slow or busy host.
+    run_soak_profile(SoakProfile {
+        duration: Duration::from_secs(1),
+        sessions: 2,
+    })
+}
+
+fn run_soak_profile(profile: SoakProfile) -> TestResult {
     let env = TestEnv::new()?;
     let mut sessions = Vec::with_capacity(profile.sessions);
 
@@ -195,8 +210,9 @@ fn exercise_active_sessions(
     sessions: &[SessionHandle],
 ) -> TestResult {
     let deadline = Instant::now() + profile.duration;
+    let minimum_ticks = sessions.len();
     let mut tick = 0usize;
-    while Instant::now() < deadline {
+    while Instant::now() < deadline || tick < minimum_ticks {
         let session = &sessions[tick % sessions.len()];
         let marker = format!("tick-{tick}");
         let needle = format!("ECHO:{}:{marker}", session.name);
