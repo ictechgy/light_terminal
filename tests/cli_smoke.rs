@@ -57,19 +57,28 @@ impl TestEnv {
         target: &str,
         needle: &str,
     ) -> TestResult<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut last = String::new();
-        while Instant::now() < deadline {
-            let output = self.cmd().args([command, target, "-S=-20"]).output()?;
-            if output.status.success() {
-                last = String::from_utf8_lossy(&output.stdout).to_string();
-                if last.contains(needle) {
-                    return Ok(last);
+        poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            &format!("{command} output containing {needle:?}"),
+            || {
+                let output = self.cmd().args([command, target, "-S=-20"]).output()?;
+                if output.status.success() {
+                    let captured = String::from_utf8_lossy(&output.stdout).to_string();
+                    if captured.contains(needle) {
+                        return Ok(PollStatus::Ready(captured));
+                    }
+                    Ok(PollStatus::Pending(format!("last capture: {captured}")))
+                } else {
+                    Ok(PollStatus::Pending(format!(
+                        "status={:?}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
                 }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        Err(format!("timed out waiting for {needle:?}; last capture: {last}").into())
+            },
+        )
     }
 }
 
@@ -114,6 +123,54 @@ fn temp_tree_snapshot(root: &Path) -> TestResult<BTreeSet<String>> {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = self.cmd().arg("shutdown").status();
+    }
+}
+
+enum PollStatus<T> {
+    Ready(T),
+    Pending(String),
+}
+
+enum PollUntilError<E> {
+    Timeout(String),
+    Check(E),
+}
+
+fn poll_until_result<T, E, F>(
+    timeout: Duration,
+    interval: Duration,
+    label: &str,
+    mut check: F,
+) -> Result<T, PollUntilError<E>>
+where
+    F: FnMut() -> Result<PollStatus<T>, E>,
+{
+    let deadline = Instant::now() + timeout;
+    let last = loop {
+        match check().map_err(PollUntilError::Check)? {
+            PollStatus::Ready(value) => return Ok(value),
+            PollStatus::Pending(detail) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break detail;
+                }
+                thread::sleep(interval.min(deadline.saturating_duration_since(now)));
+            }
+        }
+    };
+    Err(PollUntilError::Timeout(format!(
+        "timed out waiting for {label} after {timeout:?}; last={last}"
+    )))
+}
+
+fn poll_until<T, F>(timeout: Duration, interval: Duration, label: &str, check: F) -> TestResult<T>
+where
+    F: FnMut() -> TestResult<PollStatus<T>>,
+{
+    match poll_until_result(timeout, interval, label, check) {
+        Ok(value) => Ok(value),
+        Err(PollUntilError::Check(err)) => Err(err),
+        Err(PollUntilError::Timeout(message)) => Err(message.into()),
     }
 }
 
@@ -164,14 +221,18 @@ impl ChildCleanup {
 }
 
 fn wait_child_exit(child: &mut Child, timeout: Duration) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!("process {} did not exit within {timeout:?}", child.id()).into())
+    poll_until(
+        timeout,
+        Duration::from_millis(50),
+        &format!("process {} exit", child.id()),
+        || {
+            if child.try_wait()?.is_some() {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending("still running".to_string()))
+            }
+        },
+    )
 }
 
 impl Drop for ChildCleanup {
@@ -181,16 +242,20 @@ impl Drop for ChildCleanup {
 }
 
 fn wait_for_child_success(child: &mut ChildCleanup, label: &str) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if let Some(status) = child.child_mut()?.try_wait()? {
-            assert!(status.success(), "{label} failed: {status:?}");
-            child.child = None;
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("timed out waiting for {label}").into())
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        label,
+        || {
+            if let Some(status) = child.child_mut()?.try_wait()? {
+                assert!(status.success(), "{label} failed: {status:?}");
+                child.child = None;
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending("still running".to_string()))
+            }
+        },
+    )
 }
 
 fn wait_for_child_output(
@@ -198,28 +263,35 @@ fn wait_for_child_output(
     timeout: Duration,
     label: &str,
 ) -> TestResult<std::process::Output> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let wait_result = poll_until_result(timeout, Duration::from_millis(25), label, || {
         if child.child_mut()?.try_wait()?.is_some() {
-            let process = child.child.take().ok_or("child already reaped")?;
-            return process
-                .wait_with_output()
-                .map_err(|err| format!("failed to collect output for {label}: {err}").into());
+            Ok(PollStatus::Ready(()))
+        } else {
+            Ok(PollStatus::Pending("still running".to_string()))
         }
-        thread::sleep(Duration::from_millis(25));
+    });
+    match wait_result {
+        Ok(()) => {}
+        Err(PollUntilError::Check(err)) => return Err(err),
+        Err(PollUntilError::Timeout(wait_error)) => {
+            let Some(mut process) = child.child.take() else {
+                return Err(format!("{label} already reaped before timeout collection").into());
+            };
+            let _ = process.kill();
+            let output = process.wait_with_output()?;
+            return Err(format!(
+                "{wait_error}; stdout={:?}; stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
     }
 
-    let Some(mut process) = child.child.take() else {
-        return Err(format!("{label} already reaped before timeout collection").into());
-    };
-    let _ = process.kill();
-    let output = process.wait_with_output()?;
-    Err(format!(
-        "timed out waiting for {label} after {timeout:?}; stdout={:?}; stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .into())
+    let process = child.child.take().ok_or("child already reaped")?;
+    process
+        .wait_with_output()
+        .map_err(|err| format!("failed to collect output for {label}: {err}").into())
 }
 
 fn list_row<'a>(stdout: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -302,16 +374,19 @@ fn wait_for_session_names_eq(
     expected: &BTreeSet<String>,
     timeout: Duration,
 ) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    let mut last = BTreeSet::new();
-    while Instant::now() < deadline {
-        last = session_names_json(env)?;
-        if &last == expected {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!("timed out waiting for session set {expected:?}; last={last:?}").into())
+    poll_until(
+        timeout,
+        Duration::from_millis(100),
+        &format!("session set {expected:?}"),
+        || {
+            let names = session_names_json(env)?;
+            if &names == expected {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("{names:?}")))
+            }
+        },
+    )
 }
 
 fn data_store_path(env: &TestEnv) -> PathBuf {
@@ -569,42 +644,44 @@ fn assert_stderr_contains(output: &std::process::Output, expected: &str) {
 }
 
 fn wait_for_pid_exit(pid: &str) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if !pid_alive(pid)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!("pid {pid} still alive after timeout").into())
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+        &format!("pid {pid} exit"),
+        || {
+            if !pid_alive(pid)? {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending("still alive".to_string()))
+            }
+        },
+    )
 }
 
 fn wait_for_file_contents(path: &Path) -> TestResult<String> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        match std::fs::read_to_string(path) {
-            Ok(contents) if !contents.trim().is_empty() => return Ok(contents),
-            Ok(_) => {}
-            Err(err) => last_err = Some(err),
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!(
-        "timed out waiting for file {}; last error: {:?}",
-        path.display(),
-        last_err
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(50),
+        &format!("non-empty file {}", path.display()),
+        || match std::fs::read_to_string(path) {
+            Ok(contents) if !contents.trim().is_empty() => Ok(PollStatus::Ready(contents)),
+            Ok(_) => Ok(PollStatus::Pending("file exists but is empty".to_string())),
+            Err(err) => Ok(PollStatus::Pending(format!("read error: {err}"))),
+        },
     )
-    .into())
 }
 
 fn wait_for_trace_start_event(path: &Path) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            last = contents;
-            if last.lines().next().is_some_and(|line| {
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        &format!("trace start event in {}", path.display()),
+        || {
+            let contents = match std::fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(err) => return Ok(PollStatus::Pending(format!("read error: {err}"))),
+            };
+            if contents.lines().next().is_some_and(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
                     .ok()
                     .and_then(|event| {
@@ -616,37 +693,36 @@ fn wait_for_trace_start_event(path: &Path) -> TestResult {
                     .as_deref()
                     == Some("start")
             }) {
-                return Ok(());
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("last contents: {contents:?}")))
             }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!(
-        "timed out waiting for trace start event in {}; last contents: {last:?}",
-        path.display()
+        },
     )
-    .into())
 }
 
 fn wait_for_no_client_rows(env: &TestEnv, sessions: &[&str]) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        let output = env
-            .cmd()
-            .args(["tmux-compat", "list-clients", "-F", "#{client_session}"])
-            .output()?;
-        if output.status.success() {
-            last = String::from_utf8_lossy(&output.stdout).to_string();
-            if !last.lines().any(|line| sessions.contains(&line)) {
-                return Ok(());
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        "client rows to detach",
+        || {
+            let output = env
+                .cmd()
+                .args(["tmux-compat", "list-clients", "-F", "#{client_session}"])
+                .output()?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if !stdout.lines().any(|line| sessions.contains(&line)) {
+                    Ok(PollStatus::Ready(()))
+                } else {
+                    Ok(PollStatus::Pending(format!("rows: {stdout:?}")))
+                }
+            } else {
+                Ok(PollStatus::Pending(format!("last output: {output:?}")))
             }
-        } else {
-            last = format!("{output:?}");
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!("timed out waiting for client rows to detach: {last:?}").into())
+        },
+    )
 }
 
 fn wait_for_session_absent(env: &TestEnv, session: &str) -> TestResult {
@@ -654,39 +730,45 @@ fn wait_for_session_absent(env: &TestEnv, session: &str) -> TestResult {
 }
 
 fn wait_for_session_absent_for(env: &TestEnv, session: &str, timeout: Duration) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        let output = env.cmd().arg("ls").output()?;
-        if output.status.success() {
-            last = String::from_utf8_lossy(&output.stdout).to_string();
-            if list_row(&last, session).is_none() {
-                return Ok(());
+    poll_until(
+        timeout,
+        Duration::from_millis(100),
+        &format!("session {session:?} to exit"),
+        || {
+            let output = env.cmd().arg("ls").output()?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if list_row(&stdout, session).is_none() {
+                    Ok(PollStatus::Ready(()))
+                } else {
+                    Ok(PollStatus::Pending(format!("last ls: {stdout:?}")))
+                }
+            } else {
+                Ok(PollStatus::Pending(format!("last output: {output:?}")))
             }
-        } else {
-            last = format!("{output:?}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!("timed out waiting for session {session:?} to exit: {last:?}").into())
+        },
+    )
 }
 
 fn wait_for_session_present(env: &TestEnv, session: &str) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        let output = env.cmd().arg("ls").output()?;
-        if output.status.success() {
-            last = String::from_utf8_lossy(&output.stdout).to_string();
-            if list_row(&last, session).is_some() {
-                return Ok(());
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        &format!("session {session:?} to appear"),
+        || {
+            let output = env.cmd().arg("ls").output()?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                if list_row(&stdout, session).is_some() {
+                    Ok(PollStatus::Ready(()))
+                } else {
+                    Ok(PollStatus::Pending(format!("last ls: {stdout:?}")))
+                }
+            } else {
+                Ok(PollStatus::Pending(format!("last output: {output:?}")))
             }
-        } else {
-            last = format!("{output:?}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!("timed out waiting for session {session:?} to appear: {last:?}").into())
+        },
+    )
 }
 
 struct SessionCleanup<'a> {
@@ -13180,14 +13262,15 @@ fn socket_path_for(env: &TestEnv) -> std::path::PathBuf {
 /// fork 하므로 호출 직후 곧바로 connect 하면 ECONNREFUSED 가 날 수 있다.
 #[cfg(unix)]
 fn wait_for_socket(path: &Path) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if UnixStream::connect(path).is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("daemon socket {} did not appear in time", path.display()).into())
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        &format!("daemon socket {}", path.display()),
+        || match UnixStream::connect(path) {
+            Ok(_) => Ok(PollStatus::Ready(())),
+            Err(err) => Ok(PollStatus::Pending(format!("connect error: {err}"))),
+        },
+    )
 }
 
 /// 한 줄짜리 JSON 응답을 읽어 `serde_json::Value` 로 반환한다. attach 응답은
@@ -13440,16 +13523,19 @@ fn read_session_size(env: &TestEnv, name: &str) -> TestResult<(u16, u16)> {
 /// 약간의 시차가 있을 수 있어 spin 보다 polling 이 안전하다.
 #[cfg(unix)]
 fn wait_for_size(env: &TestEnv, name: &str, want: (u16, u16)) -> TestResult<(u16, u16)> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last = (0_u16, 0_u16);
-    while Instant::now() < deadline {
-        last = read_session_size(env, name)?;
-        if last == want {
-            return Ok(last);
-        }
-        thread::sleep(Duration::from_millis(40));
-    }
-    Err(format!("session {name} size = {last:?}, expected {want:?}").into())
+    poll_until(
+        Duration::from_secs(3),
+        Duration::from_millis(40),
+        &format!("session {name} size {want:?}"),
+        || {
+            let size = read_session_size(env, name)?;
+            if size == want {
+                Ok(PollStatus::Ready(size))
+            } else {
+                Ok(PollStatus::Pending(format!("last size: {size:?}")))
+            }
+        },
+    )
 }
 
 /// PR #15 핵심 시나리오: wide desktop attach + narrow mobile attach 가 공존하는
