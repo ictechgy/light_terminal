@@ -11760,6 +11760,9 @@ fn search_extracts_recent_sanitized_scrollback_matches() -> TestResult {
         .args(["search", "search", "needle", "--json"])
         .output()?;
     assert!(json.status.success(), "{json:?}");
+    let json_stdout = String::from_utf8_lossy(&json.stdout);
+    assert!(!json_stdout.contains('\x1b'), "{json_stdout:?}");
+    assert!(!json_stdout.contains("secret"), "{json_stdout:?}");
     let matches: Vec<String> = serde_json::from_slice(&json.stdout)?;
     assert_eq!(matches, vec!["alpha needle", "OSC gamma needle"]);
 
@@ -11805,6 +11808,36 @@ fn search_empty_results_are_machine_friendly() -> TestResult {
     assert!(json.status.success(), "{json:?}");
     let matches: Vec<String> = serde_json::from_slice(&json.stdout)?;
     assert_eq!(matches, Vec::<String>::new());
+    Ok(())
+}
+
+#[test]
+fn search_empty_query_is_rejected_before_reporting() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "search-empty-query",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'READY_EMPTY_QUERY\\n'; while :; do sleep 60; done",
+        ])
+        .status()?;
+    assert!(status.success());
+    env.capture_until("search-empty-query", "READY_EMPTY_QUERY")?;
+
+    let output = env
+        .cmd()
+        .args(["search", "search-empty-query", ""])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("search query cannot be empty"), "{stderr}");
+    assert!(output.stdout.is_empty(), "{output:?}");
     Ok(())
 }
 

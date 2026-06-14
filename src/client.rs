@@ -568,7 +568,7 @@ pub fn extract_search_matches(text: &str, query: &str) -> Vec<String> {
     sanitized
         .lines()
         .filter(|line| line.contains(query))
-        .map(ToOwned::to_owned)
+        .map(sanitize::terminal_text)
         .collect()
 }
 
@@ -2628,6 +2628,17 @@ where
     R: FnMut(&str) -> Result<String>,
     W: Write,
 {
+    if let Some(query) = mobile_transcript_grep_query(input) {
+        if query.is_empty() {
+            writeln!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}Usage: /grep QUERY")
+                .context("write mobile transcript grep usage")?;
+            return Ok(true);
+        }
+        let capture = capture(context.target, Some(context.tail_start), None)?;
+        write_mobile_transcript_search(&capture, query, stdout)?;
+        return Ok(true);
+    }
+
     match input {
         "/exit" | "/quit" => Ok(false),
         "/refresh" => {
@@ -2648,17 +2659,6 @@ where
         "/links" | "/urls" => {
             let capture = capture(context.target, Some(context.tail_start), None)?;
             write_mobile_transcript_urls(&capture, stdout)?;
-            Ok(true)
-        }
-        command if mobile_transcript_grep_query(command).is_some() => {
-            let query = mobile_transcript_grep_query(command).unwrap_or_default();
-            if query.is_empty() {
-                writeln!(stdout, "{MOBILE_TRANSCRIPT_SGR_RESET}Usage: /grep QUERY")
-                    .context("write mobile transcript grep usage")?;
-                return Ok(true);
-            }
-            let capture = capture(context.target, Some(context.tail_start), None)?;
-            write_mobile_transcript_search(&capture, query, stdout)?;
             Ok(true)
         }
         _ => {
@@ -2683,7 +2683,7 @@ fn mobile_transcript_grep_query(input: &str) -> Option<&str> {
         .next()
         .is_some_and(|ch| ch.is_ascii_whitespace())
     {
-        Some(rest.trim())
+        Some(rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace()))
     } else {
         None
     }
@@ -6472,14 +6472,15 @@ mod tests {
         handle_resize_tick, heartbeat_due, hex_decode, hex_encode, hex_encoded_len,
         interruptible_sleep, is_self_provided_tmux, keyboard_protocol_restore_bytes,
         likely_agent_session, matches_env_bool, mobile_client_detected,
-        mobile_transcript_capture_changed, nested_known_agent_present_in_processes,
-        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
-        parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_trace_jsonl_line, reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode,
-        resolve_status_style, run_status_command, select_status_backend,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        trace_file_summary, trace_output_open_context, trace_summary_text, validate_trace_replay,
+        mobile_transcript_capture_changed, mobile_transcript_grep_query,
+        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
+        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
+        run_status_command, select_status_backend, should_mobile_transcript_auto,
+        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
+        trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
     };
@@ -6787,6 +6788,52 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "1\tone needle\n2\ttwo needle\n"
         );
+    }
+
+    #[test]
+    fn mobile_transcript_grep_query_keeps_literal_query_after_separator() {
+        assert_eq!(mobile_transcript_grep_query("/grep"), Some(""));
+        assert_eq!(mobile_transcript_grep_query("/grep needle"), Some("needle"));
+        assert_eq!(
+            mobile_transcript_grep_query("/grep   needle  "),
+            Some("needle  ")
+        );
+        assert_eq!(mobile_transcript_grep_query("/grepneedle"), None);
+    }
+
+    #[test]
+    fn mobile_transcript_grep_preserves_trailing_query_space() {
+        let mut last_capture = "prior capture".to_string();
+        let mut out = Vec::new();
+        let mut sent_payloads = Vec::new();
+
+        let keep_running = handle_mobile_transcript_input(
+            "/grep   needle  ",
+            MobileTranscriptInputContext {
+                target: "api",
+                tail_start: -80,
+                append_enter: true,
+            },
+            &mut last_capture,
+            &mut out,
+            |target, start, end| {
+                assert_eq!(target, "api");
+                assert_eq!(start, Some(-80));
+                assert_eq!(end, None);
+                Ok("one needle  \ntwo needle\n".to_string())
+            },
+            |target, data| {
+                sent_payloads.push((target.to_string(), data));
+                Ok(())
+            },
+            |target| Ok(format!("lterm attach --raw -- {target}")),
+        )
+        .unwrap();
+
+        assert!(keep_running);
+        assert!(sent_payloads.is_empty());
+        assert_eq!(last_capture, "prior capture");
+        assert_eq!(String::from_utf8(out).unwrap(), "1\tone needle  \n");
     }
 
     #[test]

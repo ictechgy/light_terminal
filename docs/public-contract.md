@@ -76,9 +76,13 @@ without forwarding those command lines to the PTY, does not enter alternate
 screen, does not increment attached-client counts, and does not resize PTY
 geometry. `/links` and `/urls` reuse the URL extraction surface locally and print
 `No URLs found in current transcript.` when the current sanitized transcript has
-no links. `/grep QUERY` reuses the search surface locally and prints
-`No matches found in current transcript.` when the current sanitized transcript
-has no matching lines. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
+no links. `/grep QUERY` reuses the same sanitized literal matching and numbered
+row format as `lterm search`, scans the active transcript tail window (`--tail`,
+default 80 for compose/mobile rather than the `search` CLI default 120), treats
+leading whitespace after `/grep` as the command separator, and keeps the remaining
+query literal. `/grep` without a query prints `Usage: /grep QUERY`; `/grep QUERY`
+prints `No matches found in current transcript.` when the current sanitized
+transcript has no matching lines. The transcript UI may emit its own local SGR reset (`ESC[0m`) before
 lterm-owned text so stale host terminal colors do not leak into sanitized
 scrollback; that reset is not captured PTY payload and does not relax capture
 sanitization. `--raw` / `LTERM_ATTACH_MODE=raw`

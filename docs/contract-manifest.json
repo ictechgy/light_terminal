@@ -365,12 +365,15 @@
         "cargo test --bin lterm mobile_transcript_grep_command_is_local_only",
         "cargo test --bin lterm mobile_transcript_grep_reports_usage_and_empty_results_locally",
         "cargo test --test cli_smoke search_extracts_recent_sanitized_scrollback_matches",
-        "cargo test --test cli_smoke search_empty_results_are_machine_friendly"
+        "cargo test --test cli_smoke search_empty_results_are_machine_friendly",
+        "cargo test --bin lterm mobile_transcript_grep_query_keeps_literal_query_after_separator",
+        "cargo test --bin lterm mobile_transcript_grep_preserves_trailing_query_space",
+        "cargo test --test cli_smoke search_empty_query_is_rejected_before_reporting"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Search is a sanitized scrollback report surface. It scans the last --tail sanitized lines, defaults to --tail 120, never attaches to or rewrites the raw PTY stream, and performs case-sensitive literal line matching. Text output is stable 1-based numbered rows as N<TAB>LINE in capture order. --json emits the same matching sanitized line strings as a JSON array. Empty text mode produces no rows; empty JSON mode produces []. Matching lines are untrusted terminal output and are sanitized before matching and rendering.",
+      "stability_scope": "Search is a sanitized scrollback report surface. It scans the last --tail sanitized lines, defaults to --tail 120, never attaches to or rewrites the raw PTY stream, and performs case-sensitive literal line matching. Text output is stable 1-based numbered rows as N<TAB>LINE in capture order. --json emits the same fully sanitized matching line strings as a JSON array. Empty result text mode produces no rows; empty result JSON mode produces []. Empty QUERY is rejected before reporting. Matching lines are untrusted terminal output and are sanitized before matching and rendering.",
       "json_samples": [
         {
           "setup": [
@@ -506,7 +509,11 @@
         "python3 scripts/validate_contract_manifest.py --self-test",
         "cargo test --bin lterm mobile_transcript_update_appends_suffix_and_refreshes_on_divergence",
         "cargo test --bin lterm mobile_transcript_url_commands_are_local_only",
-        "cargo test --bin lterm mobile_transcript_urls_reports_empty_results_locally"
+        "cargo test --bin lterm mobile_transcript_urls_reports_empty_results_locally",
+        "cargo test --bin lterm mobile_transcript_grep_command_is_local_only",
+        "cargo test --bin lterm mobile_transcript_grep_reports_usage_and_empty_results_locally",
+        "cargo test --bin lterm mobile_transcript_grep_query_keeps_literal_query_after_separator",
+        "cargo test --bin lterm mobile_transcript_grep_preserves_trailing_query_space"
       ],
       "docs_owner": "docs/public-contract.md",
       "classification": "stable",
@@ -537,7 +544,7 @@
           "schema_path": null
         }
       ],
-      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. The composer layout is best-effort, while the displayed capture text is a stable sanitized-capture-display sub-surface. The display resolves targets like logs and captures the last --tail sanitized lines (default 80); --once captures once before commit, while interactive mode refreshes on --refresh (default 500ms), local input, and terminal resize. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry. The --transcript sub-surface uses the same normal-screen transcript display as explicit mobile attach: sanitized capture output, optional read-only follow mode, and no raw attach subscription; automatic mobile attach selection is not part of the compose/mobile contract. Transcript-local commands /refresh, /raw, /links, /urls, /exit, and /quit are local controls and are not forwarded to the PTY; unrecognized transcript input is sent through the committed-input path. /links and /urls reuse the URL extraction surface locally and print `No URLs found in current transcript.` when the current sanitized transcript has no links."
+      "stability_scope": "compose/mobile is a non-attached local composer, not a machine-readable report surface. The top-level sanitized-output-only policy applies to displayed scrollback only. The composer layout is best-effort, while the displayed capture text is a stable sanitized-capture-display sub-surface. The display resolves targets like logs and captures the last --tail sanitized lines (default 80); --once captures once before commit, while interactive mode refreshes on --refresh (default 500ms), local input, and terminal resize. Committed text is sent through the existing input/send path: default commits append Enter (carriage return), --no-enter sends exact message bytes, interactive Enter uses the same default rule even for an empty buffer, and compose must not subscribe to attach, resize, or alter attached-client counts or PTY geometry. The --transcript sub-surface uses the same normal-screen transcript display as explicit mobile attach: sanitized capture output, optional read-only follow mode, and no raw attach subscription; automatic mobile attach selection is not part of the compose/mobile contract. Transcript-local commands /refresh, /raw, /links, /urls, /grep QUERY, /exit, and /quit are local controls and are not forwarded to the PTY; unrecognized transcript input is sent through the committed-input path. /links and /urls reuse the URL extraction surface locally and print `No URLs found in current transcript.` when the current sanitized transcript has no links. /grep QUERY reuses the search surface locally over the active transcript --tail window (default 80), ignores only separator whitespace after /grep, keeps the remaining query literal, prints stable N<TAB>LINE rows, prints `Usage: /grep QUERY` when no query is provided, and prints `No matches found in current transcript.` when the current sanitized transcript has no matching lines."
     },
     {
       "command": "lterm input",

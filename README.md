@@ -322,14 +322,15 @@ you intend to use.
 for case-sensitive literal matching lines without touching the raw attached PTY
 stream. Default output is `N<TAB>LINE` with 1-based numbering; `--json` emits a
 JSON array of the same sanitized matching lines, `--tail N` changes the scan
-range, and no-match text mode exits successfully with no output. In mobile
-transcript mode, type `/grep QUERY` to show matching lines locally instead of
-sending that text to the PTY; if nothing matches it prints
-`No matches found in current transcript.`
+range, no-match text mode exits successfully with no output, and an empty
+`QUERY` is rejected. In mobile transcript mode, type `/grep QUERY` to show
+matching lines from the active transcript tail window locally instead of sending
+that text to the PTY; `/grep` without a query prints `Usage: /grep QUERY`, and
+if nothing matches it prints `No matches found in current transcript.`
 
 For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
 In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
-`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output. Transcript-local commands include `/refresh`, `/raw`, `/links` / `/urls`, `/grep QUERY`, and `/exit` / `/quit`; `/links`, `/urls`, and `/grep` are handled locally and are never forwarded to the PTY. When no links are present they print `No URLs found in current transcript.`; when no `/grep` lines match it prints `No matches found in current transcript.`; unrecognized lines are sent to the PTY.
+`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output. Transcript-local commands include `/refresh`, `/raw`, `/links` / `/urls`, `/grep QUERY`, and `/exit` / `/quit`; `/links`, `/urls`, and `/grep` are handled locally and are never forwarded to the PTY. When no links are present they print `No URLs found in current transcript.`; `/grep` uses the active transcript `--tail` window and prints `Usage: /grep QUERY` when no query is provided; when no `/grep` lines match it prints `No matches found in current transcript.`; unrecognized lines are sent to the PTY.
 
 **Stop a session:**
 
