@@ -3121,6 +3121,18 @@ pub fn process_tree(target: Option<&str>, include_orphans: bool) -> Result<Vec<P
         list_sessions()?
     };
     let processes = read_process_table()?;
+    Ok(build_process_tree_from_rows(
+        sessions,
+        processes,
+        include_orphans,
+    ))
+}
+
+fn build_process_tree_from_rows(
+    sessions: Vec<SessionInfo>,
+    processes: Vec<ProcessRow>,
+    include_orphans: bool,
+) -> Vec<ProcessInfo> {
     let mut by_parent: std::collections::HashMap<u32, Vec<ProcessRow>> =
         std::collections::HashMap::new();
     let mut by_pid = std::collections::HashMap::new();
@@ -3129,6 +3141,7 @@ pub fn process_tree(target: Option<&str>, include_orphans: bool) -> Result<Vec<P
         by_parent.entry(process.ppid).or_default().push(process);
     }
     for children in by_parent.values_mut() {
+        // Keep process reports deterministic across ps and HashMap iteration order.
         children.sort_by_key(|p| p.pid);
     }
 
@@ -3141,7 +3154,7 @@ pub fn process_tree(target: Option<&str>, include_orphans: bool) -> Result<Vec<P
             builder.append_orphans(&session, 1);
         }
     }
-    Ok(builder.into_processes())
+    builder.into_processes()
 }
 
 struct ProcessTreeBuilder<'a> {
@@ -3201,6 +3214,7 @@ impl<'a> ProcessTreeBuilder<'a> {
             .values()
             .filter(|row| row.pgid == process_group_id && !self.seen.contains(&row.pid))
             .collect();
+        // Same-pgid escapees are collected from a HashMap; sort for stable reports.
         rows.sort_by_key(|row| row.pid);
         for row in rows {
             if !self.seen.insert(row.pid) {
@@ -6584,13 +6598,14 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
         MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
         MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
-        NestedAgentDetector, NestedAgentTransition, ProcessInfo, RECONNECT_STATE_SCHEMA_VERSION,
-        ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
-        STATUS_PAYLOAD_CWD_CAP, StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot,
-        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
-        StatusTheme, SurfaceKind, TerminalOutputTracker, agent_name_from_command,
-        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
-        anyhow_error_is_broken_pipe, apply_pending_status_command, attach_pty_rows,
+        NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
+        RECONNECT_STATE_SCHEMA_VERSION, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
+        StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
+        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
+        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
+        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
+        apply_pending_status_command, attach_pty_rows, build_process_tree_from_rows,
         build_status_payload, compose_commit_bytes, compose_display_line,
         compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
         compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
@@ -8198,6 +8213,131 @@ mod tests {
             elapsed: "00:00".to_string(),
             command: command.to_string(),
         }
+    }
+
+    fn sample_process_session(
+        name: &str,
+        pane_id: &str,
+        process_id: u32,
+        process_group_id: i32,
+    ) -> crate::protocol::SessionInfo {
+        let mut session = sample_session_info(name, "sh -lc 'sleep 60'", None);
+        session.pane_id = pane_id.to_string();
+        session.process_id = Some(process_id);
+        session.process_group_id = Some(process_group_id);
+        session
+    }
+
+    fn sample_process_row(pid: u32, ppid: u32, pgid: i32, command: &str) -> ProcessRow {
+        ProcessRow {
+            pid,
+            ppid,
+            pgid,
+            stat: "S".to_string(),
+            cpu_percent: 0.0,
+            mem_percent: 0.0,
+            rss_kib: 0,
+            elapsed: "00:00".to_string(),
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn process_tree_from_rows_marks_same_group_non_descendants_as_orphans() {
+        let session = sample_process_session("main", "%7", 100, 700);
+        let processes = build_process_tree_from_rows(
+            vec![session],
+            vec![
+                sample_process_row(130, 999, 700, "escaped-b"),
+                sample_process_row(120, 100, 700, "child-b"),
+                sample_process_row(140, 999, 701, "other-group"),
+                sample_process_row(100, 1, 700, "root-shell"),
+                sample_process_row(150, 110, 700, "grandchild"),
+                sample_process_row(115, 999, 700, "escaped-a"),
+                sample_process_row(110, 100, 700, "child-a"),
+            ],
+            true,
+        );
+
+        let summary: Vec<_> = processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid,
+                    process.depth,
+                    process.orphan,
+                    process.session.as_str(),
+                    process.pane_id.as_str(),
+                    process.command.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (100, 0, false, "main", "%7", "root-shell"),
+                (110, 1, false, "main", "%7", "child-a"),
+                (150, 2, false, "main", "%7", "grandchild"),
+                (120, 1, false, "main", "%7", "child-b"),
+                (115, 1, true, "main", "%7", "escaped-a"),
+                (130, 1, true, "main", "%7", "escaped-b"),
+            ],
+            "synthetic process rows should deterministically separate descendants from same-pgid escaped rows"
+        );
+
+        let report = serde_json::to_value(&processes).expect("process report serializes");
+        let rows = report.as_array().expect("process report is a JSON array");
+        assert!(
+            rows.iter().any(|row| {
+                row.get("orphan").and_then(serde_json::Value::as_bool) == Some(true)
+                    && row
+                        .get("process_group_id")
+                        .and_then(serde_json::Value::as_i64)
+                        == Some(700)
+            }),
+            "JSON reporting must expose orphan classification and process group: {report:?}"
+        );
+        assert!(
+            rows.iter().all(|row| {
+                row.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|command| command != "other-group")
+            }),
+            "unrelated process groups must stay out of the report: {report:?}"
+        );
+    }
+
+    #[test]
+    fn process_tree_from_rows_omits_orphans_when_disabled_or_session_pgid_missing() {
+        let session = sample_process_session("main", "%7", 100, 700);
+        let process_rows = vec![
+            sample_process_row(100, 1, 700, "root-shell"),
+            sample_process_row(115, 999, 700, "escaped-a"),
+        ];
+
+        let without_orphans =
+            build_process_tree_from_rows(vec![session.clone()], process_rows.clone(), false);
+        assert_eq!(
+            without_orphans
+                .iter()
+                .map(|process| (process.pid, process.orphan))
+                .collect::<Vec<_>>(),
+            vec![(100, false)],
+            "--orphans must be an explicit opt-in for same-pgid escaped rows"
+        );
+
+        let mut missing_group = session;
+        missing_group.process_group_id = None;
+        let missing_group_report =
+            build_process_tree_from_rows(vec![missing_group], process_rows, true);
+        assert_eq!(
+            missing_group_report
+                .iter()
+                .map(|process| (process.pid, process.orphan))
+                .collect::<Vec<_>>(),
+            vec![(100, false)],
+            "sessions without a stored process group cannot classify escaped same-pgid rows"
+        );
     }
 
     #[test]
