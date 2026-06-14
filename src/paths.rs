@@ -137,6 +137,10 @@ pub fn buffer_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("tmux-buffer.txt"))
 }
 
+pub fn reconnect_state_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("reconnect-state.json"))
+}
+
 fn active_socket_marker_path() -> Result<PathBuf> {
     Ok(data_dir()?.join(ACTIVE_SOCKET_MARKER))
 }

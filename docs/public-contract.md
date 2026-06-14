@@ -143,11 +143,12 @@ or raw output stream.
 | `lterm run` | none | `stable` | none; attached stream is raw | none | `raw-transparent` |
 | `lterm resume` | `lterm attach`, `lterm a`, `lterm -a` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
+| `lterm reconnect` | none | `explicit-raw-unsafe` | none at command level; raw stream is transparent; private last-session pointer is best-effort; mobile transcript output is sanitized | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
-| `lterm init` | none | `best-effort` | `best-effort` setup preview; does not modify shell files | none | `sanitized-output-only` |
+| `lterm init` | none | `best-effort` | `best-effort` setup preview, including optional mobile reconnect snippets; does not modify shell files | none | `sanitized-output-only` |
 | `lterm logs` | `lterm capture` | `stable` | `stable` sanitized scrollback bytes for documented range semantics | none | `sanitized-output-only` |
 | `lterm urls` | none | `stable` | `stable` recent URL rows as `N<TAB>URL`; `--last` emits only the newest valid URL | `stable` string array; `--last --json` emits `[]` or a one-element array | `sanitized-output-only` |
 | `lterm search` | none | `stable` | `stable` matching rows as `N<TAB>LINE` with 1-based numbering | `stable` string array of matching sanitized lines | `sanitized-output-only` |

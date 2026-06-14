@@ -152,6 +152,33 @@ enum Commands {
         #[arg(long, conflicts_with = "raw")]
         read_only: bool,
     },
+    /// Resume the last lterm session selected on this host, or open a fallback target.
+    Reconnect {
+        /// Fallback session target to open when no recent session is available.
+        #[arg(default_value = "main")]
+        fallback: String,
+        /// Disable the lterm status bar while attached.
+        #[arg(long)]
+        no_status: bool,
+        /// Attach policy to use: auto, raw, or mobile transcript.
+        #[arg(long, value_name = "MODE", value_parser = parse_attach_mode_arg, conflicts_with_all = ["raw", "mobile"])]
+        attach_mode: Option<AttachMode>,
+        /// Force the existing raw PTY attach behavior.
+        #[arg(long, conflicts_with = "mobile")]
+        raw: bool,
+        /// Force the mobile transcript view instead of raw attach.
+        #[arg(long)]
+        mobile: bool,
+        /// Number of sanitized transcript lines to show in mobile mode.
+        #[arg(long, default_value = "120", value_parser = parse_compose_tail_arg)]
+        tail: usize,
+        /// Refresh interval for mobile transcript mode.
+        #[arg(long, value_name = "DURATION", default_value = "500ms", value_parser = parse_wait_duration_arg)]
+        refresh: Duration,
+        /// Do not prompt for input in mobile transcript mode.
+        #[arg(long, conflicts_with = "raw")]
+        read_only: bool,
+    },
     /// List sessions.
     #[command(name = "sessions", visible_aliases = ["list", "ls"])]
     Sessions {
@@ -420,6 +447,9 @@ enum Commands {
         /// Shell syntax to show in the preview; detected from SHELL when omitted.
         #[arg(long, value_enum)]
         shell: Option<ShellKind>,
+        /// Include an optional, reversible mobile SSH reconnect profile snippet.
+        #[arg(long)]
+        mobile_reconnect: bool,
     },
     /// tmux-compatible command surface used by the shim.
     TmuxCompat {
@@ -746,6 +776,38 @@ fn run() -> Result<()> {
                 no_status,
             )
         }
+        Commands::Reconnect {
+            fallback,
+            no_status,
+            attach_mode,
+            raw,
+            mobile,
+            tail,
+            refresh,
+            read_only,
+        } => {
+            let attach_policy =
+                attach_policy_options(attach_mode, raw, mobile, tail, refresh, read_only)?;
+            let info = if attach_policy.transcript.read_only
+                && matches!(attach_policy.mode, AttachMode::Auto)
+            {
+                client::reconnect_existing_or_fallback_info(&fallback)
+                    .context("--read-only in auto attach mode requires a mobile reconnect target")?
+            } else {
+                client::reconnect_or_new(&fallback)?
+            };
+            let _managed_attach_guard = match tmux_compat::prepare_managed_attach(&info.pane_id)? {
+                tmux_compat::ManagedAttachDecision::Proceed(guard) => guard,
+                tmux_compat::ManagedAttachDecision::Exit => return Ok(()),
+            };
+            client::attach_info_with_policy(
+                &info,
+                status_presence_for_existing_attach(no_status, &info),
+                AttachStdinEof::Detach,
+                attach_policy,
+                no_status,
+            )
+        }
         Commands::Sessions {
             json,
             all,
@@ -963,7 +1025,10 @@ fn run() -> Result<()> {
         Commands::Completions { shell } => print_completions(shell),
         Commands::InstallCompletions { shell, dir } => install_completions(shell, dir),
         Commands::InstallAiStatusline => install_ai_statusline(),
-        Commands::Init { shell } => print_init_preview(shell.unwrap_or_else(detect_init_shell)),
+        Commands::Init {
+            shell,
+            mobile_reconnect,
+        } => print_init_preview(shell.unwrap_or_else(detect_init_shell), mobile_reconnect),
         Commands::TmuxCompat { args } => {
             let code = tmux_compat::run_tmux_compat(args)?;
             std::process::exit(code);
@@ -1484,7 +1549,7 @@ fn detect_init_shell() -> ShellKind {
     }
 }
 
-fn print_init_preview(shell: ShellKind) -> Result<()> {
+fn print_init_preview(shell: ShellKind, mobile_reconnect: bool) -> Result<()> {
     let (shell_name, enable_command) = match shell {
         ShellKind::Bash => ("bash", "eval \"$(lterm env)\""),
         ShellKind::Zsh => ("zsh", "eval \"$(lterm env)\""),
@@ -1507,9 +1572,47 @@ fn print_init_preview(shell: ShellKind) -> Result<()> {
     println!(
         "indicator\tLTERM_SESSION/LTERM_PANE are exported inside lterm sessions; install supported AI CLI statusline integrations or add them to your shell prompt for a visible [lterm] badge."
     );
+    if mobile_reconnect {
+        print_mobile_reconnect_init_preview(shell);
+    }
     println!("note\tCopy the enable command into a trusted shell startup file only after review.");
     println!("note\tRun lterm doctor --json again after changing PATH to verify shim_dir_in_path.");
     Ok(())
+}
+
+fn print_mobile_reconnect_init_preview(shell: ShellKind) {
+    println!("mobile_reconnect\toptional");
+    println!("mobile_reconnect_command\tlterm reconnect --mobile");
+    println!(
+        "mobile_reconnect_guard\tinteractive SSH terminal only; skipped inside existing lterm sessions; disabled by LTERM_RECONNECT_DISABLE=1"
+    );
+    println!(
+        "mobile_reconnect_remove\tdelete the copied lterm mobile reconnect block from your shell startup file"
+    );
+    match shell {
+        ShellKind::Fish => {
+            println!(
+                "mobile_reconnect_snippet\t# lterm mobile reconnect (remove this block to disable)"
+            );
+            println!(
+                "mobile_reconnect_snippet\tif status is-interactive; and test -t 0; and test -t 1; and test -n \"$SSH_TTY\"; and not set -q LTERM_SESSION; and test \"$LTERM_RECONNECT_DISABLE\" != \"1\"; and command -q lterm"
+            );
+            println!("mobile_reconnect_snippet\t    exec lterm reconnect --mobile");
+            println!("mobile_reconnect_snippet\tend");
+            println!("mobile_reconnect_disable\tset -gx LTERM_RECONNECT_DISABLE 1");
+        }
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Posix => {
+            println!(
+                "mobile_reconnect_snippet\t# lterm mobile reconnect (remove this block to disable)"
+            );
+            println!(
+                "mobile_reconnect_snippet\tif case $- in *i*) true;; *) false;; esac && [ -t 0 ] && [ -t 1 ] && [ -n \"${{SSH_TTY:-}}\" ] && [ -z \"${{LTERM_SESSION:-}}\" ] && [ \"${{LTERM_RECONNECT_DISABLE:-0}}\" != \"1\" ] && command -v lterm >/dev/null 2>&1; then"
+            );
+            println!("mobile_reconnect_snippet\t  exec lterm reconnect --mobile");
+            println!("mobile_reconnect_snippet\tfi");
+            println!("mobile_reconnect_disable\texport LTERM_RECONNECT_DISABLE=1");
+        }
+    }
 }
 
 const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
@@ -4116,10 +4219,50 @@ mod tests {
         assert_eq!(attach_mode, Some(AttachMode::Raw));
         assert!(!raw);
 
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "reconnect",
+            "fallback",
+            "--mobile",
+            "--tail",
+            "24",
+            "--refresh",
+            "250ms",
+            "--read-only",
+        ])
+        .expect("reconnect attach policy flags should parse");
+        let Commands::Reconnect {
+            fallback,
+            mobile,
+            tail,
+            refresh,
+            read_only,
+            ..
+        } = cli.command
+        else {
+            panic!("expected reconnect command");
+        };
+        assert_eq!(fallback, "fallback");
+        assert!(mobile);
+        assert_eq!(tail, 24);
+        assert_eq!(refresh, Duration::from_millis(250));
+        assert!(read_only);
+
         assert!(Cli::try_parse_from(["lterm", "attach", "main", "--raw", "--mobile"]).is_err());
         assert!(
             Cli::try_parse_from(["lterm", "open", "main", "--attach-mode", "mobile", "--raw"])
                 .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lterm",
+                "reconnect",
+                "main",
+                "--attach-mode",
+                "mobile",
+                "--raw"
+            ])
+            .is_err()
         );
         let raw_read_only = Cli::try_parse_from([
             "lterm",
