@@ -7,7 +7,7 @@
 - **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI-agent tooling. Detach and reattach by name or pane id.
 - **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
 - **How** — Use `lterm start` to create a session, `lterm resume` to reconnect, and `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` for built-in shimmed agent launchers. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
-- **Status** — Alpha MVP with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
+- **Status** — 1.x CLI with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
 ---
 
@@ -305,51 +305,70 @@ lterm input api 'echo hello' --enter
 
 The generic aliases above are meant for day-to-day agent-terminal use: `sessions` lists persistent work, `processes` inspects child process trees, `logs` reads sanitized scrollback, `compose` shows sanitized scrollback with a fixed bottom prompt for committing text, mobile transcript attach gives phone clients native scrollback for long agent output, `reconnect` resumes the last selected local lterm session after an SSH reconnect, `wait` / `watch` make marker-or-exit conditions observable for scripts and agents, and `input` writes text to the target PTY. `lterm mobile` is a visible alias for `lterm compose`; separately, the `--mobile` attach flag selects the normal-screen transcript attach path. The compatibility names `list` / `ls`, `ps`, `capture`, and `send` remain available for scripts and muscle memory.
 
-`lterm reconnect [fallback]` records only a private pointer to the last selected
-session (`session_id`, pane id, user-chosen session name, and timestamp), then
-uses that pointer on the next run. Missing, corrupt, or stale pointers fall back
-to `fallback` (default: `main`) using the same attach-or-create behavior as
-`lterm open`. Do not put secrets in session names. Because `reconnect` can
-still raw-attach, use `--mobile` on phone SSH clients when you want the
-sanitized normal-screen transcript instead of the raw PTY stream. To preview an
-optional profile snippet for mobile SSH logins,
-run `lterm init --mobile-reconnect --shell zsh` (or `bash`, `fish`, `posix`).
-You can omit `--shell` to detect from `$SHELL`. The snippet is not installed
+`lterm reconnect [fallback]` stores a private, minimal pointer to the last
+selected session (`session_id`, pane id, user-chosen session name, and
+timestamp), then uses that pointer on the next run. Missing, corrupt, or stale
+pointers fall back to `fallback` (default: `main`) with the same
+attach-or-create behavior as `lterm open`.
+
+Do not put secrets in session names. `reconnect` can still raw-attach, so use
+`--mobile` on phone SSH clients when you want the sanitized normal-screen
+transcript instead of the raw PTY stream. Preview the optional SSH-login snippet
+with `lterm init --mobile-reconnect --shell zsh` (or `bash`, `fish`, `posix`);
+omit `--shell` to detect from `$SHELL`. The snippet is not installed
 automatically: copy it only after review, remove the copied block to undo it, or
 set `LTERM_RECONNECT_DISABLE=1` to skip it.
 
 `lterm urls <target>` extracts `http://` and `https://` links from the last
 120 sanitized scrollback lines without touching the raw attached PTY stream.
-Default output is `N<TAB>URL`, one link per line; `--last` prints only the
-newest valid URL occurrence for phone-friendly copy/paste, `--json` emits a
-JSON array, and `--tail N` changes the scan range. Empty text modes exit
-successfully with no output, while JSON mode prints `[]`. Extraction is bounded
-to 256 unique ASCII URL tokens and skips raw URL candidates longer than 4096
-bytes instead of truncating them. In mobile transcript mode, type `/links` or
-`/urls` to show the same numbered list locally instead of sending that text to
-the PTY. This is useful for Claude/OAuth login URLs on Termius-style mobile SSH
-clients; for Claude-specific mobile control, Claude Code's Remote Control flow
-can also reduce URL-copy round trips.
+Default output is `N<TAB>URL`, one link per line. Use `--last` for the newest
+valid URL, `--json` for a JSON array, and `--tail N` to change the scan range.
+Empty text modes exit successfully with no output; JSON mode prints `[]`. URL
+extraction is bounded to 256 unique ASCII URL tokens and skips raw candidates
+longer than 4096 bytes instead of truncating them.
 
-Treat extracted links as untrusted terminal output. A malicious program can
-print phishing URLs, and OAuth, magic-login, or device-code links may carry
-short-lived secrets. Open only links you expect, avoid pasting them into shared
-logs or chat, and prefer `--last` only when you know the newest link is the one
-you intend to use.
+In mobile transcript mode, type `/links` or `/urls` to show the same numbered
+list locally instead of sending that text to the PTY. This is useful for
+Claude/OAuth login URLs on Termius-style mobile SSH clients; for
+Claude-specific mobile control, Claude Code's Remote Control flow can also
+reduce URL-copy round trips. Treat extracted links as untrusted terminal
+output: a malicious program can print phishing URLs, and OAuth, magic-login, or
+device-code links may carry short-lived secrets. Open only links you expect,
+avoid pasting them into shared logs or chat, and use `--last` only when you
+know the newest link is the one you intend to open.
 
 `lterm search <target> QUERY` searches the last 120 sanitized scrollback lines
-for case-sensitive literal matching lines without touching the raw attached PTY
-stream. Default output is `N<TAB>LINE` with 1-based numbering; `--json` emits a
-JSON array of the same sanitized matching lines, `--tail N` changes the scan
-range, no-match text mode exits successfully with no output, and an empty
-`QUERY` is rejected. In mobile transcript mode, type `/grep QUERY` to show
-matching lines from the active transcript tail window locally instead of sending
-that text to the PTY; `/grep` without a query prints `Usage: /grep QUERY`, and
-if nothing matches it prints `No matches found in current transcript.`
+for case-sensitive literal matches without touching the raw attached PTY stream.
+Default output is `N<TAB>LINE` with 1-based numbering; `--json` emits the same
+sanitized matching lines as a JSON array, and `--tail N` changes the scan range.
+No-match text mode exits successfully with no output, while an empty `QUERY` is
+rejected. In mobile transcript mode, type `/grep QUERY` to show matching lines
+from the active transcript tail window locally instead of sending that text to
+the PTY. `/grep` without a query prints `Usage: /grep QUERY`; no matches print
+`No matches found in current transcript.`
 
-For automation and tests, `lterm compose api --once --message 'hello'` performs one sanitized capture/send cycle. It captures the last `--tail` sanitized lines (default: 80) from the same session-or-pane target model as `logs`, then appends Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to send the exact message bytes. `compose` / `mobile` is not an attach client and does not change attached-client counts or PTY geometry.
-In interactive compose, the view refreshes on `--refresh` (default: 500ms) and after local input or resize events. Pressing Enter commits the current input buffer (empty buffers are committed too) and appends `\r` by default, matching the one-shot rule above. Ctrl-C, Ctrl-D, and Esc exit the local composer instead of forwarding to the PTY.
-`lterm compose api --transcript` opens the same normal-screen transcript UI used by mobile auto attach. It is useful when you want sanitized scrollback and simple line input without the alternate-screen composer; add `--read-only` when you only want to watch output. Transcript-local commands include `/refresh`, `/raw`, `/links` / `/urls`, `/grep QUERY`, and `/exit` / `/quit`; `/links`, `/urls`, and `/grep` are handled locally and are never forwarded to the PTY. When no links are present they print `No URLs found in current transcript.`; `/grep` uses the active transcript `--tail` window and prints `Usage: /grep QUERY` when no query is provided; when no `/grep` lines match it prints `No matches found in current transcript.`; unrecognized lines are sent to the PTY.
+For automation and tests, `lterm compose api --once --message 'hello'` performs
+one sanitized capture/send cycle. It captures the last `--tail` sanitized lines
+(default: 80) from the same session-or-pane target model as `logs`, then appends
+Enter (`\r`) by default, matching `lterm input --enter`; add `--no-enter` to
+send the exact message bytes. `compose` / `mobile` is not an attach client and
+does not change attached-client counts or PTY geometry.
+
+In interactive compose, the view refreshes on `--refresh` (default: 500ms) and
+after local input or resize events. Pressing Enter commits the current input
+buffer, including an empty buffer, and appends `\r` by default. Ctrl-C, Ctrl-D,
+and Esc exit the local composer instead of forwarding to the PTY.
+
+`lterm compose api --transcript` opens the same normal-screen transcript UI used
+by mobile auto attach. Use it when you want sanitized scrollback and simple line
+input without the alternate-screen composer; add `--read-only` when you only
+want to watch output. Transcript-local commands include `/refresh`, `/raw`,
+`/links` / `/urls`, `/grep QUERY`, and `/exit` / `/quit`. `/links`, `/urls`,
+and `/grep` are handled locally and are never forwarded to the PTY. When no
+links are present they print `No URLs found in current transcript.`; `/grep`
+without a query prints `Usage: /grep QUERY`; no matches print
+`No matches found in current transcript.` Unrecognized lines are sent to the
+PTY.
 
 **Stop a session:**
 
@@ -567,7 +586,7 @@ the old code until they are stopped.
 
 **Terminal output is forwarded as-is.** `lterm resume` (compatibility name: `lterm attach`) passes PTY bytes through so full-screen terminal programs and cmux/OSC notifications keep working. The local status bar is purely a client-side decoration; use `--no-status` for a fully raw terminal surface. Any nested-agent row suspension is host-side geometry/status management only and does not sanitize or rewrite attached PTY bytes. Untrusted child programs can still emit terminal escape sequences to an attached terminal — exactly as under tmux/screen. **Do not use `lterm` as an escape-sequence sanitizer or sandbox.**
 
-**Capture output is terminal-control-sanitized before display/logging.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), and `tmux capture-pane` strip terminal control sequences, including raw or UTF-8-encoded C1 controls, before printing scrollback. Valid UTF-8 text such as Korean, CJK, and emoji is preserved. Scrollback text can still be untrusted program output, so review it before feeding it to humans or agents. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
+**Capture and report output is terminal-control-sanitized before display/logging.** `lterm logs` (compatibility name: `lterm capture`), `lterm compose` (alias: `lterm mobile`), `lterm search`, `lterm urls`, diagnostics, and `tmux capture-pane` strip terminal control sequences, including raw or UTF-8-encoded C1 controls, before printing scrollback-derived text. Valid UTF-8 text such as Korean, CJK, and emoji is preserved. Scrollback text can still be untrusted program output, so review it before feeding it to humans or agents. `compose` is a non-attached view that commits text through the existing input/send path; it does not transform raw attached PTY streams.
 
 **Process visibility.** `lterm processes [session]` (or compatibility name `lterm ps [session]`) shows the process tree rooted at each session child, including process-group ids. Add `--orphans` to also include same-process-group rows that are no longer descendants of the recorded session root, so long-running Codex/OMX/MCP subprocess buildup stays visible before it becomes a memory-leak surprise. The system `ps` is invoked by absolute path, and malformed process rows are skipped rather than guessed at.
 
