@@ -1,7 +1,7 @@
 class Lterm < Formula
   desc "Lightweight tmux-compatible terminal session daemon"
   homepage "https://github.com/ictechgy/light_terminal"
-  url "https://github.com/ictechgy/light_terminal/archive/refs/tags/v1.0.24.tar.gz"
+  url "https://github.com/ictechgy/light_terminal/archive/refs/tags/v1.0.25.tar.gz"
   sha256 "e53a7ee83304dd16f6c3b18eed58573ae64357706f32d0181230d5328895c043"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/ictechgy/light_terminal.git", branch: "main"
@@ -13,7 +13,7 @@ class Lterm < Formula
   end
 
   test do
-    assert_match "lterm 1.0.24", shell_output("#{bin}/lterm --version")
+    assert_match "lterm 1.0.25", shell_output("#{bin}/lterm --version")
     assert_match "Light Terminal", shell_output("#{bin}/lterm --help")
   end
 end
