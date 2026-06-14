@@ -11,11 +11,11 @@ use crossterm::event::{
 };
 use crossterm::terminal::ClearType;
 use crossterm::{cursor, execute, queue, terminal};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -35,6 +35,7 @@ const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_TRACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TRACE_FORMAT: &str = "lterm-trace-jsonl";
 const TRACE_SCHEMA_VERSION: &str = "1.0";
+const RECONNECT_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_TRACE_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_TRACE_REPLAY_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = DEFAULT_TRACE_MAX_BYTES;
@@ -492,6 +493,134 @@ pub fn info(target: &str) -> Result<SessionInfo> {
     rpc(&Request::Info {
         target: target.to_string(),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconnectState {
+    schema_version: u32,
+    session_id: String,
+    pane_id: String,
+    session_name: String,
+    recorded_at_unix_ms: u64,
+}
+
+impl ReconnectState {
+    fn from_session_info(info: &SessionInfo) -> Self {
+        Self {
+            schema_version: RECONNECT_STATE_SCHEMA_VERSION,
+            session_id: info.id.clone(),
+            pane_id: info.pane_id.clone(),
+            session_name: info.name.clone(),
+            recorded_at_unix_ms: current_unix_ms().unwrap_or(0),
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        self.schema_version == RECONNECT_STATE_SCHEMA_VERSION
+            && !self.session_id.is_empty()
+            && !self.pane_id.is_empty()
+            && !self.session_name.is_empty()
+    }
+}
+
+pub fn reconnect_or_new(fallback_target: &str) -> Result<SessionInfo> {
+    reconnect_target(fallback_target, true)
+}
+
+pub fn reconnect_existing_or_fallback_info(fallback_target: &str) -> Result<SessionInfo> {
+    reconnect_target(fallback_target, false)
+}
+
+fn reconnect_target(fallback_target: &str, create_fallback: bool) -> Result<SessionInfo> {
+    ensure_server()?;
+    if let Some(state) = load_reconnect_state_best_effort() {
+        if let Some(info) = resolve_reconnect_state(&state) {
+            return Ok(info);
+        }
+    }
+    if create_fallback {
+        attach_or_new(fallback_target)
+    } else {
+        info(fallback_target)
+    }
+}
+
+fn resolve_reconnect_state(state: &ReconnectState) -> Option<SessionInfo> {
+    for target in [&state.pane_id, &state.session_name] {
+        let Ok(info) = info(target) else {
+            continue;
+        };
+        if info.id == state.session_id {
+            return Some(info);
+        }
+    }
+    None
+}
+
+fn remember_reconnect_target_best_effort(info: &SessionInfo) {
+    let Ok(path) = paths::reconnect_state_path() else {
+        return;
+    };
+    remember_reconnect_target_best_effort_at_path(info, &path);
+}
+
+fn remember_reconnect_target_best_effort_at_path(info: &SessionInfo, path: &Path) {
+    let state = ReconnectState::from_session_info(info);
+    let _ = write_reconnect_state_to_path(path, &state);
+}
+
+fn load_reconnect_state_best_effort() -> Option<ReconnectState> {
+    let path = paths::reconnect_state_path().ok()?;
+    read_reconnect_state_best_effort_from_path(&path)
+}
+
+fn read_reconnect_state_best_effort_from_path(path: &Path) -> Option<ReconnectState> {
+    read_reconnect_state_from_path(path).ok().flatten()
+}
+
+fn read_reconnect_state_from_path(path: &Path) -> Result<Option<ReconnectState>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let state: ReconnectState =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    Ok(state.is_usable().then_some(state))
+}
+
+fn write_reconnect_state_to_path(path: &Path, state: &ReconnectState) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("reconnect state path has no parent: {}", path.display()))?;
+    let tmp = parent.join(format!(".reconnect-state.{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("open temporary reconnect state {}", tmp.display()))?;
+    let mut permissions = file
+        .metadata()
+        .with_context(|| format!("stat temporary reconnect state {}", tmp.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .with_context(|| format!("chmod temporary reconnect state {}", tmp.display()))?;
+    serde_json::to_writer_pretty(&mut file, state).context("serialize reconnect state")?;
+    file.write_all(b"\n")
+        .context("terminate reconnect state JSON")?;
+    file.sync_all()
+        .with_context(|| format!("sync temporary reconnect state {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "replace reconnect state {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Rename an existing session target and return its updated metadata.
@@ -2126,6 +2255,7 @@ pub fn attach_info_with_policy(
     options: AttachPolicyOptions,
     explicit_no_status: bool,
 ) -> Result<()> {
+    remember_reconnect_target_best_effort(info);
     let use_mobile = match options.mode {
         AttachMode::Raw => false,
         AttachMode::Mobile => true,
@@ -6454,19 +6584,19 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
         MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
         MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
-        NestedAgentDetector, NestedAgentTransition, ProcessInfo, ResizeTickOutcome,
-        STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP,
-        StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
-        StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
-        TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
-        agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
-        compute_sink_enabled, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        NestedAgentDetector, NestedAgentTransition, ProcessInfo, RECONNECT_STATE_SCHEMA_VERSION,
+        ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED,
+        STATUS_PAYLOAD_CWD_CAP, StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot,
+        StatusPresencePolicy, StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle,
+        StatusTheme, SurfaceKind, TerminalOutputTracker, agent_name_from_command,
+        agent_presence_banner_enabled, agent_presence_cue_enabled, alt_screen_param_matches,
+        anyhow_error_is_broken_pipe, apply_pending_status_command, attach_pty_rows,
+        build_status_payload, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled, current_unix_ms,
+        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
         format_status_line, forward_pty_output_frame_or_detached, handle_mobile_transcript_input,
         handle_resize_tick, heartbeat_due, hex_decode, hex_encode, hex_encoded_len,
@@ -6476,7 +6606,9 @@ mod tests {
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_command_bool, parse_status_command_interval, parse_status_style,
-        raw_attach_command_hint, read_attach_response_header, read_trace_jsonl_line,
+        raw_attach_command_hint, read_attach_response_header,
+        read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
+        read_trace_jsonl_line, remember_reconnect_target_best_effort_at_path,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
         run_status_command, select_status_backend, should_mobile_transcript_auto,
         status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
@@ -7012,6 +7144,104 @@ mod tests {
             status_theme: None,
             agent_name: agent_name.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn reconnect_state_minimal_round_trip_uses_exact_private_keys() {
+        let dir = tempfile::tempdir().expect("reconnect state tempdir");
+        let path = dir.path().join("reconnect-state.json");
+        let info = sample_session_info(
+            "mobile-main",
+            "TOKEN=secret sh -lc 'echo hidden'",
+            Some("codex"),
+        );
+
+        remember_reconnect_target_best_effort_at_path(&info, &path);
+
+        let bytes = std::fs::read(&path).expect("reconnect state file");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("reconnect state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "reconnect state should be private"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("reconnect state JSON");
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .expect("reconnect state object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "pane_id",
+                "recorded_at_unix_ms",
+                "schema_version",
+                "session_id",
+                "session_name",
+            ])
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("TOKEN=secret")
+                && !String::from_utf8_lossy(&bytes).contains("echo hidden")
+                && !String::from_utf8_lossy(&bytes).contains("/tmp")
+                && !String::from_utf8_lossy(&bytes).contains("codex"),
+            "reconnect state must not store command/cwd/agent metadata: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let loaded = read_reconnect_state_from_path(&path)
+            .expect("read reconnect state")
+            .expect("reconnect state present");
+        assert_eq!(loaded.schema_version, RECONNECT_STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.session_id, info.id);
+        assert_eq!(loaded.pane_id, info.pane_id);
+        assert_eq!(loaded.session_name, info.name);
+    }
+
+    #[test]
+    fn reconnect_state_best_effort_read_ignores_missing_corrupt_and_unknown_schema() {
+        let dir = tempfile::tempdir().expect("reconnect state tempdir");
+        let path = dir.path().join("reconnect-state.json");
+
+        assert!(read_reconnect_state_best_effort_from_path(&path).is_none());
+
+        std::fs::write(&path, b"not json").expect("write corrupt reconnect state");
+        assert!(read_reconnect_state_best_effort_from_path(&path).is_none());
+
+        std::fs::write(
+            &path,
+            br#"{"schema_version":999,"session_id":"id","pane_id":"%1","session_name":"main","recorded_at_unix_ms":1}"#,
+        )
+        .expect("write unsupported reconnect state");
+        assert!(read_reconnect_state_best_effort_from_path(&path).is_none());
+
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"session_id":"id","pane_id":"%1","session_name":"main","recorded_at_unix_ms":1,"command":"secret"}"#,
+        )
+        .expect("write unknown-field reconnect state");
+        assert!(read_reconnect_state_best_effort_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn reconnect_state_write_failure_is_best_effort() {
+        let dir = tempfile::tempdir().expect("reconnect state tempdir");
+        let missing_parent = dir.path().join("missing").join("reconnect-state.json");
+        let info = sample_session_info("mobile-main", "/bin/sh", None);
+
+        remember_reconnect_target_best_effort_at_path(&info, &missing_parent);
+
+        assert!(
+            !missing_parent.exists(),
+            "best-effort reconnect state write should not create missing parents in this failure fixture"
+        );
     }
 
     #[test]

@@ -199,6 +199,53 @@
       "stability_scope": "Open is a mixed attach-or-create surface: create-if-missing-control covers local control behavior before attach; raw-pty-stream is transparent; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; automatic mobile selection remains conservative best-effort policy. The agent-presence-cue sub-surface is a host-side best-effort compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus sanitized one-shot banner emitted before raw attach for row-off agent sessions, with idle title-only refresh while attached row-off; it does not filter or rewrite the attached PTY stream and is controlled by LTERM_AGENT_CUE / LTERM_AGENT_BANNER."
     },
     {
+      "command": "lterm reconnect",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --bin lterm attach_commands_parse_mobile_policy_flags",
+        "cargo test --bin lterm reconnect_state_minimal_round_trip_uses_exact_private_keys",
+        "cargo test --bin lterm reconnect_state_best_effort_read_ignores_missing_corrupt_and_unknown_schema",
+        "cargo test --bin lterm reconnect_state_write_failure_is_best_effort",
+        "cargo test --test cli_smoke reconnect_resumes_last_selected_session_in_mobile_transcript",
+        "cargo test --test cli_smoke reconnect_falls_back_to_main_when_state_is_missing_or_stale",
+        "cargo test --test cli_smoke reconnect_read_only_never_creates_missing_fallback",
+        "cargo test --test cli_smoke reconnect_ignores_live_pane_or_name_when_session_id_mismatches"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "explicit-raw-unsafe",
+      "raw_stream_policy": "raw-transparent",
+      "surface_contracts": [
+        {
+          "name": "raw-pty-stream",
+          "classification": "explicit-raw-unsafe",
+          "raw_stream_policy": "raw-transparent",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "last-session-pointer",
+          "classification": "best-effort",
+          "raw_stream_policy": "not-applicable",
+          "text_output_stability": "none",
+          "json_output_stability": "none",
+          "schema_path": null
+        },
+        {
+          "name": "mobile-transcript",
+          "classification": "stable",
+          "raw_stream_policy": "sanitized-output-only",
+          "text_output_stability": "best-effort",
+          "json_output_stability": "none",
+          "schema_path": null
+        }
+      ],
+      "stability_scope": "Reconnect is a mixed attach surface: last-session-pointer is a private best-effort local target-selection hint stored under the user-private lterm data dir. It stores only session_id, pane_id, the user-provided session_name, and a timestamp; it must not include derived command lines, cwd, scrollback, URLs, host metadata, or secrets. Users should not put secrets in session names. Stale, corrupt, or missing pointers fall back to the explicit fallback target, defaulting to main when omitted. raw-pty-stream remains transparent after target selection; mobile-transcript is a non-attached sanitized capture/send UI and must not resize or register as an attached client. Explicit --mobile / LTERM_ATTACH_MODE=mobile selection exposes the stable mobile-transcript sub-surface; --read-only never creates a missing fallback target."
+    },
+    {
       "command": "lterm sessions",
       "aliases": [
         "lterm list",
@@ -273,12 +320,13 @@
       "tests": [
         "cargo test --test cli_smoke init_prints_setup_preview_without_modifying_files",
         "cargo test --test cli_smoke init_prints_fish_source_preview",
-        "cargo test --test cli_smoke init_rejects_unsupported_shell_values"
+        "cargo test --test cli_smoke init_rejects_unsupported_shell_values",
+        "cargo test --test cli_smoke init_mobile_reconnect_preview_is_no_touch_and_reversible_for_all_shells"
       ],
       "docs_owner": "README.md",
       "classification": "best-effort",
       "raw_stream_policy": "sanitized-output-only",
-      "stability_scope": "Init is a no-touch setup preview for humans. It prints recommended commands and must not modify shell startup files or daemon state."
+      "stability_scope": "Init is a no-touch setup preview for humans. It prints recommended commands and optional reversible mobile reconnect profile snippets guarded by LTERM_RECONNECT_DISABLE=1, and must not modify shell startup files or daemon state."
     },
     {
       "command": "lterm logs",

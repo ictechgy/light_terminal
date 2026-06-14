@@ -3235,6 +3235,62 @@ fn init_detects_shell_from_environment_when_omitted() -> TestResult {
 }
 
 #[test]
+fn init_mobile_reconnect_preview_is_no_touch_and_reversible_for_all_shells() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for shell in ["zsh", "bash", "fish", "posix"] {
+        let before = temp_tree_snapshot(env.temp.path())?;
+        let output = env
+            .cmd()
+            .args(["init", "--shell", shell, "--mobile-reconnect"])
+            .output()?;
+        assert!(output.status.success(), "{shell}: {output:?}");
+        assert!(output.stderr.is_empty(), "{shell}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_fragments = [
+            "lterm init preview",
+            "modifies_files\tno",
+            "mobile_reconnect\toptional",
+            "mobile_reconnect_command\tlterm reconnect --mobile",
+            "interactive SSH terminal only",
+            "LTERM_RECONNECT_DISABLE=1",
+            "mobile_reconnect_remove\tdelete the copied lterm mobile reconnect block",
+            "exec lterm reconnect --mobile",
+        ];
+        assert!(
+            stdout.contains(&format!("shell\t{shell}")),
+            "{shell} mobile reconnect preview missing shell row:\n{stdout}"
+        );
+        for expected in expected_fragments {
+            assert!(
+                stdout.contains(expected),
+                "{shell} mobile reconnect preview missing {expected:?}:\n{stdout}"
+            );
+        }
+        if shell == "fish" {
+            assert!(
+                stdout.contains("set -gx LTERM_RECONNECT_DISABLE 1")
+                    && stdout.contains("status is-interactive"),
+                "fish preview should use fish syntax:\n{stdout}"
+            );
+        } else {
+            assert!(
+                stdout.contains("export LTERM_RECONNECT_DISABLE=1")
+                    && stdout.contains("case $- in *i*)"),
+                "{shell} preview should use POSIX-compatible syntax:\n{stdout}"
+            );
+        }
+        assert_eq!(
+            before,
+            temp_tree_snapshot(env.temp.path())?,
+            "init --mobile-reconnect must not modify shell startup files or daemon state for {shell}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn init_rejects_unsupported_shell_values() -> TestResult {
     let env = TestEnv::new()?;
     let output = env.cmd().args(["init", "--shell", "powershell"]).output()?;
@@ -3565,6 +3621,15 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
                 "default: main",
             ][..],
         ),
+        (
+            "reconnect",
+            &[
+                "Fallback session target to open when no recent session is available",
+                "default: main",
+                "Attach policy to use: auto, raw, or mobile transcript",
+                "Force the mobile transcript view instead of raw attach",
+            ][..],
+        ),
         ("close", &["Session or pane target to close"][..]),
         ("kill", &["Session or pane target to close"][..]),
         (
@@ -3698,7 +3763,7 @@ fn help_describes_target_io_and_remote_arguments() -> TestResult {
 
         let unexpected_defaults = match command {
             "resume" | "attach" => &["defaults to %0"][..],
-            "open" | "attach-or-new" | "ssh" => &["defaults to main"][..],
+            "open" | "attach-or-new" | "reconnect" | "ssh" => &["defaults to main"][..],
             _ => &[][..],
         };
         for phrase in unexpected_defaults {
@@ -3827,6 +3892,236 @@ fn open_and_attach_or_new_create_missing_session() -> TestResult {
             "{command} should attach existing {target} without creating duplicates:\n{stdout}"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn reconnect_resumes_last_selected_session_in_mobile_transcript() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (name, marker) in [
+        ("reconnect-first", "FIRST_RECONNECT_READY"),
+        ("reconnect-second", "SECOND_RECONNECT_READY"),
+    ] {
+        let status = env
+            .cmd()
+            .args([
+                "start",
+                "--detach",
+                "--name",
+                name,
+                "--",
+                "sh",
+                "-lc",
+                &format!("printf '{marker}\\n'; sleep 30"),
+            ])
+            .status()?;
+        assert!(status.success(), "failed to create {name}");
+        env.capture_until(name, marker)?;
+    }
+    let _first_cleanup = SessionCleanup::new(&env, "reconnect-first");
+    let _second_cleanup = SessionCleanup::new(&env, "reconnect-second");
+
+    for (name, marker) in [
+        ("reconnect-first", "FIRST_RECONNECT_READY"),
+        ("reconnect-second", "SECOND_RECONNECT_READY"),
+    ] {
+        let output = env
+            .cmd()
+            .stdin(Stdio::null())
+            .args(["resume", name, "--mobile", "--tail", "20"])
+            .output()?;
+        assert!(output.status.success(), "{name}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(marker), "{name} resume output: {stdout:?}");
+    }
+
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["reconnect", "--mobile", "--tail", "20"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target=reconnect-second") && stdout.contains("SECOND_RECONNECT_READY"),
+        "reconnect should resume the most recently selected session:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("FIRST_RECONNECT_READY"),
+        "reconnect attached the older session instead of the latest selection:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn reconnect_falls_back_to_main_when_state_is_missing_or_stale() -> TestResult {
+    let env = TestEnv::new()?;
+    let status = env
+        .cmd()
+        .args([
+            "start",
+            "--detach",
+            "--name",
+            "main",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'MAIN_RECONNECT_READY\\n'; sleep 30",
+        ])
+        .status()?;
+    assert!(status.success(), "failed to create main fallback");
+    let _cleanup = SessionCleanup::new(&env, "main");
+    env.capture_until("main", "MAIN_RECONNECT_READY")?;
+
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["reconnect", "--mobile", "--tail", "20"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target=main") && stdout.contains("MAIN_RECONNECT_READY"),
+        "reconnect with no state should fall back to main:\n{stdout}"
+    );
+
+    let state_path = env.temp.path().join("data").join("reconnect-state.json");
+    std::fs::create_dir_all(
+        state_path
+            .parent()
+            .ok_or("missing reconnect state parent")?,
+    )?;
+    std::fs::write(
+        &state_path,
+        br#"{"schema_version":1,"session_id":"stale-session","pane_id":"%999","session_name":"stale-reconnect","recorded_at_unix_ms":1}"#,
+    )?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&state_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&state_path, perms)?;
+    }
+
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["reconnect", "--mobile", "--tail", "20"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target=main") && stdout.contains("MAIN_RECONNECT_READY"),
+        "reconnect with stale state should fall back to main:\n{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn reconnect_read_only_never_creates_missing_fallback() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for args in [
+        vec!["reconnect", "readonly-missing", "--read-only"],
+        vec![
+            "reconnect",
+            "readonly-mobile-missing",
+            "--mobile",
+            "--read-only",
+        ],
+    ] {
+        let output = env.cmd().stdin(Stdio::null()).args(&args).output()?;
+        assert!(
+            !output.status.success(),
+            "read-only reconnect should fail instead of creating a missing fallback for {args:?}: {output:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--read-only requires an existing reconnect or fallback target"),
+            "read-only reconnect should explain that it needs an existing target for {args:?}: {stderr}"
+        );
+    }
+
+    let names = session_names_json(&env)?;
+    assert!(
+        !names.contains("readonly-missing") && !names.contains("readonly-mobile-missing"),
+        "read-only reconnect must not create missing fallback sessions: {names:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn reconnect_ignores_live_pane_or_name_when_session_id_mismatches() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (name, marker) in [
+        ("main", "MAIN_ID_MISMATCH_READY"),
+        ("reconnect-reused", "REUSED_ID_MISMATCH_READY"),
+    ] {
+        let status = env
+            .cmd()
+            .args([
+                "start",
+                "--detach",
+                "--name",
+                name,
+                "--",
+                "sh",
+                "-lc",
+                &format!("printf '{marker}\\n'; sleep 30"),
+            ])
+            .status()?;
+        assert!(status.success(), "failed to create {name}");
+        env.capture_until(name, marker)?;
+    }
+    let _main_cleanup = SessionCleanup::new(&env, "main");
+    let _reused_cleanup = SessionCleanup::new(&env, "reconnect-reused");
+
+    let rows = session_rows_json(&env, true)?;
+    let reused_pane = rows
+        .iter()
+        .find(|row| row.name == "reconnect-reused")
+        .ok_or_else(|| format!("missing reconnect-reused row: {rows:?}"))?
+        .pane_id
+        .clone();
+    let state_path = env.temp.path().join("data").join("reconnect-state.json");
+    std::fs::create_dir_all(
+        state_path
+            .parent()
+            .ok_or("missing reconnect state parent")?,
+    )?;
+    std::fs::write(
+        &state_path,
+        format!(
+            "{{\"schema_version\":1,\"session_id\":\"stale-session-id\",\"pane_id\":\"{reused_pane}\",\"session_name\":\"reconnect-reused\",\"recorded_at_unix_ms\":1}}\n"
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&state_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&state_path, perms)?;
+    }
+
+    let output = env
+        .cmd()
+        .stdin(Stdio::null())
+        .args(["reconnect", "--mobile", "--tail", "20"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target=main") && stdout.contains("MAIN_ID_MISMATCH_READY"),
+        "id-mismatched reconnect state should fall back to main:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("REUSED_ID_MISMATCH_READY"),
+        "reconnect must not attach a live pane/name whose session_id differs from the stored pointer:\n{stdout}"
+    );
 
     Ok(())
 }

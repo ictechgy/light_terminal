@@ -138,6 +138,7 @@ lterm -a api
 | tmux 호환을 켠 상태로 명령 실행 | `lterm run -- codex exec "요약해줘"` | 없음 (`--no-tmux`로 opt out) |
 | 세션 열기 또는 생성 | `lterm open main` | `attach-or-new` |
 | 기존 세션 재개 | `lterm resume api` | `attach`, `a`, `-a` |
+| 마지막으로 선택한 세션에 재접속 | `lterm reconnect --mobile` | 없음 |
 | 모바일에서 agent 출력 확인 | `LTERM_MOBILE=1 lterm resume codex-lterm` | transcript 강제는 `--mobile`, 기존 raw attach 강제는 `--raw` |
 | 세션 목록 보기 | `lterm sessions` | `list`, `ls` |
 | 프로세스 트리 확인 | `lterm processes api --json --orphans` | `ps` |
@@ -295,13 +296,27 @@ lterm urls api --last
 lterm search api 'build failed'
 lterm compose api
 LTERM_MOBILE=1 lterm resume codex-lterm
+lterm reconnect --mobile
 lterm resume --raw codex-lterm
 lterm wait api --contains READY --timeout 30s --json
 lterm watch api --exit --notify
 lterm input api 'echo hello' --enter
 ```
 
-위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다룰 수 있게 해 주는 명령 집합입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
+위의 일반 alias는 tmux 용어를 몰라도 agent terminal을 일상적으로 다룰 수 있게 해 주는 명령 집합입니다. `sessions`는 영속 작업을 나열하고, `processes`는 child process tree를 확인하고, `logs`는 정제된 scrollback을 읽고, `compose`는 정제된 scrollback과 하단 고정 prompt로 텍스트를 commit할 수 있게 하며, 모바일 transcript attach는 긴 agent 출력을 휴대폰의 기본 scrollback으로 읽을 수 있게 해 줍니다. `reconnect`는 SSH 재접속 뒤 마지막으로 선택했던 로컬 lterm 세션을 다시 엽니다. `wait` / `watch`는 marker 또는 종료 조건을 script와 agent가 관측할 수 있게 하고, `input`은 대상 PTY에 텍스트를 씁니다. `lterm mobile`은 `lterm compose`의 visible alias이고, 별개의 attach flag인 `--mobile`은 normal-screen transcript attach 경로를 선택합니다. 호환 이름 `list` / `ls`, `ps`, `capture`, `send`는 스크립트와 기존 사용 습관에서도 계속 사용할 수 있습니다.
+
+`lterm reconnect [fallback]`는 마지막으로 선택한 세션을 가리키는 private
+pointer만 저장합니다(`session_id`, pane id, 사용자가 정한 session name,
+timestamp). 다음 실행에서는 이 pointer를 사용하고, pointer가 없거나 깨졌거나 오래되어
+더 이상 맞지 않으면 `fallback`(기본값: `main`)으로 `lterm open`과 같은
+attach-or-create 동작을 수행합니다. session name에는 secret을 넣지 마세요.
+`reconnect`도 raw attach를 할 수 있으므로, 휴대폰 SSH client에서 정제된
+normal-screen transcript를 원하면 `--mobile`을 사용하세요. 모바일 SSH 로그인
+profile snippet을 미리 보려면
+`lterm init --mobile-reconnect --shell zsh`(또는 `bash`, `fish`, `posix`)를
+실행하세요. `--shell`을 생략하면 `$SHELL`에서 감지합니다. 이 snippet은 자동
+설치되지 않습니다. 검토한 뒤 직접 복사하고, 되돌리려면 복사한 block을 삭제하거나
+`LTERM_RECONNECT_DISABLE=1`을 설정하세요.
 
 `lterm urls <target>`은 raw attach PTY stream을 건드리지 않고, 마지막 120개
 정제된 scrollback line에서 `http://` / `https://` link를 추출합니다. 기본
@@ -540,6 +555,11 @@ lterm ssh user@host main
 ```bash
 lterm ssh devbox main -- -p 2222 -i ~/.ssh/id_ed25519
 ```
+
+일반 모바일 SSH로 호스트에 로그인한 뒤에는 `lterm reconnect --mobile`을 실행해
+그 호스트에서 마지막으로 선택했던 lterm 세션을 다시 열 수 있습니다. `lterm ssh`
+자체는 구버전 원격 설치와의 호환성을 위해 기존 `attach-or-new` wire command를
+그대로 유지합니다.
 
 ## 구조
 
