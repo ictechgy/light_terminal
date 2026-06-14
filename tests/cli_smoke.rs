@@ -13633,6 +13633,11 @@ fn attach_preserves_input_buffered_with_request_header() -> TestResult {
 fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
     let env = TestEnv::new()?;
     let socket = socket_path_for(&env);
+    let payload_path = env.temp.path().join("raw-attach-payload.bin");
+    std::fs::write(
+        &payload_path,
+        b"\x1b[31mRED\x1b[0m\x1b]52;c;RAW_SECRET\x07\x1bPqDCS_RAW\x1b\\",
+    )?;
 
     let status = env
         .cmd()
@@ -13645,18 +13650,20 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
             "sh",
             "-c",
             concat!(
+                "payload=$1; ",
                 "printf 'READY_RAW\\n'; ",
                 "while IFS= read -r line; do ",
                 "if [ \"$line\" = GO_RAW ]; then ",
                 "printf 'RAW_START'; ",
-                "printf '\\033[31mRED\\033[0m'; ",
-                "printf '\\033]52;c;RAW_SECRET\\007'; ",
-                "printf '\\033PqDCS_RAW\\033\\\\'; ",
+                "cat \"$payload\"; ",
                 "printf 'RAW_END\\n'; ",
+                "break; ",
                 "fi; ",
                 "done"
             ),
         ])
+        .arg("raw-byte-script")
+        .arg(&payload_path)
         .status()?;
     assert!(status.success(), "lterm new should succeed");
     wait_for_socket(&socket)?;
@@ -13716,6 +13723,30 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
     assert!(
         !captured.contains('\x07'),
         "sanitized capture should still strip BEL controls: {captured:?}"
+    );
+
+    let list = env.cmd().arg("sessions").output()?;
+    assert!(list.status.success(), "{list:?}");
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    let raw_row = list_row(&list_stdout, "raw-bytes").ok_or_else(|| {
+        format!("raw-bytes should remain visible in sessions list: {list_stdout:?}")
+    })?;
+    let raw_row = raw_row.join("\t");
+    assert!(
+        !raw_row.contains('\x1b'),
+        "sessions list should sanitize escapes in metadata: {raw_row:?}"
+    );
+    assert!(
+        !raw_row.contains('\x07'),
+        "sessions list should sanitize BEL controls in metadata: {raw_row:?}"
+    );
+    assert!(
+        !raw_row.contains("RAW_SECRET"),
+        "sessions list should not expose raw OSC payload contents: {raw_row:?}"
+    );
+    assert!(
+        !raw_row.contains("DCS_RAW"),
+        "sessions list should not expose raw DCS payload contents: {raw_row:?}"
     );
 
     drop(stream);
