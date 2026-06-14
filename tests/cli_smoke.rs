@@ -13628,6 +13628,77 @@ fn attach_preserves_input_buffered_with_request_header() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "raw-bytes",
+            "--",
+            "sh",
+            "-lc",
+            concat!(
+                "printf 'READY_RAW\\n'; ",
+                "while IFS= read -r line; do ",
+                "if [ \"$line\" = GO_RAW ]; then ",
+                "printf 'RAW_START'; ",
+                "printf '\\033[31mRED\\033[0m'; ",
+                "printf '\\033]52;c;RAW_SECRET\\007'; ",
+                "printf '\\033PqDCS_RAW\\033\\\\'; ",
+                "printf 'RAW_END\\n'; ",
+                "fi; ",
+                "done"
+            ),
+        ])
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+    env.capture_until("raw-bytes", "READY_RAW")?;
+
+    let (mut stream, _subscriber_id) = attach_with_geometry(&socket, "raw-bytes", 24, 80)?;
+
+    let send_status = env.cmd().args(["send", "raw-bytes", "GO_RAW\n"]).status()?;
+    assert!(send_status.success(), "lterm send must succeed");
+
+    let raw = read_until_marker_bytes(&mut stream, b"RAW_END", Duration::from_secs(5))?;
+    assert!(
+        contains_subsequence(&raw, b"\x1b[31mRED\x1b[0m"),
+        "raw attach must preserve CSI color bytes: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        contains_subsequence(&raw, b"\x1b]52;c;RAW_SECRET\x07"),
+        "raw attach must preserve OSC/BEL bytes: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        contains_subsequence(&raw, b"\x1bPqDCS_RAW\x1b\\"),
+        "raw attach must preserve DCS/ST bytes: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    let captured = env.capture_until("raw-bytes", "RAW_END")?;
+    assert!(captured.contains("RED"), "{captured:?}");
+    assert!(
+        !captured.contains('\x1b'),
+        "sanitized capture should still strip escapes: {captured:?}"
+    );
+    assert!(
+        !captured.contains("RAW_SECRET"),
+        "sanitized capture should still strip OSC payloads: {captured:?}"
+    );
+
+    drop(stream);
+    Ok(())
+}
+
 /// stale subscriber id 를 실어 보낸 Resize 는 silent no-op 이 아니라 명시적
 /// 에러로 surface 되어야 한다. 그렇지 않으면 client-side race 가 보이지 않는
 /// 채로 PTY 사이즈가 영원히 어긋난 상태로 남을 수 있다.
