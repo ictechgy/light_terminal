@@ -131,57 +131,33 @@ enum PollStatus<T> {
     Pending(String),
 }
 
-enum PollUntilError {
+enum PollUntilError<E> {
     Timeout(String),
-    Check(Box<dyn std::error::Error>),
+    Check(E),
 }
 
-impl std::fmt::Display for PollUntilError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout(message) => f.write_str(message),
-            Self::Check(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::fmt::Debug for PollUntilError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
-impl std::error::Error for PollUntilError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Timeout(_) => None,
-            Self::Check(err) => Some(err.as_ref()),
-        }
-    }
-}
-
-fn poll_until_result<T, F>(
+fn poll_until_result<T, E, F>(
     timeout: Duration,
     interval: Duration,
     label: &str,
     mut check: F,
-) -> Result<T, PollUntilError>
+) -> Result<T, PollUntilError<E>>
 where
-    F: FnMut() -> TestResult<PollStatus<T>>,
+    F: FnMut() -> Result<PollStatus<T>, E>,
 {
     let deadline = Instant::now() + timeout;
-    let mut last: String;
-    loop {
+    let last = loop {
         match check().map_err(PollUntilError::Check)? {
             PollStatus::Ready(value) => return Ok(value),
-            PollStatus::Pending(detail) => last = detail,
+            PollStatus::Pending(detail) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break detail;
+                }
+                thread::sleep(interval.min(deadline.saturating_duration_since(now)));
+            }
         }
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        thread::sleep(interval.min(deadline.saturating_duration_since(now)));
-    }
+    };
     Err(PollUntilError::Timeout(format!(
         "timed out waiting for {label} after {timeout:?}; last={last}"
     )))
@@ -191,7 +167,11 @@ fn poll_until<T, F>(timeout: Duration, interval: Duration, label: &str, check: F
 where
     F: FnMut() -> TestResult<PollStatus<T>>,
 {
-    poll_until_result(timeout, interval, label, check).map_err(|err| err.into())
+    match poll_until_result(timeout, interval, label, check) {
+        Ok(value) => Ok(value),
+        Err(PollUntilError::Check(err)) => Err(err),
+        Err(PollUntilError::Timeout(message)) => Err(message.into()),
+    }
 }
 
 struct ChildCleanup {
