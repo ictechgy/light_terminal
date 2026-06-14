@@ -221,6 +221,8 @@ process rows. It does not start the daemon and does not include raw PTY bytes or
 scrollback by default. `lterm inspect --json` prints the same redacted bundle for
 tools that expect an inspect-style JSON entrypoint; it requires `--json`.
 
+For opt-in local footprint measurements, run `python3 scripts/footprint_benchmark.py --quick --json target/footprint-baseline.json --markdown target/footprint-baseline.md`. See [`docs/footprint-benchmark.md`](docs/footprint-benchmark.md) for the isolated lterm-vs-tmux methodology and interpretation caveats.
+
 `lterm logs <target>` accepts `--start` / `-S` and `--end` / `-E` line offsets. Non-negative values are absolute scrollback line indexes; negative values count back from the current scrollback line count. `--end` is inclusive, so `lterm logs api -S0 -E0` captures only the first line. Capture output remains sanitized text: terminal controls are removed, while UTF-8 text such as Korean, CJK, and emoji is preserved. Attached PTY streams remain raw.
 
 `lterm trace <target> --duration 5s --output trace.jsonl` records raw PTY
