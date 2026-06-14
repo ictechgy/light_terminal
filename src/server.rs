@@ -3389,6 +3389,22 @@ fn ping_socket(socket: &Path) -> Result<bool> {
     target_os = "ios",
     target_os = "freebsd",
     target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "linux",
+    test
+))]
+fn verify_peer_uid(peer_uid: u32, expected_uid: u32) -> Result<()> {
+    if peer_uid != expected_uid {
+        bail!("peer uid {peer_uid} does not match daemon uid {expected_uid}");
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
     target_os = "netbsd"
 ))]
 fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
@@ -3403,10 +3419,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     }
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
-    if uid != expected {
-        bail!("peer uid {uid} does not match daemon uid {expected}");
-    }
-    Ok(())
+    verify_peer_uid(uid, expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -3442,10 +3455,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     }
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
-    if cred.uid != expected {
-        bail!("peer uid {} does not match daemon uid {expected}", cred.uid);
-    }
-    Ok(())
+    verify_peer_uid(cred.uid, expected)
 }
 
 #[cfg(not(any(
@@ -3494,7 +3504,7 @@ mod tests {
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
         read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        validate_terminal_geometry, wait_for_session_contains,
+        validate_terminal_geometry, verify_peer_uid, wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -3516,6 +3526,21 @@ mod tests {
         assert!(!process_group_still_owns_child(None, pgid));
         let mismatched_pgid = if pgid == i32::MAX { pgid - 1 } else { pgid + 1 };
         assert!(!process_group_still_owns_child(Some(pid), mismatched_pgid));
+    }
+
+    #[test]
+    fn peer_uid_check_accepts_same_uid() {
+        verify_peer_uid(501, 501).expect("same uid should be accepted");
+    }
+
+    #[test]
+    fn peer_uid_check_rejects_wrong_uid() {
+        let err = verify_peer_uid(502, 501).expect_err("wrong uid should be rejected");
+        assert!(
+            err.to_string()
+                .contains("peer uid 502 does not match daemon uid 501"),
+            "wrong-uid error should identify both trust-boundary endpoints: {err:#}"
+        );
     }
 
     #[test]
