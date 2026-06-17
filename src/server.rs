@@ -3627,6 +3627,12 @@ mod tests {
         let safe = sanitize_child_env(env, true).expect("tmux cmux context allowlist should pass");
         assert_eq!(safe["CMUX_SURFACE_ID"], "surface:current");
 
+        let mut codex_home_env = HashMap::new();
+        codex_home_env.insert("CODEX_HOME".to_string(), "/tmp/codex-home".to_string());
+        let safe = sanitize_child_env(codex_home_env, false)
+            .expect("CODEX_HOME should remain an ordinary allowed child env key");
+        assert_eq!(safe["CODEX_HOME"], "/tmp/codex-home");
+
         let mut lowercase_env = HashMap::new();
         lowercase_env.insert("cmux_surface_id".to_string(), "surface:lower".to_string());
         let lowercase_err = sanitize_child_env(lowercase_env, true)
