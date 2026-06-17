@@ -11,14 +11,14 @@ Goal: install `lterm`, verify it works, and leave me with the exact command I ca
 use to start an agent-backed persistent session.
 
 Repository: https://github.com/ictechgy/light_terminal
-Current release tag to prefer for source installs: v1.0.25
+Current release tag to prefer for source installs: v1.0.26
 
 Rules:
 - Detect OS, CPU architecture, shell, and whether Homebrew, npm, and Cargo are available.
 - Prefer the least surprising package manager for this machine:
   - macOS with Homebrew: `brew install ictechgy/tap/lterm`
   - supported macOS/Linux with npm: `npm install -g @ictechgy/lterm`
-  - fallback with Rust/Cargo: `cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.25`
+  - fallback with Rust/Cargo: `cargo install --git https://github.com/ictechgy/light_terminal --tag v1.0.26`
 - If an older `lterm` daemon may still be running after an upgrade, show current sessions first with `lterm sessions --all` and ask before running `lterm shutdown`.
 - Do not overwrite shell startup files. If PATH/shim setup needs `.zshrc`, `.bashrc`, `.profile`, or fish config changes, show the exact diff and ask first.
 - Keep raw terminal attach behavior untouched; only run smoke-test commands that are safe and reversible.
