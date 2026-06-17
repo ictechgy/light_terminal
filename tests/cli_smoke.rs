@@ -80,6 +80,51 @@ impl TestEnv {
             },
         )
     }
+
+    fn start_daemon_without_codex_home(&self) -> TestResult<ChildCleanup> {
+        let mut daemon = self.cmd();
+        daemon
+            .arg("daemon")
+            .env_remove("CODEX_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = ChildCleanup::new(daemon.spawn()?);
+        self.wait_for_reachable_daemon()?;
+        Ok(child)
+    }
+
+    fn wait_for_reachable_daemon(&self) -> TestResult {
+        poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            "prestarted daemon to become reachable",
+            || {
+                let output = self.cmd().args(["doctor", "--json"]).output()?;
+                if output.status.success() {
+                    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    if report
+                        .get("daemon_reachable")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    {
+                        return Ok(PollStatus::Ready(()));
+                    }
+                    Ok(PollStatus::Pending(format!(
+                        "daemon not reachable yet: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    )))
+                } else {
+                    Ok(PollStatus::Pending(format!(
+                        "doctor status={:?}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
+            },
+        )
+    }
 }
 
 fn temp_tree_snapshot(root: &Path) -> TestResult<BTreeSet<String>> {
@@ -956,6 +1001,61 @@ fn session_identity_env_is_exported_to_child_process() -> TestResult {
     let captured = env.capture_until("identity-env", &format!("PANE:{pane}"))?;
     assert!(captured.contains("SESSION:identity-env"), "{captured:?}");
     assert!(captured.contains(&format!("PANE:{pane}")), "{captured:?}");
+    Ok(())
+}
+
+#[test]
+fn codex_home_reaches_child_through_prestarted_daemon_request_env() -> TestResult {
+    let env = TestEnv::new()?;
+    let _daemon = env.start_daemon_without_codex_home()?;
+    let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
+
+    let output = env
+        .cmd()
+        .env("CODEX_HOME", &sentinel)
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-home-env",
+            "--",
+            "sh",
+            "-lc",
+            "printf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"; sleep 1",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let expected = format!("CODEX_HOME:{}", sentinel.display());
+    let captured = env.capture_until("codex-home-env", &expected)?;
+    assert!(captured.contains(&expected), "{captured:?}");
+    Ok(())
+}
+
+#[test]
+fn codex_home_reaches_fake_omx_launcher_through_prestarted_daemon() -> TestResult {
+    let env = TestEnv::new()?;
+    let _daemon = env.start_daemon_without_codex_home()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omx"),
+        "#!/bin/sh\nprintf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
+
+    let output = env
+        .cmd()
+        .env("PATH", path)
+        .env("CODEX_HOME", &sentinel)
+        .stdin(Stdio::null())
+        .args(["omx", "--raw", "--no-status", "--", "--probe"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("CODEX_HOME:{}", sentinel.display());
+    assert!(stdout.contains(&expected), "{stdout:?}");
     Ok(())
 }
 

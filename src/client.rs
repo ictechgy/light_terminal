@@ -263,6 +263,7 @@ pub fn new_session(
     }
     let cwd = Some(resolve_client_cwd(cwd)?);
     let parent = current_parent_request();
+    inherit_client_session_home_env(&mut env);
     inherit_terminal_capability_env(&mut env);
     inherit_child_color_policy_env_unless_agent(&mut env);
     if tmux {
@@ -280,6 +281,19 @@ pub fn new_session(
         status_theme,
         tmux,
     })
+}
+
+fn inherit_client_session_home_env(env: &mut std::collections::HashMap<String, String>) {
+    for key in CLIENT_SESSION_HOME_ENV {
+        if env.contains_key(*key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.insert((*key).to_string(), value);
+            }
+        }
+    }
 }
 
 fn inherit_terminal_capability_env(env: &mut std::collections::HashMap<String, String>) {
@@ -330,6 +344,8 @@ fn inherit_cmux_context_env(env: &mut std::collections::HashMap<String, String>)
         }
     }
 }
+
+const CLIENT_SESSION_HOME_ENV: &[&str] = &["CODEX_HOME"];
 
 const TERMINAL_CAPABILITY_ENV: &[&str] = &[
     "TERM",
@@ -10491,6 +10507,46 @@ mod tests {
                 "{key} is an application color policy, not a terminal capability, and must not leak into child agent sessions"
             );
         }
+    }
+
+    #[test]
+    fn new_sessions_inherit_codex_home_without_overwriting_explicit_values() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = EnvGuard::capture(&["CODEX_HOME"]);
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("CODEX_HOME", "/tmp/lterm-client-codex-home");
+        }
+
+        let mut inherited = std::collections::HashMap::new();
+        super::inherit_client_session_home_env(&mut inherited);
+        assert_eq!(
+            inherited.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/lterm-client-codex-home")
+        );
+
+        let mut explicit = std::collections::HashMap::from([(
+            "CODEX_HOME".to_string(),
+            "/tmp/explicit-codex-home".to_string(),
+        )]);
+        super::inherit_client_session_home_env(&mut explicit);
+        assert_eq!(
+            explicit.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/explicit-codex-home"),
+            "caller-supplied session env should stay authoritative"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+        }
+        let mut absent = std::collections::HashMap::new();
+        super::inherit_client_session_home_env(&mut absent);
+        assert!(
+            !absent.contains_key("CODEX_HOME"),
+            "missing client CODEX_HOME should not inject an empty session env"
+        );
     }
 
     #[test]
