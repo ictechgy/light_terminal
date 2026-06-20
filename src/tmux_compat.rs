@@ -2342,7 +2342,7 @@ const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
 /// 주의: status sink의 `apply`는 다수 [`cmux_status::CmuxCommand`]를 순차 실행하므로
 /// worst-case stall은 N×이 타임아웃이다. diff 게이트로 호출이 드물고 각 명령이 빨라 실무상
 /// 문제되지 않으나, 전면 worker-thread 전환은 본 변경 범위 밖이다.
-const CMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const CMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// [`run_cmux_command`] 타임아웃 폴링 간격. flock 폴링(`StoreLock::acquire`)과 동일한 25ms.
 const CMUX_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);

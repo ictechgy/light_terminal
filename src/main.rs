@@ -29,7 +29,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const CMUX_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+const CMUX_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
