@@ -366,11 +366,14 @@ const TERMINAL_CAPABILITY_ENV: &[&str] = &[
 pub fn attach_or_new(target: &str) -> Result<SessionInfo> {
     ensure_server()?;
     let parent = current_parent_request();
+    let mut env = std::collections::HashMap::new();
+    inherit_client_session_home_env(&mut env);
     rpc(&Request::AttachOrNew {
         target: target.to_string(),
         cwd: Some(resolve_client_cwd(None)?),
         parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
         parent_token: parent.map(|parent| parent.token),
+        env,
         status_theme: None,
     })
 }
@@ -10512,11 +10515,13 @@ mod tests {
     #[test]
     fn new_sessions_inherit_codex_home_without_overwriting_explicit_values() {
         let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
-        let _env_guard = EnvGuard::capture(&["CODEX_HOME"]);
+        let _env_guard =
+            EnvGuard::capture(&["CODEX_HOME", "LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_TEST"]);
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
         unsafe {
             std::env::set_var("CODEX_HOME", "/tmp/lterm-client-codex-home");
+            std::env::set_var("LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_TEST", "client-only");
         }
 
         let mut inherited = std::collections::HashMap::new();
@@ -10524,6 +10529,10 @@ mod tests {
         assert_eq!(
             inherited.get("CODEX_HOME").map(String::as_str),
             Some("/tmp/lterm-client-codex-home")
+        );
+        assert!(
+            !inherited.contains_key("LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_TEST"),
+            "client session home inheritance must remain narrowly allowlisted"
         );
 
         let mut explicit = std::collections::HashMap::from([(
@@ -10535,6 +10544,17 @@ mod tests {
             explicit.get("CODEX_HOME").map(String::as_str),
             Some("/tmp/explicit-codex-home"),
             "caller-supplied session env should stay authoritative"
+        );
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("CODEX_HOME", "");
+        }
+        let mut empty = std::collections::HashMap::new();
+        super::inherit_client_session_home_env(&mut empty);
+        assert!(
+            !empty.contains_key("CODEX_HOME"),
+            "empty client CODEX_HOME should not inject an empty session env"
         );
 
         // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.

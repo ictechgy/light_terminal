@@ -1561,6 +1561,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cwd,
             parent_pane_id,
             parent_token,
+            env,
             status_theme,
         } => {
             let target = normalize_target(&target);
@@ -1582,7 +1583,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cols: None,
                     parent_pane_id,
                     parent_token,
-                    env: HashMap::new(),
+                    env,
                     status_theme,
                     tmux: false,
                 },
@@ -3629,8 +3630,11 @@ mod tests {
 
         let mut codex_home_env = HashMap::new();
         codex_home_env.insert("CODEX_HOME".to_string(), "/tmp/codex-home".to_string());
-        let safe = sanitize_child_env(codex_home_env, false)
+        let safe = sanitize_child_env(codex_home_env.clone(), false)
             .expect("CODEX_HOME should remain an ordinary allowed child env key");
+        assert_eq!(safe["CODEX_HOME"], "/tmp/codex-home");
+        let safe = sanitize_child_env(codex_home_env, true)
+            .expect("CODEX_HOME should remain ordinary even when tmux env is allowlisted");
         assert_eq!(safe["CODEX_HOME"], "/tmp/codex-home");
 
         let mut lowercase_env = HashMap::new();

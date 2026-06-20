@@ -232,6 +232,8 @@ pub enum Request {
         parent_pane_id: Option<String>,
         #[serde(default)]
         parent_token: Option<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status_theme: Option<StatusTheme>,
     },
