@@ -11646,6 +11646,7 @@ fn configured_agent_profile_launches_configured_binary() -> TestResult {
 printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
 printf 'ARG1:%s\n' "$1"
+sleep 1
 "#,
     )?;
     std::fs::write(
