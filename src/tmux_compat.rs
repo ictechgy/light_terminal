@@ -2398,10 +2398,14 @@ fn run_cmux_command_with_timeout(
         thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
     let wait_result = wait_with_timeout(child_process_group, timeout);
     let child_exited = wait_result.is_ok();
+    let wait_error_needs_cleanup = wait_result
+        .as_ref()
+        .err()
+        .is_some_and(|err| !child_already_reaped_error(err));
     // 타임아웃·wait 실패 시 전체 process group 을 죽여 stdout/stderr 를 물고 있는
     // 자손까지 정리한다. direct child 만 죽이면 pipe-holding descendant 때문에
     // reader join 이 무기한 블록될 수 있다.
-    if !child_exited {
+    if wait_error_needs_cleanup {
         let _ = kill_process_group(child_process_group, libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
@@ -2507,6 +2511,10 @@ fn child_exited_without_reaping(process_id: u32) -> io::Result<bool> {
             return Err(err);
         }
     }
+}
+
+fn child_already_reaped_error(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ECHILD)
 }
 
 fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<LimitedOutput> {
@@ -5263,10 +5271,10 @@ mod tests {
     fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(contents) = fs::read_to_string(path)
-                && let Ok(pid) = contents.trim().parse::<i32>()
-            {
-                return pid;
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
             }
             assert!(
                 Instant::now() < deadline,

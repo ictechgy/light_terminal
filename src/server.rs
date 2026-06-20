@@ -2583,9 +2583,10 @@ fn wait_for_session_contains(
 
     let mut scanner = WaitContainsScanner::default();
     loop {
-        let before_capture = *lock(&session.output_progress.0);
+        let before_capture;
         let matched = {
             let _output_guard = lock(&session.output_state);
+            before_capture = *lock(&session.output_progress.0);
             scanner.contains(session, before_capture.total_bytes, start, needle)
         };
         if matched {
@@ -2665,6 +2666,7 @@ fn wait_for_session_contains(
 #[derive(Default)]
 struct WaitContainsScanner {
     initialized: bool,
+    force_full_scan: bool,
     last_total_bytes: u64,
     raw_tail: Vec<u8>,
 }
@@ -2693,23 +2695,27 @@ impl WaitContainsScanner {
     ) -> bool {
         let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
         let needs_full_scan = !self.initialized
+            || self.force_full_scan
             || self.last_total_bytes < ring_start_total
             || self.last_total_bytes > total_bytes;
 
-        let matched = if needs_full_scan {
+        let (matched, ended_in_escape) = if needs_full_scan {
             let bytes: Vec<u8> = ring.iter().copied().collect();
-            sanitize::terminal_capture(&bytes).contains(needle)
+            let (sanitized, ended_in_escape) = sanitize::terminal_capture_with_state(&bytes);
+            (sanitized.contains(needle), ended_in_escape)
         } else {
             let new_start = (self.last_total_bytes.saturating_sub(ring_start_total)) as usize;
             let mut bytes =
                 Vec::with_capacity(self.raw_tail.len() + ring.len().saturating_sub(new_start));
             bytes.extend_from_slice(&self.raw_tail);
             bytes.extend(ring.iter().skip(new_start).copied());
-            sanitize::terminal_capture(&bytes).contains(needle)
+            let (sanitized, ended_in_escape) = sanitize::terminal_capture_with_state(&bytes);
+            (sanitized.contains(needle), ended_in_escape)
         };
 
         if !matched {
             self.initialized = true;
+            self.force_full_scan = ended_in_escape;
             self.last_total_bytes = total_bytes;
             self.raw_tail = ring_tail_bytes(ring, wait_contains_overlap_bytes(needle));
         }
@@ -4225,6 +4231,39 @@ mod tests {
         assert!(
             scanner.contains(&session, second_progress.total_bytes, None, "needle"),
             "incremental scan must bridge the cached raw tail and newly appended bytes"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_does_not_match_hidden_long_osc_payload_incrementally() {
+        let session = build_test_session("wait-incremental-long-osc");
+        let mut scanner = WaitContainsScanner::default();
+        let mut hidden = b"\x1b]52;c;".to_vec();
+        hidden.extend(std::iter::repeat_n(
+            b'x',
+            super::MAX_PENDING_ESCAPE_BYTES + 64,
+        ));
+        hidden.extend_from_slice(b"needle-hidden");
+
+        session.append_output(&hidden);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "needle-hidden"),
+            "full scan must strip unterminated OSC payload"
+        );
+
+        session.append_output(b"\x07visible-after-osc");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, "needle-hidden"),
+            "incremental scan must not restart stateless sanitization inside hidden OSC payload"
+        );
+
+        session.append_output(b"\nneedle-hidden\n");
+        let third_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, third_progress.total_bytes, None, "needle-hidden"),
+            "visible text after OSC termination should still match"
         );
     }
 

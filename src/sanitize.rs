@@ -18,6 +18,10 @@ pub fn terminal_text(value: &str) -> String {
 }
 
 pub fn terminal_capture(bytes: &[u8]) -> String {
+    terminal_capture_with_state(bytes).0
+}
+
+pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
     let mut out = String::with_capacity(bytes.len());
     let mut state = EscapeState::Ground;
     let mut index = 0_usize;
@@ -119,7 +123,7 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
         index += 1;
     }
 
-    out
+    (out, state != EscapeState::Ground)
 }
 
 /// 신뢰할 수 없는 외부 명령(understatus 등)의 stdout을 lterm 하단 status row에
@@ -488,7 +492,7 @@ fn utf8_char_width(byte: u8) -> Option<usize> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EscapeState {
     Ground,
     Esc,

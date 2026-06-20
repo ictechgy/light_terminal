@@ -4538,7 +4538,10 @@ fn run_status_command(
                 }
                 thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
             }
-            Err(_) => {
+            Err(err) => {
+                if child_already_reaped_error(&err) {
+                    break false;
+                }
                 let _ = kill_process_group(child_process_group, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
@@ -4605,6 +4608,10 @@ fn child_exited_without_reaping(process_id: u32) -> std::io::Result<bool> {
             return Err(err);
         }
     }
+}
+
+fn child_already_reaped_error(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ECHILD)
 }
 
 fn kill_process_group(process_group_leader: u32, signal: libc::c_int) -> std::io::Result<()> {
@@ -7851,10 +7858,10 @@ mod tests {
     fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(pid) = contents.trim().parse::<i32>()
-            {
-                return pid;
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
             }
             assert!(
                 Instant::now() < deadline,
