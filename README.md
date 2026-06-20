@@ -17,9 +17,9 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.27
+## Current release: 1.0.28
 
-The 1.0.27 release documents the latest hardening pass as the default behavior:
+The 1.0.28 release carries the current hardening defaults and publishes the post-release documentation plus CI smoke-test stabilization:
 
 - **Safer helper lifecycle** — cmux/status helper timeouts now clean up process groups and avoid stale PID reuse.
 - **Bounded report surfaces** — RPC payloads, scrollback buffers, and wait/watch scanners are capped so daemon memory stays predictable, and oversized wait needles are rejected up front.
@@ -90,7 +90,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.27
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28
 ```
 
 Building from this checkout requires Rust 1.85 or newer:

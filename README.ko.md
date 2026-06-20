@@ -17,9 +17,9 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
-## 현재 릴리스: 1.0.27
+## 현재 릴리스: 1.0.28
 
-1.0.27 릴리스는 최근 보안·성능 hardening을 기본 동작으로 문서화합니다.
+1.0.28 릴리스는 현재 보안·성능 hardening 기본값을 유지하고, 배포 후 문서 갱신과 CI smoke-test 안정화를 함께 포함합니다.
 
 - **더 안전한 helper lifecycle** — cmux/status helper timeout에서 process group을 정리하고 stale PID 재사용 위험을 낮췄습니다.
 - **상한이 있는 report surface** — RPC payload, scrollback buffer, wait/watch scanner에 상한을 두어 daemon memory 사용을 예측 가능하게 유지하고, 지나치게 큰 wait needle은 미리 거부합니다.
@@ -87,7 +87,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.27
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
