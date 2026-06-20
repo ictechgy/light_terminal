@@ -17,6 +17,15 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
+## Current release: 1.0.27
+
+The 1.0.27 release documents the latest hardening pass as the default behavior:
+
+- **Safer helper lifecycle** — cmux/status helper timeouts now clean up process groups and avoid stale PID reuse.
+- **Bounded report surfaces** — RPC payloads, scrollback buffers, and wait/watch scanners are capped so daemon memory stays predictable, and oversized wait needles are rejected up front.
+- **Sanitizer correctness across chunks** — sanitized reports preserve valid UTF-8 while keeping terminal-control filtering state across split input, including hidden-payload style sequences.
+- **Regression-backed compatibility** — release preflight, contract checks, upgrade-matrix tests, and focused daemon tests cover the hardened behavior.
+
 ## Why lterm instead of plain tmux?
 
 Use tmux when you want a full terminal multiplexer with rich pane/window/layout

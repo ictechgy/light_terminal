@@ -17,6 +17,15 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
+## 현재 릴리스: 1.0.27
+
+1.0.27 릴리스는 최근 보안·성능 hardening을 기본 동작으로 문서화합니다.
+
+- **더 안전한 helper lifecycle** — cmux/status helper timeout에서 process group을 정리하고 stale PID 재사용 위험을 낮췄습니다.
+- **상한이 있는 report surface** — RPC payload, scrollback buffer, wait/watch scanner에 상한을 두어 daemon memory 사용을 예측 가능하게 유지하고, 지나치게 큰 wait needle은 미리 거부합니다.
+- **chunk 경계를 넘는 sanitizer 정확성** — split input에서도 유효한 UTF-8 text를 보존하고, hidden-payload 계열 sequence까지 terminal-control filtering 상태를 chunk 경계 너머로 유지합니다.
+- **회귀 테스트로 고정한 호환성** — release preflight, contract check, upgrade-matrix test, focused daemon test로 hardened behavior를 검증했습니다.
+
 ## 왜 tmux 대신 lterm인가요?
 
 풍부한 pane/window/layout 관리를 원하면 tmux가 맞습니다. `lterm`은 AI
