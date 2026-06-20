@@ -2396,49 +2396,82 @@ fn run_cmux_command_with_timeout(
         thread::spawn(move || read_limited_output(stdout, CMUX_OUTPUT_CAPTURE_BYTES));
     let stderr_reader =
         thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
-    let wait_result = wait_with_timeout(&mut child, timeout);
+    let wait_result = wait_with_timeout(child_process_group, timeout);
+    let child_exited = wait_result.is_ok();
     // 타임아웃·wait 실패 시 전체 process group 을 죽여 stdout/stderr 를 물고 있는
     // 자손까지 정리한다. direct child 만 죽이면 pipe-holding descendant 때문에
     // reader join 이 무기한 블록될 수 있다.
-    if wait_result.is_err() {
+    if !child_exited {
         let _ = kill_process_group(child_process_group, libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = join_limited_reader_within_grace(stdout_reader, CMUX_COMMAND_READER_JOIN_GRACE)?;
-    let stderr = join_limited_reader_within_grace(stderr_reader, CMUX_COMMAND_READER_JOIN_GRACE)?;
-    if stdout.is_none() || stderr.is_none() {
-        let _ = kill_process_group(child_process_group, libc::SIGKILL);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "cmux output pipe did not close before reader join deadline",
-        ));
+    let stdout_result =
+        join_limited_reader_within_grace(stdout_reader, CMUX_COMMAND_READER_JOIN_GRACE);
+    let stderr_result =
+        join_limited_reader_within_grace(stderr_reader, CMUX_COMMAND_READER_JOIN_GRACE);
+    let stdout = match stdout_result {
+        Ok(Some(stdout)) => stdout,
+        Ok(None) => {
+            if child_exited {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
+                let _ = child.wait();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cmux stdout pipe did not close before reader join deadline",
+            ));
+        }
+        Err(err) => {
+            if child_exited {
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    };
+    let stderr = match stderr_result {
+        Ok(Some(stderr)) => stderr,
+        Ok(None) => {
+            if child_exited {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
+                let _ = child.wait();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cmux stderr pipe did not close before reader join deadline",
+            ));
+        }
+        Err(err) => {
+            if child_exited {
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    };
+    if !child_exited {
+        return Err(wait_result.expect_err("non-exited child must carry timeout/wait error"));
     }
-    let status = wait_result?;
+    let status = child.wait()?;
 
     Ok(CmuxCommandOutput {
         status,
-        stdout: stdout.expect("checked stdout reader completion"),
-        stderr: stderr.expect("checked stderr reader completion"),
+        stdout,
+        stderr,
     })
 }
 
-/// 자식 프로세스를 데드라인까지 `try_wait` 폴링한다(설계 §4.4, Codex HIGH Issue 1).
+/// 자식 프로세스 종료를 데드라인까지 감지하되, 종료 상태는 아직 회수하지 않는다.
 ///
-/// `Ok(status)`: 시한 내 종료. `Err(TimedOut)`: 데드라인 초과(호출자가 kill 책임). `Err(_)`:
-/// `try_wait` I/O 오류. 외부 `timeout` 명령 대신 순수 Rust 폴링이라 macOS에서도 동작한다.
-/// 타임아웃 에러는 status sink 서킷브레이커에 정상 실패로 집계된다(`run` → `Err(_)` → false).
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> io::Result<std::process::ExitStatus> {
+/// `Ok(())`: 시한 내 종료 확인(WNOWAIT; 호출자가 reader cleanup 후 `child.wait()`로 회수).
+/// `Err(TimedOut)`: 데드라인 초과(호출자가 kill 책임). `Err(_)`: waitid I/O 오류.
+/// 종료한 child를 reader cleanup 전에 회수하면 pipe-holding descendant cleanup 경로에서
+/// PID/PGID 재사용 race가 생길 수 있어 비회수 waitid를 사용한다.
+fn wait_with_timeout(process_id: u32, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait()? {
-            Some(status) => return Ok(status),
-            None => {
+        match child_exited_without_reaping(process_id) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -2447,6 +2480,31 @@ fn wait_with_timeout(
                 }
                 thread::sleep(CMUX_COMMAND_POLL_INTERVAL);
             }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn child_exited_without_reaping(process_id: u32) -> io::Result<bool> {
+    let pid =
+        i32::try_from(process_id).map_err(|_| io::Error::other("child pid exceeds pid_t range"))?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            let info = unsafe { info.assume_init() };
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
 }
@@ -5145,7 +5203,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let started = Instant::now();
-        let result = wait_with_timeout(&mut child, Duration::from_millis(200));
+        let result = wait_with_timeout(child.id(), Duration::from_millis(200));
         let elapsed = started.elapsed();
         // 데드라인 직후 타임아웃 에러를 돌려준다(넉넉히 2초 상한으로 폴링 지연 흡수).
         let err = result.expect_err("stuck command must time out");
@@ -5159,7 +5217,7 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// 빠르게 끝나는 명령(`true`)은 타임아웃 전에 종료 코드를 돌려준다.
+    /// 빠르게 끝나는 명령(`true`)은 타임아웃 전에 종료를 감지하고, 호출자가 wait로 회수한다.
     #[test]
     fn wait_with_timeout_returns_status_for_fast_command() {
         let mut child = Command::new("true")
@@ -5168,7 +5226,8 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn true");
-        let status = wait_with_timeout(&mut child, Duration::from_secs(3)).expect("fast command");
+        wait_with_timeout(child.id(), Duration::from_secs(3)).expect("fast command");
+        let status = child.wait().expect("reap fast command");
         assert!(status.success());
     }
 

@@ -4521,17 +4521,20 @@ fn run_status_command(
         // stdin scope를 명시적으로 닫아 EOF를 보낸다.
     }
 
-    // 메인 흐름: try_wait deadline으로 자식 종료만 기다린다(read로 블로킹하지 않음).
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
+    // 메인 흐름: child 종료만 기다린다(read로 블로킹하지 않음). 종료 감지는 WNOWAIT으로
+    // 수행해 reader cleanup 전에는 child PID/PGID를 회수하지 않는다. 자식이 빨리 끝났지만
+    // 자손이 stdout 파이프를 물고 있는 케이스에서, reader grace 실패 후 process-group kill이
+    // 필요한 동안 PID/PGID 재사용 race를 막기 위한 보수적 순서다.
+    let child_exited = loop {
+        match child_exited_without_reaping(child_process_group) {
+            Ok(true) => break true,
+            Ok(false) => {
                 if started.elapsed() >= timeout {
                     // 타임아웃: process group 전체를 죽인 뒤 direct child를 wait로 회수한다.
                     let _ = kill_process_group(child_process_group, libc::SIGKILL);
                     let _ = child.kill();
                     let _ = child.wait();
-                    break None;
+                    break false;
                 }
                 thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
             }
@@ -4539,7 +4542,7 @@ fn run_status_command(
                 let _ = kill_process_group(child_process_group, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                break false;
             }
         }
     };
@@ -4550,9 +4553,8 @@ fn run_status_command(
     let output = match reader_handle {
         Some(handle) => {
             let output = join_reader_within_grace(handle, STATUS_COMMAND_READER_JOIN_GRACE);
-            if output.is_none() {
+            if output.is_none() && child_exited {
                 let _ = kill_process_group(child_process_group, libc::SIGKILL);
-                let _ = child.kill();
                 let _ = child.wait();
             }
             output
@@ -4560,8 +4562,15 @@ fn run_status_command(
         None => None,
     };
 
-    // 비정상 종료/타임아웃이면 출력을 신뢰하지 않는다.
-    let status = status?;
+    output.as_ref()?;
+
+    // 비정상 종료/타임아웃이면 출력을 신뢰하지 않는다. child가 정상 deadline 내 종료한
+    // 경우에만, reader cleanup 이후에 wait로 실제 종료 상태를 회수한다.
+    let status = if child_exited {
+        child.wait().ok()?
+    } else {
+        return None;
+    };
     if !status.success() {
         return None;
     }
@@ -4572,6 +4581,30 @@ fn run_status_command(
     }
     // 비-UTF8 stdout은 lossy 변환으로 안전하게 수용한다.
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn child_exited_without_reaping(process_id: u32) -> std::io::Result<bool> {
+    let pid = i32::try_from(process_id)
+        .map_err(|_| std::io::Error::other("child pid exceeds pid_t range"))?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            let info = unsafe { info.assume_init() };
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 fn kill_process_group(process_group_leader: u32, signal: libc::c_int) -> std::io::Result<()> {
