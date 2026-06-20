@@ -22,17 +22,25 @@ pub fn terminal_capture(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
+    let mut state = TerminalCaptureState::default();
+    let out = terminal_capture_from_state(bytes, &mut state);
+    (out, !state.is_ground())
+}
+
+pub(crate) fn terminal_capture_from_state(
+    bytes: &[u8],
+    state: &mut TerminalCaptureState,
+) -> String {
     let mut out = String::with_capacity(bytes.len());
-    let mut state = EscapeState::Ground;
     let mut index = 0_usize;
 
     while index < bytes.len() {
         let byte = bytes[index];
-        match state {
+        match state.0 {
             EscapeState::Ground => match byte {
-                0x1b => state = EscapeState::Esc,
-                0x9b => state = EscapeState::Csi,
-                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
+                0x1b => state.0 = EscapeState::Esc,
+                0x9b => state.0 = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.0 = EscapeState::String,
                 0x80..=0x9f => {}
                 b'\t' | b'\n' | b'\r' => out.push(byte as char),
                 0x00..=0x1f | 0x7f => {}
@@ -40,9 +48,9 @@ pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
                 _ => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         match ch {
-                            '\u{009b}' => state = EscapeState::Csi,
+                            '\u{009b}' => state.0 = EscapeState::Csi,
                             '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
-                                state = EscapeState::String
+                                state.0 = EscapeState::String
                             }
                             ch if is_c0_or_c1(ch) => {}
                             _ => out.push(ch),
@@ -54,56 +62,56 @@ pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
                 }
             },
             EscapeState::Esc => match byte {
-                0x18 | 0x1a => state = EscapeState::Ground,
-                0x1b => state = EscapeState::Esc,
-                b'[' => state = EscapeState::Csi,
-                b']' | b'P' | b'_' | b'^' | b'X' => state = EscapeState::String,
-                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state = EscapeState::Charset,
-                0x9b => state = EscapeState::Csi,
-                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state = EscapeState::String,
+                0x18 | 0x1a => state.0 = EscapeState::Ground,
+                0x1b => state.0 = EscapeState::Esc,
+                b'[' => state.0 = EscapeState::Csi,
+                b']' | b'P' | b'_' | b'^' | b'X' => state.0 = EscapeState::String,
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state.0 = EscapeState::Charset,
+                0x9b => state.0 = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.0 = EscapeState::String,
                 0x20..=0x2f => {}
-                _ => state = EscapeState::Ground,
+                _ => state.0 = EscapeState::Ground,
             },
             EscapeState::Csi => match byte {
                 byte if byte >= 0x80 => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         if ch == '\u{009c}' {
-                            state = EscapeState::Ground;
+                            state.0 = EscapeState::Ground;
                         }
                         index += len;
                         continue;
                     }
                     if byte == 0x9c {
-                        state = EscapeState::Ground;
+                        state.0 = EscapeState::Ground;
                     }
                 }
-                0x18 | 0x1a | 0x9c => state = EscapeState::Ground,
-                0x1b => state = EscapeState::Esc,
-                byte if (0x40..=0x7e).contains(&byte) => state = EscapeState::Ground,
+                0x18 | 0x1a | 0x9c => state.0 = EscapeState::Ground,
+                0x1b => state.0 = EscapeState::Esc,
+                byte if (0x40..=0x7e).contains(&byte) => state.0 = EscapeState::Ground,
                 _ => {}
             },
             EscapeState::String => match byte {
                 byte if byte >= 0x80 => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         if ch == '\u{009c}' {
-                            state = EscapeState::Ground;
+                            state.0 = EscapeState::Ground;
                         }
                         index += len;
                         continue;
                     }
                     if byte == 0x9c {
-                        state = EscapeState::Ground;
+                        state.0 = EscapeState::Ground;
                     }
                 }
-                0x18 | 0x1a => state = EscapeState::Ground,
-                0x07 | 0x9c => state = EscapeState::Ground,
-                0x1b => state = EscapeState::StringEsc,
+                0x18 | 0x1a => state.0 = EscapeState::Ground,
+                0x07 | 0x9c => state.0 = EscapeState::Ground,
+                0x1b => state.0 = EscapeState::StringEsc,
                 _ => {}
             },
             EscapeState::StringEsc => {
                 if byte >= 0x80 {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
-                        state = if ch == '\u{009c}' {
+                        state.0 = if ch == '\u{009c}' {
                             EscapeState::Ground
                         } else {
                             EscapeState::String
@@ -112,18 +120,18 @@ pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
                         continue;
                     }
                 }
-                state = if byte == b'\\' || byte == 0x9c {
+                state.0 = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
                 };
             }
-            EscapeState::Charset => state = EscapeState::Ground,
+            EscapeState::Charset => state.0 = EscapeState::Ground,
         }
         index += 1;
     }
 
-    (out, state != EscapeState::Ground)
+    out
 }
 
 /// 신뢰할 수 없는 외부 명령(understatus 등)의 stdout을 lterm 하단 status row에
@@ -489,6 +497,21 @@ fn utf8_char_width(byte: u8) -> Option<usize> {
         0xe0..=0xef => Some(3),
         0xf0..=0xf4 => Some(4),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalCaptureState(EscapeState);
+
+impl Default for TerminalCaptureState {
+    fn default() -> Self {
+        Self(EscapeState::Ground)
+    }
+}
+
+impl TerminalCaptureState {
+    pub(crate) fn is_ground(self) -> bool {
+        self.0 == EscapeState::Ground
     }
 }
 
