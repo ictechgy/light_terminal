@@ -20,7 +20,7 @@ pub fn terminal_text(value: &str) -> String {
 pub fn terminal_capture(bytes: &[u8]) -> String {
     let mut state = TerminalCaptureState::default();
     let mut out = terminal_capture_from_state(bytes, &mut state);
-    state.flush_pending_utf8_as_replacement(&mut out);
+    state.flush_pending_utf8_at_capture_end(&mut out);
     out
 }
 
@@ -564,11 +564,11 @@ impl TerminalCaptureState {
         true
     }
 
-    fn flush_pending_utf8_as_replacement(&mut self, out: &mut String) {
-        if self.pending_utf8_len != 0 {
+    fn flush_pending_utf8_at_capture_end(&mut self, out: &mut String) {
+        if self.pending_utf8_len != 0 && self.escape == EscapeState::Ground {
             out.push('\u{fffd}');
-            self.clear_pending_utf8();
         }
+        self.clear_pending_utf8();
     }
 }
 
@@ -680,6 +680,14 @@ mod tests {
     fn terminal_capture_replaces_incomplete_or_invalid_utf8() {
         assert_eq!(terminal_capture(&[b'A', 0xe2]), "A�");
         assert_eq!(terminal_capture(&[b'A', 0xf5, b'B']), "A�B");
+    }
+
+    #[test]
+    fn terminal_capture_hides_incomplete_utf8_inside_escape_state_at_eof() {
+        assert_eq!(terminal_capture(b"A\x1b]52;c;\xc2"), "A");
+        assert_eq!(terminal_capture(b"A\x1bPq\xc2"), "A");
+        assert_eq!(terminal_capture(b"A\x1b[1\xc2"), "A");
+        assert_eq!(terminal_capture(b"A\x1b]hidden\x1b\xc2"), "A");
     }
 
     #[test]
