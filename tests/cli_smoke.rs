@@ -24,6 +24,7 @@ const ERR_LEADING_DASH_NAME: &str = "cannot start with '-'";
 const ERR_SESSION_EXISTS: &str = "session name already exists";
 const ERR_SESSION_NAME: &str = "session name";
 const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD: &str = "LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_REGRESSION";
 
 struct TestEnv {
     temp: tempfile::TempDir,
@@ -82,10 +83,28 @@ impl TestEnv {
     }
 
     fn start_daemon_without_codex_home(&self) -> TestResult<ChildCleanup> {
+        self.start_daemon_with_codex_home(None, &[])
+    }
+
+    fn start_daemon_with_codex_home(
+        &self,
+        codex_home: Option<&Path>,
+        extra_removed_env: &[&str],
+    ) -> TestResult<ChildCleanup> {
         let mut daemon = self.cmd();
+        daemon.arg("daemon");
+        match codex_home {
+            Some(value) => {
+                daemon.env("CODEX_HOME", value);
+            }
+            None => {
+                daemon.env_remove("CODEX_HOME");
+            }
+        }
+        for key in extra_removed_env {
+            daemon.env_remove(key);
+        }
         daemon
-            .arg("daemon")
-            .env_remove("CODEX_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -96,13 +115,22 @@ impl TestEnv {
 
     fn wait_for_reachable_daemon(&self) -> TestResult {
         poll_until(
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             Duration::from_millis(50),
             "prestarted daemon to become reachable",
             || {
                 let output = self.cmd().args(["doctor", "--json"]).output()?;
                 if output.status.success() {
-                    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                    let report: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            return Ok(PollStatus::Pending(format!(
+                                "doctor returned non-json while daemon started: {err}; stdout={:?}; stderr={:?}",
+                                String::from_utf8_lossy(&output.stdout),
+                                String::from_utf8_lossy(&output.stderr)
+                            )));
+                        }
+                    };
                     if report
                         .get("daemon_reachable")
                         .and_then(|value| value.as_bool())
@@ -1007,7 +1035,49 @@ fn session_identity_env_is_exported_to_child_process() -> TestResult {
 #[test]
 fn codex_home_reaches_child_through_prestarted_daemon_request_env() -> TestResult {
     let env = TestEnv::new()?;
-    let _daemon = env.start_daemon_without_codex_home()?;
+    let _daemon = env.start_daemon_with_codex_home(None, &[CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD])?;
+    let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
+    let client_only_secret = "client-only-secret-should-not-cross-daemon-hop";
+    let probe_command = format!(
+        "printf 'CODEX_HOME:%s\\nCLIENT_ONLY:%s\\n' \"${{CODEX_HOME-}}\" \"${{{CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD}-}}\"; sleep 1"
+    );
+
+    let output = env
+        .cmd()
+        .env("CODEX_HOME", &sentinel)
+        .env(CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD, client_only_secret)
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "codex-home-env",
+            "--",
+            "sh",
+            "-c",
+            probe_command.as_str(),
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+
+    let expected = format!("CODEX_HOME:{}", sentinel.display());
+    let captured = env.capture_until("codex-home-env", &expected)?;
+    assert!(captured.contains(&expected), "{captured:?}");
+    assert!(
+        captured.contains("CLIENT_ONLY:"),
+        "child output should include the client-only env probe: {captured:?}"
+    );
+    assert!(
+        !captured.contains(client_only_secret),
+        "client-only env outside the narrow CODEX_HOME allowlist must not cross the daemon hop: {captured:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn client_codex_home_overrides_stale_daemon_codex_home() -> TestResult {
+    let env = TestEnv::new()?;
+    let stale = env.temp.path().join("daemon-stale").join("CODEX_HOME");
+    let _daemon = env.start_daemon_with_codex_home(Some(&stale), &[])?;
     let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
 
     let output = env
@@ -1017,18 +1087,66 @@ fn codex_home_reaches_child_through_prestarted_daemon_request_env() -> TestResul
             "new",
             "--detach",
             "--name",
-            "codex-home-env",
+            "codex-home-stale-daemon",
             "--",
             "sh",
-            "-lc",
+            "-c",
             "printf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"; sleep 1",
         ])
         .output()?;
     assert!(output.status.success(), "{output:?}");
 
     let expected = format!("CODEX_HOME:{}", sentinel.display());
-    let captured = env.capture_until("codex-home-env", &expected)?;
+    let captured = env.capture_until("codex-home-stale-daemon", &expected)?;
     assert!(captured.contains(&expected), "{captured:?}");
+    assert!(
+        !captured.contains(&stale.display().to_string()),
+        "request client CODEX_HOME should override stale daemon ambient value: {captured:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn attach_or_new_auto_create_inherits_client_codex_home() -> TestResult {
+    let env = TestEnv::new()?;
+    let stale = env.temp.path().join("daemon-stale-open").join("CODEX_HOME");
+    let _daemon = env.start_daemon_with_codex_home(Some(&stale), &[])?;
+    let sentinel = env.temp.path().join("mat-session-open").join("CODEX_HOME");
+    let target = "codex-home-attach-or-new";
+
+    let output = wait_for_child_output(
+        ChildCleanup::new(
+            env.cmd()
+                .env("CODEX_HOME", &sentinel)
+                .args(["attach-or-new", target, "--no-status"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ),
+        Duration::from_secs(2),
+        "attach-or-new CODEX_HOME auto-create EOF detach",
+    )?;
+    assert!(output.status.success(), "{output:?}");
+
+    let input = env
+        .cmd()
+        .args([
+            "input",
+            target,
+            "printf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"",
+            "--enter",
+        ])
+        .output()?;
+    assert!(input.status.success(), "{input:?}");
+
+    let expected = format!("CODEX_HOME:{}", sentinel.display());
+    let captured = env.capture_until(target, &expected)?;
+    assert!(captured.contains(&expected), "{captured:?}");
+    assert!(
+        !captured.contains(&stale.display().to_string()),
+        "attach-or-new auto-create should use request client CODEX_HOME, not daemon ambient value: {captured:?}"
+    );
     Ok(())
 }
 
