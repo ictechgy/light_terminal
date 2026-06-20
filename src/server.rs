@@ -4236,6 +4236,35 @@ mod tests {
     }
 
     #[test]
+    fn wait_contains_scanner_matches_split_utf8_needle_incrementally() {
+        let session = build_test_session("wait-incremental-split-utf8");
+        let mut scanner = WaitContainsScanner::default();
+        let needle = "완료";
+        let bytes = needle.as_bytes();
+
+        session.append_output(&bytes[..1]);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, needle),
+            "partial UTF-8 scalar must not be decoded as replacement during incremental scan"
+        );
+
+        session.append_output(&bytes[1..5]);
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, needle),
+            "scanner must keep the second partial scalar pending"
+        );
+
+        session.append_output(&bytes[5..]);
+        let third_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, third_progress.total_bytes, None, needle),
+            "incremental scan must bridge UTF-8 scalars split across raw chunks"
+        );
+    }
+
+    #[test]
     fn wait_contains_scanner_does_not_match_hidden_long_osc_payload_incrementally() {
         let session = build_test_session("wait-incremental-long-osc");
         let mut scanner = WaitContainsScanner::default();

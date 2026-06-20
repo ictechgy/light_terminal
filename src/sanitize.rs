@@ -18,29 +18,36 @@ pub fn terminal_text(value: &str) -> String {
 }
 
 pub fn terminal_capture(bytes: &[u8]) -> String {
-    terminal_capture_with_state(bytes).0
-}
-
-pub(crate) fn terminal_capture_with_state(bytes: &[u8]) -> (String, bool) {
     let mut state = TerminalCaptureState::default();
-    let out = terminal_capture_from_state(bytes, &mut state);
-    (out, !state.is_ground())
+    let mut out = terminal_capture_from_state(bytes, &mut state);
+    state.flush_pending_utf8_as_replacement(&mut out);
+    out
 }
 
 pub(crate) fn terminal_capture_from_state(
     bytes: &[u8],
     state: &mut TerminalCaptureState,
 ) -> String {
+    let mut pending_prefixed = Vec::new();
+    let bytes = if state.pending_utf8_len != 0 {
+        pending_prefixed.reserve(usize::from(state.pending_utf8_len) + bytes.len());
+        pending_prefixed.extend_from_slice(state.pending_utf8());
+        pending_prefixed.extend_from_slice(bytes);
+        state.clear_pending_utf8();
+        pending_prefixed.as_slice()
+    } else {
+        bytes
+    };
     let mut out = String::with_capacity(bytes.len());
     let mut index = 0_usize;
 
     while index < bytes.len() {
         let byte = bytes[index];
-        match state.0 {
+        match state.escape {
             EscapeState::Ground => match byte {
-                0x1b => state.0 = EscapeState::Esc,
-                0x9b => state.0 = EscapeState::Csi,
-                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.0 = EscapeState::String,
+                0x1b => state.escape = EscapeState::Esc,
+                0x9b => state.escape = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.escape = EscapeState::String,
                 0x80..=0x9f => {}
                 b'\t' | b'\n' | b'\r' => out.push(byte as char),
                 0x00..=0x1f | 0x7f => {}
@@ -48,9 +55,9 @@ pub(crate) fn terminal_capture_from_state(
                 _ => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         match ch {
-                            '\u{009b}' => state.0 = EscapeState::Csi,
+                            '\u{009b}' => state.escape = EscapeState::Csi,
                             '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
-                                state.0 = EscapeState::String
+                                state.escape = EscapeState::String
                             }
                             ch if is_c0_or_c1(ch) => {}
                             _ => out.push(ch),
@@ -58,60 +65,71 @@ pub(crate) fn terminal_capture_from_state(
                         index += len;
                         continue;
                     }
+                    if state.store_incomplete_utf8(&bytes[index..]) {
+                        break;
+                    }
                     out.push('\u{fffd}');
                 }
             },
             EscapeState::Esc => match byte {
-                0x18 | 0x1a => state.0 = EscapeState::Ground,
-                0x1b => state.0 = EscapeState::Esc,
-                b'[' => state.0 = EscapeState::Csi,
-                b']' | b'P' | b'_' | b'^' | b'X' => state.0 = EscapeState::String,
-                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state.0 = EscapeState::Charset,
-                0x9b => state.0 = EscapeState::Csi,
-                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.0 = EscapeState::String,
+                0x18 | 0x1a => state.escape = EscapeState::Ground,
+                0x1b => state.escape = EscapeState::Esc,
+                b'[' => state.escape = EscapeState::Csi,
+                b']' | b'P' | b'_' | b'^' | b'X' => state.escape = EscapeState::String,
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
+                    state.escape = EscapeState::Charset
+                }
+                0x9b => state.escape = EscapeState::Csi,
+                0x90 | 0x98 | 0x9d | 0x9e | 0x9f => state.escape = EscapeState::String,
                 0x20..=0x2f => {}
-                _ => state.0 = EscapeState::Ground,
+                _ => state.escape = EscapeState::Ground,
             },
             EscapeState::Csi => match byte {
                 byte if byte >= 0x80 => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         if ch == '\u{009c}' {
-                            state.0 = EscapeState::Ground;
+                            state.escape = EscapeState::Ground;
                         }
                         index += len;
                         continue;
                     }
+                    if state.store_incomplete_utf8(&bytes[index..]) {
+                        break;
+                    }
                     if byte == 0x9c {
-                        state.0 = EscapeState::Ground;
+                        state.escape = EscapeState::Ground;
                     }
                 }
-                0x18 | 0x1a | 0x9c => state.0 = EscapeState::Ground,
-                0x1b => state.0 = EscapeState::Esc,
-                byte if (0x40..=0x7e).contains(&byte) => state.0 = EscapeState::Ground,
+                0x18 | 0x1a | 0x9c => state.escape = EscapeState::Ground,
+                0x1b => state.escape = EscapeState::Esc,
+                byte if (0x40..=0x7e).contains(&byte) => state.escape = EscapeState::Ground,
                 _ => {}
             },
             EscapeState::String => match byte {
                 byte if byte >= 0x80 => {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
                         if ch == '\u{009c}' {
-                            state.0 = EscapeState::Ground;
+                            state.escape = EscapeState::Ground;
                         }
                         index += len;
                         continue;
                     }
+                    if state.store_incomplete_utf8(&bytes[index..]) {
+                        break;
+                    }
                     if byte == 0x9c {
-                        state.0 = EscapeState::Ground;
+                        state.escape = EscapeState::Ground;
                     }
                 }
-                0x18 | 0x1a => state.0 = EscapeState::Ground,
-                0x07 | 0x9c => state.0 = EscapeState::Ground,
-                0x1b => state.0 = EscapeState::StringEsc,
+                0x18 | 0x1a => state.escape = EscapeState::Ground,
+                0x07 | 0x9c => state.escape = EscapeState::Ground,
+                0x1b => state.escape = EscapeState::StringEsc,
                 _ => {}
             },
             EscapeState::StringEsc => {
                 if byte >= 0x80 {
                     if let Some((ch, len)) = decode_utf8_char(&bytes[index..]) {
-                        state.0 = if ch == '\u{009c}' {
+                        state.escape = if ch == '\u{009c}' {
                             EscapeState::Ground
                         } else {
                             EscapeState::String
@@ -119,14 +137,17 @@ pub(crate) fn terminal_capture_from_state(
                         index += len;
                         continue;
                     }
+                    if state.store_incomplete_utf8(&bytes[index..]) {
+                        break;
+                    }
                 }
-                state.0 = if byte == b'\\' || byte == 0x9c {
+                state.escape = if byte == b'\\' || byte == 0x9c {
                     EscapeState::Ground
                 } else {
                     EscapeState::String
                 };
             }
-            EscapeState::Charset => state.0 = EscapeState::Ground,
+            EscapeState::Charset => state.escape = EscapeState::Ground,
         }
         index += 1;
     }
@@ -501,17 +522,53 @@ fn utf8_char_width(byte: u8) -> Option<usize> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TerminalCaptureState(EscapeState);
+pub(crate) struct TerminalCaptureState {
+    escape: EscapeState,
+    pending_utf8: [u8; 4],
+    pending_utf8_len: u8,
+}
 
 impl Default for TerminalCaptureState {
     fn default() -> Self {
-        Self(EscapeState::Ground)
+        Self {
+            escape: EscapeState::Ground,
+            pending_utf8: [0; 4],
+            pending_utf8_len: 0,
+        }
     }
 }
 
 impl TerminalCaptureState {
-    pub(crate) fn is_ground(self) -> bool {
-        self.0 == EscapeState::Ground
+    fn pending_utf8(&self) -> &[u8] {
+        &self.pending_utf8[..usize::from(self.pending_utf8_len)]
+    }
+
+    fn clear_pending_utf8(&mut self) {
+        self.pending_utf8_len = 0;
+    }
+
+    fn store_incomplete_utf8(&mut self, bytes: &[u8]) -> bool {
+        let Some(first) = bytes.first().copied() else {
+            return false;
+        };
+        let Some(width) = utf8_char_width(first) else {
+            return false;
+        };
+        if bytes.len() >= width {
+            return false;
+        }
+        debug_assert!(width <= self.pending_utf8.len());
+        let len = bytes.len().min(self.pending_utf8.len());
+        self.pending_utf8[..len].copy_from_slice(&bytes[..len]);
+        self.pending_utf8_len = len as u8;
+        true
+    }
+
+    fn flush_pending_utf8_as_replacement(&mut self, out: &mut String) {
+        if self.pending_utf8_len != 0 {
+            out.push('\u{fffd}');
+            self.clear_pending_utf8();
+        }
     }
 }
 
@@ -528,6 +585,10 @@ enum EscapeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_state_is_ground(state: TerminalCaptureState) -> bool {
+        state.escape == EscapeState::Ground && state.pending_utf8_len == 0
+    }
 
     #[test]
     fn osc_field_drops_c0_and_c1_controls() {
@@ -619,6 +680,40 @@ mod tests {
     fn terminal_capture_replaces_incomplete_or_invalid_utf8() {
         assert_eq!(terminal_capture(&[b'A', 0xe2]), "A�");
         assert_eq!(terminal_capture(&[b'A', 0xf5, b'B']), "A�B");
+    }
+
+    #[test]
+    fn terminal_capture_state_carries_split_utf8_text() {
+        let mut state = TerminalCaptureState::default();
+        let bytes = "완료".as_bytes();
+
+        assert_eq!(terminal_capture_from_state(&bytes[..1], &mut state), "");
+        assert!(
+            !terminal_state_is_ground(state),
+            "partial UTF-8 scalar should remain pending for the next chunk"
+        );
+        assert_eq!(terminal_capture_from_state(&bytes[1..3], &mut state), "완");
+        assert!(terminal_state_is_ground(state));
+        assert_eq!(terminal_capture_from_state(&bytes[3..5], &mut state), "");
+        assert!(!terminal_state_is_ground(state));
+        assert_eq!(terminal_capture_from_state(&bytes[5..], &mut state), "료");
+        assert!(terminal_state_is_ground(state));
+    }
+
+    #[test]
+    fn terminal_capture_state_carries_split_utf8_string_terminator() {
+        let mut state = TerminalCaptureState::default();
+
+        assert_eq!(
+            terminal_capture_from_state(b"A\x1b]52;c;hidden\xc2", &mut state),
+            "A"
+        );
+        assert!(
+            !terminal_state_is_ground(state),
+            "OSC plus partial UTF-8 ST should stay pending"
+        );
+        assert_eq!(terminal_capture_from_state(&[0x9c, b'B'], &mut state), "B");
+        assert!(terminal_state_is_ground(state));
     }
 
     #[test]
