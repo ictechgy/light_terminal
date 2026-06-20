@@ -12,6 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 const WAIT_GENERATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const WAIT_GENERATION_MAX_CHANNELS: usize = 4_096;
 const WAIT_GENERATION_TOUCH_INTERVAL_SECS: u64 = 30;
+const TMUX_BUFFER_MAX_BYTES: usize = MAX_SEND_DATA_BYTES;
 const MANAGED_ATTACH_ENV: &str = "LTERM_CMUX_MANAGED_ATTACH";
 const MANAGED_ATTACH_LEASE_TTL_SECS: u64 = 120;
 const MANAGED_ATTACH_RENEW_SECS: u64 = 30;
@@ -1655,16 +1657,15 @@ fn wait_for(args: &[String]) -> Result<i32> {
 
 fn load_buffer(args: &[String]) -> Result<i32> {
     let source = buffer_path_arg(args);
-    let mut data = Vec::new();
-    if let Some(path) = source {
+    let data = if let Some(path) = source {
         if path == "-" {
-            std::io::stdin().read_to_end(&mut data)?;
+            read_tmux_buffer_limited(std::io::stdin(), "stdin")?
         } else {
-            data = fs::read(path)?;
+            read_tmux_buffer_file_limited(&path)?
         }
     } else {
-        std::io::stdin().read_to_end(&mut data)?;
-    }
+        read_tmux_buffer_limited(std::io::stdin(), "stdin")?
+    };
     fs::write(paths::buffer_path()?, data)?;
     Ok(0)
 }
@@ -1693,11 +1694,32 @@ fn paste_buffer(args: &[String]) -> Result<i32> {
 }
 
 fn read_buffer_or_empty() -> Result<Vec<u8>> {
-    match fs::read(paths::buffer_path()?) {
-        Ok(data) => Ok(data),
+    let path = paths::buffer_path()?;
+    match File::open(&path) {
+        Ok(file) => read_tmux_buffer_limited(file, "stored tmux buffer"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err).context("read tmux buffer"),
     }
+}
+
+fn read_tmux_buffer_file_limited(path: &str) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("read tmux buffer input {path}"))?;
+    read_tmux_buffer_limited(file, path)
+}
+
+fn read_tmux_buffer_limited<R: Read>(reader: R, source: &str) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    reader
+        .take((TMUX_BUFFER_MAX_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut data)
+        .with_context(|| format!("read tmux buffer from {source}"))?;
+    if data.len() > TMUX_BUFFER_MAX_BYTES {
+        bail!(
+            "tmux buffer from {source} exceeds {} bytes",
+            TMUX_BUFFER_MAX_BYTES
+        );
+    }
+    Ok(data)
 }
 
 fn open_cmux_split(direction: &str) -> Result<Option<CmuxSurfaceContext>> {
@@ -2314,16 +2336,17 @@ const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
 ///
 /// `run_cmux_command`이 `child.wait()`로 무한 대기하면 cmux가 멈출 때 attach 메인 루프가
 /// 프리즈된다. 모든 호출자(open_cmux_split/send_cmux_attach/identify/status sink 등)는 빠른
-/// 단발 명령이라 3초면 넉넉하다. 외부 `timeout` 명령은 macOS 비호환이라 순수 Rust 폴링으로
+/// 단발 명령이라 5초면 넉넉하다. 외부 `timeout` 명령은 macOS 비호환이라 순수 Rust 폴링으로
 /// 구현한다(아래 [`run_cmux_command`]).
 ///
 /// 주의: status sink의 `apply`는 다수 [`cmux_status::CmuxCommand`]를 순차 실행하므로
 /// worst-case stall은 N×이 타임아웃이다. diff 게이트로 호출이 드물고 각 명령이 빨라 실무상
 /// 문제되지 않으나, 전면 worker-thread 전환은 본 변경 범위 밖이다.
-const CMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const CMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// [`run_cmux_command`] 타임아웃 폴링 간격. flock 폴링(`StoreLock::acquire`)과 동일한 25ms.
 const CMUX_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CMUX_COMMAND_READER_JOIN_GRACE: Duration = Duration::from_millis(100);
 
 struct CmuxCommandOutput {
     status: std::process::ExitStatus,
@@ -2347,11 +2370,20 @@ struct LimitedOutput {
 }
 
 fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
+    run_cmux_command_with_timeout(command, CMUX_COMMAND_TIMEOUT)
+}
+
+fn run_cmux_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<CmuxCommandOutput> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
+    let child_process_group = child.id();
     let stdout = child
         .stdout
         .take()
@@ -2364,15 +2396,66 @@ fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
         thread::spawn(move || read_limited_output(stdout, CMUX_OUTPUT_CAPTURE_BYTES));
     let stderr_reader =
         thread::spawn(move || read_limited_output(stderr, CMUX_OUTPUT_CAPTURE_BYTES));
-    let wait_result = wait_with_timeout(&mut child, CMUX_COMMAND_TIMEOUT);
-    // 타임아웃·wait 실패 시 자식을 죽여 reader 스레드의 파이프를 닫는다(블록 해제).
-    if wait_result.is_err() {
+    let wait_result = wait_with_timeout(child_process_group, timeout);
+    let child_exited = wait_result.is_ok();
+    let wait_error_needs_cleanup = wait_result
+        .as_ref()
+        .err()
+        .is_some_and(|err| !child_already_reaped_error(err));
+    // 타임아웃·wait 실패 시 전체 process group 을 죽여 stdout/stderr 를 물고 있는
+    // 자손까지 정리한다. direct child 만 죽이면 pipe-holding descendant 때문에
+    // reader join 이 무기한 블록될 수 있다.
+    if wait_error_needs_cleanup {
+        let _ = kill_process_group(child_process_group, libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = join_limited_reader(stdout_reader)?;
-    let stderr = join_limited_reader(stderr_reader)?;
-    let status = wait_result?;
+    let stdout_result =
+        join_limited_reader_within_grace(stdout_reader, CMUX_COMMAND_READER_JOIN_GRACE);
+    let stderr_result =
+        join_limited_reader_within_grace(stderr_reader, CMUX_COMMAND_READER_JOIN_GRACE);
+    let stdout = match stdout_result {
+        Ok(Some(stdout)) => stdout,
+        Ok(None) => {
+            if child_exited {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
+                let _ = child.wait();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cmux stdout pipe did not close before reader join deadline",
+            ));
+        }
+        Err(err) => {
+            if child_exited {
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    };
+    let stderr = match stderr_result {
+        Ok(Some(stderr)) => stderr,
+        Ok(None) => {
+            if child_exited {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
+                let _ = child.wait();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "cmux stderr pipe did not close before reader join deadline",
+            ));
+        }
+        Err(err) => {
+            if child_exited {
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    };
+    if !child_exited {
+        return Err(wait_result.expect_err("non-exited child must carry timeout/wait error"));
+    }
+    let status = child.wait()?;
 
     Ok(CmuxCommandOutput {
         status,
@@ -2381,20 +2464,18 @@ fn run_cmux_command(command: &mut Command) -> io::Result<CmuxCommandOutput> {
     })
 }
 
-/// 자식 프로세스를 데드라인까지 `try_wait` 폴링한다(설계 §4.4, Codex HIGH Issue 1).
+/// 자식 프로세스 종료를 데드라인까지 감지하되, 종료 상태는 아직 회수하지 않는다.
 ///
-/// `Ok(status)`: 시한 내 종료. `Err(TimedOut)`: 데드라인 초과(호출자가 kill 책임). `Err(_)`:
-/// `try_wait` I/O 오류. 외부 `timeout` 명령 대신 순수 Rust 폴링이라 macOS에서도 동작한다.
-/// 타임아웃 에러는 status sink 서킷브레이커에 정상 실패로 집계된다(`run` → `Err(_)` → false).
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> io::Result<std::process::ExitStatus> {
+/// `Ok(())`: 시한 내 종료 확인(WNOWAIT; 호출자가 reader cleanup 후 `child.wait()`로 회수).
+/// `Err(TimedOut)`: 데드라인 초과(호출자가 kill 책임). `Err(_)`: waitid I/O 오류.
+/// 종료한 child를 reader cleanup 전에 회수하면 pipe-holding descendant cleanup 경로에서
+/// PID/PGID 재사용 race가 생길 수 있어 비회수 waitid를 사용한다.
+fn wait_with_timeout(process_id: u32, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        match child.try_wait()? {
-            Some(status) => return Ok(status),
-            None => {
+        match child_exited_without_reaping(process_id) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -2403,8 +2484,37 @@ fn wait_with_timeout(
                 }
                 thread::sleep(CMUX_COMMAND_POLL_INTERVAL);
             }
+            Err(err) => return Err(err),
         }
     }
+}
+
+fn child_exited_without_reaping(process_id: u32) -> io::Result<bool> {
+    let pid =
+        i32::try_from(process_id).map_err(|_| io::Error::other("child pid exceeds pid_t range"))?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            let info = unsafe { info.assume_init() };
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn child_already_reaped_error(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ECHILD)
 }
 
 fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<LimitedOutput> {
@@ -2433,12 +2543,41 @@ fn read_limited_output<R: Read>(mut reader: R, limit: usize) -> io::Result<Limit
     }
 }
 
-fn join_limited_reader(
+fn join_limited_reader_within_grace(
     reader: thread::JoinHandle<io::Result<LimitedOutput>>,
-) -> io::Result<LimitedOutput> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other("cmux output reader panicked"))?
+    grace: Duration,
+) -> io::Result<Option<LimitedOutput>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if reader.is_finished() {
+            return reader
+                .join()
+                .map_err(|_| io::Error::other("cmux output reader panicked"))?
+                .map(Some);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(CMUX_COMMAND_POLL_INTERVAL);
+    }
+}
+
+fn kill_process_group(process_group_leader: u32, signal: libc::c_int) -> io::Result<()> {
+    let pgid = i32::try_from(process_group_leader)
+        .map_err(|_| io::Error::other("process group id exceeds pid_t range"))?;
+    if pgid <= 1 {
+        return Ok(());
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// cmux 멀티플렉서 내부에서 실행 중인지 판정한다(`CMUX_*` env / 검증된 소켓).
@@ -5072,7 +5211,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let started = Instant::now();
-        let result = wait_with_timeout(&mut child, Duration::from_millis(200));
+        let result = wait_with_timeout(child.id(), Duration::from_millis(200));
         let elapsed = started.elapsed();
         // 데드라인 직후 타임아웃 에러를 돌려준다(넉넉히 2초 상한으로 폴링 지연 흡수).
         let err = result.expect_err("stuck command must time out");
@@ -5086,7 +5225,7 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// 빠르게 끝나는 명령(`true`)은 타임아웃 전에 종료 코드를 돌려준다.
+    /// 빠르게 끝나는 명령(`true`)은 타임아웃 전에 종료를 감지하고, 호출자가 wait로 회수한다.
     #[test]
     fn wait_with_timeout_returns_status_for_fast_command() {
         let mut child = Command::new("true")
@@ -5095,8 +5234,69 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn true");
-        let status = wait_with_timeout(&mut child, Duration::from_secs(3)).expect("fast command");
+        wait_with_timeout(child.id(), Duration::from_secs(3)).expect("fast command");
+        let status = child.wait().expect("reap fast command");
         assert!(status.success());
+    }
+
+    #[test]
+    fn run_cmux_command_timeout_kills_pipe_holding_descendant_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("cmux-grandchild.pid");
+        let quoted_pid_file =
+            shlex::try_quote(pid_file.to_str().expect("utf8 pid path")).expect("quote pid path");
+        let script = format!("sleep 30 & echo $! > {quoted_pid_file}; wait");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+
+        let started = Instant::now();
+        let result = run_cmux_command_with_timeout(&mut command, Duration::from_millis(200));
+
+        let err = match result {
+            Ok(_) => panic!("pipe-holding descendant should force timeout"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "reader join must not block on pipe-holding descendants"
+        );
+        let pid = wait_for_pid_file(&pid_file, Duration::from_secs(2));
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(2)),
+            "cmux timeout must kill process-group descendants; pid={pid}"
+        );
+    }
+
+    fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for pid file {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -5714,6 +5914,26 @@ mod tests {
             buffer_path_arg(&args(["--", "-literal-path"])).as_deref(),
             Some("-literal-path")
         );
+    }
+
+    #[test]
+    fn tmux_buffer_limited_reader_rejects_oversized_input() {
+        let oversized = vec![b'x'; TMUX_BUFFER_MAX_BYTES + 1];
+        let err = read_tmux_buffer_limited(std::io::Cursor::new(oversized), "test-buffer")
+            .expect_err("oversized tmux buffer must be rejected before storing or sending");
+        assert!(
+            err.to_string()
+                .contains(&format!("exceeds {} bytes", TMUX_BUFFER_MAX_BYTES)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tmux_buffer_limited_reader_accepts_max_sized_input() {
+        let exact = vec![b'x'; TMUX_BUFFER_MAX_BYTES];
+        let data = read_tmux_buffer_limited(std::io::Cursor::new(exact), "test-buffer")
+            .expect("exactly max-sized tmux buffer should pass");
+        assert_eq!(data.len(), TMUX_BUFFER_MAX_BYTES);
     }
 
     #[test]

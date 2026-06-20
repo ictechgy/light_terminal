@@ -240,6 +240,7 @@ struct SessionMaps {
 struct OutputProgress {
     revision: u64,
     closed: bool,
+    total_bytes: u64,
 }
 
 struct OutputClosedGuard {
@@ -435,7 +436,7 @@ impl Session {
             // The section ends before `broadcast_chunk`, so slow subscriber
             // sends/backpressure waits do not block attach snapshots or resize.
             self.update_terminal_snapshot_state(bytes);
-            self.mark_output_changed();
+            self.mark_output_changed(bytes.len());
 
             let subscribers = lock(&self.subscribers).clone();
             if subscribers.is_empty() {
@@ -520,9 +521,10 @@ impl Session {
         *lock(&self.terminal_pending) = TerminalPrefixTracker::default();
     }
 
-    fn mark_output_changed(&self) {
+    fn mark_output_changed(&self, appended_bytes: usize) {
         let (progress, changed) = &self.output_progress;
         let mut progress = lock(progress);
+        progress.total_bytes = progress.total_bytes.saturating_add(appended_bytes as u64);
         progress.revision = progress.revision.wrapping_add(1);
         changed.notify_all();
     }
@@ -2579,13 +2581,15 @@ fn wait_for_session_contains(
         })
         .transpose()?;
 
+    let mut scanner = WaitContainsScanner::default();
     loop {
-        let before_capture = *lock(&session.output_progress.0);
-        let output = {
+        let before_capture;
+        let matched = {
             let _output_guard = lock(&session.output_state);
-            session.capture(start, None)
+            before_capture = *lock(&session.output_progress.0);
+            scanner.contains(session, before_capture.total_bytes, start, needle)
         };
-        if output.contains(needle) {
+        if matched {
             return Ok(WaitContainsResult {
                 session: session.info(),
                 matched: true,
@@ -2657,6 +2661,85 @@ fn wait_for_session_contains(
             };
         }
     }
+}
+
+#[derive(Default)]
+struct WaitContainsScanner {
+    initialized: bool,
+    last_total_bytes: u64,
+    sanitized_tail: String,
+    sanitizer_state: sanitize::TerminalCaptureState,
+}
+
+impl WaitContainsScanner {
+    fn contains(
+        &mut self,
+        session: &Session,
+        total_bytes: u64,
+        start: Option<i32>,
+        needle: &str,
+    ) -> bool {
+        let ring = lock(&session.ring);
+        if start.is_some() {
+            let bytes = capture_bytes_from_ring(&ring, start, None);
+            return sanitize::terminal_capture(&bytes).contains(needle);
+        }
+        self.contains_default_start(&ring, total_bytes, needle)
+    }
+
+    fn contains_default_start(
+        &mut self,
+        ring: &VecDeque<u8>,
+        total_bytes: u64,
+        needle: &str,
+    ) -> bool {
+        let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
+        let needs_full_scan = !self.initialized
+            || self.last_total_bytes < ring_start_total
+            || self.last_total_bytes > total_bytes;
+
+        let (matched, next_state, searchable_tail) = if needs_full_scan {
+            let bytes: Vec<u8> = ring.iter().copied().collect();
+            let mut state = sanitize::TerminalCaptureState::default();
+            let sanitized = sanitize::terminal_capture_from_state(&bytes, &mut state);
+            let matched = sanitized.contains(needle);
+            (matched, state, sanitized)
+        } else {
+            let new_start = (self.last_total_bytes.saturating_sub(ring_start_total)) as usize;
+            let bytes: Vec<u8> = ring.iter().skip(new_start).copied().collect();
+            let mut state = self.sanitizer_state;
+            let sanitized_delta = sanitize::terminal_capture_from_state(&bytes, &mut state);
+            let mut searchable =
+                String::with_capacity(self.sanitized_tail.len() + sanitized_delta.len());
+            searchable.push_str(&self.sanitized_tail);
+            searchable.push_str(&sanitized_delta);
+            let matched = searchable.contains(needle);
+            (matched, state, searchable)
+        };
+
+        if !matched {
+            self.initialized = true;
+            self.last_total_bytes = total_bytes;
+            self.sanitizer_state = next_state;
+            self.sanitized_tail = sanitized_tail_for_needle(&searchable_tail, needle);
+        }
+        matched
+    }
+}
+
+fn sanitized_tail_for_needle(text: &str, needle: &str) -> String {
+    let max_bytes = needle.len().saturating_sub(1);
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 fn validate_wait_contains_needle(needle: &str) -> Result<()> {
@@ -3500,12 +3583,13 @@ mod tests {
     use super::{
         ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS,
         MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
-        Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
+        Subscriber, TerminalPrefixTracker, WaitContainsScanner, broadcast_chunk, clamp_to_smallest,
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
         read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        validate_terminal_geometry, verify_peer_uid, wait_for_session_contains,
+        sanitized_tail_for_needle, validate_terminal_geometry, verify_peer_uid,
+        wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -4132,6 +4216,153 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "timeout should stay bounded even with continuous output"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_matches_across_incremental_boundary() {
+        let session = build_test_session("wait-incremental-boundary");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(b"prefix nee");
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "needle"),
+            "first partial chunk must not match"
+        );
+
+        session.append_output(b"dle suffix");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, second_progress.total_bytes, None, "needle"),
+            "incremental scan must bridge the cached raw tail and newly appended bytes"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_matches_split_utf8_needle_incrementally() {
+        let session = build_test_session("wait-incremental-split-utf8");
+        let mut scanner = WaitContainsScanner::default();
+        let needle = "완료";
+        let bytes = needle.as_bytes();
+
+        session.append_output(&bytes[..1]);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, needle),
+            "partial UTF-8 scalar must not be decoded as replacement during incremental scan"
+        );
+
+        session.append_output(&bytes[1..5]);
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, needle),
+            "scanner must keep the second partial scalar pending"
+        );
+
+        session.append_output(&bytes[5..]);
+        let third_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, third_progress.total_bytes, None, needle),
+            "incremental scan must bridge UTF-8 scalars split across raw chunks"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_keeps_single_byte_needle_tail_bounded() {
+        let session = build_test_session("wait-incremental-single-byte-tail");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(&vec![b'x'; super::MAX_WAIT_CONTAINS_NEEDLE_BYTES * 4]);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "a"),
+            "absent one-byte needle must not match"
+        );
+        assert_eq!(
+            scanner.sanitized_tail.len(),
+            0,
+            "single-byte needles need no overlap cache"
+        );
+
+        session.append_output(b"still-no-hit");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, "a"),
+            "subsequent incremental misses must remain bounded"
+        );
+        assert_eq!(scanner.sanitized_tail.len(), 0);
+    }
+
+    #[test]
+    fn sanitized_tail_for_single_byte_needle_is_empty() {
+        assert_eq!(sanitized_tail_for_needle("large visible text", "a"), "");
+        assert_eq!(sanitized_tail_for_needle("완료", "✅"), "");
+    }
+
+    #[test]
+    fn wait_contains_scanner_does_not_match_hidden_long_osc_payload_incrementally() {
+        let session = build_test_session("wait-incremental-long-osc");
+        let mut scanner = WaitContainsScanner::default();
+        let mut hidden = b"\x1b]52;c;".to_vec();
+        hidden.extend(std::iter::repeat_n(
+            b'x',
+            super::MAX_PENDING_ESCAPE_BYTES + 64,
+        ));
+        hidden.extend_from_slice(b"needle-hidden");
+
+        session.append_output(&hidden);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "needle-hidden"),
+            "full scan must strip unterminated OSC payload"
+        );
+
+        session.append_output(b"\x07visible-after-osc");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, "needle-hidden"),
+            "incremental scan must not restart stateless sanitization inside hidden OSC payload"
+        );
+
+        session.append_output(b"\nneedle-hidden\n");
+        let third_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, third_progress.total_bytes, None, "needle-hidden"),
+            "visible text after OSC termination should still match"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_does_not_reparse_completed_long_osc_tail_as_visible() {
+        let session = build_test_session("wait-incremental-completed-long-osc");
+        let mut scanner = WaitContainsScanner::default();
+        let mut hidden = b"\x1b]52;c;".to_vec();
+        hidden.extend(std::iter::repeat_n(
+            b'x',
+            super::MAX_PENDING_ESCAPE_BYTES + 64,
+        ));
+        hidden.extend_from_slice(b"needle-hidden\x07SAFE");
+
+        session.append_output(&hidden);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "needle-hidden"),
+            "full scan must strip completed OSC payload"
+        );
+
+        session.append_output(b"\nmore-visible-text\n");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, "needle-hidden"),
+            "incremental scan must not reparse a completed hidden OSC tail as visible text"
+        );
+
+        session.append_output(b"needle-hidden\n");
+        let third_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, third_progress.total_bytes, None, "needle-hidden"),
+            "visible text after the completed OSC should still match"
         );
     }
 
