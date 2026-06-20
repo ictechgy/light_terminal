@@ -240,6 +240,7 @@ struct SessionMaps {
 struct OutputProgress {
     revision: u64,
     closed: bool,
+    total_bytes: u64,
 }
 
 struct OutputClosedGuard {
@@ -435,7 +436,7 @@ impl Session {
             // The section ends before `broadcast_chunk`, so slow subscriber
             // sends/backpressure waits do not block attach snapshots or resize.
             self.update_terminal_snapshot_state(bytes);
-            self.mark_output_changed();
+            self.mark_output_changed(bytes.len());
 
             let subscribers = lock(&self.subscribers).clone();
             if subscribers.is_empty() {
@@ -520,9 +521,10 @@ impl Session {
         *lock(&self.terminal_pending) = TerminalPrefixTracker::default();
     }
 
-    fn mark_output_changed(&self) {
+    fn mark_output_changed(&self, appended_bytes: usize) {
         let (progress, changed) = &self.output_progress;
         let mut progress = lock(progress);
+        progress.total_bytes = progress.total_bytes.saturating_add(appended_bytes as u64);
         progress.revision = progress.revision.wrapping_add(1);
         changed.notify_all();
     }
@@ -2579,13 +2581,14 @@ fn wait_for_session_contains(
         })
         .transpose()?;
 
+    let mut scanner = WaitContainsScanner::default();
     loop {
         let before_capture = *lock(&session.output_progress.0);
-        let output = {
+        let matched = {
             let _output_guard = lock(&session.output_state);
-            session.capture(start, None)
+            scanner.contains(session, before_capture.total_bytes, start, needle)
         };
-        if output.contains(needle) {
+        if matched {
             return Ok(WaitContainsResult {
                 session: session.info(),
                 matched: true,
@@ -2657,6 +2660,76 @@ fn wait_for_session_contains(
             };
         }
     }
+}
+
+#[derive(Default)]
+struct WaitContainsScanner {
+    initialized: bool,
+    last_total_bytes: u64,
+    raw_tail: Vec<u8>,
+}
+
+impl WaitContainsScanner {
+    fn contains(
+        &mut self,
+        session: &Session,
+        total_bytes: u64,
+        start: Option<i32>,
+        needle: &str,
+    ) -> bool {
+        let ring = lock(&session.ring);
+        if start.is_some() {
+            let bytes = capture_bytes_from_ring(&ring, start, None);
+            return sanitize::terminal_capture(&bytes).contains(needle);
+        }
+        self.contains_default_start(&ring, total_bytes, needle)
+    }
+
+    fn contains_default_start(
+        &mut self,
+        ring: &VecDeque<u8>,
+        total_bytes: u64,
+        needle: &str,
+    ) -> bool {
+        let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
+        let needs_full_scan = !self.initialized
+            || self.last_total_bytes < ring_start_total
+            || self.last_total_bytes > total_bytes;
+
+        let matched = if needs_full_scan {
+            let bytes: Vec<u8> = ring.iter().copied().collect();
+            sanitize::terminal_capture(&bytes).contains(needle)
+        } else {
+            let new_start = (self.last_total_bytes.saturating_sub(ring_start_total)) as usize;
+            let mut bytes =
+                Vec::with_capacity(self.raw_tail.len() + ring.len().saturating_sub(new_start));
+            bytes.extend_from_slice(&self.raw_tail);
+            bytes.extend(ring.iter().skip(new_start).copied());
+            sanitize::terminal_capture(&bytes).contains(needle)
+        };
+
+        if !matched {
+            self.initialized = true;
+            self.last_total_bytes = total_bytes;
+            self.raw_tail = ring_tail_bytes(ring, wait_contains_overlap_bytes(needle));
+        }
+        matched
+    }
+}
+
+fn wait_contains_overlap_bytes(needle: &str) -> usize {
+    needle
+        .len()
+        .saturating_add(MAX_PENDING_ESCAPE_BYTES)
+        .min(RING_LIMIT)
+}
+
+fn ring_tail_bytes(ring: &VecDeque<u8>, max_bytes: usize) -> Vec<u8> {
+    if max_bytes == 0 || ring.is_empty() {
+        return Vec::new();
+    }
+    let take = ring.len().min(max_bytes);
+    ring.iter().skip(ring.len() - take).copied().collect()
 }
 
 fn validate_wait_contains_needle(needle: &str) -> Result<()> {
@@ -3500,7 +3573,7 @@ mod tests {
     use super::{
         ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS,
         MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
-        Subscriber, TerminalPrefixTracker, broadcast_chunk, clamp_to_smallest,
+        Subscriber, TerminalPrefixTracker, WaitContainsScanner, broadcast_chunk, clamp_to_smallest,
         evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
@@ -4132,6 +4205,26 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "timeout should stay bounded even with continuous output"
+        );
+    }
+
+    #[test]
+    fn wait_contains_scanner_matches_across_incremental_boundary() {
+        let session = build_test_session("wait-incremental-boundary");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(b"prefix nee");
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "needle"),
+            "first partial chunk must not match"
+        );
+
+        session.append_output(b"dle suffix");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, second_progress.total_bytes, None, "needle"),
+            "incremental scan must bridge the cached raw tail and newly appended bytes"
         );
     }
 

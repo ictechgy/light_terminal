@@ -30,6 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const RPC_PARSE_ERROR_PREVIEW_BYTES: usize = 4 * 1024;
 const ATTACH_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_TRACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -237,7 +238,7 @@ fn rpc_with_read_timeout<T: DeserializeOwned>(
         );
     }
     let response: Response = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse response: {}", String::from_utf8_lossy(&bytes)))?;
+        .with_context(|| format!("parse response: {}", rpc_parse_error_preview(&bytes)))?;
     if !response.ok {
         bail!(
             response
@@ -247,6 +248,18 @@ fn rpc_with_read_timeout<T: DeserializeOwned>(
     }
     let value = response.result.unwrap_or(serde_json::Value::Null);
     serde_json::from_value(value).context("decode response result")
+}
+
+fn rpc_parse_error_preview(bytes: &[u8]) -> String {
+    let preview_len = bytes.len().min(RPC_PARSE_ERROR_PREVIEW_BYTES);
+    let mut preview = sanitize::strip_controls(&sanitize::terminal_capture(&bytes[..preview_len]));
+    if bytes.len() > preview_len {
+        preview.push_str(&format!(
+            "… ({} bytes omitted)",
+            bytes.len().saturating_sub(preview_len)
+        ));
+    }
+    preview
 }
 
 pub fn new_session(
@@ -4464,11 +4477,9 @@ const STATUS_COMMAND_READER_JOIN_GRACE: Duration = Duration::from_millis(100);
 ///   않는다**(H2 방어). 자식 종료/타임아웃 후 reader 스레드를 deadline 내 짧은 grace로만
 ///   join 시도하고, 제때 안 끝나면(자손이 파이프 점유) 결과를 포기하고 `None`을 반환해
 ///   메인 status 스레드를 진행시킨다.
-/// - `process_group(0)`(std, 무의존)로 자식을 자기 프로세스 그룹에 둔다. 정상 경로
-///   (자식 단독, 예 understatus)에서는 child.kill()로 stdout이 닫혀 reader가 정상 종료한다.
-///   Phase 2: 자손까지 죽이려면 `kill(-pgid, SIGKILL)` 같은 group-kill이 필요하고 이는
-///   libc 의존(또는 unsafe 직접 syscall)을 요하므로 의도적으로 미구현이다. 현재 핵심
-///   요구는 "status 스레드 무블로킹"이며 reader 스레드를 버리는 것으로 그 보장을 만족한다.
+/// - `process_group(0)`로 자식을 자기 프로세스 그룹에 둔 뒤 timeout/read-grace 실패 시
+///   그룹 전체에 SIGKILL을 보낸다. direct child만 죽이면 pipe-holding descendant가
+///   stdout을 잡고 남아 reader 스레드와 외부 프로세스를 누적시킬 수 있다.
 fn run_status_command(
     argv: &[String],
     stdin_payload: &str,
@@ -4485,6 +4496,7 @@ fn run_status_command(
         .process_group(0)
         .spawn()
         .ok()?;
+    let child_process_group = child.id();
 
     // 방어: 타임아웃 시계를 어떤 블로킹 호출(stdin write 등)보다 먼저 시작한다.
     let started = Instant::now();
@@ -4515,8 +4527,8 @@ fn run_status_command(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if started.elapsed() >= timeout {
-                    // 타임아웃: kill 후 wait로 좀비 회수. child.kill()이 stdout fd를 닫아
-                    // 정상 경로의 reader 스레드도 곧 EOF로 종료한다.
+                    // 타임아웃: process group 전체를 죽인 뒤 direct child를 wait로 회수한다.
+                    let _ = kill_process_group(child_process_group, libc::SIGKILL);
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -4524,6 +4536,7 @@ fn run_status_command(
                 thread::sleep(STATUS_COMMAND_POLL_INTERVAL);
             }
             Err(_) => {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -4535,7 +4548,15 @@ fn run_status_command(
     // 자손이 stdout 파이프를 점유하면 read_to_end가 안 끝날 수 있다. 그 경우 핸들을
     // detach(버림)하고 None을 반환해 메인 status 스레드를 절대 막지 않는다.
     let output = match reader_handle {
-        Some(handle) => join_reader_within_grace(handle, STATUS_COMMAND_READER_JOIN_GRACE),
+        Some(handle) => {
+            let output = join_reader_within_grace(handle, STATUS_COMMAND_READER_JOIN_GRACE);
+            if output.is_none() {
+                let _ = kill_process_group(child_process_group, libc::SIGKILL);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            output
+        }
         None => None,
     };
 
@@ -4551,6 +4572,24 @@ fn run_status_command(
     }
     // 비-UTF8 stdout은 lossy 변환으로 안전하게 수용한다.
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn kill_process_group(process_group_leader: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let pgid = i32::try_from(process_group_leader)
+        .map_err(|_| std::io::Error::other("process group id exceeds pid_t range"))?;
+    if pgid <= 1 {
+        return Ok(());
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// reader 스레드를 `grace` 안에서만 join 시도한다. 끝났으면 결과를, 아직 실행 중이면
@@ -5872,17 +5911,21 @@ impl TerminalOutputTracker {
                 &self.restore_state,
             );
             observe_alt_screen_sequences_after(&boundary, old_tail.len(), &self.alt_screen);
-            effects.status_area_dirty |= observe_status_area_damage_sequences_after(
-                &boundary,
-                old_tail.len(),
-                self.status_scroll_bottom,
-            );
+            if self.status_scroll_bottom.is_some() {
+                effects.status_area_dirty |= observe_status_area_damage_sequences_after(
+                    &boundary,
+                    old_tail.len(),
+                    self.status_scroll_bottom,
+                );
+            }
         }
 
         observe_keyboard_protocol_sequences(bytes, &self.restore_state);
         observe_alt_screen_sequences(bytes, &self.alt_screen);
-        effects.status_area_dirty |=
-            observe_status_area_damage_sequences(bytes, self.status_scroll_bottom);
+        if self.status_scroll_bottom.is_some() {
+            effects.status_area_dirty |=
+                observe_status_area_damage_sequences(bytes, self.status_scroll_bottom);
+        }
 
         if bytes.len() >= TAIL_LIMIT {
             self.tail
@@ -6618,9 +6661,9 @@ mod tests {
         MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
         MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
         NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
-        RECONNECT_STATE_SCHEMA_VERSION, ResizeTickOutcome, STATUS_DAMAGE_HEARTBEAT,
-        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, StatusBackend,
-        StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
+        RECONNECT_STATE_SCHEMA_VERSION, RPC_PARSE_ERROR_PREVIEW_BYTES, ResizeTickOutcome,
+        STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP,
+        StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
         StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
         TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
@@ -6644,9 +6687,9 @@ mod tests {
         read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
         read_trace_jsonl_line, remember_reconnect_target_best_effort_at_path,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
-        run_status_command, select_status_backend, should_mobile_transcript_auto,
-        status_sgr_stack_supported, status_theme_protocol_error, trace_file_summary,
-        trace_output_open_context, trace_summary_text, validate_trace_replay,
+        rpc_parse_error_preview, run_status_command, select_status_backend,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        trace_file_summary, trace_output_open_context, trace_summary_text, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
     };
@@ -7772,6 +7815,37 @@ mod tests {
         );
     }
 
+    fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> i32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for pid file {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn run_status_command_returns_stdout_for_successful_command() {
         let argv = vec!["printf".to_string(), "HELLO".to_string()];
@@ -7795,6 +7869,30 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "timeout must trigger well before the command would finish"
+        );
+    }
+
+    #[test]
+    fn run_status_command_kills_pipe_holding_descendant_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("status-grandchild.pid");
+        let quoted_pid_file =
+            shlex::try_quote(pid_file.to_str().expect("utf8 pid path")).expect("quote pid path");
+        let script = format!("sleep 30 & echo $! > {quoted_pid_file}; wait");
+        let argv = vec!["sh".to_string(), "-c".to_string(), script];
+
+        let started = Instant::now();
+        let out = run_status_command(&argv, "", Duration::from_millis(200), 65536);
+
+        assert_eq!(out, None, "timed-out status command must yield None");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "pipe-holding descendant must not keep status command blocked"
+        );
+        let pid = wait_for_pid_file(&pid_file, Duration::from_secs(2));
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(2)),
+            "status command timeout must kill process-group descendants; pid={pid}"
         );
     }
 
@@ -7843,6 +7941,51 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "large stdout + early exit must return within deadline, got {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn rpc_parse_error_preview_is_sanitized_and_capped() {
+        let mut bytes = b"SAFE\x1b]52;c;SECRET\x07_AFTER".to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'A',
+            RPC_PARSE_ERROR_PREVIEW_BYTES + 256,
+        ));
+
+        let preview = rpc_parse_error_preview(&bytes);
+
+        assert!(preview.contains("SAFE"), "{preview:?}");
+        assert!(
+            !preview.contains("SECRET"),
+            "OSC payload must not survive preview sanitization: {preview:?}"
+        );
+        assert!(
+            preview.contains("bytes omitted"),
+            "oversized preview should report omitted bytes: {preview:?}"
+        );
+        assert!(
+            preview.len() < RPC_PARSE_ERROR_PREVIEW_BYTES + 256,
+            "preview must be capped, got {} bytes",
+            preview.len()
+        );
+    }
+
+    #[test]
+    fn terminal_output_tracker_skips_status_damage_scan_without_status_row() {
+        let restore = Arc::new(KeyboardProtocolRestoreState::default());
+        let alt = Arc::new(AltScreenState::default());
+        let mut no_status =
+            TerminalOutputTracker::new(Arc::clone(&restore), Arc::clone(&alt), None);
+        let mut with_status =
+            TerminalOutputTracker::new(Arc::clone(&restore), Arc::clone(&alt), Some(23));
+
+        assert!(
+            !no_status.observe(b"\x1b[2J").status_area_dirty,
+            "status-disabled raw attach must not mark an impossible status-row redraw"
+        );
+        assert!(
+            with_status.observe(b"\x1b[2J").status_area_dirty,
+            "status-enabled attach still treats screen clear as status damage"
         );
     }
 
