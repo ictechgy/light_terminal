@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Light Terminal (lterm) — Browser Guide / 한국어 가이드</title>
-  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.27, a hardened lightweight tmux-compatible session daemon for persistent AI agent workflows, mobile reconnect, and sanitized reports. AI 에이전트 세션 유지, 모바일 재접속, 정제된 리포트를 위한 lterm 1.0.27 가이드입니다.">
+  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.28, a hardened lightweight tmux-compatible session daemon for persistent AI agent workflows, mobile reconnect, and sanitized reports. AI 에이전트 세션 유지, 모바일 재접속, 정제된 리포트를 위한 lterm 1.0.28 가이드입니다.">
   <style>
     :root {
       --bg: #08111f;
@@ -337,17 +337,17 @@
     <section class="hero">
       <div class="wrap hero-grid">
         <div>
-          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.27 hardened</span>
-          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.27 hardening</span>
+          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.28 current</span>
+          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.28 current</span>
           <h1 data-lang="en"><span class="gradient-text">lterm</span> keeps agents running.</h1>
           <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible session daemon for Claude Code, Codex CLI,
-            Gemini CLI, OpenCode, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, now hardened in 1.0.27 for helper cleanup, bounded reports, and safer sanitized output.
+            Gemini CLI, OpenCode, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, now current in 1.0.28 with helper cleanup, bounded reports, and safer sanitized output.
           </p>
           <p class="lead" data-lang="ko">
             Claude Code, Codex CLI, Gemini CLI, OpenCode 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
-            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.27 hardening으로 helper 정리·bounded report·더 안전한 정제 출력을 강화했습니다.
+            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.28 현재 릴리스는 helper 정리·bounded report·더 안전한 정제 출력을 포함합니다.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#install" data-lang="en">Install lterm</a>
@@ -356,8 +356,8 @@
             <a class="button" href="https://github.com/ictechgy/light_terminal/blob/main/README.ko.md" data-lang="ko">전체 README 보기</a>
           </div>
           <div class="callout release-callout">
-            <p data-lang="en"><strong>Now live: v1.0.27.</strong> The release tightens helper timeout cleanup, process/PID handling, RPC and scrollback bounds, and wait/watch sanitizer edge cases.</p>
-            <p data-lang="ko"><strong>v1.0.27 배포 완료.</strong> helper timeout 정리, process/PID 처리, RPC·scrollback 상한, wait/watch sanitizer edge case를 강화했습니다.</p>
+            <p data-lang="en"><strong>Now live: v1.0.28.</strong> This patch refreshes the public docs after the hardening release and keeps helper cleanup, bounded reports, and safer sanitizer behavior current.</p>
+            <p data-lang="ko"><strong>v1.0.28 배포 완료.</strong> hardening 릴리스 이후 public docs를 갱신하고 helper 정리, bounded report, 더 안전한 sanitizer 동작을 현재 릴리스로 유지합니다.</p>
           </div>
         </div>
         <div class="terminal-card" aria-label="lterm terminal example">
@@ -412,7 +412,7 @@
             <p data-lang="ko">TUI가 깨지지 않도록 PTY 연결에서는 바이트를 raw로 전달합니다. 대신 리포트 출력은 터미널 제어 코드를 제거하고 UTF-8 텍스트는 그대로 보존합니다.</p>
           </article>
           <article class="card">
-            <span class="badge">1.0.27</span>
+            <span class="badge">1.0.28</span>
             <h3 data-lang="en">Hardened release path</h3>
             <h3 data-lang="ko">강화된 릴리스 경로</h3>
             <p data-lang="en">The current release is backed by release preflight, contract checks, upgrade-matrix coverage, and focused daemon regressions.</p>
@@ -449,7 +449,7 @@
             <h3>Cargo</h3>
             <p data-lang="en">Pin the release tag when installing from source; check GitHub Releases for newer tags.</p>
             <p data-lang="ko">소스에서 설치할 때는 릴리스 태그를 고정하세요. 최신 태그는 GitHub Releases에서 확인할 수 있습니다.</p>
-            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.27</pre>
+            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28</pre>
           </article>
         </div>
       </div>
