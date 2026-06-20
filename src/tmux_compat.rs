@@ -2336,7 +2336,7 @@ const CMUX_OUTPUT_CAPTURE_BYTES: usize = 16 * 1024;
 ///
 /// `run_cmux_command`이 `child.wait()`로 무한 대기하면 cmux가 멈출 때 attach 메인 루프가
 /// 프리즈된다. 모든 호출자(open_cmux_split/send_cmux_attach/identify/status sink 등)는 빠른
-/// 단발 명령이라 3초면 넉넉하다. 외부 `timeout` 명령은 macOS 비호환이라 순수 Rust 폴링으로
+/// 단발 명령이라 5초면 넉넉하다. 외부 `timeout` 명령은 macOS 비호환이라 순수 Rust 폴링으로
 /// 구현한다(아래 [`run_cmux_command`]).
 ///
 /// 주의: status sink의 `apply`는 다수 [`cmux_status::CmuxCommand`]를 순차 실행하므로

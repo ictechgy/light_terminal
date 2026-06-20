@@ -2729,7 +2729,10 @@ impl WaitContainsScanner {
 
 fn sanitized_tail_for_needle(text: &str, needle: &str) -> String {
     let max_bytes = needle.len().saturating_sub(1);
-    if max_bytes == 0 || text.len() <= max_bytes {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if text.len() <= max_bytes {
         return text.to_string();
     }
     let mut start = text.len() - max_bytes;
@@ -3585,7 +3588,8 @@ mod tests {
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
         read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        validate_terminal_geometry, verify_peer_uid, wait_for_session_contains,
+        sanitized_tail_for_needle, validate_terminal_geometry, verify_peer_uid,
+        wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -4262,6 +4266,38 @@ mod tests {
             scanner.contains(&session, third_progress.total_bytes, None, needle),
             "incremental scan must bridge UTF-8 scalars split across raw chunks"
         );
+    }
+
+    #[test]
+    fn wait_contains_scanner_keeps_single_byte_needle_tail_bounded() {
+        let session = build_test_session("wait-incremental-single-byte-tail");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(&vec![b'x'; super::MAX_WAIT_CONTAINS_NEEDLE_BYTES * 4]);
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, None, "a"),
+            "absent one-byte needle must not match"
+        );
+        assert_eq!(
+            scanner.sanitized_tail.len(),
+            0,
+            "single-byte needles need no overlap cache"
+        );
+
+        session.append_output(b"still-no-hit");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, second_progress.total_bytes, None, "a"),
+            "subsequent incremental misses must remain bounded"
+        );
+        assert_eq!(scanner.sanitized_tail.len(), 0);
+    }
+
+    #[test]
+    fn sanitized_tail_for_single_byte_needle_is_empty() {
+        assert_eq!(sanitized_tail_for_needle("large visible text", "a"), "");
+        assert_eq!(sanitized_tail_for_needle("완료", "✅"), "");
     }
 
     #[test]
