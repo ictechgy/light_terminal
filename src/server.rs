@@ -3542,6 +3542,16 @@ fn verify_peer_uid(peer_uid: u32, expected_uid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn verify_linux_peercred_len(actual_len: usize, expected_len: usize) -> Result<()> {
+    if actual_len < expected_len {
+        bail!(
+            "getsockopt(SO_PEERCRED) returned short credential length {actual_len}, expected at least {expected_len}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -3595,6 +3605,7 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    verify_linux_peercred_len(len as usize, std::mem::size_of::<UCred>())?;
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
     verify_peer_uid(cred.uid, expected)
@@ -3646,8 +3657,8 @@ mod tests {
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
         read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        sanitized_tail_for_needle, validate_terminal_geometry, verify_peer_uid,
-        wait_for_session_contains,
+        sanitized_tail_for_needle, validate_terminal_geometry, verify_linux_peercred_len,
+        verify_peer_uid, wait_for_session_contains,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -3683,6 +3694,18 @@ mod tests {
             err.to_string()
                 .contains("peer uid 502 does not match daemon uid 501"),
             "wrong-uid error should identify both trust-boundary endpoints: {err:#}"
+        );
+    }
+
+    #[test]
+    fn linux_peercred_len_check_fails_closed_on_short_buffer() {
+        verify_linux_peercred_len(12, 12).expect("exact SO_PEERCRED length should pass");
+        verify_linux_peercred_len(16, 12).expect("longer SO_PEERCRED length should pass");
+        let err =
+            verify_linux_peercred_len(11, 12).expect_err("short SO_PEERCRED length must fail");
+        assert!(
+            err.to_string().contains("short credential length"),
+            "unexpected short credential error: {err:#}"
         );
     }
 
