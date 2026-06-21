@@ -5,7 +5,7 @@
 ## TL;DR
 
 - **What** — A persistent terminal session daemon (like tmux, but smaller) with a tmux-compatible command layer for AI-agent tooling. Detach and reattach by name or pane id.
-- **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
+- **Who it's for** — Terminal-first coding agents such as Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, Grok Build CLI via custom `lterm agent grok`, `oh-my-codex` / `oh-my-claude`, and users running them inside `cmux`.
 - **How** — Use `lterm start` to create a session, `lterm resume` to reconnect, and `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` for built-in shimmed agent launchers. Inside a tmux-enabled session, the `tmux` command resolves to `lterm tmux-compat`.
 - **Status** — 1.x CLI with a documented 1.0 command/output compatibility boundary. It is a same-user convenience daemon — **not** a sandbox, an escape-sequence sanitizer, or a full tmux replacement.
 
@@ -17,14 +17,15 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.28
+## Current release: 1.0.29
 
-The 1.0.28 release carries the current hardening defaults and publishes the post-release documentation plus CI smoke-test stabilization:
+The 1.0.29 release focuses on terminal-session resilience and tighter local trust boundaries:
 
-- **Safer helper lifecycle** — cmux/status helper timeouts now clean up process groups and avoid stale PID reuse.
-- **Bounded report surfaces** — RPC payloads, scrollback buffers, and wait/watch scanners are capped so daemon memory stays predictable, and oversized wait needles are rejected up front.
-- **Sanitizer correctness across chunks** — sanitized reports preserve valid UTF-8 while keeping terminal-control filtering state across split input, including hidden-payload style sequences.
-- **Regression-backed compatibility** — release preflight, contract checks, upgrade-matrix tests, and focused daemon tests cover the hardened behavior.
+- **Bounded tmux wait state** — wait-for channels enforce entry and byte limits, quarantine corrupt or oversized state files, and do less work parsing idle stores.
+- **More compatible tmux shims** — clustered `new-session` value flags parse like tmux, and `wait --contains --tail` reuses scanner progress across unchanged output.
+- **Clearer attach failures** — raw attach reports stdin and input-thread failures instead of silently losing the writer path.
+- **Hardened local reports and paths** — sanitized status/report output, socket path handling, and peer-credential checks reject spoofable or unsafe inputs before they cross trust boundaries.
+- **Faster nested-agent teardown** — nested-agent monitors wake immediately during teardown instead of waiting for the next poll.
 
 ## Why lterm instead of plain tmux?
 
@@ -37,7 +38,7 @@ need:
 - **tmux-compatible where agents expect it** — `lterm tmux-compat` implements
   the command subset used by Claude Code, Codex CLI, OpenCode, GitHub Copilot
   CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp,
-  Crush, Kimi, Qwen, Gemini CLI, OMX/OMC, and similar terminal-first tooling.
+  Crush, Kimi, Qwen, Gemini CLI, custom PATH-based launchers such as Grok Build CLI, OMX/OMC, and similar terminal-first tooling.
 - **Raw attach, safe reports** — attached PTY streams remain raw for TUIs and
   interactive shells, while `logs`, `capture`, `compose`, `doctor`,
   `diagnose`, the `notify` fallback path, and other report surfaces strip
@@ -90,7 +91,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.29
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
@@ -434,6 +435,8 @@ lterm agent cursor-agent
 lterm agent agy -- -p "summarize this repo"
 lterm agent qwen
 lterm agent gemini -- -p "summarize this repo"
+# Any safe PATH command can use the generic launcher; Grok is not a built-in shortcut.
+lterm agent grok -- -p "summarize this repo"
 ```
 
 Agent launchers accept the same session controls across built-in profiles and custom `lterm agent <profile>` launches:
@@ -457,7 +460,7 @@ The lterm session command becomes `mat exec <cli> <profile> -- <agent-binary> ..
 
 Independently of `--mat-profile`, lterm preserves a narrow Codex profile-home signal across the client→daemon hop: if the launching client has `CODEX_HOME` set, new sessions inherit that value unless an explicit session env already provided `CODEX_HOME`. This is intentionally not broad environment forwarding.
 
-Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to the `auto` attach policy. On desktop, that means a raw full-terminal attach without the lterm status bar, so the agent's own TUI, status, and alternate-screen rendering stay in control. Reattaching those agent sessions later with `lterm resume` or `lterm open` keeps the same row-off default. On Termius-style mobile clients, `auto` uses the normal-screen transcript described above so long agent output can be reviewed with native mobile scrollback. Use `--raw` to force raw attach, `--mobile` to force transcript attach, `--status` to request the lterm status bar on the raw path during direct agent launch, or `--no-status` to suppress it for any raw launch/profile that would otherwise show it. `--status` is intentionally a best-effort override for agent debugging and can still conflict with agent TUIs; `--mobile --status` does not create a raw status row because mobile transcript owns its own UI. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
+Known Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profiles default to the `auto` attach policy. On desktop, that means a raw full-terminal attach without the lterm status bar, so the agent's own TUI, status, and alternate-screen rendering stay in control. Reattaching those agent sessions later with `lterm resume` or `lterm open` keeps the same row-off default. On Termius-style mobile clients, `auto` uses the normal-screen transcript described above so long agent output can be reviewed with native mobile scrollback. Use `--raw` to force raw attach, `--mobile` to force transcript attach, `--status` to request the lterm status bar on the raw path during direct agent launch, or `--no-status` to suppress it for any raw launch/profile that would otherwise show it. `--status` is intentionally a best-effort override for agent debugging and can still conflict with agent TUIs; `--mobile --status` does not create a raw status row because mobile transcript owns its own UI. Put `--` before agent arguments that could be parsed as lterm launch options. `lterm agent <name>` also works for any safe bare command name available in `PATH` (for example `lterm agent grok` or `lterm agent qwen-code`); use `lterm run -- <command>` only when you want the lower-level tmux-compatible primitive directly.
 
 Agent launchers also keep host/application color policy separate from the agent child. Ambient `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` from the client or long-lived daemon are not forwarded to sessions marked with `LTERM_AGENT`, because mobile SSH or host status preferences can otherwise force full-screen agent TUIs into monochrome output. Ordinary non-agent sessions (`lterm start` / `lterm new` / `lterm run`) still preserve those variables for child processes, and lterm's own status style continues to honor `NO_COLOR`.
 

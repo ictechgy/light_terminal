@@ -5,7 +5,7 @@
 ## TL;DR
 
 - **무엇** — tmux처럼 터미널 세션을 백그라운드에서 오래 유지하는 데몬이지만, 기능 범위를 더 작게 좁힌 도구입니다. AI 에이전트 도구를 위한 tmux 호환 명령 계층을 제공하며, 세션을 이름이나 pane id로 detach·reattach할 수 있습니다.
-- **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
+- **대상** — Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, custom `lterm agent grok`으로 실행하는 Grok Build CLI, `oh-my-codex` / `oh-my-claude` 같은 terminal-first coding agent를 쓰는 사용자와, 이를 `cmux` 안에서 실행하는 사용자.
 - **사용법** — `lterm start`로 만들고 `lterm resume`으로 (재)접속합니다. shim이 적용된 agent 실행에는 `lterm agent <profile>` / `lterm claude` / `lterm codex` / `lterm opencode` / `lterm agy` / `lterm kiro` / `lterm gemini` 같은 내장 단축 명령을 사용할 수 있습니다. tmux가 켜진 세션 안에서는 `tmux` 명령이 `lterm tmux-compat`으로 해석됩니다.
 - **상태** — 문서화된 1.0 명령/출력 호환성 경계를 따르는 1.x CLI입니다. 같은 OS 사용자 안에서 쓰는 편의용 데몬이며, **샌드박스도, escape-sequence sanitizer도, 완전한 tmux 대체품도 아닙니다.**
 
@@ -17,14 +17,15 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
-## 현재 릴리스: 1.0.28
+## 현재 릴리스: 1.0.29
 
-1.0.28 릴리스는 현재 보안·성능 hardening 기본값을 유지하고, 배포 후 문서 갱신과 CI smoke-test 안정화를 함께 포함합니다.
+1.0.29 릴리스는 터미널 세션 복원력과 로컬 trust boundary hardening에 집중합니다.
 
-- **더 안전한 helper lifecycle** — cmux/status helper timeout에서 process group을 정리하고 stale PID 재사용 위험을 낮췄습니다.
-- **상한이 있는 report surface** — RPC payload, scrollback buffer, wait/watch scanner에 상한을 두어 daemon memory 사용을 예측 가능하게 유지하고, 지나치게 큰 wait needle은 미리 거부합니다.
-- **chunk 경계를 넘는 sanitizer 정확성** — split input에서도 유효한 UTF-8 text를 보존하고, hidden-payload 계열 sequence까지 terminal-control filtering 상태를 chunk 경계 너머로 유지합니다.
-- **회귀 테스트로 고정한 호환성** — release preflight, contract check, upgrade-matrix test, focused daemon test로 hardened behavior를 검증했습니다.
+- **상한이 있는 tmux wait 상태** — wait-for 채널에 entry/byte 상한을 두고, 손상되거나 지나치게 큰 state file은 quarantine하며, idle store parsing 비용을 줄였습니다.
+- **더 호환되는 tmux shim** — clustered `new-session` value flag를 tmux처럼 파싱하고, `wait --contains --tail`은 출력이 바뀌지 않은 구간의 scanner 진행 상태를 재사용합니다.
+- **명확한 attach 실패 보고** — raw attach의 stdin/input thread 실패를 조용히 놓치지 않고 호출자에게 전달합니다.
+- **강화된 로컬 report와 path 경계** — status/report sanitizer, socket path 처리, peer credential 검증이 spoofing 가능하거나 unsafe한 입력을 trust boundary 안쪽으로 들이기 전에 거부합니다.
+- **빠른 nested-agent teardown** — nested monitor가 다음 poll을 기다리지 않고 teardown 때 즉시 깨어납니다.
 
 ## 왜 tmux 대신 lterm인가요?
 
@@ -35,7 +36,7 @@ agent가 보통 필요로 하는 더 작은 기능 범위에 집중합니다.
   계속 실행되므로, 모든 workflow가 full tmux server를 직접 관리할 필요가
   적습니다.
 - **Agent가 기대하는 tmux 호환성** — `lterm tmux-compat`는 Claude Code, Codex
-  CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, OMX/OMC 같은 terminal-first tooling이 쓰는 tmux command
+  CLI, OpenCode, GitHub Copilot CLI, Cursor Agent, Antigravity/`agy`, Kiro, Jules, Aider, Goose, Amp, Crush, Kimi, Qwen, Gemini CLI, Grok Build CLI 같은 custom PATH 기반 launcher와 OMX/OMC 등 terminal-first tooling이 쓰는 tmux command
   subset을 구현합니다.
 - **Raw attach, safe reports** — attach된 PTY stream은 TUI/interactive shell을
   위해 raw로 유지합니다. 대신 `logs`, `capture`, `compose`, `doctor`,
@@ -87,7 +88,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.29
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
@@ -433,6 +434,8 @@ lterm agent cursor-agent
 lterm agent agy -- -p "이 저장소를 요약해줘"
 lterm agent qwen
 lterm agent gemini -- -p "이 저장소를 요약해줘"
+# 안전한 PATH command는 generic launcher로 실행할 수 있습니다. Grok은 built-in shortcut이 아닙니다.
+lterm agent grok -- -p "이 저장소를 요약해줘"
 ```
 
 agent launcher는 built-in profile과 custom `lterm agent <profile>` 실행에서 같은 세션 제어 옵션을 받습니다.
@@ -456,7 +459,7 @@ lterm claude --profile work -- --profile native
 
 `--mat-profile`과 별개로, lterm은 client→daemon hop을 건널 때 Codex profile home 신호 하나만 좁게 보존합니다. 실행한 client에 `CODEX_HOME`이 설정되어 있으면 새 세션은 명시적인 session env가 이미 `CODEX_HOME`을 제공하지 않는 한 그 값을 상속합니다. 이는 의도적으로 broad environment forwarding이 아닙니다.
 
-Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. 이후 해당 agent 세션을 `lterm resume` 또는 `lterm open`으로 다시 붙을 때도 같은 row-off 기본값을 유지합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 직접 agent launch의 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
+Claude/Codex/OpenCode/Copilot/Cursor Agent/Antigravity/Kiro/Jules/Aider/Goose/Amp/Crush/Kimi/Qwen/Gemini/OMX/OMC profile의 기본 attach 정책은 `auto`입니다. 데스크톱에서는 lterm status bar를 끈 raw full-terminal attach를 사용하므로 각 도구의 자체 TUI/status/alternate-screen 렌더링이 그대로 동작합니다. 이후 해당 agent 세션을 `lterm resume` 또는 `lterm open`으로 다시 붙을 때도 같은 row-off 기본값을 유지합니다. Termius 계열 모바일 클라이언트에서는 `auto`가 위에서 설명한 normal-screen transcript로 전환되어 긴 agent 출력을 모바일 기본 scrollback으로 읽을 수 있습니다. raw attach를 강제하려면 `--raw`, transcript를 강제하려면 `--mobile`을 사용하세요. `--status`는 직접 agent launch의 raw 경로에서 lterm status bar를 요청하고, raw launch/profile에서 표시되는 status bar는 `--no-status`로 숨길 수 있습니다. `--status`는 agent 디버깅용 best-effort override라 agent TUI와 충돌할 수 있으며, `--mobile --status`는 mobile transcript가 자체 UI를 소유하므로 raw status row를 만들지 않습니다. agent에 넘길 인자가 lterm launch option처럼 보일 수 있으면 앞에 `--`를 두세요. `lterm agent <name>`은 `PATH`에서 찾을 수 있는 안전한 bare command name이면 바로 동작하므로, 예를 들어 `lterm agent grok`이나 `lterm agent qwen-code`처럼 미래/서드파티 agent도 쓸 수 있습니다. `lterm run -- <command>`는 더 낮은 수준의 tmux-compatible primitive를 직접 쓰고 싶을 때만 사용하세요.
 
 Agent launcher는 색상 관련 환경 변수도 host 쪽과 agent child 쪽을 분리해 다룹니다. lterm은 클라이언트나 장기 실행 daemon에 설정된 `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`를 `LTERM_AGENT` metadata가 있는 세션으로는 전달하지 않습니다. 모바일 SSH renderer나 host status 설정이 full-screen agent TUI를 의도치 않게 monochrome 출력으로 고정할 수 있기 때문입니다. 일반 non-agent 세션(`lterm start` / `lterm new` / `lterm run`)은 이 변수들을 계속 child process에 보존하며, lterm 자체 status style도 `NO_COLOR`를 계속 존중합니다.
 
