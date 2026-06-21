@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Light Terminal (lterm) — Browser Guide / 한국어 가이드</title>
-  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.28, a hardened lightweight tmux-compatible session daemon for persistent AI agent workflows, mobile reconnect, and sanitized reports. AI 에이전트 세션 유지, 모바일 재접속, 정제된 리포트를 위한 lterm 1.0.28 가이드입니다.">
+  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.29, a hardened lightweight tmux-compatible session daemon for persistent AI agent workflows, mobile reconnect, and sanitized reports. AI 에이전트 세션 유지, 모바일 재접속, 정제된 리포트를 위한 lterm 1.0.29 가이드입니다.">
   <style>
     :root {
       --bg: #08111f;
@@ -337,17 +337,17 @@
     <section class="hero">
       <div class="wrap hero-grid">
         <div>
-          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.28 current</span>
-          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.28 current</span>
+          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.29 current</span>
+          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.29 current</span>
           <h1 data-lang="en"><span class="gradient-text">lterm</span> keeps agents running.</h1>
           <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible session daemon for Claude Code, Codex CLI,
-            Gemini CLI, OpenCode, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, now current in 1.0.28 with helper cleanup, bounded reports, and safer sanitized output.
+            Gemini CLI, OpenCode, Grok Build CLI through custom profiles, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, now current in 1.0.29 with stronger wait-state bounds, safer local trust boundaries, and faster nested-agent teardown.
           </p>
           <p class="lead" data-lang="ko">
-            Claude Code, Codex CLI, Gemini CLI, OpenCode 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
-            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.28 현재 릴리스는 helper 정리·bounded report·더 안전한 정제 출력을 포함합니다.
+            Claude Code, Codex CLI, Gemini CLI, OpenCode, custom profile로 실행하는 Grok Build CLI 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
+            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.29 현재 릴리스는 wait 상태 상한, 더 안전한 로컬 trust boundary, 빠른 nested-agent teardown을 포함합니다.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#install" data-lang="en">Install lterm</a>
@@ -356,8 +356,8 @@
             <a class="button" href="https://github.com/ictechgy/light_terminal/blob/main/README.ko.md" data-lang="ko">전체 README 보기</a>
           </div>
           <div class="callout release-callout">
-            <p data-lang="en"><strong>Now live: v1.0.28.</strong> This patch refreshes the public docs after the hardening release and keeps helper cleanup, bounded reports, and safer sanitizer behavior current.</p>
-            <p data-lang="ko"><strong>v1.0.28 배포 완료.</strong> hardening 릴리스 이후 public docs를 갱신하고 helper 정리, bounded report, 더 안전한 sanitizer 동작을 현재 릴리스로 유지합니다.</p>
+            <p data-lang="en"><strong>Now live: v1.0.29.</strong> This release improves tmux wait-state recovery, attach failure visibility, local path and credential checks, and nested-agent shutdown responsiveness.</p>
+            <p data-lang="ko"><strong>v1.0.29 배포 완료.</strong> tmux wait 상태 복구력, attach 실패 가시성, 로컬 path/credential 검증, nested-agent 종료 반응성을 개선한 릴리스입니다.</p>
           </div>
         </div>
         <div class="terminal-card" aria-label="lterm terminal example">
@@ -412,11 +412,11 @@
             <p data-lang="ko">TUI가 깨지지 않도록 PTY 연결에서는 바이트를 raw로 전달합니다. 대신 리포트 출력은 터미널 제어 코드를 제거하고 UTF-8 텍스트는 그대로 보존합니다.</p>
           </article>
           <article class="card">
-            <span class="badge">1.0.28</span>
-            <h3 data-lang="en">Hardened release path</h3>
-            <h3 data-lang="ko">강화된 릴리스 경로</h3>
-            <p data-lang="en">The current release is backed by release preflight, contract checks, upgrade-matrix coverage, and focused daemon regressions.</p>
-            <p data-lang="ko">현재 릴리스는 release preflight, contract check, upgrade-matrix coverage, daemon 회귀 테스트로 검증했습니다.</p>
+            <span class="badge">1.0.29</span>
+            <h3 data-lang="en">Resilient release path</h3>
+            <h3 data-lang="ko">복원력 중심 릴리스</h3>
+            <p data-lang="en">The current release is backed by release preflight, contract checks, upgrade-matrix coverage, and focused wait/attach hardening regressions.</p>
+            <p data-lang="ko">현재 릴리스는 release preflight, contract check, upgrade-matrix coverage, wait/attach hardening 회귀 테스트로 검증했습니다.</p>
           </article>
         </div>
       </div>
@@ -449,7 +449,7 @@
             <h3>Cargo</h3>
             <p data-lang="en">Pin the release tag when installing from source; check GitHub Releases for newer tags.</p>
             <p data-lang="ko">소스에서 설치할 때는 릴리스 태그를 고정하세요. 최신 태그는 GitHub Releases에서 확인할 수 있습니다.</p>
-            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.28</pre>
+            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.29</pre>
           </article>
         </div>
       </div>
@@ -536,6 +536,8 @@
               <tr data-lang="ko"><td>완료 시 알림</td><td><code>lterm watch api --exit --notify</code></td><td>없음</td></tr>
               <tr data-lang="en"><td>Launch an agent profile</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
               <tr data-lang="ko"><td>agent profile 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
+              <tr data-lang="en"><td>Launch a custom PATH agent</td><td><code>lterm agent grok -- -p 'summarize'</code></td><td>Grok is custom, not a built-in shortcut</td></tr>
+              <tr data-lang="ko"><td>custom PATH agent 실행</td><td><code>lterm agent grok -- -p '요약해줘'</code></td><td>Grok은 built-in shortcut이 아닌 custom profile</td></tr>
               <tr data-lang="en"><td>Diagnose local state</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="ko"><td>로컬 상태 진단</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
               <tr data-lang="en"><td>Inspect redacted diagnostics</td><td><code>lterm inspect --json</code></td><td>same bundle as <code>diagnose --bundle</code></td></tr>
