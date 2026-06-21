@@ -541,7 +541,9 @@ target이면 현재 pane이 아니어도 허용합니다. 이는 tmux의 cross-p
 만들 때 각각 cmux `left`, `up` placement로 매핑됩니다. Detached `new-window -d` /
 `neww -d`는 의도적으로 partial 지원입니다. standalone lterm helper session을
 만들고, tmux 스타일 `-P`/`-F` target 출력을 지원하며, attached-window mode는
-현재 pane을 조용히 바꾸는 대신 거부합니다.
+현재 pane을 조용히 바꾸는 대신 거부합니다. `wait-for` channel은 lterm local
+compatibility store key이며, 최대 1024 bytes까지 허용하고 control character는
+거부합니다.
 `lterm tmux-compat list-commands --verbose`는 `command`, alias, support tier,
 usage를 tab-separated로 출력하고, `--json`은 machine-readable row를 출력합니다.
 Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`

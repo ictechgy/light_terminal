@@ -18,11 +18,14 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const WAIT_GENERATION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const WAIT_GENERATION_MAX_CHANNELS: usize = 4_096;
+const WAIT_GENERATION_MAX_CHANNEL_BYTES: usize = 1024;
 const WAIT_GENERATION_TOUCH_INTERVAL_SECS: u64 = 30;
+const WAIT_GENERATION_FORCE_READ_INTERVAL: Duration = Duration::from_secs(1);
+const COMPAT_STORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TMUX_BUFFER_MAX_BYTES: usize = MAX_SEND_DATA_BYTES;
 const MANAGED_ATTACH_ENV: &str = "LTERM_CMUX_MANAGED_ATTACH";
 const MANAGED_ATTACH_LEASE_TTL_SECS: u64 = 120;
@@ -1614,6 +1617,7 @@ fn wait_for(args: &[String]) -> Result<i32> {
         }
     }
     let channel = channel.context("tmux wait-for requires a channel")?;
+    validate_wait_channel(&channel)?;
     if signal {
         update_store(|store| {
             prune_wait_generations(store, None);
@@ -1633,18 +1637,37 @@ fn wait_for(args: &[String]) -> Result<i32> {
     let deadline = Instant::now() + Duration::from_secs(60 * 60 * 24);
     let touch_interval = Duration::from_secs(WAIT_GENERATION_TOUCH_INTERVAL_SECS);
     let mut next_touch = Instant::now() + touch_interval;
+    let mut last_store_signature = compat_store_signature().ok();
+    let mut last_forced_read = Instant::now();
     let mut sleep_for = Duration::from_millis(100);
     while Instant::now() < deadline {
         let now = Instant::now();
         let current_generation = if now >= next_touch {
             next_touch = now + touch_interval;
-            update_store(|store| {
+            let generation = update_store(|store| {
                 prune_wait_generations(store, Some(&channel));
                 touch_existing_wait_generation(store, &channel);
                 Ok(*store.wait_generations.get(&channel).unwrap_or(&0))
-            })?
+            })?;
+            last_store_signature = compat_store_signature().ok();
+            last_forced_read = now;
+            generation
         } else {
-            read_store(|store| Ok(*store.wait_generations.get(&channel).unwrap_or(&0)))?
+            let current_signature = compat_store_signature().ok();
+            if should_read_wait_store(
+                current_signature,
+                last_store_signature,
+                now,
+                last_forced_read,
+            ) {
+                let generation =
+                    read_store(|store| Ok(*store.wait_generations.get(&channel).unwrap_or(&0)))?;
+                last_store_signature = compat_store_signature().ok();
+                last_forced_read = now;
+                generation
+            } else {
+                observed_generation
+            }
         };
         if wait_generation_has_advanced(observed_generation, current_generation) {
             return Ok(0);
@@ -1653,6 +1676,22 @@ fn wait_for(args: &[String]) -> Result<i32> {
         sleep_for = (sleep_for + Duration::from_millis(100)).min(Duration::from_secs(1));
     }
     Ok(1)
+}
+
+fn validate_wait_channel(channel: &str) -> Result<()> {
+    if channel.is_empty() {
+        bail!("tmux wait-for channel cannot be empty");
+    }
+    if channel.len() > WAIT_GENERATION_MAX_CHANNEL_BYTES {
+        bail!(
+            "tmux wait-for channel exceeds {} bytes",
+            WAIT_GENERATION_MAX_CHANNEL_BYTES
+        );
+    }
+    if channel.chars().any(|ch| ch.is_control()) {
+        bail!("tmux wait-for channel contains a control character");
+    }
+    Ok(())
 }
 
 fn load_buffer(args: &[String]) -> Result<i32> {
@@ -2913,22 +2952,128 @@ fn prune_wait_generations(store: &mut CompatStore, protected_channel: Option<&st
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoreSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn should_read_wait_store(
+    current_signature: Option<Option<StoreSignature>>,
+    last_store_signature: Option<Option<StoreSignature>>,
+    now: Instant,
+    last_forced_read: Instant,
+) -> bool {
+    current_signature != last_store_signature
+        || now.saturating_duration_since(last_forced_read) >= WAIT_GENERATION_FORCE_READ_INTERVAL
+}
+
+fn compat_store_signature() -> Result<Option<StoreSignature>> {
+    let path = paths::store_path()?;
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+    };
+    Ok(Some(StoreSignature {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    }))
+}
+
 fn load_store() -> Result<CompatStore> {
     let path = paths::store_path()?;
-    if !path.exists() {
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(CompatStore::default()),
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    let mut limited = file.take(COMPAT_STORE_MAX_BYTES + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > COMPAT_STORE_MAX_BYTES {
+        quarantine_store_file(&path, "oversized")?;
         return Ok(CompatStore::default());
     }
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    match serde_json::from_slice(&bytes) {
+        Ok(store) => Ok(store),
+        Err(err) => {
+            quarantine_store_file(&path, "corrupt")?;
+            eprintln!(
+                "quarantined corrupt tmux compat store {}: {}",
+                path.display(),
+                err
+            );
+            Ok(CompatStore::default())
+        }
+    }
 }
 
 fn save_store(store: &CompatStore) -> Result<()> {
     let path = paths::store_path()?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(store)?)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    let bytes = serde_json::to_vec_pretty(store)?;
+    if bytes.len() as u64 > COMPAT_STORE_MAX_BYTES {
+        bail!(
+            "tmux compat store exceeds {} bytes; refusing to write {}",
+            COMPAT_STORE_MAX_BYTES,
+            path.display()
+        );
+    }
+    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+}
+
+fn quarantine_store_file(path: &PathBuf, reason: &str) -> Result<()> {
+    let basename = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "tmux-compat-store.json".into());
+    let mut quarantine = path.with_file_name(format!(
+        "{basename}.corrupt.{}.{}.{}",
+        std::process::id(),
+        now_unix_secs(),
+        reason
+    ));
+    let mut moved = false;
+    for attempt in 0..100 {
+        if attempt > 0 {
+            quarantine = path.with_file_name(format!(
+                "{basename}.corrupt.{}.{}.{}.{}",
+                std::process::id(),
+                now_unix_secs(),
+                reason,
+                attempt
+            ));
+        }
+        if quarantine.exists() {
+            continue;
+        }
+        match fs::rename(path, &quarantine) {
+            Ok(()) => {
+                moved = true;
+                break;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("quarantine {} to {}", path.display(), quarantine.display())
+                });
+            }
+        }
+    }
+    if !moved {
+        bail!("could not choose a quarantine path for {}", path.display());
+    }
+    eprintln!(
+        "quarantined {} tmux compat store {} to {}",
+        reason,
+        path.display(),
+        quarantine.display()
+    );
+    Ok(())
 }
 
 fn update_store<T>(f: impl FnOnce(&mut CompatStore) -> Result<T>) -> Result<T> {
@@ -6023,6 +6168,48 @@ mod tests {
     }
 
     #[test]
+    fn wait_channel_validation_accepts_documented_boundary() {
+        let max_channel = "x".repeat(WAIT_GENERATION_MAX_CHANNEL_BYTES);
+        validate_wait_channel(&max_channel).expect("documented max channel length");
+    }
+
+    #[test]
+    fn wait_for_rejects_oversized_or_control_channels() {
+        let long_channel = "x".repeat(WAIT_GENERATION_MAX_CHANNEL_BYTES + 1);
+        assert!(wait_for(&["-S".to_string(), long_channel]).is_err());
+        assert!(wait_for(&args(["bad\u{7}channel"])).is_err());
+    }
+
+    #[test]
+    fn wait_store_poll_forces_read_for_same_signature_after_interval() {
+        let signature = Some(StoreSignature {
+            len: 10,
+            modified: None,
+        });
+        let visible_signature = Some(signature);
+        let started = Instant::now();
+
+        assert!(!should_read_wait_store(
+            visible_signature,
+            visible_signature,
+            started,
+            started
+        ));
+        assert!(should_read_wait_store(
+            visible_signature,
+            visible_signature,
+            started + WAIT_GENERATION_FORCE_READ_INTERVAL,
+            started
+        ));
+        assert!(should_read_wait_store(
+            None,
+            visible_signature,
+            started,
+            started
+        ));
+    }
+
+    #[test]
     fn cmux_surface_ref_prefers_focused_surface_over_caller() {
         let value = serde_json::json!({
             "caller": {
@@ -6819,6 +7006,80 @@ exit 65
 
         let store = load_store().expect("old store should load with serde defaults");
         assert!(store.managed_attaches.is_empty());
+    }
+
+    #[test]
+    fn compat_store_corruption_is_quarantined_and_reset() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        let mut permissions = fs::metadata(&data_dir)
+            .expect("data dir metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&data_dir, permissions).expect("chmod data dir");
+        fs::write(data_dir.join("tmux-compat-store.json"), b"{not-json")
+            .expect("write corrupt store");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let store = load_store().expect("corrupt store should self-heal");
+        assert!(store.panes.is_empty());
+        assert!(!data_dir.join("tmux-compat-store.json").exists());
+        assert!(
+            fs::read_dir(&data_dir)
+                .expect("read data dir")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tmux-compat-store.json.corrupt.")),
+            "corrupt store should be quarantined"
+        );
+    }
+
+    #[test]
+    fn compat_store_oversize_is_quarantined_without_unbounded_read() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env_guard = EnvGuard::capture(&["LTERM_DATA_DIR"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        let mut permissions = fs::metadata(&data_dir)
+            .expect("data dir metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&data_dir, permissions).expect("chmod data dir");
+        fs::write(
+            data_dir.join("tmux-compat-store.json"),
+            vec![b' '; COMPAT_STORE_MAX_BYTES as usize + 1],
+        )
+        .expect("write oversized store");
+
+        // SAFETY: crate::TEST_ENV_LOCK is held; EnvGuard restores on drop.
+        unsafe {
+            std::env::set_var("LTERM_DATA_DIR", &data_dir);
+        }
+
+        let store = load_store().expect("oversized store should self-heal");
+        assert!(store.panes.is_empty());
+        assert!(!data_dir.join("tmux-compat-store.json").exists());
+        assert!(
+            fs::read_dir(&data_dir)
+                .expect("read data dir")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name().to_string_lossy().contains(".oversized")),
+            "oversized store should be quarantined with reason"
+        );
     }
 
     struct InterruptedOnceReader {
