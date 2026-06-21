@@ -2667,8 +2667,14 @@ fn wait_for_session_contains(
 struct WaitContainsScanner {
     initialized: bool,
     last_total_bytes: u64,
+    last_start: Option<i32>,
+    last_start_total: u64,
     sanitized_tail: String,
     sanitizer_state: sanitize::TerminalCaptureState,
+    #[cfg(test)]
+    full_scan_count: u64,
+    #[cfg(test)]
+    incremental_scan_count: u64,
 }
 
 impl WaitContainsScanner {
@@ -2680,31 +2686,41 @@ impl WaitContainsScanner {
         needle: &str,
     ) -> bool {
         let ring = lock(&session.ring);
-        if start.is_some() {
-            let bytes = capture_bytes_from_ring(&ring, start, None);
-            return sanitize::terminal_capture(&bytes).contains(needle);
-        }
-        self.contains_default_start(&ring, total_bytes, needle)
+        let start_total = capture_start_total_from_ring(&ring, total_bytes, start);
+        self.contains_from_start(&ring, total_bytes, start, start_total, needle)
     }
 
-    fn contains_default_start(
+    fn contains_from_start(
         &mut self,
         ring: &VecDeque<u8>,
         total_bytes: u64,
+        start: Option<i32>,
+        start_total: u64,
         needle: &str,
     ) -> bool {
         let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
         let needs_full_scan = !self.initialized
+            || self.last_start != start
+            || self.last_start_total != start_total
             || self.last_total_bytes < ring_start_total
+            || self.last_total_bytes < start_total
             || self.last_total_bytes > total_bytes;
 
         let (matched, next_state, searchable_tail) = if needs_full_scan {
-            let bytes: Vec<u8> = ring.iter().copied().collect();
+            #[cfg(test)]
+            {
+                self.full_scan_count = self.full_scan_count.saturating_add(1);
+            }
+            let bytes = copy_ring_bytes_from_total(ring, total_bytes, start_total);
             let mut state = sanitize::TerminalCaptureState::default();
             let sanitized = sanitize::terminal_capture_from_state(&bytes, &mut state);
             let matched = sanitized.contains(needle);
             (matched, state, sanitized)
         } else {
+            #[cfg(test)]
+            {
+                self.incremental_scan_count = self.incremental_scan_count.saturating_add(1);
+            }
             let new_start = (self.last_total_bytes.saturating_sub(ring_start_total)) as usize;
             let bytes: Vec<u8> = ring.iter().skip(new_start).copied().collect();
             let mut state = self.sanitizer_state;
@@ -2720,6 +2736,8 @@ impl WaitContainsScanner {
         if !matched {
             self.initialized = true;
             self.last_total_bytes = total_bytes;
+            self.last_start = start;
+            self.last_start_total = start_total;
             self.sanitizer_state = next_state;
             self.sanitized_tail = sanitized_tail_for_needle(&searchable_tail, needle);
         }
@@ -3282,6 +3300,30 @@ fn capture_bytes_from_ring(ring: &VecDeque<u8>, start: Option<i32>, end: Option<
     copy_ring_lines(ring, first, last)
 }
 
+fn capture_start_total_from_ring(ring: &VecDeque<u8>, total_bytes: u64, start: Option<i32>) -> u64 {
+    if ring.is_empty() {
+        return total_bytes;
+    }
+    let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
+    let Some(start) = start else {
+        return ring_start_total;
+    };
+    let line_count = ring_line_count(ring);
+    let first = capture_line_index(start, line_count);
+    if first >= line_count {
+        return total_bytes;
+    }
+    ring_start_total.saturating_add(ring_byte_index_for_line(ring, first) as u64)
+}
+
+fn copy_ring_bytes_from_total(ring: &VecDeque<u8>, total_bytes: u64, start_total: u64) -> Vec<u8> {
+    let ring_start_total = total_bytes.saturating_sub(ring.len() as u64);
+    let start = start_total
+        .saturating_sub(ring_start_total)
+        .min(ring.len() as u64) as usize;
+    ring.iter().skip(start).copied().collect()
+}
+
 fn ring_line_count(ring: &VecDeque<u8>) -> usize {
     if ring.is_empty() {
         return 0;
@@ -3323,6 +3365,22 @@ fn copy_ring_lines(ring: &VecDeque<u8>, first: usize, last: Option<usize>) -> Ve
         }
     }
     out
+}
+
+fn ring_byte_index_for_line(ring: &VecDeque<u8>, target_line: usize) -> usize {
+    if target_line == 0 {
+        return 0;
+    }
+    let mut line_index = 0usize;
+    for (byte_index, byte) in ring.iter().enumerate() {
+        if *byte == b'\n' {
+            line_index += 1;
+            if line_index == target_line {
+                return byte_index + 1;
+            }
+        }
+    }
+    ring.len()
 }
 
 fn capture_line_index(line: i32, line_count: usize) -> usize {
@@ -4236,6 +4294,57 @@ mod tests {
         assert!(
             scanner.contains(&session, second_progress.total_bytes, None, "needle"),
             "incremental scan must bridge the cached raw tail and newly appended bytes"
+        );
+    }
+
+    #[test]
+    fn wait_contains_tail_scanner_incremental_same_line_without_recapturing_tail() {
+        let session = build_test_session("wait-tail-incremental-same-line");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(b"old-line\nprefix nee");
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            !scanner.contains(&session, first_progress.total_bytes, Some(-1), "needle"),
+            "first tail scan sees only a partial match"
+        );
+        assert_eq!(
+            scanner.full_scan_count, 1,
+            "initial tail search needs one bounded full scan"
+        );
+
+        session.append_output(b"dle suffix");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(
+            scanner.contains(&session, second_progress.total_bytes, Some(-1), "needle"),
+            "tail scan must bridge cached sanitized suffix and newly appended bytes"
+        );
+        assert_eq!(
+            scanner.full_scan_count, 1,
+            "same-line tail progress should not recapture and resanitize the full tail"
+        );
+        assert_eq!(
+            scanner.incremental_scan_count, 1,
+            "same-line tail progress should scan only the appended delta"
+        );
+    }
+
+    #[test]
+    fn wait_contains_tail_scanner_rescans_when_tail_window_rolls() {
+        let session = build_test_session("wait-tail-rollover-rescan");
+        let mut scanner = WaitContainsScanner::default();
+
+        session.append_output(b"one\nmissing");
+        let first_progress = *super::lock(&session.output_progress.0);
+        assert!(!scanner.contains(&session, first_progress.total_bytes, Some(-1), "needle"));
+        assert_eq!(scanner.full_scan_count, 1);
+
+        session.append_output(b"\ntwo\n");
+        let second_progress = *super::lock(&session.output_progress.0);
+        assert!(!scanner.contains(&session, second_progress.total_bytes, Some(-1), "needle"));
+        assert_eq!(
+            scanner.full_scan_count, 2,
+            "tail rollover changes the capture start, so sanitizer state must reset"
         );
     }
 
