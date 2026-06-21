@@ -4140,8 +4140,9 @@ fn attach_with_presence_and_cue(
     if let Some((_, status_metadata_thread)) = status_metadata {
         let _ = status_metadata_thread.join();
     }
-    // command thread는 공유 running 플래그가 이미 false라 interruptible_sleep이
-    // 다음 청크(≤100ms) 내에 깨어 종료된다. 긴 interval에서도 teardown이 블로킹되지 않는다.
+    // command/nested-monitor thread는 공유 running 플래그가 이미 false라
+    // interruptible_sleep이 다음 청크(≤100ms) 내에 깨어 종료된다. 긴 interval에서도
+    // teardown이 블로킹되지 않는다.
     if let Some((_, status_command_thread)) = status_command {
         let _ = status_command_thread.join();
     }
@@ -4234,13 +4235,24 @@ fn spawn_nested_agent_detection_thread(
 ) -> (mpsc::Receiver<NestedAgentPresence>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(NESTED_AGENT_DETECTION_CHANNEL_LIMIT);
     let handle = thread::spawn(move || {
-        while running.load(Ordering::SeqCst) {
-            let result = nested_known_agent_present(&target).map_err(|err| format!("{err:#}"));
-            let _ = tx.try_send(result);
-            thread::sleep(NESTED_AGENT_POLL);
-        }
+        run_nested_agent_detection_loop(&running, &tx, || {
+            nested_known_agent_present(&target).map_err(|err| format!("{err:#}"))
+        });
     });
     (rx, handle)
+}
+
+fn run_nested_agent_detection_loop(
+    running: &AtomicBool,
+    tx: &mpsc::SyncSender<NestedAgentPresence>,
+    mut poll_presence: impl FnMut() -> NestedAgentPresence,
+) {
+    while running.load(Ordering::SeqCst) {
+        let _ = tx.try_send(poll_presence());
+        if !interruptible_sleep(NESTED_AGENT_POLL, running) {
+            break;
+        }
+    }
 }
 
 fn apply_pending_status_metadata(
@@ -6736,7 +6748,7 @@ mod tests {
         KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
         MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
         MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
-        NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
+        NESTED_AGENT_POLL, NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
         RECONNECT_STATE_SCHEMA_VERSION, RPC_PARSE_ERROR_PREVIEW_BYTES, ResizeTickOutcome,
         STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP,
         StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
@@ -6763,11 +6775,12 @@ mod tests {
         read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
         read_trace_jsonl_line, remember_reconnect_target_best_effort_at_path,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
-        rpc_parse_error_preview, run_status_command, select_status_backend,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        trace_file_summary, trace_output_open_context, trace_summary_text, validate_trace_replay,
-        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
-        write_mobile_transcript_urls, write_numbered_search_matches,
+        rpc_parse_error_preview, run_nested_agent_detection_loop, run_status_command,
+        select_status_backend, should_mobile_transcript_auto, status_sgr_stack_supported,
+        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
+        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
+        write_lterm_title_cue, write_mobile_transcript_update, write_mobile_transcript_urls,
+        write_numbered_search_matches,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -8126,6 +8139,34 @@ mod tests {
         let started = Instant::now();
         assert!(!interruptible_sleep(Duration::from_secs(3600), &running));
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn nested_agent_detection_loop_interrupts_poll_sleep_on_shutdown() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::sync_channel(4);
+        let thread_running = Arc::clone(&running);
+        let handle = std::thread::spawn(move || {
+            run_nested_agent_detection_loop(&thread_running, &tx, || Ok(false));
+        });
+
+        let first_poll = rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("first nested-agent poll should be sent before sleeping");
+        assert_eq!(first_poll, Ok(false));
+        let started = Instant::now();
+        running.store(false, Ordering::SeqCst);
+        handle.join().expect("nested detection thread joins");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "nested detection teardown should not wait for the full {:?} poll sleep; elapsed {:?}",
+            NESTED_AGENT_POLL,
+            started.elapsed()
+        );
     }
 
     /// 지정된 환경 변수의 현재 값을 저장하고, Drop 시 원래 값(또는 unset 상태)으로 복원한다.
