@@ -242,33 +242,57 @@ fn strip_global_flags(raw_args: Vec<String>) -> Result<Vec<String>> {
 }
 
 fn new_session(args: &[String]) -> Result<i32> {
-    let mut detached = false;
-    let mut print = false;
-    let mut format = "#{pane_id}".to_string();
-    let mut name = None;
-    let mut cwd = None;
+    let (parsed, command) = parse_new_session_args(args)?;
+    let command = tmux_shell_command(&command)?;
+    let info = client::new_session(parsed.name, command, parsed.cwd, HashMap::new(), None, true)?;
+    remember_pane(&info, None)?;
+    if parsed.print {
+        println!("{}", expand_format(&parsed.format, &info));
+    }
+    if parsed.detached {
+        Ok(0)
+    } else {
+        client::attach(&info.name, true, AttachStdinEof::KeepAttached)?;
+        Ok(0)
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct NewSessionArgs {
+    detached: bool,
+    print: bool,
+    format: String,
+    name: Option<String>,
+    cwd: Option<String>,
+}
+
+fn parse_new_session_args(args: &[String]) -> Result<(NewSessionArgs, Vec<String>)> {
+    let mut parsed = NewSessionArgs {
+        format: "#{pane_id}".to_string(),
+        ..NewSessionArgs::default()
+    };
     let mut command = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-d" => {
-                detached = true;
+                parsed.detached = true;
                 i += 1;
             }
             "-P" => {
-                print = true;
+                parsed.print = true;
                 i += 1;
             }
             "-F" => {
-                format = value_for_option(args.get(i + 1).cloned(), "-F")?;
+                parsed.format = value_for_option(args.get(i + 1).cloned(), "-F")?;
                 i += 2;
             }
             "-s" => {
-                name = Some(value_for_option(args.get(i + 1).cloned(), "-s")?);
+                parsed.name = Some(value_for_option(args.get(i + 1).cloned(), "-s")?);
                 i += 2;
             }
             "-c" => {
-                cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
+                parsed.cwd = Some(value_for_option(args.get(i + 1).cloned(), "-c")?);
                 i += 2;
             }
             "--" => {
@@ -276,16 +300,8 @@ fn new_session(args: &[String]) -> Result<i32> {
                 break;
             }
             flag if flag.starts_with('-') => {
-                if has_flag_in_arg(flag, 'd') {
-                    detached = true;
-                }
-                if has_flag_in_arg(flag, 'P') {
-                    print = true;
-                }
-                if let Some((_, value)) = short_cluster_flag_value(flag, 'F', args, i) {
-                    format = value_for_option(value.or_else(|| args.get(i + 1).cloned()), "-F")?;
-                }
-                i += flag_arg_width(flag, args, i);
+                let consumed_next = parse_new_session_short_flags(flag, args, i, &mut parsed)?;
+                i += if consumed_next { 2 } else { 1 };
             }
             _ => {
                 command.extend_from_slice(&args[i..]);
@@ -293,18 +309,49 @@ fn new_session(args: &[String]) -> Result<i32> {
             }
         }
     }
-    let command = tmux_shell_command(&command)?;
-    let info = client::new_session(name, command, cwd, HashMap::new(), None, true)?;
-    remember_pane(&info, None)?;
-    if print {
-        println!("{}", expand_format(&format, &info));
+    Ok((parsed, command))
+}
+
+fn parse_new_session_short_flags(
+    flag: &str,
+    args: &[String],
+    i: usize,
+    parsed: &mut NewSessionArgs,
+) -> Result<bool> {
+    let Some(cluster) = short_cluster(flag) else {
+        return Ok(false);
+    };
+    for (pos, short_flag) in cluster.char_indices() {
+        match short_flag {
+            'd' => parsed.detached = true,
+            'P' => parsed.print = true,
+            'F' | 's' | 'c' => {
+                let rest = &cluster[pos + short_flag.len_utf8()..];
+                let (value, consumed_next) = if rest.is_empty() {
+                    (args.get(i + 1).cloned(), true)
+                } else {
+                    (
+                        Some(rest.strip_prefix('=').unwrap_or(rest).to_string()),
+                        false,
+                    )
+                };
+                match short_flag {
+                    'F' => parsed.format = value_for_option(value, "-F")?,
+                    's' => parsed.name = Some(value_for_option(value, "-s")?),
+                    'c' => parsed.cwd = Some(value_for_option(value, "-c")?),
+                    _ => unreachable!("value-taking new-session flag was matched above"),
+                }
+                return Ok(consumed_next);
+            }
+            _ => {
+                if is_value_taking_short_flag(short_flag) {
+                    let rest = &cluster[pos + short_flag.len_utf8()..];
+                    return Ok(rest.is_empty() && args.get(i + 1).is_some());
+                }
+            }
+        }
     }
-    if detached {
-        Ok(0)
-    } else {
-        client::attach(&info.name, true, AttachStdinEof::KeepAttached)?;
-        Ok(0)
-    }
+    Ok(false)
 }
 
 fn new_window(args: &[String]) -> Result<i32> {
@@ -5911,6 +5958,44 @@ mod tests {
                 .to_string()
                 .contains("tmux option -c requires a value")
         );
+    }
+
+    #[test]
+    fn parses_new_session_clustered_value_flags() {
+        let (parsed, command) = parse_new_session_args(&args([
+            "-dPsworker",
+            "-c/tmp/lterm",
+            "-F#{session_name}:#{pane_id}",
+            "--",
+            "echo",
+            "ok",
+        ]))
+        .expect("clustered new-session flags");
+
+        assert_eq!(
+            parsed,
+            NewSessionArgs {
+                detached: true,
+                print: true,
+                format: "#{session_name}:#{pane_id}".to_string(),
+                name: Some("worker".to_string()),
+                cwd: Some("/tmp/lterm".to_string()),
+            }
+        );
+        assert_eq!(command, args(["echo", "ok"]));
+    }
+
+    #[test]
+    fn parses_new_session_clustered_values_from_next_arg() {
+        let (parsed, command) =
+            parse_new_session_args(&args(["-dPs", "worker", "-Pc", "/tmp/lterm", "run"]))
+                .expect("clustered new-session flags with next-arg values");
+
+        assert_eq!(parsed.name.as_deref(), Some("worker"));
+        assert_eq!(parsed.cwd.as_deref(), Some("/tmp/lterm"));
+        assert!(parsed.detached);
+        assert!(parsed.print);
+        assert_eq!(command, args(["run"]));
     }
 
     #[test]
