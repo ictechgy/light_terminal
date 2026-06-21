@@ -184,6 +184,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
     let mut state = EscapeState::Ground;
     // CSI 파라미터/intermediate 바이트 누적 버퍼와 유효성 플래그.
     let mut csi_params: Vec<u8> = Vec::new();
+    let mut csi_param_semicolons = 0_usize;
     let mut csi_valid = true;
     let mut emitted_sgr = false;
     let mut index = 0_usize;
@@ -201,6 +202,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 0x1b => state = EscapeState::Esc,
                 0x9b => {
                     csi_params.clear();
+                    csi_param_semicolons = 0;
                     csi_valid = true;
                     state = EscapeState::Csi;
                 }
@@ -214,6 +216,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                         match ch {
                             '\u{009b}' => {
                                 csi_params.clear();
+                                csi_param_semicolons = 0;
                                 csi_valid = true;
                                 state = EscapeState::Csi;
                             }
@@ -234,6 +237,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 0x1b => state = EscapeState::Esc,
                 b'[' => {
                     csi_params.clear();
+                    csi_param_semicolons = 0;
                     csi_valid = true;
                     state = EscapeState::Csi;
                 }
@@ -241,6 +245,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => state = EscapeState::Charset,
                 0x9b => {
                     csi_params.clear();
+                    csi_param_semicolons = 0;
                     csi_valid = true;
                     state = EscapeState::Csi;
                 }
@@ -274,7 +279,7 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                     let is_sgr = byte == b'm';
                     // 파라미터 개수 = (`;` 개수 + 1). count + 1 <= MAX 는 count < MAX 와 동치.
                     let within_limits = csi_params.len() <= MAX_CSI_PARAM_BYTES
-                        && csi_params.iter().filter(|&&b| b == b';').count() < MAX_CSI_PARAM_COUNT;
+                        && csi_param_semicolons < MAX_CSI_PARAM_COUNT;
                     if allow_color && is_sgr && csi_valid && within_limits {
                         // 정규 `\x1b[<params>m` 형태로 emit(C1형도 정규화됨).
                         out.push('\u{001b}');
@@ -292,7 +297,20 @@ pub fn sanitize_status_command_line(bytes: &[u8], allow_color: bool) -> String {
                 // 파라미터 바이트: `[0-9;:]`만 유효.
                 byte if matches!(byte, b'0'..=b'9' | b';' | b':') => {
                     if csi_valid {
-                        csi_params.push(byte);
+                        let would_exceed_byte_limit = csi_params.len() >= MAX_CSI_PARAM_BYTES;
+                        let would_exceed_param_count =
+                            byte == b';' && csi_param_semicolons >= MAX_CSI_PARAM_COUNT - 1;
+                        if would_exceed_byte_limit || would_exceed_param_count {
+                            // 한도 초과 시 더 이상 누적하지 않고 최종 바이트까지 폐기한다.
+                            // 기존 최종 바이트 판정만으로는 악성 CSI가 EOF/최종 바이트 전까지
+                            // 임의 길이로 Vec를 키울 수 있으므로, push 직전에 fail-closed 한다.
+                            csi_valid = false;
+                        } else {
+                            if byte == b';' {
+                                csi_param_semicolons += 1;
+                            }
+                            csi_params.push(byte);
+                        }
                     }
                 }
                 // private(`<=>?`)·intermediate(`0x20..=0x2f`)·기타는 무효 표시.
@@ -458,8 +476,9 @@ enum StatusSegment<'a> {
 /// 살균된 단일행을 SGR 시퀀스와 가시 텍스트 구간으로 분해한다.
 ///
 /// 입력은 `sanitize_status_command_line` 출력을 가정하므로 escape는 `\x1b[...m`
-/// (최종 바이트 `m`) SGR뿐이다. 그 외 ESC는 나타나지 않지만, 방어적으로 `m`을
-/// 만나지 못하면 남은 전체를 SGR로 흡수해 ESC 누수를 막는다.
+/// (최종 바이트 `m`) SGR뿐이다. 그 외 ESC는 나타나지 않지만, 방어적으로 완결된
+/// 파라미터-only SGR이 아닌 CSI/ESC는 폐기해 unsanitized `ESC[` 입력이 터미널로
+/// 재방출되지 않게 한다.
 fn split_sgr_and_text(line: &str) -> Vec<StatusSegment<'_>> {
     let bytes = line.as_bytes();
     let mut segments: Vec<StatusSegment<'_>> = Vec::new();
@@ -467,22 +486,48 @@ fn split_sgr_and_text(line: &str) -> Vec<StatusSegment<'_>> {
     let mut index = 0_usize;
 
     while index < bytes.len() {
-        // `\x1b[` 로 시작하는 SGR 시퀀스 탐지.
-        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+        if bytes[index] == 0x1b {
             if text_start < index {
                 segments.push(StatusSegment::Text(&line[text_start..index]));
             }
-            // 최종 바이트 `m`까지 흡수.
-            let mut end = index + 2;
-            while end < bytes.len() && bytes[end] != b'm' {
-                end += 1;
+
+            // `\x1b[` 로 시작하는 완결 SGR만 보존한다. 그 외 CSI는 첫 최종 바이트까지
+            // 폐기하고, 최종 바이트가 없으면 EOF까지 폐기해 dangling ESC 누수를 막는다.
+            if index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+                let mut end = index + 2;
+                let mut sgr_valid = true;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'0'..=b'9' | b';' | b':' => end += 1,
+                        b'm' => {
+                            end += 1;
+                            if sgr_valid {
+                                segments.push(StatusSegment::Sgr(&line[index..end]));
+                            }
+                            break;
+                        }
+                        // 다른 CSI 최종 바이트(예: J/K/h/l)는 status row에서 위험하므로 폐기.
+                        0x40..=0x7e => {
+                            end += 1;
+                            break;
+                        }
+                        // Nested ESC는 현재 CSI만 폐기하고 새 ESC부터 다시 재동기화한다.
+                        0x1b => break,
+                        // private/intermediate/제어 바이트 등은 SGR로 인정하지 않되,
+                        // 첫 최종 바이트까지 계속 소비해 파라미터 payload 누수를 줄인다.
+                        _ => {
+                            sgr_valid = false;
+                            end += 1;
+                        }
+                    }
+                }
+                index = end;
+                text_start = index;
+                continue;
             }
-            // `m`을 포함하도록 확장(존재 시).
-            if end < bytes.len() {
-                end += 1;
-            }
-            segments.push(StatusSegment::Sgr(&line[index..end]));
-            index = end;
+
+            // CSI가 아닌 ESC는 ESC byte 자체만 폐기한다.
+            index += 1;
             text_start = index;
             continue;
         }
@@ -890,6 +935,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_status_command_line_bounds_param_accumulation_before_final_byte() {
+        // 최종 바이트 전까지 매우 긴 파라미터를 보내도 내부 CSI 버퍼는 64바이트에서
+        // fail-closed 되고, 최종 `m`에서 시퀀스 전체가 폐기된다.
+        let mut payload = Vec::from(&b"a\x1b["[..]);
+        payload.extend(std::iter::repeat_n(b'1', 128 * 1024));
+        payload.push(b'm');
+        payload.push(b'b');
+
+        let out = sanitize_status_command_line(&payload, true);
+        assert_eq!(out, "ab");
+        assert!(!out.contains('\x1b'), "oversized CSI must not be emitted");
+    }
+
+    #[test]
     fn sanitize_status_command_line_discards_csi_over_param_count_limit() {
         // ⑨ `;`로 분리된 파라미터 개수 > 16이면 폐기(`1;1;...;1` 17개).
         let params = vec!["1"; 17].join(";");
@@ -1030,6 +1089,37 @@ mod tests {
         );
         assert!(out.ends_with("\x1b[0m"), "must close with reset: {out:?}");
         assert_eq!(out, "\x1b[31mAAA…\x1b[0m");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_drops_unsanitized_non_sgr_csi() {
+        // 방어층: 호출자가 실수로 sanitize_status_command_line 출력을 거치지 않은
+        // ESC[2J/ESC[?25h 같은 CSI를 넘겨도 truncate가 다시 방출하지 않는다.
+        let out = truncate_status_line_ansi("a\x1b[2Jb\x1b[?25hc", 10);
+        assert_eq!(out, "abc");
+        assert!(!out.contains('\x1b'), "non-SGR CSI must not be preserved");
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_drops_unsanitized_invalid_csi_ending_in_m() {
+        let private = truncate_status_line_ansi("a\x1b[?25mb", 10);
+        assert_eq!(private, "ab");
+        assert!(!private.contains('\x1b'), "private CSI must not be SGR");
+
+        let with_control = truncate_status_line_ansi("a\x1b[31\x07mb", 10);
+        assert_eq!(with_control, "ab");
+        assert!(
+            !with_control.contains('\x1b'),
+            "control-containing CSI must not be preserved as SGR"
+        );
+    }
+
+    #[test]
+    fn truncate_status_line_ansi_drops_dangling_unsanitized_csi() {
+        let out = truncate_status_line_ansi("a\x1b[31", 10);
+        assert_eq!(out, "a");
+        assert!(!out.contains('\x1b'), "dangling CSI must not leak");
+        assert!(!out.contains("31"), "dangling CSI params must not leak");
     }
 
     #[test]

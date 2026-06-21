@@ -224,20 +224,57 @@ fn validate_private_dir_metadata(path: &Path, meta: &fs::Metadata) -> Result<()>
     validate_private_dir_base_metadata(path, meta)?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        let mut perms = meta.permissions();
-        perms.set_mode(mode & !0o077);
-        fs::set_permissions(path, perms)
-            .with_context(|| format!("tighten permissions on {}", path.display()))?;
-        let tightened =
-            fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
-        if tightened.file_type().is_symlink() {
+        let dir = open_private_dir_no_follow(path)?;
+        let handle_meta = dir
+            .metadata()
+            .with_context(|| format!("fstat {}", path.display()))?;
+        validate_private_dir_base_metadata(path, &handle_meta)?;
+
+        let handle_mode = handle_meta.permissions().mode() & 0o777;
+        if handle_mode & 0o077 != 0 {
+            let mut perms = handle_meta.permissions();
+            perms.set_mode(handle_mode & !0o077);
+            dir.set_permissions(perms)
+                .with_context(|| format!("tighten permissions on {}", path.display()))?;
+        }
+
+        let tightened = dir
+            .metadata()
+            .with_context(|| format!("fstat {}", path.display()))?;
+        validate_private_dir_base_metadata(path, &tightened)?;
+        let tightened_mode = tightened.permissions().mode() & 0o777;
+        if tightened_mode & 0o077 != 0 {
             bail!(
-                "{} became a symlink while tightening permissions",
-                path.display()
+                "{} must be private (mode 0700 or stricter), found {:03o}",
+                path.display(),
+                tightened_mode
+            );
+        }
+
+        // Re-check the path after descriptor-based chmod so callers do not proceed if
+        // the pathname was swapped while permissions were being tightened.
+        let latest =
+            fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+        validate_private_dir_base_metadata(path, &latest)?;
+        let latest_mode = latest.permissions().mode() & 0o777;
+        if latest_mode & 0o077 != 0 {
+            bail!(
+                "{} changed while tightening permissions (mode {:03o})",
+                path.display(),
+                latest_mode
             );
         }
     }
     Ok(())
+}
+
+fn open_private_dir_no_follow(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC);
+    options
+        .open(path)
+        .with_context(|| format!("open private directory {}", path.display()))
 }
 
 fn validate_private_dir_metadata_without_chmod(path: &Path, meta: &fs::Metadata) -> Result<()> {
@@ -653,6 +690,32 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode & 0o077, 0, "group/world bits must be cleared");
+    }
+
+    #[test]
+    fn ensure_private_dir_refuses_symlink_without_chmod_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        fs::create_dir(&target).expect("target dir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("world-readable target dir");
+        let link = dir.path().join("link");
+        symlink(&target, &link).expect("symlink private dir candidate");
+
+        let err = ensure_private_dir(&link).expect_err("symlink private dir must fail");
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected symlink error: {err:#}"
+        );
+        let target_mode = fs::symlink_metadata(&target)
+            .expect("target metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            target_mode, 0o755,
+            "symlink target permissions must not be tightened through the link"
+        );
     }
 
     #[test]
