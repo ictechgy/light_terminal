@@ -3721,8 +3721,10 @@ fn attach_with_presence_and_cue(
             let stdin_fd = stdin.as_raw_fd();
             let mut buf = [0_u8; 8192];
             while input_running.load(Ordering::SeqCst) {
-                if !stdin_has_input(stdin_fd, Duration::from_millis(100))? {
-                    continue;
+                match stdin_input_state(stdin_fd, Duration::from_millis(100))? {
+                    StdinInputState::Pending => continue,
+                    StdinInputState::Ready => {}
+                    StdinInputState::InvalidFd { .. } => break,
                 }
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
@@ -3742,7 +3744,10 @@ fn attach_with_presence_and_cue(
             }
             Ok(())
         })();
-        if detach_on_stdin_eof {
+        if result.is_err() {
+            input_running.store(false, Ordering::SeqCst);
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        } else if detach_on_stdin_eof {
             let _ = writer.shutdown(std::net::Shutdown::Write);
         }
         result
@@ -4130,7 +4135,7 @@ fn attach_with_presence_and_cue(
     })();
 
     running.store(false, Ordering::SeqCst);
-    let _ = input_thread.join();
+    let input_result = join_attach_input_thread(input_thread);
     let _ = resize_thread.join();
     if let Some((_, status_metadata_thread)) = status_metadata {
         let _ = status_metadata_thread.join();
@@ -4143,7 +4148,25 @@ fn attach_with_presence_and_cue(
     if let Some((_, nested_detection_thread)) = nested_detection {
         let _ = nested_detection_thread.join();
     }
-    output_result
+    finish_attach_results(output_result, input_result)
+}
+
+fn join_attach_input_thread(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result.context("attach input thread failed"),
+        Err(_) => bail!("attach input thread panicked"),
+    }
+}
+
+fn finish_attach_results(output_result: Result<()>, input_result: Result<()>) -> Result<()> {
+    match (output_result, input_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(input_err)) => Err(input_err),
+        (Err(output_err), Ok(())) => Err(output_err),
+        (Err(output_err), Err(input_err)) => Err(anyhow!(
+            "{output_err:#}; attach input thread also failed: {input_err:#}"
+        )),
+    }
 }
 
 fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
@@ -6610,7 +6633,14 @@ impl Drop for AttachActiveGuard {
     }
 }
 
-fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinInputState {
+    Ready,
+    Pending,
+    InvalidFd { revents: i16 },
+}
+
+fn stdin_input_state(fd: RawFd, timeout: Duration) -> Result<StdinInputState> {
     let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     let mut pollfd = libc::pollfd {
         fd,
@@ -6620,16 +6650,22 @@ fn stdin_has_input(fd: RawFd, timeout: Duration) -> Result<bool> {
     loop {
         let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
         if rc > 0 {
+            if pollfd.revents & libc::POLLNVAL != 0 {
+                return Ok(StdinInputState::InvalidFd {
+                    revents: pollfd.revents,
+                });
+            }
             if pollfd.revents & libc::POLLERR != 0 {
                 bail!("stdin poll reported error events: {:#x}", pollfd.revents);
             }
-            if pollfd.revents & libc::POLLNVAL != 0 {
-                bail!("stdin poll reported invalid fd: {:#x}", pollfd.revents);
-            }
-            return Ok((pollfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0);
+            return Ok(if pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                StdinInputState::Ready
+            } else {
+                StdinInputState::Pending
+            });
         }
         if rc == 0 {
-            return Ok(false);
+            return Ok(StdinInputState::Pending);
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINTR) {
@@ -6715,11 +6751,11 @@ mod tests {
         compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled, current_unix_ms,
         cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
-        format_status_line, forward_pty_output_frame_or_detached, handle_mobile_transcript_input,
-        handle_resize_tick, heartbeat_due, hex_decode, hex_encode, hex_encoded_len,
-        interruptible_sleep, is_self_provided_tmux, keyboard_protocol_restore_bytes,
-        likely_agent_session, matches_env_bool, mobile_client_detected,
-        mobile_transcript_capture_changed, mobile_transcript_grep_query,
+        finish_attach_results, format_status_line, forward_pty_output_frame_or_detached,
+        handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
+        hex_encoded_len, interruptible_sleep, is_self_provided_tmux, join_attach_input_thread,
+        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
+        mobile_client_detected, mobile_transcript_capture_changed, mobile_transcript_grep_query,
         nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_command_bool, parse_status_command_interval, parse_status_style,
@@ -6737,6 +6773,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -11338,6 +11375,42 @@ mod tests {
         let other =
             anyhow::Error::new(std::io::Error::from(ErrorKind::ConnectionReset)).context("flush");
         assert!(!anyhow_error_is_broken_pipe(&other));
+    }
+
+    #[test]
+    fn attach_input_thread_join_surfaces_worker_errors() {
+        let handle = thread::spawn(|| -> anyhow::Result<()> { anyhow::bail!("stdin failed") });
+
+        let err = join_attach_input_thread(handle).expect_err("input thread error");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("attach input thread failed"), "{err}");
+        assert!(err.contains("stdin failed"), "{err}");
+    }
+
+    #[test]
+    fn attach_result_reports_input_error_when_output_loop_is_clean() {
+        let err = finish_attach_results(Ok(()), Err(anyhow::anyhow!("write pty input")))
+            .expect_err("input error should propagate");
+
+        assert!(format!("{err:#}").contains("write pty input"));
+    }
+
+    #[test]
+    fn attach_result_preserves_output_error_and_mentions_input_error() {
+        let err = finish_attach_results(
+            Err(anyhow::anyhow!("read pty output")),
+            Err(anyhow::anyhow!("read stdin")),
+        )
+        .expect_err("output error should remain primary");
+
+        let err = format!("{err:#}");
+        assert!(
+            err.starts_with("read pty output"),
+            "output error must stay first: {err}"
+        );
+        assert!(err.contains("attach input thread also failed"), "{err}");
+        assert!(err.contains("read stdin"), "{err}");
     }
 
     #[test]
