@@ -542,6 +542,8 @@ to cmux `left` and `up` placements respectively when a visible cmux split is
 created. Detached `new-window -d` / `neww -d` is intentionally partial: it creates
 a standalone lterm helper session, supports tmux-style `-P`/`-F` target printing,
 and rejects attached-window mode instead of silently changing the current pane.
+`wait-for` channels are local lterm compatibility-store keys; they may be up to
+1024 bytes and must not contain control characters.
 Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`,
 alias, support tier, and usage fields, or `--json` for machine-readable rows.
 Support tiers are `full`, `partial`, and `noop` within lterm's compatibility
