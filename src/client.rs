@@ -3644,6 +3644,14 @@ fn attach_with_presence_and_cue(
     // row_runtime은 in-grid DECSTBM row 예약(pty rows-1, scroll-region)을 관장한다.
     // sink(cmux pill)는 off-grid라 풀 rows를 PTY에 넘겨야 하므로 in_grid만 전달한다.
     let row_runtime = StatusPresenceRuntimeHandle::new(in_grid);
+    // `--status` maps to ForceRow: the user explicitly chose to trade a host
+    // row for agent visibility.  Some agent launch modes (for example OMC
+    // madmax) enter alt-screen during startup; if repaint is skipped while the
+    // alt buffer is active, that startup clear erases the initially drawn row
+    // and the explicit status request appears to do nothing.  Keep the old
+    // conservative behavior for RowAuto shell sessions (vim/fullscreen apps),
+    // but let ForceRow self-heal inside alt-screen.
+    let draw_status_during_alt_screen = presence_policy == StatusPresencePolicy::ForceRow;
     let (cols, rows) = terminal_size();
     let pty_rows = row_runtime.pty_rows_for(rows);
 
@@ -3857,6 +3865,7 @@ fn attach_with_presence_and_cue(
                 Arc::clone(&running),
                 Arc::clone(&status_metadata_enabled),
                 Arc::clone(&alt_screen_state),
+                draw_status_during_alt_screen,
                 status_backend.surface_format(),
             )
         });
@@ -3948,7 +3957,7 @@ fn attach_with_presence_and_cue(
                 && row_runtime.can_draw_status()
             {
                 status_dirty = true;
-                if !alt_screen_active
+                if (!alt_screen_active || draw_status_during_alt_screen)
                     && refresh_status_or_detached(
                         &mut status_bar,
                         &mut stdout,
@@ -3974,7 +3983,7 @@ fn attach_with_presence_and_cue(
                     status_bar.command_line = Some(latest);
                     if row_runtime.can_draw_status() {
                         status_dirty = true;
-                        if !alt_screen_active
+                        if (!alt_screen_active || draw_status_during_alt_screen)
                             && refresh_status_or_detached(
                                 &mut status_bar,
                                 &mut stdout,
@@ -4020,7 +4029,7 @@ fn attach_with_presence_and_cue(
                 // 리사이즈 자체는 daemon-side resize 호출이 이미 처리했으므로, alt-screen
                 // 종료 후 edge refresh가 새 크기로 다시 그린다.
                 if row_runtime.can_draw_status()
-                    && !alt_screen_active
+                    && (!alt_screen_active || draw_status_during_alt_screen)
                     && refresh_status_or_detached(
                         &mut status_bar,
                         &mut stdout,
@@ -4046,7 +4055,7 @@ fn attach_with_presence_and_cue(
                 last_forced_redraw = Instant::now();
             }
             if row_runtime.can_draw_status()
-                && !alt_screen_active
+                && (!alt_screen_active || draw_status_during_alt_screen)
                 && heartbeat_due(last_status_refresh.elapsed(), status_dirty, damage_pending)
             {
                 // 이 repaint가 status row 손상을 복구하므로 fast lane 플래그를 여기서 내린다.
@@ -4076,7 +4085,7 @@ fn attach_with_presence_and_cue(
                     // alt-screen 동안 refresh하면 alt buffer로 출력되어 vim 등과 충돌한다.
                     if status_dirty
                         && row_runtime.can_draw_status()
-                        && !alt_screen_active
+                        && (!alt_screen_active || draw_status_during_alt_screen)
                         && refresh_status_or_detached(
                             &mut status_bar,
                             &mut stdout,
@@ -4121,7 +4130,7 @@ fn attach_with_presence_and_cue(
         }
         if status_dirty
             && row_runtime.can_draw_status()
-            && !prev_alt_screen_active
+            && (!prev_alt_screen_active || draw_status_during_alt_screen)
             && refresh_status_or_detached(
                 &mut status_bar,
                 &mut stdout,
@@ -4707,9 +4716,10 @@ fn join_reader_within_grace(
 /// - `allow_color`: stdout SGR 통과 여부.
 /// - `debug`: 실패를 stderr 1줄로 보고할지 여부.
 /// - `running`/`enabled`: metadata 스레드와 동일한 생명주기/일시정지 게이트.
-/// - `alt_screen`: alt-screen(vim 등) 활성 상태. 활성 중에는 그리기가 막히므로
-///   외부 명령 실행도 건너뛴다(draw 가드와 일관). 그리지도 않을 출력을 위해 매
-///   interval마다 외부 프로세스를 spawn하는 낭비를 막는다.
+/// - `alt_screen`: alt-screen(vim 등) 활성 상태.
+/// - `run_during_alt_screen`: ForceRow(`--status`)처럼 draw 가드가 alt-screen 중에도
+///   열리는 명시적 상태줄 요청. false면 그리지도 않을 출력을 위해 매 interval마다
+///   외부 프로세스를 spawn하는 낭비를 막는다.
 /// - `surface_format`: 매 tick의 payload에 직렬화할 출력 포맷(`"cmux-status"`/`"oneline"`).
 ///   backend에서 파생된 내부 상수라 `&'static str`. 설계 §3.3.
 ///
@@ -4724,6 +4734,7 @@ fn spawn_status_command_thread(
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     alt_screen: Arc<AltScreenState>,
+    run_during_alt_screen: bool,
     surface_format: &'static str,
 ) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(STATUS_COMMAND_CHANNEL_LIMIT);
@@ -4736,9 +4747,11 @@ fn spawn_status_command_thread(
             if !interruptible_sleep(interval, &running) {
                 break;
             }
-            // enabled(nested-agent suspend 게이트)이거나 alt-screen 활성 중이면 명령을
-            // 실행하지 않는다. alt-screen 중에는 status row를 그리지 않으므로 spawn 낭비다.
-            if !enabled.load(Ordering::SeqCst) || alt_screen.active.load(Ordering::Relaxed) {
+            // enabled(nested-agent suspend 게이트)이 아니거나, alt-screen 활성 중인데
+            // draw 가드가 닫혀 있으면 명령을 실행하지 않는다.
+            if !enabled.load(Ordering::SeqCst)
+                || (alt_screen.active.load(Ordering::Relaxed) && !run_during_alt_screen)
+            {
                 continue;
             }
             let info: Result<SessionInfo> = rpc_with_read_timeout(

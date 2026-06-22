@@ -11936,6 +11936,54 @@ fn agent_alias_status_default_controls_attached_tty_rendering() -> TestResult {
 
 #[test]
 #[cfg(unix)]
+fn agent_alias_force_status_repaints_after_alt_screen_startup_clear() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omc"),
+        "#!/bin/sh\n\
+         printf 'ARGS:%s\\n' \"$*\"\n\
+         printf '\\033[?1049h\\033[2J\\033[HAGENT_READY\\n'\n\
+         sleep 1\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = run_agent_alias_on_pty_until_exit(
+        &env,
+        &path,
+        &["omc", "--status", "--madmax"],
+        "omc force status after alt-screen startup",
+    )?;
+    assert!(
+        contains_subsequence(&output, b"ARGS:--madmax"),
+        "--madmax should be forwarded to omc: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_subsequence(&output, b"AGENT_READY"),
+        "fake omc marker should be forwarded: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    let alt_enter = find_subsequence(&output, b"\x1b[?1049h").ok_or_else(|| {
+        format!(
+            "fake omc did not emit alt-screen enter: {:?}",
+            String::from_utf8_lossy(&output)
+        )
+    })?;
+    let after_alt_enter = &output[alt_enter..];
+    let status_indicator = b"lterm  omc-lterm";
+    assert!(
+        contains_subsequence(after_alt_enter, status_indicator),
+        "--status/ForceRow should repaint the lterm status row after an agent alt-screen startup clear: {:?}",
+        String::from_utf8_lossy(after_alt_enter)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn agent_launch_controls_set_name_cwd_and_detach() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
