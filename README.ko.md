@@ -17,15 +17,13 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
-## 현재 릴리스: 1.0.29
+## 현재 릴리스: 1.0.30
 
-1.0.29 릴리스는 터미널 세션 복원력과 로컬 trust boundary hardening에 집중합니다.
+1.0.30 릴리스는 OMC madmax 실행에서 명시적으로 요청한 status row가 보이도록 복구하는 데 집중합니다.
 
-- **상한이 있는 tmux wait 상태** — wait-for 채널에 entry/byte 상한을 두고, 손상되거나 지나치게 큰 state file은 quarantine하며, idle store parsing 비용을 줄였습니다.
-- **더 호환되는 tmux shim** — clustered `new-session` value flag를 tmux처럼 파싱하고, `wait --contains --tail`은 출력이 바뀌지 않은 구간의 scanner 진행 상태를 재사용합니다.
-- **명확한 attach 실패 보고** — raw attach의 stdin/input thread 실패를 조용히 놓치지 않고 호출자에게 전달합니다.
-- **강화된 로컬 report와 path 경계** — status/report sanitizer, socket path 처리, peer credential 검증이 spoofing 가능하거나 unsafe한 입력을 trust boundary 안쪽으로 들이기 전에 거부합니다.
-- **빠른 nested-agent teardown** — nested monitor가 다음 poll을 기다리지 않고 teardown 때 즉시 깨어납니다.
+- **OMC madmax status 복구** — `lterm omc --status --madmax`가 OMC 시작 중 alt-screen 진입과 화면 clear를 수행한 뒤에도 요청한 lterm status row를 다시 그립니다.
+- **보수적인 기본값 유지** — 내장 agent launcher는 `--status`를 명시하지 않는 한 기존처럼 전체 높이 raw attach를 기본으로 유지합니다.
+- **회귀 테스트 추가** — PTY smoke test가 `--madmax` 인자 전달과 explicit status 경로의 post-alt-screen status repaint를 검증합니다.
 
 ## 왜 tmux 대신 lterm인가요?
 
@@ -88,7 +86,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.29
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.30
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
