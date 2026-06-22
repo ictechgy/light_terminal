@@ -17,15 +17,13 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.29
+## Current release: 1.0.30
 
-The 1.0.29 release focuses on terminal-session resilience and tighter local trust boundaries:
+The 1.0.30 release focuses on explicit OMC status-row visibility for madmax launches:
 
-- **Bounded tmux wait state** — wait-for channels enforce entry and byte limits, quarantine corrupt or oversized state files, and do less work parsing idle stores.
-- **More compatible tmux shims** — clustered `new-session` value flags parse like tmux, and `wait --contains --tail` reuses scanner progress across unchanged output.
-- **Clearer attach failures** — raw attach reports stdin and input-thread failures instead of silently losing the writer path.
-- **Hardened local reports and paths** — sanitized status/report output, socket path handling, and peer-credential checks reject spoofable or unsafe inputs before they cross trust boundaries.
-- **Faster nested-agent teardown** — nested-agent monitors wake immediately during teardown instead of waiting for the next poll.
+- **OMC madmax status recovery** — `lterm omc --status --madmax` now restores the requested lterm status row after OMC startup enters alt-screen and clears the display.
+- **Conservative defaults preserved** — built-in agent launchers still default to full-height raw attaches unless `--status` explicitly asks for the host row.
+- **Regression coverage** — a PTY smoke test now verifies `--madmax` argument forwarding and post-alt-screen status repaint for the explicit status path.
 
 ## Why lterm instead of plain tmux?
 
@@ -91,7 +89,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.29
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.30
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
