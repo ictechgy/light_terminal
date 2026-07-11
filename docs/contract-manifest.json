@@ -267,6 +267,46 @@
       ]
     },
     {
+      "command": "lterm instrument",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/instrument-snapshot.schema.json",
+      "tests": [
+        "cargo test --bin lterm instrument_requires_json_and_preserves_target",
+        "cargo test --bin lterm instrument_request_and_snapshot_round_trip_with_exact_raw_free_keys",
+        "cargo test --bin lterm instrument_snapshot_tracks_exact_output_bytes_revision_and_close",
+        "cargo test --test cli_smoke instrument_emits_one_raw_free_json_line_and_rejects_unknown_targets",
+        "cargo test --test cli_smoke instrument_rejects_protocol_three_before_sending_instrument_request",
+        "cargo test --test cli_smoke instrument_polling_does_not_perturb_direct_raw_attach"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Instrument is a read-only, raw-free generic RPC and requires --json. It never attaches, captures, traces, parses, sanitizes, or rewrites PTY bytes. Only output_closed, output_revision, and output_total_bytes are copied together; identity, alive, attached_clients, rows, and cols are relaxed independent samples rather than one transactional snapshot. The exact schema contains only opaque identity, booleans, counters, geometry, and observation time; it excludes name, command, cwd, environment, captured text, and raw terminal-derived content.",
+      "json_samples": [
+        {
+          "setup": [
+            [
+              "start",
+              "-d",
+              "-n",
+              "schema-instrument",
+              "--",
+              "sh",
+              "-lc",
+              "sleep 5"
+            ]
+          ],
+          "argv": [
+            "instrument",
+            "schema-instrument",
+            "--json"
+          ]
+        }
+      ]
+    },
+    {
       "command": "lterm processes",
       "aliases": [
         "lterm ps"

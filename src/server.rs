@@ -1,7 +1,7 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, PROTOCOL_VERSION, Request, Response,
-    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, InstrumentSnapshot, PROTOCOL_VERSION,
+    Request, Response, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -417,6 +417,27 @@ impl Session {
             process_group_id: self.process_group_id,
             status_theme: *lock(&self.status_theme),
             agent_name: self.agent_name.clone(),
+        }
+    }
+
+    fn instrument_snapshot_relaxed(&self) -> InstrumentSnapshot {
+        let progress = *lock(&self.output_progress.0);
+        let alive = self.alive.load(Ordering::SeqCst);
+        let attached_clients = lock(&self.subscribers).len();
+        let rows = *lock(&self.rows);
+        let cols = *lock(&self.cols);
+        InstrumentSnapshot {
+            schema_version: "1.0".to_string(),
+            observed_unix_ms: u64::try_from(now_unix_ms()).unwrap_or(u64::MAX),
+            session_id: self.id.clone(),
+            pane_id: self.pane_id.clone(),
+            alive,
+            output_closed: progress.closed,
+            output_revision: progress.revision,
+            output_total_bytes: progress.total_bytes,
+            attached_clients,
+            rows,
+            cols,
         }
     }
 
@@ -1602,6 +1623,9 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::ok(infos))
         }
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
+        Request::Instrument { target } => Ok(Response::ok(
+            resolve_session(state, &target)?.instrument_snapshot_relaxed(),
+        )),
         Request::Rename { target, name } => Ok(Response::ok(rename_session(state, &target, name)?)),
         Request::SetStatusTheme {
             target,
@@ -4237,6 +4261,36 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[test]
+    fn instrument_snapshot_tracks_exact_output_bytes_revision_and_close() {
+        let session = build_test_session("instrument-progress");
+        let initial = session.instrument_snapshot_relaxed();
+        assert_eq!(initial.schema_version, "1.0");
+        assert_eq!(initial.output_total_bytes, 0);
+        assert_eq!(initial.output_revision, 0);
+        assert!(!initial.output_closed);
+        assert_eq!(initial.attached_clients, 0);
+        assert_eq!((initial.rows, initial.cols), (24, 80));
+
+        session.append_output(b"abc");
+        let first = session.instrument_snapshot_relaxed();
+        assert_eq!(first.output_total_bytes, 3);
+        assert!(first.output_revision > initial.output_revision);
+        assert!(!first.output_closed);
+
+        session.append_output(&[0, 0xff, b'\n', 0x1b]);
+        let second = session.instrument_snapshot_relaxed();
+        assert_eq!(second.output_total_bytes, 7);
+        assert!(second.output_revision > first.output_revision);
+        assert!(!second.output_closed);
+
+        session.mark_output_closed();
+        let closed = session.instrument_snapshot_relaxed();
+        assert_eq!(closed.output_total_bytes, 7);
+        assert!(closed.output_revision > second.output_revision);
+        assert!(closed.output_closed);
     }
 
     #[test]

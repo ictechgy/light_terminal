@@ -152,6 +152,7 @@ lterm -a api
 | Reconnect to the last selected session | `lterm reconnect --mobile` | None |
 | Review an agent session in mobile scrollback | `LTERM_MOBILE=1 lterm resume codex-lterm` | Force with `--mobile`; force raw with `--raw` |
 | List sessions | `lterm sessions` | `list`, `ls` |
+| Measure a session without attaching or reading PTY bytes | `lterm instrument api --json` | None |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
@@ -210,6 +211,14 @@ Compatibility names are subcommands unless shown as a leading flag: `-a` is the 
 This table is the product CLI surface for humans and agents. `lterm tmux-compat ...` is a separate shim namespace for scripts that already speak tmux; not every product command has a tmux-compatible spelling. Use `lterm tmux-compat list-commands` to inspect the supported shim subset at runtime, and `lterm tmux-compat --version` when you only need the compatibility version banner.
 
 `lterm sessions` hides child panes by default, preserves the original first five tab-separated columns (`name`, `pane`, `alive`, `cwd`, `command`), then appends attach state (`attached` / `detached`) and parent pane (`-` or a pane id). The JSON form also includes optional `agent_name` metadata for sessions launched through an agent profile; non-agent sessions omit that field. The compatibility names `lterm list` and `lterm ls` keep the same text output shape. Attached clients render a small status bar on the bottom row showing the current session and pane; the PTY is resized to the remaining rows. To force the older raw full-terminal resume, use `lterm resume --raw --no-status api` (or compatibility name `lterm attach --raw --no-status api`) or set `LTERM_ATTACH_MODE=raw`; add `LTERM_NO_STATUS=1` or `LTERM_STATUS=0` when only the status line conflicts with the client.
+
+`lterm instrument <target> --json` prints one raw-free measurement snapshot on
+a normal daemon RPC connection. It reports opaque ids, liveness/output progress,
+attached-client count, and geometry without attaching, capturing, tracing, or
+reading PTY bytes. Output progress is coherent as a three-field group; the
+other values are relaxed independent samples rather than a transactional
+snapshot. See the [public contract](docs/public-contract.md) for the exact
+schema and privacy boundary.
 
 Row presence is separate from attach mode. `--attach-mode=auto` still chooses the raw-vs-mobile transcript transport only. On the raw attach path, ordinary sessions keep the row by default, while built-in agent launchers and later `resume` / `open` attaches to known agent sessions default to a full-height row-off surface. Direct agent launchers emit a compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner before attach when the terminal supports it; while attached row-off, lterm periodically refreshes only the title cue after idle gaps so Codex-like TUIs can overwrite their own title without losing the lterm identity. Set `LTERM_AGENT_CUE=0` to suppress both the terminal-title cue and banner, or `LTERM_AGENT_BANNER=0` to suppress only the inline banner while keeping the terminal-title cue. When a row-on shell session later appears to run a known agent command as a child process, lterm may best-effort suspend the row and restore full PTY height until that agent exits; ambiguous process detection fails safe by keeping the row. The global `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` status kill-switches still win over CLI status requests.
 
