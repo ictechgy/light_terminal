@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 /// Maximum decoded byte length accepted for `Request::Send` payloads.
 ///
@@ -7,7 +8,9 @@ use std::collections::HashMap;
 /// base64 inside JSON. Keep the decoded cap below that frame limit with margin
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",
@@ -128,6 +131,95 @@ pub struct InstrumentSnapshot {
     pub cols: u16,
 }
 
+/// Opaque daemon-generated input capability. Debug output is deliberately
+/// redacted because tokens are bearer credentials inside the cooperative
+/// same-UID trust boundary.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityToken(String);
+
+impl CapabilityToken {
+    pub fn from_canonical(value: String) -> Option<Self> {
+        let parsed = uuid::Uuid::parse_str(&value).ok()?;
+        (parsed.hyphenated().to_string() == value).then_some(Self(value))
+    }
+
+    pub fn new_random() -> Self {
+        Self(uuid::Uuid::new_v4().hyphenated().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapabilityToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilityToken([REDACTED])")
+    }
+}
+
+impl Serialize for CapabilityToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_canonical(value)
+            .ok_or_else(|| serde::de::Error::custom("invalid capability token format"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAction {
+    Input,
+    Revoke,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueInputCapabilityResult {
+    pub token: CapabilityToken,
+    pub byte_budget: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SensitiveCapabilityRequest {
+    Input {
+        token: CapabilityToken,
+        #[serde(with = "capability_data_serde")]
+        data: Vec<u8>,
+    },
+    Revoke {
+        token: CapabilityToken,
+    },
+}
+
+impl fmt::Debug for SensitiveCapabilityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input { token, data } => formatter
+                .debug_struct("Input")
+                .field("token", token)
+                .field("data_len", &data.len())
+                .finish(),
+            Self::Revoke { token } => formatter
+                .debug_struct("Revoke")
+                .field("token", token)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitExitResult {
     pub session: SessionInfo,
@@ -171,6 +263,13 @@ pub enum Request {
     },
     Instrument {
         target: String,
+    },
+    IssueInputCapability {
+        target: String,
+        byte_budget: u64,
+    },
+    CapabilityChannel {
+        action: CapabilityAction,
     },
     Rename {
         target: String,
@@ -331,7 +430,7 @@ mod send_data_serde {
         }
     }
 
-    fn encode_base64(data: &[u8]) -> String {
+    pub(super) fn encode_base64(data: &[u8]) -> String {
         let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
         for chunk in data.chunks(3) {
             let b0 = chunk[0];
@@ -354,7 +453,7 @@ mod send_data_serde {
         out
     }
 
-    fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    pub(super) fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         if !value.is_ascii() {
             return Err("base64 data must be ASCII".to_string());
         }
@@ -439,13 +538,98 @@ mod send_data_serde {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+mod capability_data_serde {
+    use super::{MAX_CAPABILITY_INPUT_BYTES, send_data_serde};
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&send_data_serde::encode_base64(data))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(CapabilityDataVisitor)
+    }
+
+    struct CapabilityDataVisitor;
+
+    impl<'de> Visitor<'de> for CapabilityDataVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("bounded base64 capability input")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let max_encoded = MAX_CAPABILITY_INPUT_BYTES.div_ceil(3) * 4;
+            if value.len() > max_encoded {
+                return Err(E::custom(format!(
+                    "capability input exceeds {MAX_CAPABILITY_INPUT_BYTES} bytes"
+                )));
+            }
+            let bytes = send_data_serde::decode_base64(value).map_err(E::custom)?;
+            if bytes.len() > MAX_CAPABILITY_INPUT_BYTES {
+                return Err(E::custom(format!(
+                    "capability input exceeds {MAX_CAPABILITY_INPUT_BYTES} bytes"
+                )));
+            }
+            Ok(bytes)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_CAPABILITY_INPUT_BYTES));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if bytes.len() >= MAX_CAPABILITY_INPUT_BYTES {
+                    return Err(de::Error::custom(format!(
+                        "capability input exceeds {MAX_CAPABILITY_INPUT_BYTES} bytes"
+                    )));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Response")
+            .field("ok", &self.ok)
+            .field("error_present", &self.error.is_some())
+            .field("result_present", &self.result.is_some())
+            .finish()
+    }
 }
 
 impl Response {
@@ -479,7 +663,10 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstrumentSnapshot, MAX_SEND_DATA_BYTES, Request, SessionInfo, StatusTheme};
+    use super::{
+        CapabilityAction, CapabilityToken, InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES,
+        MAX_SEND_DATA_BYTES, Request, SensitiveCapabilityRequest, SessionInfo, StatusTheme,
+    };
 
     #[test]
     fn status_theme_parse_aliases_and_round_trips_canonical_names() {
@@ -604,6 +791,64 @@ mod tests {
             round_trip,
             Request::Send { data, .. } if data == b"hello\r\n\0"
         ));
+    }
+
+    #[test]
+    fn capability_frames_are_separate_and_token_debug_is_redacted() {
+        let token =
+            CapabilityToken::from_canonical("123e4567-e89b-42d3-a456-426614174000".to_string())
+                .expect("canonical v4-shaped UUID");
+        assert_eq!(format!("{token:?}"), "CapabilityToken([REDACTED])");
+        assert!(!format!("{token:?}").contains(token.as_str()));
+
+        let hello = serde_json::to_value(Request::CapabilityChannel {
+            action: CapabilityAction::Input,
+        })
+        .expect("serialize nonsecret hello");
+        assert_eq!(
+            hello,
+            serde_json::json!({"type":"capability_channel","action":"input"})
+        );
+        assert!(!hello.to_string().contains(token.as_str()));
+
+        let sensitive = SensitiveCapabilityRequest::Input {
+            token: token.clone(),
+            data: b"\0\xff\r\n\x1b".to_vec(),
+        };
+        let debug = format!("{sensitive:?}");
+        assert!(debug.contains("data_len"));
+        assert!(!debug.contains(token.as_str()));
+        assert!(!debug.contains("xff"));
+        let value = serde_json::to_value(&sensitive).expect("serialize sensitive input");
+        let decoded: SensitiveCapabilityRequest =
+            serde_json::from_value(value).expect("deserialize sensitive input");
+        assert!(
+            matches!(decoded, SensitiveCapabilityRequest::Input { token: actual, data } if actual == token && data == b"\0\xff\r\n\x1b")
+        );
+
+        let issued = super::IssueInputCapabilityResult {
+            token: token.clone(),
+            byte_budget: 8,
+        };
+        let response = super::Response::ok(issued);
+        let response_debug = format!("{response:?}");
+        assert_eq!(
+            response_debug,
+            "Response { ok: true, error_present: false, result_present: true }"
+        );
+        assert!(!response_debug.contains(token.as_str()));
+    }
+
+    #[test]
+    fn sensitive_capability_input_rejects_over_64k_during_decode() {
+        let encoded = "A".repeat((MAX_CAPABILITY_INPUT_BYTES + 1).div_ceil(3) * 4);
+        let err = serde_json::from_value::<SensitiveCapabilityRequest>(serde_json::json!({
+            "type": "input",
+            "token": "123e4567-e89b-42d3-a456-426614174000",
+            "data": encoded,
+        }))
+        .expect_err("oversized capability input should fail");
+        assert!(err.to_string().contains("capability input exceeds"));
     }
 
     #[test]

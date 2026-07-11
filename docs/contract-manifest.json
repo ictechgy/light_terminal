@@ -307,6 +307,37 @@
       ]
     },
     {
+      "command": "lterm capability",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --bin lterm capability_commands_keep_tokens_out_of_argv",
+        "cargo test --bin lterm capability_frames_are_separate_and_token_debug_is_redacted",
+        "cargo test --bin lterm capability_reservation_is_atomic_charged_and_revocation_is_idempotent",
+        "cargo test --bin lterm capability_teardown_purges_grants_and_dead_or_unknown_tokens_are_generic",
+        "cargo test --bin lterm capability_file_is_exclusive_private_and_exact_format_only",
+        "cargo test --bin lterm capability_file_rejects_symlink_and_wrong_mode",
+        "cargo test --test cli_smoke cooperative_input_capability_delivers_exact_binary_and_enforces_budget",
+        "cargo test --test cli_smoke capability_daemon_swap_sends_only_nonsecret_hello_before_ready",
+        "cargo test --bin lterm capability_partial_and_full_write_failures_charge_the_full_attempt",
+        "cargo test --bin lterm capability_issuance_enforces_per_session_and_global_caps",
+        "cargo test --bin lterm capability_reservation_before_revoke_may_finish_but_later_use_fails",
+        "cargo test --bin lterm capability_issue_and_teardown_follow_sessions_then_registry_order",
+        "cargo test --bin lterm capability_reservation_before_teardown_may_finish_but_later_use_fails",
+        "cargo test --bin lterm capability_rename_and_pane_reuse_never_migrate_grant",
+        "cargo test --bin lterm capability_persistence_failure_cleanup_refuses_replaced_path_leaf",
+        "cargo test --bin lterm malformed_sensitive_capability_frame_error_never_contains_payload_sentinel",
+        "cargo test --test cli_smoke capability_revoke_refuses_replaced_path_after_daemon_success",
+        "cargo test --test cli_smoke capability_revoke_transport_failure_retains_private_file"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "not-applicable",
+      "stability_scope": "Capability is an opt-in cooperative input attenuation surface inside the existing same-UID trust boundary, not a sandbox. Tokens exist only in validated private files and a same-connection v5 sensitive frame; raw Attach and legacy Send remain unchanged. Attempt bytes are atomically charged before one PTY write and are not refunded on failure."
+    },
+    {
       "command": "lterm processes",
       "aliases": [
         "lterm ps"

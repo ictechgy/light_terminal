@@ -153,6 +153,7 @@ lterm -a api
 | Review an agent session in mobile scrollback | `LTERM_MOBILE=1 lterm resume codex-lterm` | Force with `--mobile`; force raw with `--raw` |
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Measure a session without attaching or reading PTY bytes | `lterm instrument api --json` | None |
+| Delegate finite cooperative input authority | `lterm capability issue-input api --bytes 4096 --output ./api.input-cap` | None |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
@@ -219,6 +220,32 @@ reading PTY bytes. Output progress is coherent as a three-field group; the
 other values are relaxed independent samples rather than a transactional
 snapshot. See the [public contract](docs/public-contract.md) for the exact
 schema and privacy boundary.
+
+`lterm capability` provides an opt-in cooperative input voucher for agents that
+choose a least-authority integration path. Issue a daemon-generated capability
+to a new private file, pipe exact binary input through it, and revoke it when
+finished:
+
+```sh
+lterm capability issue-input api --bytes 4096 --output ./api.input-cap
+printf 'cargo test\r' | lterm capability input --capability ./api.input-cap
+lterm capability revoke --capability ./api.input-cap
+```
+
+The file is exclusively created as an owner-only `0600` regular file and is
+the only place the bearer token is persisted; lterm does not print the token.
+Input is read exactly from stdin (including NUL, invalid UTF-8, CR/LF, and ESC),
+with a 64 KiB per-operation limit and a 1 MiB maximum issued attempt budget.
+The daemon atomically charges the complete attempted payload before one PTY
+write and does not refund partial or failed writes. Capabilities are bound to
+an immutable session id, disappear on daemon restart/session teardown, and do
+not migrate on rename or pane reuse.
+
+This is **cooperative attenuation, not a same-user sandbox**. Any process with
+the same OS uid can still use lterm's legacy ambient `input`/`send` or raw
+attach APIs unless an external sandbox denies access to the daemon socket.
+Keep capability files private, do not copy them into repositories, and revoke
+them after use. The raw Attach stream and legacy Send behavior are unchanged.
 
 Row presence is separate from attach mode. `--attach-mode=auto` still chooses the raw-vs-mobile transcript transport only. On the raw attach path, ordinary sessions keep the row by default, while built-in agent launchers and later `resume` / `open` attaches to known agent sessions default to a full-height row-off surface. Direct agent launchers emit a compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner before attach when the terminal supports it; while attached row-off, lterm periodically refreshes only the title cue after idle gaps so Codex-like TUIs can overwrite their own title without losing the lterm identity. Set `LTERM_AGENT_CUE=0` to suppress both the terminal-title cue and banner, or `LTERM_AGENT_BANNER=0` to suppress only the inline banner while keeping the terminal-title cue. When a row-on shell session later appears to run a known agent command as a child process, lterm may best-effort suspend the row and restore full PTY height until that agent exits; ambiguous process detection fails safe by keeping the row. The global `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` status kill-switches still win over CLI status requests.
 

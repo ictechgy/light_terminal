@@ -268,6 +268,11 @@ enum Commands {
         #[arg(long)]
         enter: bool,
     },
+    /// Issue and use cooperative least-authority session capabilities.
+    Capability {
+        #[command(subcommand)]
+        command: CapabilityCommands,
+    },
     /// Capture scrollback from a session or pane.
     #[command(name = "logs", visible_alias = "capture")]
     Logs {
@@ -650,6 +655,34 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CapabilityCommands {
+    /// Issue a finite byte-budget input capability into a private file.
+    #[command(name = "issue-input")]
+    IssueInput {
+        /// Session or pane target to receive delegated input.
+        target: String,
+        /// Total attempted input bytes authorized by this capability.
+        #[arg(long, value_name = "N")]
+        bytes: u64,
+        /// Private capability file to create; existing paths are refused.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Send exact binary stdin through an input capability.
+    Input {
+        /// Private capability file created by issue-input.
+        #[arg(long, value_name = "PATH")]
+        capability: PathBuf,
+    },
+    /// Idempotently revoke a capability and remove its private file on success.
+    Revoke {
+        /// Private capability file created by issue-input.
+        #[arg(long, value_name = "PATH")]
+        capability: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ShellKind {
     Bash,
@@ -909,6 +942,18 @@ fn run() -> Result<()> {
             text,
             enter,
         } => client::send(&target, input_commit_bytes(text, enter)),
+        Commands::Capability { command } => match command {
+            CapabilityCommands::IssueInput {
+                target,
+                bytes,
+                output,
+            } => client::issue_input_capability(&target, bytes, &output),
+            CapabilityCommands::Input { capability } => {
+                let stdin = std::io::stdin();
+                client::input_with_capability(&capability, &mut stdin.lock())
+            }
+            CapabilityCommands::Revoke { capability } => client::revoke_capability(&capability),
+        },
         Commands::Logs { target, start, end } => {
             let output = if end.is_some() {
                 client::capture_range(&target, start, end)?
@@ -3842,6 +3887,42 @@ mod tests {
             panic!("expected inspect command");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn capability_commands_keep_tokens_out_of_argv() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "capability",
+            "issue-input",
+            "%7",
+            "--bytes",
+            "8",
+            "--output",
+            "/tmp/input.cap",
+        ])
+        .expect("issue-input should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Capability {
+                command: CapabilityCommands::IssueInput { target, bytes: 8, output }
+            } if target == "%7" && output.as_path() == Path::new("/tmp/input.cap")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "capability",
+            "input",
+            "--capability",
+            "/tmp/input.cap",
+        ])
+        .expect("capability input should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Capability {
+                command: CapabilityCommands::Input { capability }
+            } if capability.as_path() == Path::new("/tmp/input.cap")
+        ));
     }
 
     #[test]

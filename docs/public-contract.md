@@ -146,6 +146,7 @@ or raw output stream.
 | `lterm reconnect` | none | `explicit-raw-unsafe` | none at command level; raw stream is transparent; private last-session pointer is best-effort; mobile transcript output is sanitized | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm instrument` | none | `stable` | none | `stable` raw-free measurement snapshot; `--json` is required | `sanitized-output-only` |
+| `lterm capability` | none | `stable` | none | none | `not-applicable` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
@@ -187,6 +188,56 @@ independently. Consumers may use the counters for monotonic progress but must
 not infer that every field describes one atomic instant. Protocol-3 daemons are
 rejected before the client sends an instrument request, with restart/upgrade
 guidance.
+
+### `lterm capability` cooperative attenuation semantics
+
+`lterm capability issue-input TARGET --bytes N --output PATH` creates one
+daemon-generated UUIDv4 bearer capability bound to the target's immutable
+session identity and a finite attempted-input byte budget. `N` is 1 through
+1 MiB. The daemon keeps at most 1024 live input capabilities globally and 64
+per session. Rename and pane/name reuse do not migrate a grant; session removal
+purges its grants and daemon restart invalidates all grants.
+
+The output file is exclusive-create, `O_NOFOLLOW`, current-euid-owned, exactly
+`0600`, regular, single-link, and synced before success. Its private format is
+`lterm-input-capability-v1\n<CANONICAL-UUID>\n`; callers must treat the entire
+file as opaque and secret. Existing files, symlinks, hard-linked files, wrong
+owners or modes, non-regular files, oversized files, truncation, and trailing
+data are rejected. The token is never accepted in argv or environment and is
+not printed to normal stdout/stderr, logs, diagnostics, or session metadata.
+
+`lterm capability input --capability PATH` reads exact binary stdin to EOF,
+preserving NUL, invalid UTF-8, CR/LF, and ESC. Empty input is rejected and one
+operation is limited to 64 KiB. The client first opens a same-connection
+protocol-v5 channel with a nonsecret hello, validates the ready response, and
+only then opens the private file and sends one sensitive frame. An old or
+swapped daemon therefore receives no token or payload before proving the v5
+channel. Sensitive request and issue-response parse failures report only frame
+kind/length, without payload previews.
+
+Authorization subtracts the complete payload atomically under the capability
+registry mutex before releasing it and performing one PTY `write_all`. A
+partial or failed write is not refunded. Oversized, over-budget, exhausted,
+unknown, dead-session, and revoked tokens touch no PTY and return a generic
+non-oracular rejection. A reservation that linearizes before concurrent revoke
+or teardown may finish; later reservations fail. `revoke` is idempotent at the
+daemon for valid tokens. Successful CLI revoke unlinks the validated private
+file; transport/protocol failure preserves it, while unsafe or malformed files
+send nothing and are not unlinked.
+
+Before unlinking, the client reopens and fully revalidates the capability file,
+compares its device/inode identity and token with the file used for the
+operation, then checks the leaf identity once more immediately before removal.
+A detected path replacement is never deleted. Portable POSIX APIs do not offer
+an atomic "unlink this already-open fd" operation, so a malicious same-UID
+process can still race after the final identity check; that residual limitation
+is part of the cooperative same-UID boundary rather than a sandbox guarantee.
+
+This surface is cooperative attenuation inside lterm's existing owner-only
+socket and same-UID peer-credential boundary. It is not protection from a
+malicious same-UID process: that process retains ambient access to legacy
+`lterm input`/`send` and raw Attach unless an external sandbox denies the socket.
+The capability protocol does not modify either legacy Send or raw Attach.
 
 ### `lterm urls` stable extraction semantics
 

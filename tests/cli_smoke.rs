@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -197,6 +197,61 @@ impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = self.cmd().arg("shutdown").status();
     }
+}
+
+#[cfg(unix)]
+fn spawn_fake_capability_server<F>(
+    listener: UnixListener,
+    before_operation_response: F,
+    send_success: bool,
+) -> thread::JoinHandle<Result<Vec<u8>, String>>
+where
+    F: FnOnce() -> TestResult + Send + 'static,
+{
+    thread::spawn(move || {
+        (|| -> TestResult<Vec<u8>> {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let response = if request["type"] == "ping" {
+                    serde_json::json!({"ok":true,"result":{"pong":true}})
+                } else {
+                    serde_json::json!({"ok":true,"result":{
+                        "version":"1.0.30",
+                        "protocol_version":5,
+                        "session_count":0,
+                        "active_connections":1,
+                        "shutting_down":false
+                    }})
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut hello = Vec::new();
+            reader.read_until(b'\n', &mut hello)?;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&hello)?["type"],
+                "capability_channel"
+            );
+            reader
+                .get_mut()
+                .write_all(b"{\"ok\":true,\"result\":{\"ready\":true,\"protocol_version\":5}}\n")?;
+            reader.get_mut().flush()?;
+            let mut sensitive = Vec::new();
+            reader.read_until(b'\n', &mut sensitive)?;
+            before_operation_response()?;
+            if send_success {
+                reader.get_mut().write_all(b"{\"ok\":true}\n")?;
+                reader.get_mut().flush()?;
+            }
+            Ok(sensitive)
+        })()
+        .map_err(|err| err.to_string())
+    })
 }
 
 enum PollStatus<T> {
@@ -3968,6 +4023,184 @@ fn instrument_rejects_protocol_three_before_sending_instrument_request() -> Test
             .map_err(|_| "fake daemon requests lock poisoned")?,
         ["ping", "status", "status"]
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn capability_daemon_swap_sends_only_nonsecret_hello_before_ready() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run_dir.join("lterm.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let thread_observed = observed.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let response = if request["type"] == "ping" {
+                    serde_json::json!({"ok":true,"result":{"pong":true}})
+                } else {
+                    serde_json::json!({"ok":true,"result":{
+                        "version":"1.0.30",
+                        "protocol_version":5,
+                        "session_count":0,
+                        "active_connections":1,
+                        "shutting_down":false
+                    }})
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut hello = Vec::new();
+            reader.read_until(b'\n', &mut hello)?;
+            *thread_observed
+                .lock()
+                .map_err(|_| "observed hello lock poisoned")? = hello;
+            reader
+                .get_mut()
+                .write_all(b"{\"ok\":false,\"error\":\"unknown request type\"}\n")?;
+            reader.get_mut().flush()?;
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let sentinel = "123e4567-e89b-42d3-a456-426614174000";
+    let capability = env.temp.path().join("swap.cap");
+    std::fs::write(
+        &capability,
+        format!("lterm-input-capability-v1\n{sentinel}\n"),
+    )?;
+    std::fs::set_permissions(&capability, std::fs::Permissions::from_mode(0o600))?;
+    let mut child = env
+        .cmd()
+        .args(["capability", "input", "--capability"])
+        .arg(&capability)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("capability stdin unavailable")?
+        .write_all(b"SECRET_PAYLOAD")?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success(), "swap daemon must reject channel");
+    server.join().map_err(|_| "fake swap daemon panicked")??;
+    let hello = observed
+        .lock()
+        .map_err(|_| "observed hello lock poisoned")?
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&hello)?["type"],
+        "capability_channel"
+    );
+    assert!(
+        !hello
+            .windows(sentinel.len())
+            .any(|part| part == sentinel.as_bytes())
+    );
+    assert!(!hello.windows(14).any(|part| part == b"SECRET_PAYLOAD"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET_PAYLOAD"));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn capability_revoke_refuses_replaced_path_after_daemon_success() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let capability = env.temp.path().join("revoke-replace.cap");
+    let original = env.temp.path().join("revoke-original.cap");
+    let original_token = "123e4567-e89b-42d3-a456-426614174000";
+    let replacement_token = "223e4567-e89b-42d3-a456-426614174000";
+    std::fs::write(
+        &capability,
+        format!("lterm-input-capability-v1\n{original_token}\n"),
+    )?;
+    std::fs::set_permissions(&capability, std::fs::Permissions::from_mode(0o600))?;
+    let replace_path = capability.clone();
+    let replace_original = original.clone();
+    let server = spawn_fake_capability_server(
+        listener,
+        move || {
+            std::fs::rename(&replace_path, &replace_original)?;
+            std::fs::write(
+                &replace_path,
+                format!("lterm-input-capability-v1\n{replacement_token}\n"),
+            )?;
+            std::fs::set_permissions(&replace_path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        },
+        true,
+    );
+    let output = env
+        .cmd()
+        .args(["capability", "revoke", "--capability"])
+        .arg(&capability)
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "replaced leaf must not be removed"
+    );
+    assert_stderr_contains(&output, "changed; refusing to unlink");
+    let sensitive = server
+        .join()
+        .map_err(|_| "fake capability server panicked")??;
+    assert!(
+        String::from_utf8_lossy(&sensitive).contains(original_token),
+        "server should receive only the originally validated token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&capability)?,
+        format!("lterm-input-capability-v1\n{replacement_token}\n")
+    );
+    assert!(original.exists(), "original inode remains at moved path");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn capability_revoke_transport_failure_retains_private_file() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let capability = env.temp.path().join("revoke-transport.cap");
+    let token = "123e4567-e89b-42d3-a456-426614174000";
+    let contents = format!("lterm-input-capability-v1\n{token}\n");
+    std::fs::write(&capability, &contents)?;
+    std::fs::set_permissions(&capability, std::fs::Permissions::from_mode(0o600))?;
+    let server = spawn_fake_capability_server(listener, || Ok(()), false);
+    let output = env
+        .cmd()
+        .args(["capability", "revoke", "--capability"])
+        .arg(&capability)
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "missing operation response must fail"
+    );
+    let sensitive = server
+        .join()
+        .map_err(|_| "fake capability server panicked")??;
+    assert!(String::from_utf8_lossy(&sensitive).contains(token));
+    assert_eq!(std::fs::read_to_string(&capability)?, contents);
     Ok(())
 }
 
@@ -14297,6 +14530,104 @@ fn instrument_polling_does_not_perturb_direct_raw_attach() -> TestResult {
     assert_eq!(after["rows"], baseline["rows"]);
     assert_eq!(after["cols"], baseline["cols"]);
 
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn cooperative_input_capability_delivers_exact_binary_and_enforces_budget() -> TestResult {
+    let env = TestEnv::new()?;
+    let cap = env.temp.path().join("exact-input.cap");
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "cap-binary",
+            "--",
+            "sh",
+            "-lc",
+            "stty raw -echo; printf CAP_READY\\n; dd bs=1 count=7 2>/dev/null | od -An -tx1; printf '\\nCAP_DONE\\n'; sleep 2",
+        ])
+        .status()?;
+    assert!(status.success(), "create capability target");
+    env.capture_until("cap-binary", "CAP_READY")?;
+
+    let issue = env
+        .cmd()
+        .args([
+            "capability",
+            "issue-input",
+            "cap-binary",
+            "--bytes",
+            "7",
+            "--output",
+        ])
+        .arg(&cap)
+        .output()?;
+    assert!(issue.status.success(), "issue failed: {issue:?}");
+    assert!(issue.stdout.is_empty(), "token must not reach stdout");
+    assert_eq!(std::fs::metadata(&cap)?.permissions().mode() & 0o777, 0o600);
+    let private = std::fs::read_to_string(&cap)?;
+    assert!(private.starts_with("lterm-input-capability-v1\n"));
+
+    let exact = [0x00, 0xff, 0x80, 0x0d, 0x0a, 0x1b, 0x41];
+    let mut child = env
+        .cmd()
+        .args(["capability", "input", "--capability"])
+        .arg(&cap)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("capability stdin unavailable")?
+        .write_all(&exact)?;
+    let input = child.wait_with_output()?;
+    assert!(input.status.success(), "capability input failed: {input:?}");
+    assert!(input.stdout.is_empty(), "capability input must be silent");
+    let captured = env.capture_until("cap-binary", "CAP_DONE")?;
+    let words = captured.split_whitespace().collect::<Vec<_>>();
+    assert!(
+        words
+            .windows(7)
+            .any(|window| window == ["00", "ff", "80", "0d", "0a", "1b", "41"]),
+        "exact binary payload was not preserved: {captured:?}"
+    );
+
+    let over = env
+        .cmd()
+        .args(["capability", "input", "--capability"])
+        .arg(&cap)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut over = over;
+    over.stdin
+        .take()
+        .ok_or("over-budget stdin unavailable")?
+        .write_all(b"x")?;
+    let rejected = over.wait_with_output()?;
+    assert!(!rejected.status.success(), "exhausted token must fail");
+    assert!(
+        !String::from_utf8_lossy(&rejected.stderr).contains(private.trim()),
+        "stderr must not reveal the token"
+    );
+
+    let revoke = env
+        .cmd()
+        .args(["capability", "revoke", "--capability"])
+        .arg(&cap)
+        .output()?;
+    assert!(
+        revoke.status.success(),
+        "idempotent revoke failed: {revoke:?}"
+    );
+    assert!(!cap.exists(), "successful revoke must unlink the file");
     Ok(())
 }
 
