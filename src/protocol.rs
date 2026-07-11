@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// base64 inside JSON. Keep the decoded cap below that frame limit with margin
 /// for base64 expansion plus the request envelope.
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",
@@ -108,6 +108,26 @@ pub struct DaemonStatus {
     pub started_at_unix_secs: Option<u64>,
 }
 
+/// Raw-free, read-only measurements for one live or recently exited session.
+///
+/// Only `output_closed`, `output_revision`, and `output_total_bytes` are copied
+/// as one coherent group. The remaining fields are sampled independently, so
+/// this is intentionally a relaxed snapshot rather than a transactional view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentSnapshot {
+    pub schema_version: String,
+    pub observed_unix_ms: u64,
+    pub session_id: String,
+    pub pane_id: String,
+    pub alive: bool,
+    pub output_closed: bool,
+    pub output_revision: u64,
+    pub output_total_bytes: u64,
+    pub attached_clients: usize,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitExitResult {
     pub session: SessionInfo,
@@ -147,6 +167,9 @@ pub enum Request {
     },
     List,
     Info {
+        target: String,
+    },
+    Instrument {
         target: String,
     },
     Rename {
@@ -456,7 +479,7 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SEND_DATA_BYTES, Request, SessionInfo, StatusTheme};
+    use super::{InstrumentSnapshot, MAX_SEND_DATA_BYTES, Request, SessionInfo, StatusTheme};
 
     #[test]
     fn status_theme_parse_aliases_and_round_trips_canonical_names() {
@@ -502,6 +525,69 @@ mod tests {
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
         assert_eq!(info.status_theme, None);
+    }
+
+    #[test]
+    fn instrument_request_and_snapshot_round_trip_with_exact_raw_free_keys() {
+        let request = Request::Instrument {
+            target: "%7".to_string(),
+        };
+        let request_value = serde_json::to_value(&request).expect("serialize instrument request");
+        assert_eq!(
+            request_value,
+            serde_json::json!({"type": "instrument", "target": "%7"})
+        );
+        let round_trip: Request =
+            serde_json::from_value(request_value).expect("deserialize instrument request");
+        assert!(matches!(
+            round_trip,
+            Request::Instrument { target } if target == "%7"
+        ));
+
+        let snapshot = InstrumentSnapshot {
+            schema_version: "1.0".to_string(),
+            observed_unix_ms: 42,
+            session_id: "opaque-session-id".to_string(),
+            pane_id: "%7".to_string(),
+            alive: true,
+            output_closed: false,
+            output_revision: 3,
+            output_total_bytes: 17,
+            attached_clients: 1,
+            rows: 24,
+            cols: 80,
+        };
+        let value = serde_json::to_value(&snapshot).expect("serialize instrument snapshot");
+        let keys = value
+            .as_object()
+            .expect("instrument snapshot object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "alive",
+                "attached_clients",
+                "cols",
+                "observed_unix_ms",
+                "output_closed",
+                "output_revision",
+                "output_total_bytes",
+                "pane_id",
+                "rows",
+                "schema_version",
+                "session_id",
+            ]
+            .into_iter()
+            .collect()
+        );
+        for forbidden in ["name", "command", "cwd", "env", "output", "bytes"] {
+            assert!(value.get(forbidden).is_none(), "leaked field {forbidden}");
+        }
+        let decoded: InstrumentSnapshot =
+            serde_json::from_value(value).expect("deserialize instrument snapshot");
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

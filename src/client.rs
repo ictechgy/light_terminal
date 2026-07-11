@@ -1,7 +1,8 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION,
-    Request, Response, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, InstrumentSnapshot,
+    MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
+    WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -96,6 +97,7 @@ const HOST_TERMINAL_SGR_RESET: &[u8] = b"\x1b[0m";
 const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
+const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
 
 pub fn ensure_server() -> Result<()> {
     // Validate the socket path before the optimistic ping. If the socket leaf is
@@ -451,6 +453,14 @@ fn require_wait_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_instrument_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for instrument snapshots")?;
+    if let Some(message) = instrument_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -465,6 +475,15 @@ fn wait_protocol_error(status: &DaemonStatus) -> Option<String> {
         format!(
             "lterm daemon protocol {} does not support wait/watch (requires protocol {}); run `lterm shutdown` and retry after upgrading",
             status.protocol_version, WAIT_PROTOCOL_VERSION
+        )
+    })
+}
+
+fn instrument_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < INSTRUMENT_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support instrument snapshots (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version, INSTRUMENT_PROTOCOL_VERSION
         )
     })
 }
@@ -523,6 +542,14 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>> {
 pub fn info(target: &str) -> Result<SessionInfo> {
     ensure_server()?;
     rpc(&Request::Info {
+        target: target.to_string(),
+    })
+}
+
+pub fn instrument(target: &str) -> Result<InstrumentSnapshot> {
+    ensure_server()?;
+    require_instrument_protocol()?;
+    rpc(&Request::Instrument {
         target: target.to_string(),
     })
 }
@@ -6778,13 +6805,13 @@ mod tests {
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
         finish_attach_results, format_status_line, forward_pty_output_frame_or_detached,
         handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
-        hex_encoded_len, interruptible_sleep, is_self_provided_tmux, join_attach_input_thread,
-        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
-        mobile_client_detected, mobile_transcript_capture_changed, mobile_transcript_grep_query,
-        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
-        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
-        parse_status_command_bool, parse_status_command_interval, parse_status_style,
-        raw_attach_command_hint, read_attach_response_header,
+        hex_encoded_len, instrument_protocol_error, interruptible_sleep, is_self_provided_tmux,
+        join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        mobile_transcript_grep_query, nested_known_agent_present_in_processes,
+        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
+        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
+        parse_status_style, raw_attach_command_hint, read_attach_response_header,
         read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
         read_trace_jsonl_line, remember_reconnect_target_best_effort_at_path,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
@@ -9109,7 +9136,7 @@ mod tests {
                 "trace_id": "trace-1",
                 "producer": "lterm",
                 "client_version": "1.2.3",
-                "client_protocol_version": 3_u64,
+                "client_protocol_version": 4_u64,
                 "target": "main",
                 "created_at_unix_ms": 123_u64,
                 "duration_ms": 250_u64,
@@ -9145,7 +9172,7 @@ mod tests {
         assert_eq!(summary.trace_id.as_deref(), Some("trace-1"));
         assert_eq!(summary.producer.as_deref(), Some("lterm"));
         assert_eq!(summary.client_version.as_deref(), Some("1.2.3"));
-        assert_eq!(summary.client_protocol_version, Some(3));
+        assert_eq!(summary.client_protocol_version, Some(4));
         assert_eq!(summary.target.as_deref(), Some("main"));
         assert_eq!(summary.created_at_unix_ms, Some(123));
         assert_eq!(summary.duration_ms, Some(250));
@@ -9217,7 +9244,7 @@ mod tests {
             trace_id: Some("trace-id".to_string()),
             producer: Some("lterm".to_string()),
             client_version: Some("1.0.0".to_string()),
-            client_protocol_version: Some(3),
+            client_protocol_version: Some(4),
             target: Some("main".to_string()),
             created_at_unix_ms: Some(123),
             duration_ms: Some(250),
@@ -9243,7 +9270,7 @@ mod tests {
         );
         assert!(rendered.contains("path\t/tmp/trace.jsonl\n"));
         assert!(rendered.contains("format\tlterm-trace-jsonl\n"));
-        assert!(rendered.contains("client_protocol_version\t3\n"));
+        assert!(rendered.contains("client_protocol_version\t4\n"));
         assert!(rendered.contains("event_count\t3\n"));
         assert!(rendered.contains("end_reason\tduration\n"));
         assert!(rendered.contains("unknown_events\t0\n"));
@@ -11784,6 +11811,28 @@ mod tests {
                 .contains("does not support status themes")
         );
         assert_eq!(status_theme_protocol_error(&current), None);
+    }
+
+    #[test]
+    fn instrument_protocol_guard_rejects_old_daemon() {
+        let old = DaemonStatus {
+            version: "0.1.2".to_string(),
+            protocol_version: 3,
+            session_count: 0,
+            active_connections: 0,
+            shutting_down: false,
+            daemon_uid: None,
+            started_at_unix_secs: None,
+        };
+        let current = DaemonStatus {
+            protocol_version: super::INSTRUMENT_PROTOCOL_VERSION,
+            ..old.clone()
+        };
+
+        let message = instrument_protocol_error(&old).expect("old daemon should be rejected");
+        assert!(message.contains("does not support instrument snapshots"));
+        assert!(message.contains("lterm shutdown"));
+        assert_eq!(instrument_protocol_error(&current), None);
     }
 
     #[test]

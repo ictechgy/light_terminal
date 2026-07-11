@@ -3824,6 +3824,154 @@ fn help_describes_machine_readable_session_surfaces() -> TestResult {
 }
 
 #[test]
+fn instrument_emits_one_raw_free_json_line_and_rejects_unknown_targets() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "instrument-json")?;
+
+    let output = env.cmd().args(["instrument", &pane, "--json"]).output()?;
+    assert!(output.status.success(), "instrument failed: {output:?}");
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1,
+        "instrument must emit exactly one JSON line: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let keys = value
+        .as_object()
+        .ok_or("instrument output should be a JSON object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "alive",
+            "attached_clients",
+            "cols",
+            "observed_unix_ms",
+            "output_closed",
+            "output_revision",
+            "output_total_bytes",
+            "pane_id",
+            "rows",
+            "schema_version",
+            "session_id",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(value["schema_version"], "1.0");
+    assert_eq!(value["pane_id"], pane);
+    let encoded = String::from_utf8(output.stdout)?;
+    for forbidden in [
+        "SESSION_READY",
+        "sleep 30",
+        "\"command\"",
+        "\"cwd\"",
+        "\"name\"",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "leaked {forbidden:?}: {encoded}"
+        );
+    }
+
+    let missing = env
+        .cmd()
+        .args(["instrument", "missing-instrument", "--json"])
+        .output()?;
+    assert!(!missing.status.success(), "unknown target should fail");
+    assert!(
+        missing.stdout.is_empty(),
+        "failure must not emit fallback JSON"
+    );
+    assert_stderr_contains(&missing, "no such lterm session or pane");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn instrument_rejects_protocol_three_before_sending_instrument_request() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run_dir.join("lterm.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let thread_requests = requests.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let request_type = request["type"]
+                    .as_str()
+                    .ok_or("fake daemon request missing type")?
+                    .to_string();
+                thread_requests
+                    .lock()
+                    .map_err(|_| "fake daemon requests lock poisoned")?
+                    .push(request_type.clone());
+                let response = if request_type == "ping" {
+                    serde_json::json!({"ok": true, "result": {"pong": true}})
+                } else {
+                    assert_eq!(request_type, "status");
+                    serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "version": "1.0.29",
+                            "protocol_version": 3,
+                            "session_count": 0,
+                            "active_connections": 1,
+                            "shutting_down": false
+                        }
+                    })
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        return Err(format!("unexpected fourth request: {request}").into());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let output = env.cmd().args(["instrument", "stale", "--json"]).output()?;
+    assert!(!output.status.success(), "protocol 3 must be rejected");
+    assert_stderr_contains(&output, "does not support instrument snapshots");
+    assert_stderr_contains(&output, "lterm shutdown");
+    server
+        .join()
+        .map_err(|_| "fake protocol-three daemon panicked")??;
+    assert_eq!(
+        *requests
+            .lock()
+            .map_err(|_| "fake daemon requests lock poisoned")?,
+        ["ping", "status", "status"]
+    );
+    Ok(())
+}
+
+#[test]
 fn help_describes_session_creation_arguments() -> TestResult {
     let env = TestEnv::new()?;
 
@@ -14006,6 +14154,149 @@ fn raw_attach_live_stream_preserves_escape_and_control_bytes() -> TestResult {
     assert!(kill.success(), "raw-bytes session should be killable");
 
     drop(stream);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn instrument_polling_does_not_perturb_direct_raw_attach() -> TestResult {
+    let env = TestEnv::new()?;
+    let socket = socket_path_for(&env);
+    let payload_path = env.temp.path().join("instrument-raw-payload.bin");
+    let expected_payload = b"\0\xff\x80\x1b[35mTWIN\x1b[0m\x1b]52;c;SIDE_SECRET\x07";
+    std::fs::write(&payload_path, expected_payload)?;
+
+    let status = env
+        .cmd()
+        .args([
+            "new",
+            "--detach",
+            "--name",
+            "instrument-raw",
+            "--",
+            "sh",
+            "-c",
+            concat!(
+                "payload=$1; ",
+                "printf 'INSTRUMENT_READY\\n'; ",
+                "while IFS= read -r line; do ",
+                "if [ \"$line\" = GO_INSTRUMENT ]; then ",
+                "printf 'INSTRUMENT_START'; ",
+                "cat \"$payload\"; ",
+                "printf 'INSTRUMENT_END\\n'; ",
+                "fi; ",
+                "done"
+            ),
+        ])
+        .arg("instrument-raw-script")
+        .arg(&payload_path)
+        .status()?;
+    assert!(status.success(), "lterm new should succeed");
+    wait_for_socket(&socket)?;
+    env.capture_until("instrument-raw", "INSTRUMENT_READY")?;
+
+    let (mut stream, _subscriber_id) = attach_with_geometry(&socket, "instrument-raw", 37, 119)?;
+    let baseline_output = env
+        .cmd()
+        .args(["instrument", "instrument-raw", "--json"])
+        .output()?;
+    assert!(baseline_output.status.success(), "{baseline_output:?}");
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline_output.stdout)?;
+    assert_eq!(baseline["attached_clients"], 1);
+    assert_eq!(
+        (baseline["rows"].as_u64(), baseline["cols"].as_u64()),
+        (Some(37), Some(119))
+    );
+
+    let bin = env!("CARGO_BIN_EXE_lterm").to_string();
+    let runtime_dir = env.temp.path().join("run");
+    let data_dir = env.temp.path().join("data");
+    let tmp_dir = env.temp.path().join("tmp");
+    let (poll_started_tx, poll_started_rx) = std::sync::mpsc::sync_channel(0);
+    let poller = thread::spawn(move || -> Result<Vec<serde_json::Value>, String> {
+        let mut snapshots = Vec::new();
+        for _ in 0..40 {
+            let output = Command::new(&bin)
+                .args(["instrument", "instrument-raw", "--json"])
+                .env_remove("LTERM_SOCKET")
+                .env_remove("LTERM_PANE")
+                .env_remove("LTERM_PARENT_TOKEN")
+                .env("LTERM_RUNTIME_DIR", &runtime_dir)
+                .env("LTERM_DATA_DIR", &data_dir)
+                .env("TMPDIR", &tmp_dir)
+                .output()
+                .map_err(|err| format!("spawn instrument poll: {err}"))?;
+            if !output.status.success() {
+                return Err(format!("instrument poll failed: {output:?}"));
+            }
+            snapshots.push(
+                serde_json::from_slice(&output.stdout)
+                    .map_err(|err| format!("decode instrument poll: {err}"))?,
+            );
+            if snapshots.len() == 1 {
+                poll_started_tx
+                    .send(())
+                    .map_err(|err| format!("signal first successful instrument poll: {err}"))?;
+            }
+        }
+        Ok(snapshots)
+    });
+
+    poll_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|err| format!("first successful instrument poll was not observed: {err}"))?;
+    let send = env
+        .cmd()
+        .args(["send", "instrument-raw", "GO_INSTRUMENT\n"])
+        .status()?;
+    assert!(send.success(), "send should succeed");
+    let raw = read_until_marker_bytes(&mut stream, b"INSTRUMENT_END", Duration::from_secs(5))?;
+    let start = find_subsequence(&raw, b"INSTRUMENT_START")
+        .ok_or("raw output missing INSTRUMENT_START")?
+        + b"INSTRUMENT_START".len();
+    let end =
+        find_subsequence(&raw, b"INSTRUMENT_END").ok_or("raw output missing INSTRUMENT_END")?;
+    assert_eq!(
+        &raw[start..end],
+        expected_payload,
+        "instrument polling changed marker-delimited raw bytes"
+    );
+
+    let snapshots = poller.join().map_err(|_| "instrument poller panicked")?;
+    let snapshots = snapshots.map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+    let after_output = env
+        .cmd()
+        .args(["instrument", "instrument-raw", "--json"])
+        .output()?;
+    assert!(after_output.status.success(), "{after_output:?}");
+    let after: serde_json::Value = serde_json::from_slice(&after_output.stdout)?;
+
+    let mut previous_revision = baseline["output_revision"].as_u64().unwrap_or(0);
+    let mut previous_bytes = baseline["output_total_bytes"].as_u64().unwrap_or(0);
+    for snapshot in snapshots.iter().chain(std::iter::once(&after)) {
+        assert_eq!(snapshot["attached_clients"], 1);
+        assert_eq!(snapshot["rows"], 37);
+        assert_eq!(snapshot["cols"], 119);
+        let revision = snapshot["output_revision"]
+            .as_u64()
+            .ok_or("instrument revision missing")?;
+        let total_bytes = snapshot["output_total_bytes"]
+            .as_u64()
+            .ok_or("instrument byte count missing")?;
+        assert!(revision >= previous_revision, "revision regressed");
+        assert!(total_bytes >= previous_bytes, "byte count regressed");
+        previous_revision = revision;
+        previous_bytes = total_bytes;
+    }
+    assert!(
+        after["output_total_bytes"].as_u64().unwrap_or(0)
+            > baseline["output_total_bytes"].as_u64().unwrap_or(0),
+        "output counter did not advance"
+    );
+    assert_eq!(after["attached_clients"], baseline["attached_clients"]);
+    assert_eq!(after["rows"], baseline["rows"]);
+    assert_eq!(after["cols"], baseline["cols"]);
+
     Ok(())
 }
 

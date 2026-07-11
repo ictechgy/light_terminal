@@ -44,7 +44,7 @@ behavior, but it also means untrusted programs can emit terminal escape
 sequences to the attaching terminal. Do not use raw attached `lterm` streams as
 a sanitizer or sandbox.
 
-Report-style surfaces are different: `sessions`, `processes`, `doctor`, `logs`,
+Report-style surfaces are different: `sessions`, `instrument`, `processes`, `doctor`, `logs`,
 `wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
 surfaces sanitize terminal controls before printing human-readable or
 machine-readable reports.
@@ -145,6 +145,7 @@ or raw output stream.
 | `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm reconnect` | none | `explicit-raw-unsafe` | none at command level; raw stream is transparent; private last-session pointer is best-effort; mobile transcript output is sanitized | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
+| `lterm instrument` | none | `stable` | none | `stable` raw-free measurement snapshot; `--json` is required | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
@@ -165,6 +166,27 @@ or raw output stream.
 | `lterm inspect --json` | none | `best-effort` | none | `best-effort` alias for the redacted local diagnostic bundle; requires `--json` | `sanitized-output-only` |
 | `lterm daemon` | none | `internal` | none | none | `not-applicable` |
 | `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
+
+### `lterm instrument` stable raw-free snapshot semantics
+
+`lterm instrument <target> --json` performs a read-only generic daemon RPC and
+prints exactly one JSON object followed by one newline. It never registers an
+attach subscriber, captures scrollback, starts a trace, parses terminal state,
+sanitizes terminal bytes, or writes to the PTY. Its stable schema is
+[`docs/schemas/instrument-snapshot.schema.json`](schemas/instrument-snapshot.schema.json).
+The object contains only schema/observation time, opaque session and pane ids,
+alive/output-closed booleans, output revision and byte counters, attached-client
+count, and geometry. It excludes session name, command, cwd, environment,
+captured text, and raw or terminal-derived content.
+
+The snapshot is intentionally relaxed rather than transactional. The three
+output-progress fields (`output_closed`, `output_revision`, and
+`output_total_bytes`) are copied together under one mutex. That mutex is
+released before `alive`, `attached_clients`, `rows`, and `cols` are sampled
+independently. Consumers may use the counters for monotonic progress but must
+not infer that every field describes one atomic instant. Protocol-3 daemons are
+rejected before the client sends an instrument request, with restart/upgrade
+guidance.
 
 ### `lterm urls` stable extraction semantics
 
@@ -262,10 +284,10 @@ entirely. The schema lives at
 ```json
 {
   "client_version": "1.0.3",
-  "client_protocol_version": 3,
+  "client_protocol_version": 4,
   "daemon_reachable": true,
   "daemon_version": "1.0.3",
-  "daemon_protocol_version": 3,
+  "daemon_protocol_version": 4,
   "version_match": true,
   "daemon_session_count": 0,
   "daemon_active_connections": 1,

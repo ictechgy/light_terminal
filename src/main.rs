@@ -192,6 +192,14 @@ enum Commands {
         #[arg(long, conflicts_with = "all")]
         children: bool,
     },
+    /// Print a raw-free live measurement snapshot for a session or pane.
+    Instrument {
+        /// Session or pane target to measure.
+        target: String,
+        /// Print exactly one JSON object for automation.
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// Show child process trees for lterm sessions.
     #[command(visible_alias = "ps")]
     Processes {
@@ -869,6 +877,10 @@ fn run() -> Result<()> {
             Ok(())
         }
         Commands::Doctor { json } => print_doctor_report(json),
+        Commands::Instrument { target, json: _ } => {
+            println!("{}", serde_json::to_string(&client::instrument(&target)?)?);
+            Ok(())
+        }
         Commands::Diagnose { bundle: _ } => print_diagnose_bundle(),
         Commands::Inspect { json: _ } => print_diagnose_bundle(),
         Commands::Close { target } => client::kill(&target),
@@ -3829,6 +3841,18 @@ mod tests {
         let Commands::Inspect { json } = cli.command else {
             panic!("expected inspect command");
         };
+        assert!(json);
+    }
+
+    #[test]
+    fn instrument_requires_json_and_preserves_target() {
+        assert!(Cli::try_parse_from(["lterm", "instrument", "main"]).is_err());
+        let cli = Cli::try_parse_from(["lterm", "instrument", "%7", "--json"])
+            .expect("instrument --json should parse");
+        let Commands::Instrument { target, json } = cli.command else {
+            panic!("expected instrument command");
+        };
+        assert_eq!(target, "%7");
         assert!(json);
     }
 
