@@ -1,8 +1,9 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, InstrumentSnapshot,
-    MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response, SessionInfo, StatusTheme,
-    WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction, CapabilityToken, DaemonStatus,
+    InstrumentSnapshot, IssueInputCapabilityResult, MAX_CAPABILITY_INPUT_BYTES,
+    MAX_INPUT_CAPABILITY_BUDGET, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response,
+    SensitiveCapabilityRequest, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,10 +17,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,22 @@ const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
 const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
+const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
+const CAPABILITY_FILE_PREFIX: &[u8] = b"lterm-input-capability-v1\n";
+const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
+const CAPABILITY_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapabilityFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone)]
+struct ValidatedCapabilityFile {
+    token: CapabilityToken,
+    identity: CapabilityFileIdentity,
+}
 
 pub fn ensure_server() -> Result<()> {
     // Validate the socket path before the optimistic ping. If the socket leaf is
@@ -461,6 +478,18 @@ fn require_instrument_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_capability_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for capabilities")?;
+    if status.protocol_version < CAPABILITY_PROTOCOL_VERSION {
+        bail!(
+            "lterm daemon protocol {} does not support capabilities (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version,
+            CAPABILITY_PROTOCOL_VERSION
+        );
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -552,6 +581,325 @@ pub fn instrument(target: &str) -> Result<InstrumentSnapshot> {
     rpc(&Request::Instrument {
         target: target.to_string(),
     })
+}
+
+pub fn issue_input_capability(target: &str, byte_budget: u64, path: &Path) -> Result<()> {
+    ensure_server()?;
+    require_capability_protocol()?;
+    if !(1..=MAX_INPUT_CAPABILITY_BUDGET).contains(&byte_budget) {
+        bail!("input capability byte budget must be between 1 and {MAX_INPUT_CAPABILITY_BUDGET}");
+    }
+
+    let mut file = create_private_capability_file(path)?;
+    let file_identity = capability_file_identity(
+        &file
+            .metadata()
+            .context("stat newly created capability file")?,
+    );
+    let issued = match issue_input_capability_rpc(target, byte_budget) {
+        Ok(issued) => issued,
+        Err(err) => {
+            drop(file);
+            let _ = unlink_capability_path_if_identity_matches(path, file_identity);
+            return Err(err);
+        }
+    };
+    let persistence = (|| -> Result<()> {
+        file.write_all(CAPABILITY_FILE_PREFIX)
+            .context("write capability file header")?;
+        file.write_all(issued.token.as_str().as_bytes())
+            .context("write capability token")?;
+        file.write_all(b"\n").context("terminate capability file")?;
+        file.sync_all().context("sync capability file")?;
+        validate_capability_metadata(&file.metadata().context("stat capability file")?)
+    })();
+    if let Err(err) = persistence {
+        let _ = capability_exchange(
+            CapabilityAction::Revoke,
+            SensitiveCapabilityRequest::Revoke {
+                token: issued.token,
+            },
+        );
+        drop(file);
+        let _ = unlink_capability_path_if_identity_matches(path, file_identity);
+        return Err(err).with_context(|| format!("persist capability file {}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn input_with_capability(path: &Path, input: &mut impl Read) -> Result<()> {
+    let mut data = Vec::new();
+    input
+        .take((MAX_CAPABILITY_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .context("read capability input from stdin")?;
+    if data.is_empty() {
+        bail!("capability input must not be empty");
+    }
+    if data.len() > MAX_CAPABILITY_INPUT_BYTES {
+        bail!("capability input exceeds {MAX_CAPABILITY_INPUT_BYTES} bytes");
+    }
+    capability_exchange_from_file(path, CapabilityAction::Input, |token| {
+        SensitiveCapabilityRequest::Input { token, data }
+    })
+    .map(|_| ())
+}
+
+pub fn revoke_capability(path: &Path) -> Result<()> {
+    let validated = capability_exchange_from_file(path, CapabilityAction::Revoke, |token| {
+        SensitiveCapabilityRequest::Revoke { token }
+    })?;
+    unlink_revalidated_capability_path(path, &validated)
+}
+
+fn issue_input_capability_rpc(
+    target: &str,
+    byte_budget: u64,
+) -> Result<IssueInputCapabilityResult> {
+    let path = paths::socket_path()?;
+    let mut stream = UnixStream::connect(&path).with_context(|| daemon_connect_context(&path))?;
+    stream.set_read_timeout(Some(RPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(RPC_TIMEOUT))?;
+    let request = Request::IssueInputCapability {
+        target: target.to_string(),
+        byte_budget,
+    };
+    serde_json::to_writer(&mut stream, &request).context("serialize capability issue request")?;
+    stream
+        .write_all(b"\n")
+        .context("write capability issue request")?;
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let mut bytes = Vec::new();
+    stream
+        .take(MAX_RPC_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read capability issue response")?;
+    if bytes.len() as u64 > MAX_RPC_RESPONSE_BYTES {
+        bail!("capability issue response exceeded limit");
+    }
+    let response: Response = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse capability issue response ({} bytes)", bytes.len()))?;
+    if !response.ok {
+        bail!(
+            response
+                .error
+                .unwrap_or_else(|| "capability issue rejected".to_string())
+        );
+    }
+    let value = response.result.unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(value).context("decode capability issue result")
+}
+
+fn capability_exchange_from_file<F>(
+    path: &Path,
+    action: CapabilityAction,
+    build: F,
+) -> Result<ValidatedCapabilityFile>
+where
+    F: FnOnce(CapabilityToken) -> SensitiveCapabilityRequest,
+{
+    ensure_server()?;
+    require_capability_protocol()?;
+    let socket = paths::socket_path()?;
+    let mut stream =
+        UnixStream::connect(&socket).with_context(|| daemon_connect_context(&socket))?;
+    stream.set_read_timeout(Some(RPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(RPC_TIMEOUT))?;
+    serde_json::to_writer(&mut stream, &Request::CapabilityChannel { action })
+        .context("serialize capability channel hello")?;
+    stream
+        .write_all(b"\n")
+        .context("write capability channel hello")?;
+    stream.flush().context("flush capability channel hello")?;
+    let mut reader = BufReader::new(stream);
+    parse_capability_ready(read_private_response_header(&mut reader)?)?;
+
+    // The token is read only after a protocol-v5 daemon has acknowledged the
+    // nonsecret hello on this exact connection.
+    let validated = read_validated_capability_file(path)?;
+    let sensitive = build(validated.token.clone());
+    serde_json::to_writer(reader.get_mut(), &sensitive)
+        .context("serialize sensitive capability request")?;
+    reader
+        .get_mut()
+        .write_all(b"\n")
+        .context("write sensitive capability request")?;
+    reader.get_mut().shutdown(std::net::Shutdown::Write).ok();
+    parse_capability_response(
+        read_private_response_header(&mut reader)?,
+        "capability operation",
+    )?;
+    Ok(validated)
+}
+
+fn capability_exchange(
+    action: CapabilityAction,
+    sensitive: SensitiveCapabilityRequest,
+) -> Result<()> {
+    let socket = paths::socket_path()?;
+    let mut stream =
+        UnixStream::connect(&socket).with_context(|| daemon_connect_context(&socket))?;
+    stream.set_read_timeout(Some(RPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(RPC_TIMEOUT))?;
+    serde_json::to_writer(&mut stream, &Request::CapabilityChannel { action })?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    parse_capability_ready(read_private_response_header(&mut reader)?)?;
+    serde_json::to_writer(reader.get_mut(), &sensitive)?;
+    reader.get_mut().write_all(b"\n")?;
+    reader.get_mut().shutdown(std::net::Shutdown::Write).ok();
+    parse_capability_response(
+        read_private_response_header(&mut reader)?,
+        "capability operation",
+    )
+}
+
+fn read_private_response_header(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((CAPABILITY_RESPONSE_HEADER_LIMIT + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .context("read capability response")?;
+    if bytes.len() > CAPABILITY_RESPONSE_HEADER_LIMIT {
+        bail!("capability response exceeded limit");
+    }
+    if !bytes.ends_with(b"\n") {
+        bail!("capability response missing newline");
+    }
+    Ok(bytes)
+}
+
+fn parse_capability_response(bytes: Vec<u8>, frame_type: &str) -> Result<()> {
+    let response: Response = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {frame_type} response ({} bytes)", bytes.len()))?;
+    if !response.ok {
+        bail!(
+            response
+                .error
+                .unwrap_or_else(|| "capability operation rejected".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn parse_capability_ready(bytes: Vec<u8>) -> Result<()> {
+    let response: Response = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse capability ready response ({} bytes)", bytes.len()))?;
+    if !response.ok {
+        bail!(
+            response
+                .error
+                .unwrap_or_else(|| "capability channel rejected".to_string())
+        );
+    }
+    let value = response.result.unwrap_or(serde_json::Value::Null);
+    let ready = value.get("ready").and_then(serde_json::Value::as_bool) == Some(true);
+    let protocol = value
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64);
+    if !ready || protocol != Some(u64::from(CAPABILITY_PROTOCOL_VERSION)) {
+        bail!("daemon did not acknowledge a protocol-v5 capability channel");
+    }
+    Ok(())
+}
+
+fn create_private_capability_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("create private capability file {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod capability file {}", path.display()))?;
+    validate_capability_metadata(&file.metadata().context("stat new capability file")?)?;
+    Ok(file)
+}
+
+#[cfg(test)]
+fn read_private_capability_file(path: &Path) -> Result<CapabilityToken> {
+    Ok(read_validated_capability_file(path)?.token)
+}
+
+fn read_validated_capability_file(path: &Path) -> Result<ValidatedCapabilityFile> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("open private capability file {}", path.display()))?;
+    let metadata = file.metadata().context("stat capability file")?;
+    validate_capability_metadata(&metadata)?;
+    if metadata.len() == 0 || metadata.len() > MAX_CAPABILITY_FILE_BYTES {
+        bail!("unsafe or malformed capability file");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CAPABILITY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read capability file")?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > MAX_CAPABILITY_FILE_BYTES {
+        bail!("unsafe or malformed capability file");
+    }
+    let Some(token_bytes) = bytes
+        .strip_prefix(CAPABILITY_FILE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(b"\n"))
+    else {
+        bail!("unsafe or malformed capability file");
+    };
+    let token = std::str::from_utf8(token_bytes)
+        .ok()
+        .and_then(|value| CapabilityToken::from_canonical(value.to_string()))
+        .ok_or_else(|| anyhow!("unsafe or malformed capability file"))?;
+    Ok(ValidatedCapabilityFile {
+        token,
+        identity: capability_file_identity(&metadata),
+    })
+}
+
+fn capability_file_identity(metadata: &fs::Metadata) -> CapabilityFileIdentity {
+    CapabilityFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+fn unlink_capability_path_if_identity_matches(
+    path: &Path,
+    expected: CapabilityFileIdentity,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("revalidate capability path {}", path.display()))?;
+    if !metadata.file_type().is_file() || capability_file_identity(&metadata) != expected {
+        bail!("capability path changed; refusing to unlink");
+    }
+    fs::remove_file(path).with_context(|| format!("remove capability file {}", path.display()))
+}
+
+fn unlink_revalidated_capability_path(
+    path: &Path,
+    expected: &ValidatedCapabilityFile,
+) -> Result<()> {
+    let current = read_validated_capability_file(path)?;
+    if current.identity != expected.identity || current.token != expected.token {
+        bail!("capability path changed; refusing to unlink");
+    }
+    // POSIX has no portable fd-relative compare-and-unlink primitive. Recheck
+    // the leaf immediately before remove and refuse known replacements; a
+    // malicious same-UID process can still race after this final check.
+    unlink_capability_path_if_identity_matches(path, expected.identity)
+}
+
+fn validate_capability_metadata(metadata: &fs::Metadata) -> Result<()> {
+    // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
+    let euid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != euid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        bail!("unsafe capability file metadata");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6784,9 +7132,9 @@ mod tests {
     use super::{
         AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
-        AttachActiveGuard, AttachMode, ComposeRenderAction, DaemonStatus, HOST_TERMINAL_SGR_RESET,
-        KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS,
-        MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
+        AttachActiveGuard, AttachMode, CapabilityFileIdentity, ComposeRenderAction, DaemonStatus,
+        HOST_TERMINAL_SGR_RESET, KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES,
+        MAX_EXTRACTED_URLS, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
         MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
         NESTED_AGENT_POLL, NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
         RECONNECT_STATE_SCHEMA_VERSION, RPC_PARSE_ERROR_PREVIEW_BYTES, ResizeTickOutcome,
@@ -6800,8 +7148,9 @@ mod tests {
         compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
         compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
         compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled, current_unix_ms,
-        cursor_clamp_into_scroll_region, dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled,
+        create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
+        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
         finish_attach_results, format_status_line, forward_pty_output_frame_or_detached,
         handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
@@ -6812,22 +7161,139 @@ mod tests {
         normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
         panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
         parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
-        read_trace_jsonl_line, remember_reconnect_target_best_effort_at_path,
-        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
-        rpc_parse_error_preview, run_nested_agent_detection_loop, run_status_command,
-        select_status_backend, should_mobile_transcript_auto, status_sgr_stack_supported,
-        status_theme_protocol_error, trace_file_summary, trace_output_open_context,
-        trace_summary_text, validate_trace_replay, write_lterm_agent_presence_banner,
-        write_lterm_title_cue, write_mobile_transcript_update, write_mobile_transcript_urls,
-        write_numbered_search_matches,
+        read_private_capability_file, read_reconnect_state_best_effort_from_path,
+        read_reconnect_state_from_path, read_trace_jsonl_line,
+        remember_reconnect_target_best_effort_at_path, reset_raw_attach_initial_sgr_if_needed,
+        resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
+        run_nested_agent_detection_loop, run_status_command, select_status_backend,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        trace_file_summary, trace_output_open_context, trace_summary_text,
+        unlink_capability_path_if_identity_matches, validate_trace_replay,
+        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
+        write_mobile_transcript_urls, write_numbered_search_matches,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn capability_file_is_exclusive_private_and_exact_format_only() {
+        let dir = tempfile::tempdir().expect("capability tempdir");
+        let path = dir.path().join("input.cap");
+        let mut file = create_private_capability_file(&path).expect("create capability file");
+        let token = crate::protocol::CapabilityToken::new_random();
+        write!(file, "lterm-input-capability-v1\n{}\n", token.as_str())
+            .expect("write capability file");
+        file.sync_all().expect("sync capability file");
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat capability")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            read_private_capability_file(&path).expect("read capability"),
+            token
+        );
+        assert!(create_private_capability_file(&path).is_err());
+
+        std::fs::write(
+            &path,
+            format!("lterm-input-capability-v1\n{}\ntrailing", token.as_str()),
+        )
+        .expect("replace malformed capability contents");
+        assert!(read_private_capability_file(&path).is_err());
+
+        std::fs::write(&path, b"lterm-input-capability-v1\n").expect("truncate capability token");
+        assert!(read_private_capability_file(&path).is_err());
+        std::fs::write(&path, vec![b'x'; 129]).expect("write oversized capability");
+        assert!(read_private_capability_file(&path).is_err());
+    }
+
+    #[test]
+    fn capability_file_rejects_symlink_and_wrong_mode() {
+        let dir = tempfile::tempdir().expect("capability tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"not a capability").expect("seed target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+        let link = dir.path().join("link");
+        symlink(&target, &link).expect("create symlink");
+        assert!(read_private_capability_file(&link).is_err());
+        assert!(create_private_capability_file(&link).is_err());
+
+        let token = crate::protocol::CapabilityToken::new_random();
+        std::fs::write(
+            &target,
+            format!("lterm-input-capability-v1\n{}\n", token.as_str()),
+        )
+        .expect("write capability");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod unsafe capability");
+        assert!(read_private_capability_file(&target).is_err());
+
+        for mode in [0o4600, 0o2600, 0o1600] {
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .expect("set special capability mode");
+            assert!(
+                read_private_capability_file(&target).is_err(),
+                "special permission mode {mode:o} must be rejected"
+            );
+        }
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("restore private mode");
+        let hardlink = dir.path().join("hardlink");
+        std::fs::hard_link(&target, &hardlink).expect("create hard link");
+        assert!(read_private_capability_file(&target).is_err());
+        assert!(read_private_capability_file(&hardlink).is_err());
+        assert!(read_private_capability_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn capability_persistence_failure_cleanup_refuses_replaced_path_leaf() {
+        let dir = tempfile::tempdir().expect("capability tempdir");
+        let path = dir.path().join("input.cap");
+        let file = create_private_capability_file(&path).expect("create capability file");
+        let metadata = file.metadata().expect("stat capability file");
+        let identity = CapabilityFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        drop(file);
+        let original = dir.path().join("original.cap");
+        std::fs::rename(&path, &original).expect("move original capability leaf");
+        std::fs::write(&path, b"replacement must survive").expect("create replacement leaf");
+        let error = unlink_capability_path_if_identity_matches(&path, identity)
+            .expect_err("replacement path must not be unlinked");
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read(&path).expect("replacement remains"),
+            b"replacement must survive"
+        );
+    }
+
+    #[test]
+    fn capability_issue_error_cleanup_unlinks_matching_original_leaf() {
+        let dir = tempfile::tempdir().expect("capability tempdir");
+        let path = dir.path().join("input.cap");
+        let file = create_private_capability_file(&path).expect("create capability file");
+        let metadata = file.metadata().expect("stat capability file");
+        let identity = CapabilityFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        drop(file);
+        unlink_capability_path_if_identity_matches(&path, identity)
+            .expect("matching original leaf should be removed");
+        assert!(!path.exists());
+    }
 
     #[test]
     fn compose_commit_bytes_match_input_enter_semantics() {

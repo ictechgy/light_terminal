@@ -1,7 +1,9 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, DaemonStatus, InstrumentSnapshot, PROTOCOL_VERSION,
-    Request, Response, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction, CapabilityToken, DaemonStatus,
+    InstrumentSnapshot, IssueInputCapabilityResult, MAX_CAPABILITY_INPUT_BYTES,
+    MAX_INPUT_CAPABILITY_BUDGET, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
+    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -56,6 +58,9 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 /// `BACKPRESSURE_SEND_TIMEOUT` 하나로 묶인다.
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SENSITIVE_CAPABILITY_FRAME_BYTES: usize = 128 * 1024;
+const MAX_INPUT_CAPABILITIES: usize = 1024;
+const MAX_INPUT_CAPABILITIES_PER_SESSION: usize = 64;
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
@@ -140,6 +145,8 @@ pub fn serve_forever() -> Result<()> {
 #[derive(Default)]
 struct State {
     sessions: Mutex<SessionMaps>,
+    /// Canonical multi-lock order is `sessions -> input_capabilities`.
+    input_capabilities: Mutex<InputCapabilityRegistry>,
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
     active_blocking_waits: AtomicUsize,
@@ -147,6 +154,17 @@ struct State {
     // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
     // 보내 client가 uptime을 omit하게 한다.
     started_at_unix_secs: Option<u64>,
+}
+
+#[derive(Default)]
+struct InputCapabilityRegistry {
+    grants: HashMap<CapabilityToken, InputCapabilityGrant>,
+}
+
+struct InputCapabilityGrant {
+    session_id: String,
+    session: Weak<Session>,
+    remaining_attempt_bytes: u64,
 }
 
 impl State {
@@ -1398,6 +1416,13 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         return handle_attach(state, stream, &target, rows, cols, frame.buffered);
     }
 
+    if let Request::CapabilityChannel { action } = request {
+        if !frame.buffered.is_empty() {
+            bail!("capability channel sent sensitive bytes before ready");
+        }
+        return handle_capability_channel(state, stream, action);
+    }
+
     let shutdown = matches!(request, Request::Shutdown);
     let response = match handle_request(&state, request) {
         Ok(response) => response,
@@ -1412,6 +1437,57 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         std::process::exit(0);
     }
     Ok(())
+}
+
+fn handle_capability_channel(
+    state: Arc<State>,
+    mut stream: UnixStream,
+    action: CapabilityAction,
+) -> Result<()> {
+    let ready = Response::ok(serde_json::json!({
+        "ready": true,
+        "protocol_version": PROTOCOL_VERSION,
+    }));
+    serde_json::to_writer(&mut stream, &ready).context("write capability ready response")?;
+    stream
+        .write_all(b"\n")
+        .context("write capability ready newline")?;
+    stream.flush().context("flush capability ready response")?;
+
+    let frame = read_request_frame_with_limit(
+        &mut stream,
+        REQUEST_READ_TIMEOUT,
+        MAX_SENSITIVE_CAPABILITY_FRAME_BYTES,
+    )
+    .map_err(|_| anyhow!("invalid sensitive capability frame"))?;
+    if !frame.buffered.is_empty() {
+        return write_capability_response(&mut stream, Response::err("invalid capability request"));
+    }
+    let frame_len = frame.line.len();
+    let sensitive: SensitiveCapabilityRequest = serde_json::from_str(&frame.line)
+        .map_err(|_| anyhow!("invalid sensitive capability frame ({frame_len} bytes)"))?;
+    let response = match (action, sensitive) {
+        (CapabilityAction::Input, SensitiveCapabilityRequest::Input { token, data }) => {
+            match apply_capability_input(&state, &token, data) {
+                Ok(()) => Response::empty(),
+                Err(_) => Response::err("capability input rejected"),
+            }
+        }
+        (CapabilityAction::Revoke, SensitiveCapabilityRequest::Revoke { token }) => {
+            revoke_input_capability(&state, &token);
+            Response::empty()
+        }
+        _ => Response::err("capability request does not match channel action"),
+    };
+    write_capability_response(&mut stream, response)
+}
+
+fn write_capability_response(stream: &mut UnixStream, response: Response) -> Result<()> {
+    serde_json::to_writer(&mut *stream, &response).context("write capability response")?;
+    stream
+        .write_all(b"\n")
+        .context("write capability response newline")?;
+    stream.flush().context("flush capability response")
 }
 
 #[derive(Debug)]
@@ -1626,6 +1702,14 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
         Request::Instrument { target } => Ok(Response::ok(
             resolve_session(state, &target)?.instrument_snapshot_relaxed(),
         )),
+        Request::IssueInputCapability {
+            target,
+            byte_budget,
+        } => Ok(Response::ok(issue_input_capability(
+            state,
+            &target,
+            byte_budget,
+        )?)),
         Request::Rename { target, name } => Ok(Response::ok(rename_session(state, &target, name)?)),
         Request::SetStatusTheme {
             target,
@@ -1739,7 +1823,9 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             }
             Ok(Response::empty())
         }
-        Request::Attach { .. } => unreachable!("handled by handle_attach above"),
+        Request::Attach { .. } | Request::CapabilityChannel { .. } => {
+            unreachable!("handled by handle_connection above")
+        }
     }
 }
 
@@ -2406,6 +2492,9 @@ fn remove_session(state: &Arc<State>, session: &Session) {
     {
         sessions.by_id.remove(&session.id);
     }
+    lock(&state.input_capabilities)
+        .grants
+        .retain(|_, grant| grant.session_id != session.id);
 }
 
 fn terminate_child_sessions(state: &Arc<State>, parent_session_id: &str) {
@@ -3056,6 +3145,103 @@ fn wait_for_process_group_exit_or_leader_observed(
     }
 }
 
+fn issue_input_capability(
+    state: &Arc<State>,
+    target: &str,
+    byte_budget: u64,
+) -> Result<IssueInputCapabilityResult> {
+    if !(1..=MAX_INPUT_CAPABILITY_BUDGET).contains(&byte_budget) {
+        bail!("input capability byte budget must be between 1 and {MAX_INPUT_CAPABILITY_BUDGET}");
+    }
+    let normalized = normalize_target(target);
+    let sessions = lock(&state.sessions);
+    let session = resolve_session_locked(&sessions, &normalized).ok_or_else(|| {
+        anyhow!(
+            "no such lterm session or pane: {}. Run `lterm list` to see active sessions or `lterm start <NAME>` to create one.",
+            sanitized_preview(&normalized)
+        )
+    })?;
+    if !session.alive.load(Ordering::SeqCst) {
+        bail!("session is not alive: {}", sanitized_preview(&normalized));
+    }
+
+    let mut registry = lock(&state.input_capabilities);
+    registry.grants.retain(|_, grant| {
+        grant
+            .session
+            .upgrade()
+            .is_some_and(|candidate| candidate.alive.load(Ordering::SeqCst))
+    });
+    if registry.grants.len() >= MAX_INPUT_CAPABILITIES {
+        bail!("too many outstanding input capabilities");
+    }
+    let session_grants = registry
+        .grants
+        .values()
+        .filter(|grant| grant.session_id == session.id)
+        .count();
+    if session_grants >= MAX_INPUT_CAPABILITIES_PER_SESSION {
+        bail!("too many outstanding input capabilities for session");
+    }
+    let token = loop {
+        let candidate = CapabilityToken::new_random();
+        if !registry.grants.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    registry.grants.insert(
+        token.clone(),
+        InputCapabilityGrant {
+            session_id: session.id.clone(),
+            session: Arc::downgrade(&session),
+            remaining_attempt_bytes: byte_budget,
+        },
+    );
+    drop(registry);
+    drop(sessions);
+    Ok(IssueInputCapabilityResult { token, byte_budget })
+}
+
+fn apply_capability_input(
+    state: &Arc<State>,
+    token: &CapabilityToken,
+    data: Vec<u8>,
+) -> Result<()> {
+    if data.is_empty() || data.len() > MAX_CAPABILITY_INPUT_BYTES {
+        bail!("capability input rejected");
+    }
+    let data_len = u64::try_from(data.len()).map_err(|_| anyhow!("capability input rejected"))?;
+    let session = {
+        let mut registry = lock(&state.input_capabilities);
+        let Some(grant) = registry.grants.get_mut(token) else {
+            bail!("capability input rejected");
+        };
+        let Some(session) = grant.session.upgrade() else {
+            registry.grants.remove(token);
+            bail!("capability input rejected");
+        };
+        if !session.alive.load(Ordering::SeqCst) {
+            registry.grants.remove(token);
+            bail!("capability input rejected");
+        }
+        if data_len > grant.remaining_attempt_bytes {
+            bail!("capability input rejected");
+        }
+        grant.remaining_attempt_bytes -= data_len;
+        if grant.remaining_attempt_bytes == 0 {
+            registry.grants.remove(token);
+        }
+        session
+    };
+    lock(&session.writer)
+        .write_all(&data)
+        .context("capability input write failed")
+}
+
+fn revoke_input_capability(state: &Arc<State>, token: &CapabilityToken) {
+    lock(&state.input_capabilities).grants.remove(token);
+}
+
 fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
     let target = normalize_target(target);
     let sessions = lock(&state.sessions);
@@ -3674,23 +3860,27 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, MAX_TERMINAL_COLS,
-        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
-        Subscriber, TerminalPrefixTracker, WaitContainsScanner, broadcast_chunk, clamp_to_smallest,
-        evict_disconnected_subscribers, forward_attach_output, initial_pty_size,
+        ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, InputCapabilityGrant,
+        MAX_INPUT_CAPABILITIES, MAX_INPUT_CAPABILITIES_PER_SESSION, MAX_TERMINAL_COLS,
+        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session, State,
+        Subscriber, TerminalPrefixTracker, WaitContainsScanner, apply_capability_input,
+        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers, forward_attach_output,
+        handle_capability_channel, initial_pty_size, issue_input_capability,
         os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
         process_group_still_owns_child, read_request_frame_with_limit,
-        read_request_frame_with_timeout, request_frame_from_chunk, sanitize_child_env,
-        sanitized_tail_for_needle, validate_terminal_geometry, verify_linux_peercred_len,
-        verify_peer_uid, wait_for_session_contains,
+        read_request_frame_with_timeout, remove_session, rename_session, request_frame_from_chunk,
+        revoke_input_capability, sanitize_child_env, sanitized_tail_for_needle,
+        validate_terminal_geometry, verify_linux_peercred_len, verify_peer_uid,
+        wait_for_session_contains,
     };
+    use crate::protocol::{CapabilityAction, CapabilityToken};
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Condvar, Mutex, mpsc};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Barrier, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -4261,6 +4451,364 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    fn install_test_capability(
+        state: &Arc<State>,
+        session: &Arc<Session>,
+        remaining: u64,
+    ) -> CapabilityToken {
+        let token = CapabilityToken::new_random();
+        super::lock(&state.input_capabilities).grants.insert(
+            token.clone(),
+            InputCapabilityGrant {
+                session_id: session.id.clone(),
+                session: Arc::downgrade(session),
+                remaining_attempt_bytes: remaining,
+            },
+        );
+        token
+    }
+
+    fn register_test_session(state: &Arc<State>, session: &Arc<Session>) {
+        let mut sessions = super::lock(&state.sessions);
+        sessions.by_name.insert(session.name(), Arc::clone(session));
+        sessions
+            .by_pane
+            .insert(session.pane_id.clone(), Arc::clone(session));
+        sessions
+            .by_id
+            .insert(session.id.clone(), Arc::clone(session));
+    }
+
+    struct PartialThenFailWriter {
+        first_write: usize,
+        calls: usize,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    struct BlockingWriter {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).map_err(std::io::Error::other)?;
+            self.release.recv().map_err(std::io::Error::other)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for PartialThenFailWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 && self.first_write > 0 {
+                let accepted = bytes.len().min(self.first_write);
+                self.accepted.fetch_add(accepted, Ordering::SeqCst);
+                Ok(accepted)
+            } else {
+                Err(std::io::Error::other("injected writer failure"))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capability_reservation_is_atomic_charged_and_revocation_is_idempotent() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-atomic");
+        *super::lock(&session.writer) = Box::new(Vec::<u8>::new());
+        let token = install_test_capability(&state, &session, 8);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let state = Arc::clone(&state);
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                apply_capability_input(&state, &token, vec![b'x'; 6]).is_ok()
+            }));
+        }
+        barrier.wait();
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("capability worker"))
+            .filter(|succeeded| *succeeded)
+            .count();
+        assert_eq!(successes, 1, "8 bytes cannot authorize two 6-byte writes");
+        assert_eq!(
+            super::lock(&state.input_capabilities)
+                .grants
+                .get(&token)
+                .map(|grant| grant.remaining_attempt_bytes),
+            Some(2)
+        );
+        revoke_input_capability(&state, &token);
+        revoke_input_capability(&state, &token);
+        assert!(super::lock(&state.input_capabilities).grants.is_empty());
+    }
+
+    #[test]
+    fn capability_teardown_purges_grants_and_dead_or_unknown_tokens_are_generic() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-teardown");
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert(session.name(), Arc::clone(&session));
+            sessions
+                .by_pane
+                .insert(session.pane_id.clone(), Arc::clone(&session));
+            sessions
+                .by_id
+                .insert(session.id.clone(), Arc::clone(&session));
+        }
+        let token = install_test_capability(&state, &session, 8);
+        remove_session(&state, &session);
+        assert!(super::lock(&state.input_capabilities).grants.is_empty());
+        let error = apply_capability_input(&state, &token, b"x".to_vec())
+            .expect_err("removed grant must fail")
+            .to_string();
+        assert_eq!(error, "capability input rejected");
+        assert!(!error.contains(token.as_str()));
+    }
+
+    #[test]
+    fn capability_partial_and_full_write_failures_charge_the_full_attempt() {
+        for first_write in [0, 2] {
+            let state = Arc::new(State::default());
+            let session = build_test_session(&format!("capability-write-fail-{first_write}"));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            *super::lock(&session.writer) = Box::new(PartialThenFailWriter {
+                first_write,
+                calls: 0,
+                accepted: Arc::clone(&accepted),
+            });
+            let token = install_test_capability(&state, &session, 8);
+            let error = apply_capability_input(&state, &token, b"abcd".to_vec())
+                .expect_err("injected writer must fail")
+                .to_string();
+            assert!(error.contains("capability input write failed"));
+            assert_eq!(accepted.load(Ordering::SeqCst), first_write);
+            assert_eq!(
+                super::lock(&state.input_capabilities)
+                    .grants
+                    .get(&token)
+                    .map(|grant| grant.remaining_attempt_bytes),
+                Some(4),
+                "full four-byte attempt must be charged without refund"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_issuance_enforces_per_session_and_global_caps() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-caps");
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert(session.name(), Arc::clone(&session));
+            sessions
+                .by_pane
+                .insert(session.pane_id.clone(), Arc::clone(&session));
+            sessions
+                .by_id
+                .insert(session.id.clone(), Arc::clone(&session));
+        }
+        for _ in 0..MAX_INPUT_CAPABILITIES_PER_SESSION {
+            issue_input_capability(&state, &session.pane_id, 1)
+                .expect("grant below per-session cap");
+        }
+        assert!(
+            issue_input_capability(&state, &session.pane_id, 1)
+                .expect_err("per-session cap must reject")
+                .to_string()
+                .contains("for session")
+        );
+
+        super::lock(&state.input_capabilities).grants.clear();
+        {
+            let mut registry = super::lock(&state.input_capabilities);
+            for index in 0..MAX_INPUT_CAPABILITIES {
+                registry.grants.insert(
+                    CapabilityToken::new_random(),
+                    InputCapabilityGrant {
+                        session_id: format!("other-{index}"),
+                        session: Arc::downgrade(&session),
+                        remaining_attempt_bytes: 1,
+                    },
+                );
+            }
+        }
+        assert!(
+            issue_input_capability(&state, &session.pane_id, 1)
+                .expect_err("global cap must reject")
+                .to_string()
+                .contains("too many outstanding input capabilities")
+        );
+    }
+
+    #[test]
+    fn capability_reservation_before_revoke_may_finish_but_later_use_fails() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-revoke-linearization");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        *super::lock(&session.writer) = Box::new(BlockingWriter {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let token = install_test_capability(&state, &session, 8);
+        let worker_state = Arc::clone(&state);
+        let worker_token = token.clone();
+        let worker = thread::spawn(move || {
+            apply_capability_input(&worker_state, &worker_token, b"abcd".to_vec())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer entered after reservation");
+        revoke_input_capability(&state, &token);
+        release_tx.send(()).expect("release writer");
+        worker
+            .join()
+            .expect("reserved writer thread")
+            .expect("pre-revoke reservation may finish");
+        assert!(apply_capability_input(&state, &token, b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn capability_issue_and_teardown_follow_sessions_then_registry_order() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-issue-teardown");
+        register_test_session(&state, &session);
+        let mut sessions = super::lock(&state.sessions);
+        let worker_state = Arc::clone(&state);
+        let target = session.pane_id.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal issue attempt");
+            issue_input_capability(&worker_state, &target, 8)
+        });
+        started_rx.recv().expect("issue worker started");
+        sessions.by_name.remove(&session.name());
+        sessions.by_pane.remove(&session.pane_id);
+        sessions.by_id.remove(&session.id);
+        super::lock(&state.input_capabilities)
+            .grants
+            .retain(|_, grant| grant.session_id != session.id);
+        drop(sessions);
+        assert!(
+            worker
+                .join()
+                .expect("issue worker")
+                .expect_err("teardown linearized before issue")
+                .to_string()
+                .contains("no such lterm session")
+        );
+        assert!(super::lock(&state.input_capabilities).grants.is_empty());
+    }
+
+    #[test]
+    fn capability_reservation_before_teardown_may_finish_but_later_use_fails() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-teardown-linearization");
+        register_test_session(&state, &session);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        *super::lock(&session.writer) = Box::new(BlockingWriter {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let token = install_test_capability(&state, &session, 8);
+        let worker_state = Arc::clone(&state);
+        let worker_token = token.clone();
+        let worker = thread::spawn(move || {
+            apply_capability_input(&worker_state, &worker_token, b"abcd".to_vec())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer entered after reservation");
+        remove_session(&state, &session);
+        release_tx.send(()).expect("release writer");
+        worker
+            .join()
+            .expect("reserved writer thread")
+            .expect("pre-teardown reservation may finish");
+        assert!(apply_capability_input(&state, &token, b"x".to_vec()).is_err());
+        assert!(super::lock(&state.input_capabilities).grants.is_empty());
+    }
+
+    #[test]
+    fn capability_rename_and_pane_reuse_never_migrate_grant() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("capability-original");
+        *super::lock(&session.writer) = Box::new(Vec::<u8>::new());
+        register_test_session(&state, &session);
+        let issued = issue_input_capability(&state, &session.pane_id, 8)
+            .expect("issue capability before rename");
+        rename_session(&state, &session.pane_id, "capability-renamed".to_string())
+            .expect("rename original session");
+        apply_capability_input(&state, &issued.token, b"abcd".to_vec())
+            .expect("rename keeps immutable-session grant valid");
+        let old_pane = session.pane_id.clone();
+        remove_session(&state, &session);
+
+        let replacement = build_test_session("capability-replacement");
+        *super::lock(&replacement.writer) = Box::new(Vec::<u8>::new());
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .by_name
+                .insert("capability-original".to_string(), Arc::clone(&replacement));
+            sessions.by_pane.insert(old_pane, Arc::clone(&replacement));
+            sessions
+                .by_id
+                .insert(replacement.id.clone(), Arc::clone(&replacement));
+        }
+        assert!(apply_capability_input(&state, &issued.token, b"x".to_vec()).is_err());
+        assert!(super::lock(&state.input_capabilities).grants.is_empty());
+    }
+
+    #[test]
+    fn malformed_sensitive_capability_frame_error_never_contains_payload_sentinel() {
+        let state = Arc::new(State::default());
+        let (server_stream, client_stream) = UnixStream::pair().expect("capability stream pair");
+        let server = thread::spawn(move || {
+            handle_capability_channel(state, server_stream, CapabilityAction::Input)
+        });
+        let mut reader = std::io::BufReader::new(client_stream);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).expect("read capability ready");
+        assert!(ready.contains("\"ready\":true"));
+        const SENTINEL: &str = "MALFORMED_CAPABILITY_SECRET_SENTINEL";
+        writeln!(
+            reader.get_mut(),
+            "{{\"type\":\"input\",\"token\":\"123e4567-e89b-42d3-a456-426614174000\",\"data\":{{\"secret\":\"{SENTINEL}\"}}}}"
+        )
+        .expect("write malformed sensitive frame");
+        reader
+            .get_mut()
+            .shutdown(std::net::Shutdown::Write)
+            .expect("finish malformed frame");
+        let error = server
+            .join()
+            .expect("capability server thread")
+            .expect_err("malformed frame must fail")
+            .to_string();
+        assert!(error.contains("invalid sensitive capability frame"));
+        assert!(!error.contains(SENTINEL));
     }
 
     #[test]
