@@ -10,7 +10,9 @@ use std::fmt;
 pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
+pub const MAX_METADATA_JOURNAL_ENTRIES: usize = 1024;
 pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",
@@ -129,6 +131,78 @@ pub struct InstrumentSnapshot {
     pub attached_clients: usize,
     pub rows: u16,
     pub cols: u16,
+}
+
+/// Raw-free live session metadata. This intentionally excludes command, cwd,
+/// environment, PTY output, capability tokens, and process details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataValue {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_theme: Option<StatusTheme>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataOperation {
+    Rename,
+    StatusTheme,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataJournalEntry {
+    pub operation: MetadataOperation,
+    pub before: MetadataValue,
+    pub after: MetadataValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPurgeAggregate {
+    pub generation: u64,
+    pub purged_entries_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_purged_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataHistoryResult {
+    pub schema_version: String,
+    pub session_id: String,
+    pub pane_id: String,
+    pub current: MetadataValue,
+    pub entries: Vec<MetadataJournalEntry>,
+    pub cursor: usize,
+    pub capacity: usize,
+    pub purge: MetadataPurgeAggregate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataStepDirection {
+    Undo,
+    Redo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataStepResult {
+    pub session_id: String,
+    pub pane_id: String,
+    pub direction: MetadataStepDirection,
+    pub applied: MetadataJournalEntry,
+    pub current: MetadataValue,
+    pub cursor: usize,
+    pub entry_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPurgeResult {
+    pub session_id: String,
+    pub pane_id: String,
+    pub current: MetadataValue,
+    pub purged_entries: usize,
+    pub cursor: usize,
+    pub entry_count: usize,
+    pub purge: MetadataPurgeAggregate,
 }
 
 /// Opaque daemon-generated input capability. Debug output is deliberately
@@ -263,6 +337,20 @@ pub enum Request {
     },
     Instrument {
         target: String,
+    },
+    MetadataHistory {
+        target: String,
+    },
+    MetadataUndo {
+        target: String,
+    },
+    MetadataRedo {
+        target: String,
+    },
+    MetadataPurgeHistory {
+        target: String,
+        irreversible: bool,
+        session_id: String,
     },
     IssueInputCapability {
         target: String,
@@ -665,7 +753,9 @@ impl Response {
 mod tests {
     use super::{
         CapabilityAction, CapabilityToken, InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES,
-        MAX_SEND_DATA_BYTES, Request, SensitiveCapabilityRequest, SessionInfo, StatusTheme,
+        MAX_METADATA_JOURNAL_ENTRIES, MAX_SEND_DATA_BYTES, MetadataHistoryResult,
+        MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate, MetadataValue, Request,
+        SensitiveCapabilityRequest, SessionInfo, StatusTheme,
     };
 
     #[test]
@@ -775,6 +865,92 @@ mod tests {
         let decoded: InstrumentSnapshot =
             serde_json::from_value(value).expect("deserialize instrument snapshot");
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn metadata_history_round_trip_has_exact_raw_free_allowlist() {
+        let request = Request::MetadataPurgeHistory {
+            target: "%7".to_string(),
+            irreversible: true,
+            session_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
+        };
+        let round_trip: Request = serde_json::from_value(
+            serde_json::to_value(&request).expect("serialize metadata request"),
+        )
+        .expect("deserialize metadata request");
+        assert!(matches!(
+            round_trip,
+            Request::MetadataPurgeHistory {
+                target,
+                irreversible: true,
+                session_id,
+            } if target == "%7" && session_id == "123e4567-e89b-42d3-a456-426614174000"
+        ));
+
+        let history = MetadataHistoryResult {
+            schema_version: "1.0".to_string(),
+            session_id: "opaque-session-id".to_string(),
+            pane_id: "%7".to_string(),
+            current: MetadataValue {
+                name: "example".to_string(),
+                status_theme: Some(StatusTheme::Blue),
+            },
+            entries: vec![MetadataJournalEntry {
+                operation: MetadataOperation::Rename,
+                before: MetadataValue {
+                    name: "old".to_string(),
+                    status_theme: None,
+                },
+                after: MetadataValue {
+                    name: "example".to_string(),
+                    status_theme: None,
+                },
+            }],
+            cursor: 1,
+            capacity: MAX_METADATA_JOURNAL_ENTRIES,
+            purge: MetadataPurgeAggregate {
+                generation: 0,
+                purged_entries_total: 0,
+                last_purged_unix_ms: None,
+            },
+        };
+        let value = serde_json::to_value(&history).expect("serialize metadata history");
+        let keys = value
+            .as_object()
+            .expect("metadata history object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "capacity",
+                "current",
+                "cursor",
+                "entries",
+                "pane_id",
+                "purge",
+                "schema_version",
+                "session_id",
+            ]
+            .into_iter()
+            .collect()
+        );
+        let encoded = value.to_string();
+        for forbidden in [
+            "command",
+            "cwd",
+            "environment",
+            "output",
+            "scrollback",
+            "token",
+            "process_id",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked field {forbidden}");
+        }
+        let decoded: MetadataHistoryResult =
+            serde_json::from_value(value).expect("deserialize metadata history");
+        assert_eq!(decoded, history);
     }
 
     #[test]

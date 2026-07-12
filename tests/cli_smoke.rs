@@ -4028,6 +4028,88 @@ fn instrument_rejects_protocol_three_before_sending_instrument_request() -> Test
 
 #[test]
 #[cfg(unix)]
+fn metadata_rejects_protocol_five_before_sending_metadata_request() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let thread_requests = requests.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let request_type = request["type"]
+                    .as_str()
+                    .ok_or("fake daemon request missing type")?
+                    .to_string();
+                thread_requests
+                    .lock()
+                    .map_err(|_| "fake daemon requests lock poisoned")?
+                    .push(request_type.clone());
+                let response = if request_type == "ping" {
+                    serde_json::json!({"ok": true, "result": {"pong": true}})
+                } else {
+                    assert_eq!(request_type, "status");
+                    serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "version": "1.0.30",
+                            "protocol_version": 5,
+                            "session_count": 1,
+                            "active_connections": 1,
+                            "shutting_down": false
+                        }
+                    })
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        return Err(format!("unexpected metadata request: {request}").into());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let output = env
+        .cmd()
+        .args(["metadata", "history", "stale", "--json"])
+        .output()?;
+    assert!(!output.status.success(), "protocol 5 must be rejected");
+    assert_stderr_contains(&output, "does not support metadata history");
+    assert_stderr_contains(&output, "lterm shutdown");
+    server
+        .join()
+        .map_err(|_| "fake protocol-five daemon panicked")??;
+    assert_eq!(
+        *requests
+            .lock()
+            .map_err(|_| "fake daemon requests lock poisoned")?,
+        ["ping", "status", "status"]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn capability_daemon_swap_sends_only_nonsecret_hello_before_ready() -> TestResult {
     let env = TestEnv::new()?;
     let run_dir = env.temp.path().join("run");
@@ -5270,6 +5352,149 @@ fn rename_rejects_conflicts_and_invalid_names_without_mutation() -> TestResult {
     env.cmd().args(["close", "rename-taken"]).status()?;
     wait_for_session_absent(&env, "rename-keep")?;
     wait_for_session_absent(&env, "rename-taken")?;
+    Ok(())
+}
+
+#[test]
+fn metadata_history_undo_redo_and_irreversible_purge_are_exact() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "metadata-cli")?;
+
+    let initial = env
+        .cmd()
+        .args(["metadata", "history", &pane, "--json"])
+        .output()?;
+    assert!(initial.status.success(), "{initial:?}");
+    let initial: serde_json::Value = serde_json::from_slice(&initial.stdout)?;
+    let keys = initial
+        .as_object()
+        .ok_or("metadata history must be an object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "capacity",
+            "current",
+            "cursor",
+            "entries",
+            "pane_id",
+            "purge",
+            "schema_version",
+            "session_id",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(initial["entries"].as_array().map(Vec::len), Some(0));
+    let session_id = initial["session_id"]
+        .as_str()
+        .ok_or("metadata session_id missing")?
+        .to_string();
+
+    let renamed = env
+        .cmd()
+        .args(["rename", &pane, "metadata-cli-renamed"])
+        .output()?;
+    assert!(renamed.status.success(), "{renamed:?}");
+    let themed = env.cmd().args(["status-theme", &pane, "green"]).output()?;
+    assert!(themed.status.success(), "{themed:?}");
+
+    let history = env
+        .cmd()
+        .args(["metadata", "history", &pane, "--json"])
+        .output()?;
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(history["cursor"], 2);
+    assert_eq!(history["entries"].as_array().map(Vec::len), Some(2));
+    assert_eq!(history["entries"][0]["operation"], "rename");
+    assert_eq!(history["entries"][1]["operation"], "status_theme");
+    assert_eq!(history["current"]["name"], "metadata-cli-renamed");
+    assert_eq!(history["current"]["status_theme"], "green");
+    let encoded = history.to_string();
+    for forbidden in [
+        "command",
+        "cwd",
+        "environment",
+        "output",
+        "scrollback",
+        "token",
+    ] {
+        assert!(!encoded.contains(forbidden), "metadata leaked {forbidden}");
+    }
+
+    for expected_cursor in [1_u64, 0] {
+        let undo = env.cmd().args(["metadata", "undo", &pane]).output()?;
+        assert!(undo.status.success(), "{undo:?}");
+        let undo: serde_json::Value = serde_json::from_slice(&undo.stdout)?;
+        assert_eq!(undo["direction"], "undo");
+        assert_eq!(undo["cursor"], expected_cursor);
+    }
+    for expected_cursor in [1_u64, 2] {
+        let redo = env.cmd().args(["metadata", "redo", &pane]).output()?;
+        assert!(redo.status.success(), "{redo:?}");
+        let redo: serde_json::Value = serde_json::from_slice(&redo.stdout)?;
+        assert_eq!(redo["direction"], "redo");
+        assert_eq!(redo["cursor"], expected_cursor);
+    }
+
+    let missing_gate = env
+        .cmd()
+        .args([
+            "metadata",
+            "purge-history",
+            &pane,
+            "--session-id",
+            &session_id,
+        ])
+        .output()?;
+    assert!(!missing_gate.status.success(), "{missing_gate:?}");
+    let wrong_id = "123e4567-e89b-42d3-a456-426614174000".to_string();
+    let wrong_uuid = env
+        .cmd()
+        .args([
+            "metadata",
+            "purge-history",
+            &pane,
+            "--irreversible",
+            "--session-id",
+            &wrong_id,
+        ])
+        .output()?;
+    assert!(!wrong_uuid.status.success(), "{wrong_uuid:?}");
+
+    let purge = env
+        .cmd()
+        .args([
+            "metadata",
+            "purge-history",
+            &pane,
+            "--irreversible",
+            "--session-id",
+            &session_id,
+        ])
+        .output()?;
+    assert!(purge.status.success(), "{purge:?}");
+    let purge: serde_json::Value = serde_json::from_slice(&purge.stdout)?;
+    assert_eq!(purge["purged_entries"], 2);
+    assert_eq!(purge["current"]["name"], "metadata-cli-renamed");
+    assert_eq!(purge["current"]["status_theme"], "green");
+
+    let after = env
+        .cmd()
+        .args(["metadata", "history", &pane, "--json"])
+        .output()?;
+    assert!(after.status.success(), "{after:?}");
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout)?;
+    assert_eq!(after["cursor"], 0);
+    assert_eq!(after["entries"].as_array().map(Vec::len), Some(0));
+    assert_eq!(after["purge"]["generation"], 1);
+    assert_eq!(after["purge"]["purged_entries_total"], 2);
+
+    env.cmd().args(["close", &pane]).status()?;
+    wait_for_session_absent(&env, &pane)?;
     Ok(())
 }
 
@@ -10588,6 +10813,18 @@ fn tmux_compat_rename_session_updates_session_name() -> TestResult {
         "{stdout}"
     );
 
+    let history = env
+        .cmd()
+        .args(["metadata", "history", "tmux-rename-final", "--json"])
+        .output()?;
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(history["cursor"], 2);
+    assert_eq!(history["entries"].as_array().map(Vec::len), Some(2));
+    assert_eq!(history["entries"][0]["operation"], "rename");
+    assert_eq!(history["entries"][1]["operation"], "rename");
+    assert_eq!(history["current"]["name"], "tmux-rename-final");
+
     let old = env
         .cmd()
         .args(["tmux-compat", "has-session", "-t", "tmux-rename-old"])
@@ -11909,6 +12146,7 @@ printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'TERM_PROGRAM:%s\n' "${TERM_PROGRAM-}"
 printf 'LC_TERMINAL:%s\n' "${LC_TERMINAL-}"
 printf 'COLORTERM:%s\n' "${COLORTERM-}"
+sleep 1
 "#,
     )?;
     let path = path_with_prepended(&fake_bin)?;
@@ -11948,6 +12186,7 @@ if [ -n "${NO_COLOR-}" ]; then
 else
   printf '\033[31mCOLOR_OK\033[0m\n'
 fi
+sleep 1
 "#,
     )?;
     let path = path_with_prepended(&fake_bin)?;

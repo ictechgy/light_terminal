@@ -257,6 +257,11 @@ enum Commands {
         /// Theme name, or `default` to use the attaching client's default.
         theme: String,
     },
+    /// Inspect or change the live reversible session metadata journal.
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommands,
+    },
     /// Write text to a session or pane.
     #[command(name = "input", visible_alias = "send")]
     Input {
@@ -683,6 +688,40 @@ enum CapabilityCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MetadataCommands {
+    /// Print the raw-free live metadata journal.
+    History {
+        /// Session or pane target to inspect.
+        target: String,
+        /// Print exactly one JSON object for automation.
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Undo the most recent applied metadata operation.
+    Undo {
+        /// Session or pane target to update.
+        target: String,
+    },
+    /// Redo the next unapplied metadata operation.
+    Redo {
+        /// Session or pane target to update.
+        target: String,
+    },
+    /// Irreversibly discard this live session's metadata journal.
+    #[command(name = "purge-history")]
+    PurgeHistory {
+        /// Session or pane target whose history will be discarded.
+        target: String,
+        /// Explicit accident gate acknowledging that undo/redo evidence is lost.
+        #[arg(long, required = true)]
+        irreversible: bool,
+        /// Exact immutable UUID reported by metadata history or sessions --json.
+        #[arg(long, value_name = "EXACT_UUID")]
+        session_id: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ShellKind {
     Bash,
@@ -935,6 +974,30 @@ fn run() -> Result<()> {
                 sanitize::terminal_text(&info.pane_id),
                 format_status_theme(info.status_theme)
             );
+            Ok(())
+        }
+        Commands::Metadata { command } => {
+            let value = match command {
+                MetadataCommands::History { target, json: _ } => {
+                    serde_json::to_value(client::metadata_history(&target)?)?
+                }
+                MetadataCommands::Undo { target } => {
+                    serde_json::to_value(client::metadata_undo(&target)?)?
+                }
+                MetadataCommands::Redo { target } => {
+                    serde_json::to_value(client::metadata_redo(&target)?)?
+                }
+                MetadataCommands::PurgeHistory {
+                    target,
+                    irreversible,
+                    session_id,
+                } => serde_json::to_value(client::metadata_purge_history(
+                    &target,
+                    irreversible,
+                    &session_id,
+                )?)?,
+            };
+            println!("{}", serde_json::to_string(&value)?);
             Ok(())
         }
         Commands::Input {
