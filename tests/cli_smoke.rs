@@ -12146,6 +12146,7 @@ printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'TERM_PROGRAM:%s\n' "${TERM_PROGRAM-}"
 printf 'LC_TERMINAL:%s\n' "${LC_TERMINAL-}"
 printf 'COLORTERM:%s\n' "${COLORTERM-}"
+sleep 1
 "#,
     )?;
     let path = path_with_prepended(&fake_bin)?;
@@ -12185,6 +12186,7 @@ if [ -n "${NO_COLOR-}" ]; then
 else
   printf '\033[31mCOLOR_OK\033[0m\n'
 fi
+sleep 1
 "#,
     )?;
     let path = path_with_prepended(&fake_bin)?;
