@@ -147,6 +147,7 @@ or raw output stream.
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm instrument` | none | `stable` | none | `stable` raw-free measurement snapshot; `--json` is required | `sanitized-output-only` |
 | `lterm capability` | none | `stable` | none | none | `not-applicable` |
+| `lterm metadata` | none | `stable` | none except JSON objects from undo/redo/purge | `stable` for `history --json` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
 | `lterm status-theme` | `lterm theme` | `stable` | `stable` updated `name\tpane\ttheme` row | none | `sanitized-output-only` |
@@ -238,6 +239,47 @@ socket and same-UID peer-credential boundary. It is not protection from a
 malicious same-UID process: that process retains ambient access to legacy
 `lterm input`/`send` and raw Attach unless an external sandbox denies the socket.
 The capability protocol does not modify either legacy Send or raw Attach.
+
+### `lterm metadata` live reversible side-state semantics
+
+Protocol v6 adds an in-memory linear journal for the current session `name` and
+`status_theme` pair. `lterm metadata history TARGET --json` prints exactly one
+JSON object and newline matching `docs/schemas/metadata-history.schema.json`.
+It contains only the live metadata pair, operation entries, cursor/capacity,
+opaque session and pane identity, and volatile purge aggregate. It excludes
+command, cwd, environment, PTY output, scrollback, process details, and
+capability tokens.
+
+Each successful non-idempotent `lterm rename`, `lterm status-theme`, or
+tmux-compatible `rename-session` processed by a v6 daemon appends exactly one
+entry. No-op mutation succeeds without an entry, including when the journal is
+full or behind its tip. The 1024-entry cap is hard: new mutations at capacity
+reject without eviction. A new mutation while redo entries exist also rejects
+without branch truncation; redo to the tip or explicitly purge before making a
+different change.
+
+`metadata undo` requires the complete current pair to equal the entry's `after`
+value; `metadata redo` requires equality with `before`. A state mismatch,
+invalid destination, active or reserved name conflict, empty cursor, or any
+other validation error leaves the name index, current pair, entries, cursor,
+and purge aggregate unchanged. New metadata RPCs return operation-specific
+copied JSON results. Legacy rename and theme responses remain relaxed
+`SessionInfo` snapshots after mutation.
+
+`metadata purge-history TARGET --irreversible --session-id EXACT_UUID` is the
+only irreversible journal operation. The daemon requires the true flag, exact
+canonical immutable UUID for the currently resolved target, a nonempty
+journal, and nonoverflowing counters. Success preserves current name/theme,
+clears entries and cursor, and updates informational `generation`,
+`purged_entries_total`, and `last_purged_unix_ms` values. This is an accident
+gate, not same-UID authorization or durable audit: all journal and purge state
+disappears on close, shutdown, or crash.
+
+Only history/undo/redo/purge require protocol v6 and fail before sending those
+requests to an older daemon. Existing rename/theme/tmux behavior remains
+available under its prior version gates. PTY bytes, input, process/filesystem
+effects, raw Attach, legacy Send, Kill, and close are outside the reversible
+scope and keep their existing contracts.
 
 ### `lterm urls` stable extraction semantics
 

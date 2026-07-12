@@ -1,9 +1,11 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction, CapabilityToken, DaemonStatus,
-    InstrumentSnapshot, IssueInputCapabilityResult, MAX_CAPABILITY_INPUT_BYTES,
-    MAX_INPUT_CAPABILITY_BUDGET, MAX_SEND_DATA_BYTES, PROTOCOL_VERSION, Request, Response,
-    SensitiveCapabilityRequest, SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
+    CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
+    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_SEND_DATA_BYTES,
+    MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult, PROTOCOL_VERSION, Request,
+    Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme, WaitContainsResult,
+    WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -99,7 +101,7 @@ const PS_CANDIDATES: &[&str] = &["/bin/ps", "/usr/bin/ps"];
 const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
 const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
-const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
+const METADATA_PROTOCOL_VERSION: u32 = 6;
 const CAPABILITY_FILE_PREFIX: &[u8] = b"lterm-input-capability-v1\n";
 const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
 const CAPABILITY_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
@@ -490,6 +492,18 @@ fn require_capability_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_metadata_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for metadata history")?;
+    if status.protocol_version < METADATA_PROTOCOL_VERSION {
+        bail!(
+            "lterm daemon protocol {} does not support metadata history (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version,
+            METADATA_PROTOCOL_VERSION
+        );
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -580,6 +594,44 @@ pub fn instrument(target: &str) -> Result<InstrumentSnapshot> {
     require_instrument_protocol()?;
     rpc(&Request::Instrument {
         target: target.to_string(),
+    })
+}
+
+pub fn metadata_history(target: &str) -> Result<MetadataHistoryResult> {
+    ensure_server()?;
+    require_metadata_protocol()?;
+    rpc(&Request::MetadataHistory {
+        target: target.to_string(),
+    })
+}
+
+pub fn metadata_undo(target: &str) -> Result<MetadataStepResult> {
+    ensure_server()?;
+    require_metadata_protocol()?;
+    rpc(&Request::MetadataUndo {
+        target: target.to_string(),
+    })
+}
+
+pub fn metadata_redo(target: &str) -> Result<MetadataStepResult> {
+    ensure_server()?;
+    require_metadata_protocol()?;
+    rpc(&Request::MetadataRedo {
+        target: target.to_string(),
+    })
+}
+
+pub fn metadata_purge_history(
+    target: &str,
+    irreversible: bool,
+    session_id: &str,
+) -> Result<MetadataPurgeResult> {
+    ensure_server()?;
+    require_metadata_protocol()?;
+    rpc(&Request::MetadataPurgeHistory {
+        target: target.to_string(),
+        irreversible,
+        session_id: session_id.to_string(),
     })
 }
 

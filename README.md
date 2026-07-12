@@ -154,6 +154,7 @@ lterm -a api
 | List sessions | `lterm sessions` | `list`, `ls` |
 | Measure a session without attaching or reading PTY bytes | `lterm instrument api --json` | None |
 | Delegate finite cooperative input authority | `lterm capability issue-input api --bytes 4096 --output ./api.input-cap` | None |
+| Inspect reversible live metadata | `lterm metadata history api --json` | None |
 | Inspect process trees | `lterm processes api --json --orphans` | `ps` |
 | Rename a session | `lterm rename api api-renamed` | None |
 | Set a session status theme | `lterm status-theme api green` | `theme` |
@@ -246,6 +247,28 @@ the same OS uid can still use lterm's legacy ambient `input`/`send` or raw
 attach APIs unless an external sandbox denies access to the daemon socket.
 Keep capability files private, do not copy them into repositories, and revoke
 them after use. The raw Attach stream and legacy Send behavior are unchanged.
+
+`lterm metadata` provides a live-session operation algebra for names and status
+themes only. Successful non-idempotent `rename`, `status-theme`, and
+tmux-compatible `rename-session` changes append to a bounded in-memory journal:
+
+```sh
+lterm metadata history api --json
+lterm metadata undo api
+lterm metadata redo api
+lterm metadata purge-history api --irreversible --session-id EXACT_UUID
+```
+
+Undo and redo require the entire current name/theme pair to match the journal
+entry and reject atomically on a rename conflict. The journal holds 1024
+entries. At the cap, or while redo entries exist, new mutations reject rather
+than evicting history or truncating a branch; no-op rename/theme calls still
+succeed. Purge is an explicit accident gate that preserves the current name
+and theme while irreversibly discarding this live journal. Its counters are
+informational memory only: history and purge evidence disappear on session
+close, daemon shutdown, or crash. This does not reverse PTY bytes, input,
+processes, filesystem/network effects, Kill, or close, and it is not an
+authorization or durable-audit mechanism.
 
 Row presence is separate from attach mode. `--attach-mode=auto` still chooses the raw-vs-mobile transcript transport only. On the raw attach path, ordinary sessions keep the row by default, while built-in agent launchers and later `resume` / `open` attaches to known agent sessions default to a full-height row-off surface. Direct agent launchers emit a compact terminal-title cue (`lt:<session>:<pane> · <agent>`) plus a one-shot `[lterm] <session> <pane> · <agent> (status row hidden for agent TUI; use --status to show it)` banner before attach when the terminal supports it; while attached row-off, lterm periodically refreshes only the title cue after idle gaps so Codex-like TUIs can overwrite their own title without losing the lterm identity. Set `LTERM_AGENT_CUE=0` to suppress both the terminal-title cue and banner, or `LTERM_AGENT_BANNER=0` to suppress only the inline banner while keeping the terminal-title cue. When a row-on shell session later appears to run a known agent command as a child process, lterm may best-effort suspend the row and restore full PTY height until that agent exits; ambiguous process detection fails safe by keeping the row. The global `LTERM_NO_STATUS=1` / `LTERM_STATUS=0` status kill-switches still win over CLI status requests.
 

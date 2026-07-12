@@ -1,9 +1,12 @@
 use crate::paths;
 use crate::protocol::{
-    CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction, CapabilityToken, DaemonStatus,
-    InstrumentSnapshot, IssueInputCapabilityResult, MAX_CAPABILITY_INPUT_BYTES,
-    MAX_INPUT_CAPABILITY_BUDGET, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
-    SessionInfo, StatusTheme, WaitContainsResult, WaitExitResult,
+    CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
+    CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
+    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
+    MetadataHistoryResult, MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate,
+    MetadataPurgeResult, MetadataStepDirection, MetadataStepResult, MetadataValue,
+    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme,
+    WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -280,11 +283,10 @@ impl Drop for OutputClosedGuard {
 
 struct Session {
     id: String,
-    // Lock order: when a code path needs both the global session map and this
-    // mutable display/target name, take `State.sessions` before `Session.name`.
-    // Plain metadata reads may lock `name` alone, but must not call back into
-    // session-map operations while holding that guard.
-    name: Mutex<String>,
+    // Canonical lock order is `State.sessions -> Session.metadata`. The
+    // unified lock keeps current metadata, journal cursor, entries, and purge
+    // evidence coherent. Never call `Session::info()` while holding it.
+    metadata: Mutex<SessionMetadata>,
     pane_id: String,
     parent_pane_id: Mutex<Option<String>>,
     parent_session_id: Mutex<Option<String>>,
@@ -295,7 +297,6 @@ struct Session {
     process_id: Option<u32>,
     process_group_id: Option<i32>,
     agent_name: Option<String>,
-    status_theme: Mutex<Option<StatusTheme>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -410,16 +411,40 @@ struct Session {
     cols: Mutex<u16>,
 }
 
+#[derive(Clone)]
+struct SessionMetadata {
+    current: MetadataValue,
+    entries: Vec<MetadataJournalEntry>,
+    cursor: usize,
+    purge: MetadataPurgeAggregate,
+}
+
+impl SessionMetadata {
+    fn new(name: String, status_theme: Option<StatusTheme>) -> Self {
+        Self {
+            current: MetadataValue { name, status_theme },
+            entries: Vec::new(),
+            cursor: 0,
+            purge: MetadataPurgeAggregate {
+                generation: 0,
+                purged_entries_total: 0,
+                last_purged_unix_ms: None,
+            },
+        }
+    }
+}
+
 impl Session {
     fn name(&self) -> String {
-        lock(&self.name).clone()
+        lock(&self.metadata).current.name.clone()
     }
 
     fn info(&self) -> SessionInfo {
         let exit = self.exit_code.load(Ordering::SeqCst);
+        let metadata = lock(&self.metadata).current.clone();
         SessionInfo {
             id: self.id.clone(),
-            name: self.name(),
+            name: metadata.name,
             pane_id: self.pane_id.clone(),
             parent_pane_id: lock(&self.parent_pane_id).clone(),
             parent_session_id: lock(&self.parent_session_id).clone(),
@@ -433,7 +458,7 @@ impl Session {
             attached_clients: lock(&self.subscribers).len(),
             process_id: self.process_id,
             process_group_id: self.process_group_id,
-            status_theme: *lock(&self.status_theme),
+            status_theme: metadata.status_theme,
             agent_name: self.agent_name.clone(),
         }
     }
@@ -1446,7 +1471,7 @@ fn handle_capability_channel(
 ) -> Result<()> {
     let ready = Response::ok(serde_json::json!({
         "ready": true,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": CAPABILITY_PROTOCOL_VERSION,
     }));
     serde_json::to_writer(&mut stream, &ready).context("write capability ready response")?;
     stream
@@ -1702,6 +1727,27 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
         Request::Instrument { target } => Ok(Response::ok(
             resolve_session(state, &target)?.instrument_snapshot_relaxed(),
         )),
+        Request::MetadataHistory { target } => Ok(Response::ok(metadata_history(state, &target)?)),
+        Request::MetadataUndo { target } => Ok(Response::ok(metadata_step(
+            state,
+            &target,
+            MetadataStepDirection::Undo,
+        )?)),
+        Request::MetadataRedo { target } => Ok(Response::ok(metadata_step(
+            state,
+            &target,
+            MetadataStepDirection::Redo,
+        )?)),
+        Request::MetadataPurgeHistory {
+            target,
+            irreversible,
+            session_id,
+        } => Ok(Response::ok(metadata_purge_history(
+            state,
+            &target,
+            irreversible,
+            &session_id,
+        )?)),
         Request::IssueInputCapability {
             target,
             byte_budget,
@@ -1978,7 +2024,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
 
     let session = Arc::new(Session {
         id,
-        name: Mutex::new(name.clone()),
+        metadata: Mutex::new(SessionMetadata::new(name.clone(), params.status_theme)),
         pane_id,
         parent_pane_id: Mutex::new(None),
         parent_session_id: Mutex::new(None),
@@ -1989,7 +2035,6 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         process_id: Some(process_id),
         process_group_id,
         agent_name,
-        status_theme: Mutex::new(params.status_theme),
         child: Mutex::new(child),
         killer: Mutex::new(killer),
         master: Mutex::new(pair.master),
@@ -2395,8 +2440,34 @@ fn set_status_theme(
     target: &str,
     status_theme: Option<StatusTheme>,
 ) -> Result<SessionInfo> {
-    let session = resolve_session(state, target)?;
-    *lock(&session.status_theme) = status_theme;
+    let target = normalize_target(target);
+    let session = {
+        let sessions = lock(&state.sessions);
+        let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
+            anyhow!(
+                "no such lterm session or pane: {}. Run `lterm list` to see active sessions or `lterm start <NAME>` to create one.",
+                sanitized_preview(&target)
+            )
+        })?;
+        let mut metadata = lock(&session.metadata);
+        if metadata.current.status_theme != status_theme {
+            validate_metadata_append(&metadata)?;
+            let before = metadata.current.clone();
+            let after = MetadataValue {
+                name: before.name.clone(),
+                status_theme,
+            };
+            let entry = MetadataJournalEntry {
+                operation: MetadataOperation::StatusTheme,
+                before,
+                after: after.clone(),
+            };
+            metadata.entries.push(entry);
+            metadata.cursor += 1;
+            metadata.current = after;
+        }
+        Arc::clone(&session)
+    };
     Ok(session.info())
 }
 
@@ -2409,7 +2480,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
     validate_session_name_syntax(&new_name)?;
 
     let target = normalize_target(target);
-    let info = {
+    let session = {
         let mut sessions = lock(&state.sessions);
         let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
             anyhow!(
@@ -2418,15 +2489,14 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
             )
         })?;
 
-        let mut current_name = lock(&session.name);
-        if *current_name == new_name {
+        let mut metadata = lock(&session.metadata);
+        if metadata.current.name == new_name {
             if sessions
                 .by_name
                 .get(&new_name)
                 .is_some_and(|candidate| candidate.id == session.id)
             {
-                drop(current_name);
-                session.info()
+                Arc::clone(&session)
             } else {
                 bail!(
                     "internal session name index inconsistent for: {}",
@@ -2444,24 +2514,253 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 sanitized_preview(&new_name)
             );
         } else {
-            let old_name = current_name.clone();
+            validate_metadata_append(&metadata)?;
+            let old_name = metadata.current.name.clone();
             if sessions
                 .by_name
                 .get(&old_name)
-                .is_some_and(|candidate| candidate.id == session.id)
+                .is_none_or(|candidate| candidate.id != session.id)
             {
-                sessions.by_name.remove(&old_name);
+                bail!(
+                    "internal session name index inconsistent for: {}",
+                    sanitized_preview(&old_name)
+                );
             }
+
+            let before = metadata.current.clone();
+            let after = MetadataValue {
+                name: new_name.clone(),
+                status_theme: before.status_theme,
+            };
+            let entry = MetadataJournalEntry {
+                operation: MetadataOperation::Rename,
+                before,
+                after: after.clone(),
+            };
+
+            sessions.by_name.remove(&old_name);
             sessions
                 .by_name
                 .insert(new_name.clone(), Arc::clone(&session));
-            *current_name = new_name;
-            drop(current_name);
-            session.info()
+            metadata.entries.push(entry);
+            metadata.cursor += 1;
+            metadata.current = after;
+            Arc::clone(&session)
         }
     };
 
-    Ok(info)
+    Ok(session.info())
+}
+
+fn validate_metadata_append(metadata: &SessionMetadata) -> Result<()> {
+    if metadata.cursor != metadata.entries.len() {
+        bail!(
+            "metadata history has redo entries; run `lterm metadata redo` until the tip or explicitly purge history before changing metadata"
+        );
+    }
+    if metadata.entries.len() >= MAX_METADATA_JOURNAL_ENTRIES {
+        bail!(
+            "metadata history is full ({MAX_METADATA_JOURNAL_ENTRIES} entries); explicitly purge history before changing metadata"
+        );
+    }
+    Ok(())
+}
+
+fn metadata_history(state: &Arc<State>, target: &str) -> Result<MetadataHistoryResult> {
+    let target = normalize_target(target);
+    let sessions = lock(&state.sessions);
+    let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
+        anyhow!(
+            "no such lterm session or pane: {}. Run `lterm list` to see active sessions.",
+            sanitized_preview(&target)
+        )
+    })?;
+    let metadata = lock(&session.metadata);
+    Ok(MetadataHistoryResult {
+        schema_version: "1.0".to_string(),
+        session_id: session.id.clone(),
+        pane_id: session.pane_id.clone(),
+        current: metadata.current.clone(),
+        entries: metadata.entries.clone(),
+        cursor: metadata.cursor,
+        capacity: MAX_METADATA_JOURNAL_ENTRIES,
+        purge: metadata.purge.clone(),
+    })
+}
+
+fn metadata_step(
+    state: &Arc<State>,
+    target: &str,
+    direction: MetadataStepDirection,
+) -> Result<MetadataStepResult> {
+    let target = normalize_target(target);
+    let mut sessions = lock(&state.sessions);
+    let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
+        anyhow!(
+            "no such lterm session or pane: {}. Run `lterm list` to see active sessions.",
+            sanitized_preview(&target)
+        )
+    })?;
+    let mut metadata = lock(&session.metadata);
+    let (entry, expected, next, next_cursor) = match direction {
+        MetadataStepDirection::Undo => {
+            let index = metadata
+                .cursor
+                .checked_sub(1)
+                .context("metadata history has nothing to undo")?;
+            let entry = metadata.entries[index].clone();
+            (entry.clone(), entry.after, entry.before, index)
+        }
+        MetadataStepDirection::Redo => {
+            let entry = metadata
+                .entries
+                .get(metadata.cursor)
+                .cloned()
+                .context("metadata history has nothing to redo")?;
+            (
+                entry.clone(),
+                entry.before,
+                entry.after,
+                metadata.cursor + 1,
+            )
+        }
+    };
+    if metadata.current != expected {
+        bail!(
+            "metadata current state does not match the journal entry; refusing {} without mutation",
+            match direction {
+                MetadataStepDirection::Undo => "undo",
+                MetadataStepDirection::Redo => "redo",
+            }
+        );
+    }
+
+    validate_metadata_name_transition(&sessions, &session, &metadata.current.name, &next.name)?;
+    let result = MetadataStepResult {
+        session_id: session.id.clone(),
+        pane_id: session.pane_id.clone(),
+        direction,
+        applied: entry,
+        current: next.clone(),
+        cursor: next_cursor,
+        entry_count: metadata.entries.len(),
+    };
+
+    apply_metadata_name_transition(&mut sessions, &session, &metadata.current.name, &next.name);
+    metadata.current = next;
+    metadata.cursor = next_cursor;
+    Ok(result)
+}
+
+fn validate_metadata_name_transition(
+    sessions: &SessionMaps,
+    session: &Session,
+    current_name: &str,
+    next_name: &str,
+) -> Result<()> {
+    if sessions
+        .by_name
+        .get(current_name)
+        .is_none_or(|candidate| candidate.id != session.id)
+    {
+        bail!(
+            "internal session name index inconsistent for: {}",
+            sanitized_preview(current_name)
+        );
+    }
+    if current_name != next_name {
+        validate_session_name_syntax(next_name)?;
+        if sessions.reserved_names.contains(next_name)
+            || sessions
+                .by_name
+                .get(next_name)
+                .is_some_and(|candidate| candidate.id != session.id)
+        {
+            bail!(
+                "session name already exists: {}",
+                sanitized_preview(next_name)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_metadata_name_transition(
+    sessions: &mut SessionMaps,
+    session: &Arc<Session>,
+    current_name: &str,
+    next_name: &str,
+) {
+    if current_name == next_name {
+        return;
+    }
+    sessions.by_name.remove(current_name);
+    sessions
+        .by_name
+        .insert(next_name.to_string(), Arc::clone(session));
+}
+
+fn metadata_purge_history(
+    state: &Arc<State>,
+    target: &str,
+    irreversible: bool,
+    claimed_session_id: &str,
+) -> Result<MetadataPurgeResult> {
+    if !irreversible {
+        bail!("metadata history purge requires --irreversible");
+    }
+    let parsed = Uuid::parse_str(claimed_session_id)
+        .context("metadata history purge requires a canonical session UUID")?;
+    if parsed.hyphenated().to_string() != claimed_session_id {
+        bail!("metadata history purge requires a canonical session UUID");
+    }
+
+    let target = normalize_target(target);
+    let sessions = lock(&state.sessions);
+    let session = resolve_session_locked(&sessions, &target).ok_or_else(|| {
+        anyhow!(
+            "no such lterm session or pane: {}. Run `lterm list` to see active sessions.",
+            sanitized_preview(&target)
+        )
+    })?;
+    if session.id != claimed_session_id {
+        bail!("metadata history purge session id does not match the live target");
+    }
+    let mut metadata = lock(&session.metadata);
+    if metadata.entries.is_empty() {
+        bail!("metadata history is empty; nothing to purge");
+    }
+    let purged_entries = metadata.entries.len();
+    let purged_entries_u64 = u64::try_from(purged_entries).context("metadata history too large")?;
+    let generation = metadata
+        .purge
+        .generation
+        .checked_add(1)
+        .context("metadata purge generation overflow")?;
+    let purged_entries_total = metadata
+        .purge
+        .purged_entries_total
+        .checked_add(purged_entries_u64)
+        .context("metadata purged entry counter overflow")?;
+    let purge = MetadataPurgeAggregate {
+        generation,
+        purged_entries_total,
+        last_purged_unix_ms: Some(u64::try_from(now_unix_ms()).unwrap_or(u64::MAX)),
+    };
+    let result = MetadataPurgeResult {
+        session_id: session.id.clone(),
+        pane_id: session.pane_id.clone(),
+        current: metadata.current.clone(),
+        purged_entries,
+        cursor: 0,
+        entry_count: 0,
+        purge: purge.clone(),
+    };
+
+    metadata.entries.clear();
+    metadata.cursor = 0;
+    metadata.purge = purge;
+    Ok(result)
 }
 
 fn remove_session(state: &Arc<State>, session: &Session) {
@@ -3862,18 +4161,21 @@ mod tests {
     use super::{
         ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, InputCapabilityGrant,
         MAX_INPUT_CAPABILITIES, MAX_INPUT_CAPABILITIES_PER_SESSION, MAX_TERMINAL_COLS,
-        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session, State,
-        Subscriber, TerminalPrefixTracker, WaitContainsScanner, apply_capability_input,
-        broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers, forward_attach_output,
-        handle_capability_channel, initial_pty_size, issue_input_capability,
-        os_key_is_private_multiplexer_env, os_key_starts_with_cmux_prefix,
-        process_group_still_owns_child, read_request_frame_with_limit,
-        read_request_frame_with_timeout, remove_session, rename_session, request_frame_from_chunk,
-        revoke_input_capability, sanitize_child_env, sanitized_tail_for_needle,
-        validate_terminal_geometry, verify_linux_peercred_len, verify_peer_uid,
-        wait_for_session_contains,
+        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
+        SessionMetadata, State, Subscriber, TerminalPrefixTracker, WaitContainsScanner,
+        apply_capability_input, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
+        forward_attach_output, handle_capability_channel, initial_pty_size, issue_input_capability,
+        metadata_history, metadata_purge_history, metadata_step, os_key_is_private_multiplexer_env,
+        os_key_starts_with_cmux_prefix, process_group_still_owns_child,
+        read_request_frame_with_limit, read_request_frame_with_timeout, remove_session,
+        rename_session, request_frame_from_chunk, revoke_input_capability, sanitize_child_env,
+        sanitized_tail_for_needle, set_status_theme, validate_terminal_geometry,
+        verify_linux_peercred_len, verify_peer_uid, wait_for_session_contains,
     };
-    use crate::protocol::{CapabilityAction, CapabilityToken};
+    use crate::protocol::{
+        CapabilityAction, CapabilityToken, MAX_METADATA_JOURNAL_ENTRIES, MetadataStepDirection,
+        StatusTheme,
+    };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
@@ -3883,6 +4185,7 @@ mod tests {
     use std::sync::{Barrier, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
+    use uuid::Uuid;
 
     #[test]
     fn process_group_check_requires_current_child_group_match() {
@@ -4408,8 +4711,8 @@ mod tests {
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("take pty writer");
         Arc::new(Session {
-            id: format!("test-{name}"),
-            name: Mutex::new(name.to_string()),
+            id: Uuid::new_v4().to_string(),
+            metadata: Mutex::new(SessionMetadata::new(name.to_string(), None)),
             pane_id: format!("%test-{name}"),
             parent_pane_id: Mutex::new(None),
             parent_session_id: Mutex::new(None),
@@ -4420,7 +4723,6 @@ mod tests {
             created_unix_ms: 0,
             process_id: None,
             process_group_id: None,
-            status_theme: Mutex::new(None),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             master: Mutex::new(pair.master),
@@ -4479,6 +4781,254 @@ mod tests {
         sessions
             .by_id
             .insert(session.id.clone(), Arc::clone(session));
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MetadataFiveState {
+        indexed_name: Option<String>,
+        current: crate::protocol::MetadataValue,
+        entries: Vec<crate::protocol::MetadataJournalEntry>,
+        cursor: usize,
+        purge: crate::protocol::MetadataPurgeAggregate,
+    }
+
+    fn metadata_five_state(state: &Arc<State>, session: &Arc<Session>) -> MetadataFiveState {
+        let sessions = super::lock(&state.sessions);
+        let metadata = super::lock(&session.metadata);
+        MetadataFiveState {
+            indexed_name: sessions
+                .by_name
+                .iter()
+                .find_map(|(name, candidate)| (candidate.id == session.id).then(|| name.clone())),
+            current: metadata.current.clone(),
+            entries: metadata.entries.clone(),
+            cursor: metadata.cursor,
+            purge: metadata.purge.clone(),
+        }
+    }
+
+    #[test]
+    fn metadata_thousand_mixed_operations_undo_to_baseline_and_redo_to_final() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("metadata-baseline");
+        register_test_session(&state, &session);
+        let baseline = metadata_history(&state, &session.pane_id)
+            .expect("baseline history")
+            .current;
+
+        for index in 0..500 {
+            rename_session(&state, &session.pane_id, format!("metadata-{index}"))
+                .expect("journal rename");
+            let theme = if index % 2 == 0 {
+                Some(StatusTheme::Blue)
+            } else {
+                Some(StatusTheme::Green)
+            };
+            set_status_theme(&state, &session.pane_id, theme).expect("journal theme");
+        }
+        let final_state = metadata_history(&state, &session.pane_id).expect("final history");
+        assert_eq!(final_state.entries.len(), 1000);
+        assert_eq!(final_state.cursor, 1000);
+
+        for _ in 0..1000 {
+            metadata_step(&state, &session.pane_id, MetadataStepDirection::Undo)
+                .expect("undo exact operation");
+        }
+        let undone = metadata_history(&state, &session.pane_id).expect("undone history");
+        assert_eq!(undone.current, baseline);
+        assert_eq!(undone.cursor, 0);
+        assert_eq!(undone.entries.len(), 1000);
+
+        for _ in 0..1000 {
+            metadata_step(&state, &session.pane_id, MetadataStepDirection::Redo)
+                .expect("redo exact operation");
+        }
+        let redone = metadata_history(&state, &session.pane_id).expect("redone history");
+        assert_eq!(redone.current, final_state.current);
+        assert_eq!(redone.cursor, 1000);
+        assert_eq!(redone.entries, final_state.entries);
+    }
+
+    #[test]
+    fn metadata_cap_and_redo_branch_reject_without_truncation_but_noop_succeeds() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("metadata-cap");
+        register_test_session(&state, &session);
+        for index in 0..MAX_METADATA_JOURNAL_ENTRIES {
+            let theme = if index % 2 == 0 {
+                Some(StatusTheme::Blue)
+            } else {
+                Some(StatusTheme::Green)
+            };
+            set_status_theme(&state, &session.pane_id, theme).expect("fill journal");
+        }
+        let full = metadata_five_state(&state, &session);
+        let same_theme = full.current.status_theme;
+        set_status_theme(&state, &session.pane_id, same_theme).expect("no-op at cap");
+        assert_eq!(metadata_five_state(&state, &session), full);
+        let err = rename_session(&state, &session.pane_id, "metadata-over-cap".to_string())
+            .expect_err("1025th mutation must reject");
+        assert!(err.to_string().contains("history is full"));
+        assert_eq!(metadata_five_state(&state, &session), full);
+
+        metadata_step(&state, &session.pane_id, MetadataStepDirection::Undo)
+            .expect("create redo branch");
+        let branched = metadata_five_state(&state, &session);
+        rename_session(&state, &session.pane_id, branched.current.name.clone())
+            .expect("rename no-op on redo branch");
+        assert_eq!(metadata_five_state(&state, &session), branched);
+        let err = set_status_theme(&state, &session.pane_id, Some(StatusTheme::Red))
+            .expect_err("new mutation must not truncate redo branch");
+        assert!(err.to_string().contains("redo entries"));
+        assert_eq!(metadata_five_state(&state, &session), branched);
+    }
+
+    #[test]
+    fn metadata_mismatch_conflict_and_reserved_name_fail_all_five_atomically() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("metadata-source");
+        register_test_session(&state, &session);
+        rename_session(&state, &session.pane_id, "metadata-destination".to_string())
+            .expect("initial rename");
+
+        // Give the conflicting session a distinct immutable pane id, then
+        // rename it into the undo destination. Reusing `metadata-source` at
+        // construction time would also reuse the test helper's pane id and
+        // accidentally replace the session under test in `by_pane`.
+        let conflict = build_test_session("metadata-conflict");
+        register_test_session(&state, &conflict);
+        rename_session(&state, &conflict.pane_id, "metadata-source".to_string())
+            .expect("occupy undo destination");
+        let before_conflict = metadata_five_state(&state, &session);
+        let err = metadata_step(&state, &session.pane_id, MetadataStepDirection::Undo)
+            .expect_err("undo destination conflict must fail");
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(metadata_five_state(&state, &session), before_conflict);
+
+        remove_session(&state, &conflict);
+        {
+            let mut sessions = super::lock(&state.sessions);
+            sessions
+                .reserved_names
+                .insert("metadata-source".to_string());
+        }
+        let before_reserved = metadata_five_state(&state, &session);
+        metadata_step(&state, &session.pane_id, MetadataStepDirection::Undo)
+            .expect_err("reserved undo destination must fail");
+        assert_eq!(metadata_five_state(&state, &session), before_reserved);
+        super::lock(&state.sessions)
+            .reserved_names
+            .remove("metadata-source");
+
+        {
+            let mut metadata = super::lock(&session.metadata);
+            metadata.current.status_theme = Some(StatusTheme::Amber);
+        }
+        let before_mismatch = metadata_five_state(&state, &session);
+        let err = metadata_step(&state, &session.pane_id, MetadataStepDirection::Undo)
+            .expect_err("whole-current mismatch must fail");
+        assert!(err.to_string().contains("does not match"));
+        assert_eq!(metadata_five_state(&state, &session), before_mismatch);
+    }
+
+    #[test]
+    fn metadata_purge_gate_uuid_empty_and_overflow_fail_atomically() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("metadata-purge");
+        register_test_session(&state, &session);
+        let id = session.id.clone();
+
+        metadata_purge_history(&state, &session.pane_id, true, &id)
+            .expect_err("empty history must fail");
+        rename_session(
+            &state,
+            &session.pane_id,
+            "metadata-purge-renamed".to_string(),
+        )
+        .expect("populate history");
+        let populated = metadata_five_state(&state, &session);
+        metadata_purge_history(&state, &session.pane_id, false, &id)
+            .expect_err("missing irreversible gate must fail");
+        assert_eq!(metadata_five_state(&state, &session), populated);
+        metadata_purge_history(&state, &session.pane_id, true, &Uuid::new_v4().to_string())
+            .expect_err("wrong exact UUID must fail");
+        assert_eq!(metadata_five_state(&state, &session), populated);
+        metadata_purge_history(&state, &session.pane_id, true, &id.to_uppercase())
+            .expect_err("noncanonical UUID must fail");
+        assert_eq!(metadata_five_state(&state, &session), populated);
+
+        {
+            super::lock(&session.metadata).purge.generation = u64::MAX;
+        }
+        let before_overflow = metadata_five_state(&state, &session);
+        metadata_purge_history(&state, &session.pane_id, true, &id)
+            .expect_err("purge generation overflow must fail");
+        assert_eq!(metadata_five_state(&state, &session), before_overflow);
+        super::lock(&session.metadata).purge.generation = 0;
+
+        let current_before = super::lock(&session.metadata).current.clone();
+        let purged = metadata_purge_history(&state, &session.pane_id, true, &id)
+            .expect("valid irreversible purge");
+        assert_eq!(purged.purged_entries, 1);
+        assert_eq!(purged.current, current_before);
+        let after = metadata_history(&state, &session.pane_id).expect("history after purge");
+        assert!(after.entries.is_empty());
+        assert_eq!(after.cursor, 0);
+        assert_eq!(after.current, current_before);
+        assert_eq!(after.purge.generation, 1);
+        assert_eq!(after.purge.purged_entries_total, 1);
+        assert!(after.purge.last_purged_unix_ms.is_some());
+    }
+
+    #[test]
+    fn metadata_concurrent_renames_linearize_and_same_destination_has_one_winner() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("metadata-concurrent");
+        register_test_session(&state, &session);
+        let barrier = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let state = Arc::clone(&state);
+            let pane = session.pane_id.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                rename_session(&state, &pane, format!("metadata-linear-{index}"))
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("rename thread")
+                .expect("unique rename");
+        }
+        let history = metadata_history(&state, &session.pane_id).expect("linear history");
+        assert_eq!(history.entries.len(), 8);
+        assert_eq!(history.cursor, 8);
+        for pair in history.entries.windows(2) {
+            assert_eq!(pair[0].after, pair[1].before);
+        }
+
+        let other = build_test_session("metadata-other");
+        register_test_session(&state, &other);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut racers = Vec::new();
+        for racer in [Arc::clone(&session), Arc::clone(&other)] {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            racers.push(thread::spawn(move || {
+                barrier.wait();
+                rename_session(&state, &racer.pane_id, "metadata-one-winner".to_string())
+            }));
+        }
+        barrier.wait();
+        let successes = racers
+            .into_iter()
+            .map(|handle| handle.join().expect("race thread"))
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(successes, 1);
     }
 
     struct PartialThenFailWriter {
@@ -4792,6 +5342,7 @@ mod tests {
         let mut ready = String::new();
         reader.read_line(&mut ready).expect("read capability ready");
         assert!(ready.contains("\"ready\":true"));
+        assert!(ready.contains("\"protocol_version\":5"));
         const SENTINEL: &str = "MALFORMED_CAPABILITY_SECRET_SENTINEL";
         writeln!(
             reader.get_mut(),

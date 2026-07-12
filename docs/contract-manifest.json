@@ -338,6 +338,53 @@
       "stability_scope": "Capability is an opt-in cooperative input attenuation surface inside the existing same-UID trust boundary, not a sandbox. Tokens exist only in validated private files and a same-connection v5 sensitive frame; raw Attach and legacy Send remain unchanged. Attempt bytes are atomically charged before one PTY write and are not refunded on failure."
     },
     {
+      "command": "lterm metadata",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/metadata-history.schema.json",
+      "tests": [
+        "cargo test --bin lterm metadata_history_round_trip_has_exact_raw_free_allowlist",
+        "cargo test --bin lterm metadata_thousand_mixed_operations_undo_to_baseline_and_redo_to_final",
+        "cargo test --bin lterm metadata_cap_and_redo_branch_reject_without_truncation_but_noop_succeeds",
+        "cargo test --bin lterm metadata_mismatch_conflict_and_reserved_name_fail_all_five_atomically",
+        "cargo test --bin lterm metadata_purge_gate_uuid_empty_and_overflow_fail_atomically",
+        "cargo test --bin lterm metadata_concurrent_renames_linearize_and_same_destination_has_one_winner",
+        "cargo test --test cli_smoke metadata_history_undo_redo_and_irreversible_purge_are_exact"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Metadata is a protocol-v6, raw-free, live-session-only linear journal for name and status_theme. It hard-rejects new mutations behind the tip or at 1024 entries without branch truncation or eviction; no-ops still succeed. Undo/redo validate the whole current pair and rename index before atomic commit. Purge requires --irreversible plus the exact canonical live session UUID, preserves current metadata, and clears only volatile history; it is an accident gate, not authorization or durable audit. Raw Attach, legacy Send, Kill, close, and process/filesystem effects are not reversible and remain unchanged.",
+      "json_samples": [
+        {
+          "setup": [
+            [
+              "start",
+              "-d",
+              "-n",
+              "schema-metadata",
+              "--",
+              "sh",
+              "-lc",
+              "sleep 5"
+            ],
+            [
+              "rename",
+              "schema-metadata",
+              "schema-metadata-renamed"
+            ]
+          ],
+          "argv": [
+            "metadata",
+            "history",
+            "schema-metadata-renamed",
+            "--json"
+          ]
+        }
+      ]
+    },
+    {
       "command": "lterm processes",
       "aliases": [
         "lterm ps"

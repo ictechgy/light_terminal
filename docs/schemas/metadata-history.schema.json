@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm metadata history TARGET --json output",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "pane_id",
+    "current",
+    "entries",
+    "cursor",
+    "capacity",
+    "purge"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "session_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "pane_id": { "type": "string", "pattern": "^%[0-9]+$" },
+    "current": { "$ref": "#/$defs/value" },
+    "entries": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "cursor": { "type": "integer", "minimum": 0, "maximum": 1024 },
+    "capacity": { "const": 1024 },
+    "purge": { "$ref": "#/$defs/purge" }
+  },
+  "$defs": {
+    "theme": {
+      "type": "string",
+      "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"]
+    },
+    "value": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status_theme": { "$ref": "#/$defs/theme" }
+      },
+      "additionalProperties": false
+    },
+    "entry": {
+      "type": "object",
+      "required": ["operation", "before", "after"],
+      "properties": {
+        "operation": { "enum": ["rename", "status_theme"] },
+        "before": { "$ref": "#/$defs/value" },
+        "after": { "$ref": "#/$defs/value" }
+      },
+      "additionalProperties": false
+    },
+    "purge": {
+      "type": "object",
+      "required": ["generation", "purged_entries_total"],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 0 },
+        "purged_entries_total": { "type": "integer", "minimum": 0 },
+        "last_purged_unix_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
