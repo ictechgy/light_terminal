@@ -142,6 +142,23 @@ fn failed_exec_is_observed_and_durably_tombstoned() {
 }
 
 #[test]
+fn missing_executable_tombstones_pre_spawn_intent() {
+    let temp = private_temp();
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(temp.path().join("missing-executable"))
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run missing-executable launch driver");
+    assert!(!output.status.success());
+    assert_eq!(
+        slot_state(&slot_path(&temp)).as_deref(),
+        Some("resolved_tombstone")
+    );
+}
+
+#[test]
 fn terminate_and_wait_reaps_root_and_tombstones() {
     let temp = private_temp();
     let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
