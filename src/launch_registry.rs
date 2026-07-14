@@ -1084,11 +1084,18 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     managed_test_failpoint("parent_before_intent");
     let intent = registry.allocate_intent(now_unix_secs()?)?;
     managed_test_failpoint("parent_after_intent");
-    let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
+    let SlotState::IntentDurable { nonce, .. } = &intent.record.state else {
         unreachable!("allocator returns intent")
     };
-    let target = open_pinned_executable(&request.executable)?;
-    let (parent_control, child_control) = seqpacket_pair()?;
+    let nonce = *nonce;
+    let target = match open_pinned_executable(&request.executable) {
+        Ok(target) => target,
+        Err(err) => return Err(resolve_unspawned_intent(&registry, intent, err)),
+    };
+    let (parent_control, child_control) = match seqpacket_pair() {
+        Ok(pair) => pair,
+        Err(err) => return Err(resolve_unspawned_intent(&registry, intent, err)),
+    };
     let guard_fd = intent.guard.file.as_raw_fd();
     let control_fd = child_control.as_raw_fd();
 
@@ -1109,9 +1116,10 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     unsafe {
         command.pre_exec(move || remap_gate_fds(control_fd, guard_fd));
     }
-    let mut child = command
-        .spawn()
-        .context("spawn trusted managed launch gate")?;
+    let mut child = match command.spawn().context("spawn trusted managed launch gate") {
+        Ok(child) => child,
+        Err(err) => return Err(resolve_unspawned_intent(&registry, intent, err)),
+    };
     managed_test_failpoint("parent_after_spawn");
     drop(child_control);
     let launch_result = (|| -> Result<ProcessIdentity> {
@@ -1166,6 +1174,26 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
             );
             Err(err)
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_unspawned_intent(
+    registry: &Registry,
+    intent: LaunchIntent,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let slot = intent.record.slot;
+    let generation = intent.record.generation;
+    drop(intent);
+    match registry.cleanup(slot, generation) {
+        Ok(ReconcileOutcome::ResolvedTombstone) => error,
+        Ok(outcome) => error.context(format!(
+            "pre-spawn intent did not reach a tombstone: {outcome:?}"
+        )),
+        Err(cleanup_error) => error.context(format!(
+            "pre-spawn intent cleanup failed: {cleanup_error:#}"
+        )),
     }
 }
 
