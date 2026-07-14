@@ -300,9 +300,6 @@ fn cleanup_crash_boundaries_resume_to_tombstone() {
         reconcile_until_tombstone(&temp);
     }
 }
-<<<<<<< HEAD
-=======
-
 #[test]
 fn concurrent_reconcilers_fail_closed_and_converge() {
     let temp = private_temp();
@@ -337,4 +334,3 @@ fn concurrent_reconcilers_fail_closed_and_converge() {
     assert!(second.wait().unwrap().success());
     reconcile_until_tombstone(&temp);
 }
->>>>>>> 6b51e05
