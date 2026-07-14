@@ -23,6 +23,8 @@ const TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const INTERNAL_GATE_ARG: &str = "__lterm-internal-managed-launch-gate-v1";
 #[cfg(debug_assertions)]
 const INTERNAL_TEST_LAUNCH_ARG: &str = "__lterm-internal-managed-launch-test-v1";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_RECONCILE_ARG: &str = "__lterm-internal-managed-reconcile-test-v1";
 #[cfg(target_os = "linux")]
 const GATE_CONTROL_FD: RawFd = 3;
 #[cfg(target_os = "linux")]
@@ -110,6 +112,13 @@ struct GateCommit {
     identity: ProcessIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GateExecFailure {
+    protocol: String,
+    errno: Option<i32>,
+    message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReconcileOutcome {
     Absent,
@@ -131,6 +140,67 @@ pub(crate) struct ManagedProcess {
     pub slot: u16,
     pub generation: u64,
     pub identity: ProcessIdentity,
+    child: Option<std::process::Child>,
+    registry: Registry,
+}
+
+impl ManagedProcess {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn wait(mut self) -> Result<std::process::ExitStatus> {
+        let status = self
+            .child
+            .take()
+            .context("managed root-process handle was already consumed")?
+            .wait()
+            .context("wait for managed root process")?;
+        ensure!(
+            self.registry.cleanup(self.slot, self.generation)?
+                == ReconcileOutcome::ResolvedTombstone,
+            "managed root process exited without a durable tombstone"
+        );
+        Ok(status)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn terminate_and_wait(mut self) -> Result<std::process::ExitStatus> {
+        let first = self.registry.cleanup(self.slot, self.generation)?;
+        ensure!(
+            matches!(
+                first,
+                ReconcileOutcome::ResolvedTombstone | ReconcileOutcome::UnknownOrphanRisk(_)
+            ),
+            "managed cleanup did not start conservatively: {first:?}"
+        );
+        let status = self
+            .child
+            .take()
+            .context("managed root-process handle was already consumed")?
+            .wait()
+            .context("reap managed root process after cleanup")?;
+        ensure!(
+            self.registry.cleanup(self.slot, self.generation)?
+                == ReconcileOutcome::ResolvedTombstone,
+            "managed cleanup did not reach a durable tombstone after reap"
+        );
+        Ok(status)
+    }
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(mut child) = self.child.take() {
+            let registry = self.registry.clone();
+            let slot = self.slot;
+            let generation = self.generation;
+            let _ = std::thread::Builder::new()
+                .name("lterm-managed-root-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                    let _ = registry.cleanup(slot, generation);
+                });
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -495,10 +565,12 @@ impl Registry {
         if current != pending {
             self.replace_slot(&current, &pending)?;
         }
+        managed_test_failpoint("after_cleanup_pending");
 
         match open_verified_pidfd(&identity) {
             Evidence::Present(pidfd) => {
                 pidfd.send_signal(libc::SIGKILL)?;
+                managed_test_failpoint("after_cleanup_signal");
                 pidfd.wait(Duration::from_secs(5))?;
                 match verify_exact_process(&identity) {
                     Evidence::Absent => self.persist_tombstone(&pending, nonce, Some(identity)),
@@ -529,9 +601,42 @@ impl Registry {
             },
             ..current.clone()
         };
+        #[cfg(target_os = "linux")]
+        managed_test_failpoint("before_tombstone");
         self.replace_slot(current, &tombstone)?;
+        #[cfg(target_os = "linux")]
+        managed_test_failpoint("after_tombstone");
         Ok(ReconcileOutcome::ResolvedTombstone)
     }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_all(&self) -> Vec<(u16, ReconcileOutcome)> {
+        (0..self.slot_count)
+            .map(|slot| u16::try_from(slot).expect("validated registry slot count"))
+            .filter_map(|slot| match self.read_slot(slot) {
+                SlotRead::Valid(SlotRecord {
+                    state: SlotState::Vacant | SlotState::ResolvedTombstone { .. },
+                    ..
+                }) => None,
+                SlotRead::Valid(record) => Some((
+                    slot,
+                    self.cleanup(slot, record.generation).unwrap_or_else(|err| {
+                        ReconcileOutcome::UnknownOrphanRisk(format!(
+                            "slot {slot} reconciliation failed: {err:#}"
+                        ))
+                    }),
+                )),
+                SlotRead::Unknown(reason) => {
+                    Some((slot, ReconcileOutcome::UnknownOrphanRisk(reason)))
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reconcile_managed_processes() -> Result<Vec<(u16, ReconcileOutcome)>> {
+    Ok(Registry::open_default()?.reconcile_all())
 }
 
 fn validate_slot_record(record: &SlotRecord, expected_slot: u16) -> Result<()> {
@@ -946,6 +1051,8 @@ impl PidFd {
         let result = unsafe { libc::poll(&mut pollfd, 1, millis) };
         if result < 0 {
             Err(std::io::Error::last_os_error()).context("poll pidfd")
+        } else if result == 0 {
+            bail!("timed out waiting for pidfd readiness")
         } else {
             Ok(())
         }
@@ -974,7 +1081,9 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     use std::process::Command;
 
     let registry = Registry::open_default()?;
+    managed_test_failpoint("parent_before_intent");
     let intent = registry.allocate_intent(now_unix_secs()?)?;
+    managed_test_failpoint("parent_after_intent");
     let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
         unreachable!("allocator returns intent")
     };
@@ -1000,41 +1109,134 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     unsafe {
         command.pre_exec(move || remap_gate_fds(control_fd, guard_fd));
     }
-    let child = command
+    let mut child = command
         .spawn()
         .context("spawn trusted managed launch gate")?;
+    managed_test_failpoint("parent_after_spawn");
     drop(child_control);
+    let launch_result = (|| -> Result<ProcessIdentity> {
+        set_socket_timeout(parent_control.as_raw_fd(), Duration::from_secs(10))?;
+        let hello: GateHello = recv_packet(parent_control.as_raw_fd())?;
+        ensure!(hello.protocol == "lterm-managed-hello-v1");
+        ensure!(hello.registration.slot == intent.record.slot);
+        ensure!(hello.registration.generation == intent.record.generation);
+        ensure!(hello.registration.nonce == nonce);
+        ensure!(hello.registration.identity.pid == child.id());
+        managed_test_failpoint("parent_after_hello");
+        let verified = match open_verified_pidfd(&hello.registration.identity) {
+            Evidence::Present(pidfd) => pidfd,
+            Evidence::Absent => bail!("managed gate exited before identity promotion"),
+            Evidence::Unavailable(reason) => bail!("managed gate identity unavailable: {reason}"),
+        };
+        drop(verified);
+        let identity_record = registry.record_identity(&intent.record, &hello.registration)?;
+        managed_test_failpoint("parent_after_identity");
+        let SlotState::IdentityDurable { identity, .. } = &identity_record.state else {
+            unreachable!()
+        };
+        let commit = GateCommit {
+            protocol: "lterm-managed-commit-v1".into(),
+            slot: intent.record.slot,
+            generation: intent.record.generation,
+            nonce,
+            identity: identity.clone(),
+        };
+        managed_test_failpoint("parent_before_commit");
+        send_commit_with_fd(parent_control.as_raw_fd(), &commit, target.as_raw_fd())?;
+        managed_test_failpoint("parent_after_commit");
+        wait_for_gate_exec(parent_control.as_raw_fd())?;
+        Ok(identity.clone())
+    })();
 
-    set_socket_timeout(parent_control.as_raw_fd(), Duration::from_secs(10))?;
-    let hello: GateHello = recv_packet(parent_control.as_raw_fd())?;
-    ensure!(hello.protocol == "lterm-managed-hello-v1");
-    ensure!(hello.registration.slot == intent.record.slot);
-    ensure!(hello.registration.generation == intent.record.generation);
-    ensure!(hello.registration.nonce == nonce);
-    ensure!(hello.registration.identity.pid == child.id());
-    let verified = match open_verified_pidfd(&hello.registration.identity) {
-        Evidence::Present(pidfd) => pidfd,
-        Evidence::Absent => bail!("managed gate exited before identity promotion"),
-        Evidence::Unavailable(reason) => bail!("managed gate identity unavailable: {reason}"),
+    match launch_result {
+        Ok(identity) => Ok(ManagedProcess {
+            slot: intent.record.slot,
+            generation: intent.record.generation,
+            identity,
+            child: Some(child),
+            registry,
+        }),
+        Err(err) => {
+            drop(parent_control);
+            settle_failed_launch(
+                &registry,
+                intent.record.slot,
+                intent.record.generation,
+                &mut child,
+            );
+            Err(err)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_gate_exec(control_fd: RawFd) -> Result<()> {
+    let mut bytes = [0u8; MAX_RECORD_BYTES + 1];
+    let received = unsafe {
+        libc::recv(
+            control_fd,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::MSG_TRUNC,
+        )
     };
-    drop(verified);
-    let identity_record = registry.record_identity(&intent.record, &hello.registration)?;
-    let SlotState::IdentityDurable { identity, .. } = &identity_record.state else {
-        unreachable!()
-    };
-    let commit = GateCommit {
-        protocol: "lterm-managed-commit-v1".into(),
-        slot: intent.record.slot,
-        generation: intent.record.generation,
-        nonce,
-        identity: identity.clone(),
-    };
-    send_commit_with_fd(parent_control.as_raw_fd(), &commit, target.as_raw_fd())?;
-    Ok(ManagedProcess {
-        slot: intent.record.slot,
-        generation: intent.record.generation,
-        identity: identity.clone(),
-    })
+    if received == 0 {
+        return Ok(());
+    }
+    if received < 0 {
+        return Err(std::io::Error::last_os_error()).context("wait for managed target exec");
+    }
+    ensure!(
+        received as usize <= MAX_RECORD_BYTES,
+        "oversized gate exec status"
+    );
+    let failure: GateExecFailure = serde_json::from_slice(&bytes[..received as usize])
+        .context("malformed gate exec failure")?;
+    ensure!(failure.protocol == "lterm-managed-exec-failure-v1");
+    bail!(
+        "managed target exec failed{}: {}",
+        failure
+            .errno
+            .map(|errno| format!(" (errno {errno})"))
+            .unwrap_or_default(),
+        failure.message
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn settle_failed_launch(
+    registry: &Registry,
+    slot: u16,
+    generation: u64,
+    child: &mut std::process::Child,
+) {
+    if !reap_child_until(child, Duration::from_secs(2)).unwrap_or(false) {
+        let _ = registry.cleanup(slot, generation);
+        let _ = reap_child_until(child, Duration::from_secs(5));
+    }
+    let _ = registry.cleanup(slot, generation);
+}
+
+#[cfg(target_os = "linux")]
+fn reap_child_until(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn managed_test_failpoint(name: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("LTERM_INTERNAL_MANAGED_FAILPOINT").as_deref() == Ok(name) {
+        unsafe { libc::_exit(86) };
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1063,28 +1265,65 @@ pub(crate) fn dispatch_internal_gate() -> Result<bool> {
 pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new(INTERNAL_TEST_LAUNCH_ARG)) {
+    let action = arguments.next();
+    if action.as_deref() != Some(std::ffi::OsStr::new(INTERNAL_TEST_LAUNCH_ARG))
+        && action.as_deref() != Some(std::ffi::OsStr::new(INTERNAL_TEST_RECONCILE_ARG))
+    {
         return Ok(false);
     }
     ensure!(
         std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1")),
         "internal managed-launch test driver requires LTERM_INTERNAL_TEST_MODE=1"
     );
-    let executable = arguments
-        .next()
-        .map(PathBuf::from)
-        .context("internal managed-launch test driver requires an executable")?;
-    let process = launch_managed_process(ManagedLaunchRequest {
-        executable,
-        arguments: arguments.collect(),
-        current_dir: None,
-        environment: std::env::vars_os().collect(),
-    })?;
-    println!(
-        "managed-launch slot={} generation={} pid={}",
-        process.slot, process.generation, process.identity.pid
-    );
-    Ok(true)
+    #[cfg(not(target_os = "linux"))]
+    bail!("internal managed-launch test driver is supported only on Linux");
+    #[cfg(target_os = "linux")]
+    if action.as_deref() == Some(std::ffi::OsStr::new(INTERNAL_TEST_RECONCILE_ARG)) {
+        for (slot, outcome) in reconcile_managed_processes()? {
+            println!("managed-reconcile slot={slot} outcome={outcome:?}");
+        }
+        return Ok(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let executable = arguments
+            .next()
+            .map(PathBuf::from)
+            .context("internal managed-launch test driver requires an executable")?;
+        let process = launch_managed_process(ManagedLaunchRequest {
+            executable,
+            arguments: arguments.collect(),
+            current_dir: None,
+            environment: std::env::vars_os().collect(),
+        })?;
+        let slot = process.slot;
+        let generation = process.generation;
+        let pid = process.identity.pid;
+        println!(
+            "managed-launch slot={} generation={} pid={}",
+            slot, generation, pid
+        );
+        if std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_NO_WAIT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            drop(process);
+            return Ok(true);
+        }
+        let terminate = std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_TERMINATE").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        let status = if terminate {
+            process.terminate_and_wait()?
+        } else {
+            process.wait()?
+        };
+        if !terminate {
+            ensure!(
+                status.success(),
+                "managed root process exited with {status}"
+            );
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1145,6 +1384,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         intent.state,
         SlotState::IntentDurable { nonce: value, .. } if value == nonce
     ));
+    managed_test_failpoint("gate_before_registration");
 
     let identity = match observe_identity(std::process::id()) {
         Evidence::Present(identity) => identity,
@@ -1169,6 +1409,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
             registration: Some(registration.clone()),
         },
     )?;
+    managed_test_failpoint("gate_after_registration");
     send_packet(
         control.as_raw_fd(),
         &GateHello {
@@ -1176,9 +1417,11 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
             registration: registration.clone(),
         },
     )?;
+    managed_test_failpoint("gate_after_hello");
 
     set_socket_timeout(control.as_raw_fd(), Duration::from_secs(30))?;
     let (commit, target) = recv_commit_with_fd(control.as_raw_fd())?;
+    managed_test_failpoint("gate_after_commit");
     ensure!(commit.protocol == "lterm-managed-commit-v1");
     ensure!(commit.slot == slot && commit.generation == generation && commit.nonce == nonce);
     ensure!(commit.identity == identity);
@@ -1198,6 +1441,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
     validate_pinned_executable(&target)?;
     set_cloexec(control.as_raw_fd())?;
     set_cloexec(guard.as_raw_fd())?;
+    managed_test_failpoint("gate_before_exec");
 
     let argv = target_argv
         .iter()
@@ -1231,11 +1475,18 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
             libc::AT_EMPTY_PATH,
         )
     };
-    ensure!(
-        result == 0,
-        "execveat failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = send_packet(
+            control.as_raw_fd(),
+            &GateExecFailure {
+                protocol: "lterm-managed-exec-failure-v1".into(),
+                errno: error.raw_os_error(),
+                message: error.to_string(),
+            },
+        );
+        return Err(error).context("execveat failed");
+    }
     Ok(())
 }
 
@@ -1614,6 +1865,31 @@ mod tests {
         let second = registry.allocate_intent(1).unwrap();
         assert!(registry.allocate_intent(1).is_err());
         drop((first, second));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_fixed_capacity_refuses_before_creating_another_intent() {
+        let (_temp, registry) = registry(SLOT_COUNT);
+        for slot in 0..SLOT_COUNT {
+            let slot = u16::try_from(slot).unwrap();
+            let vacant = registry.read_valid_slot(slot).unwrap();
+            registry
+                .replace_slot(
+                    &vacant,
+                    &SlotRecord {
+                        generation: 1,
+                        state: SlotState::IntentDurable {
+                            nonce: Uuid::new_v4(),
+                            created_unix_secs: 1,
+                        },
+                        ..vacant.clone()
+                    },
+                )
+                .unwrap();
+        }
+        let error = registry.allocate_intent(2).unwrap_err().to_string();
+        assert!(error.contains("1024/1024 unresolved"), "{error}");
     }
 
     #[cfg(target_os = "linux")]
