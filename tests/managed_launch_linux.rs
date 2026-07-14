@@ -10,6 +10,13 @@ use tempfile::TempDir;
 const INTERNAL_TEST_LAUNCH_ARG: &str = "__lterm-internal-managed-launch-test-v1";
 const INTERNAL_TEST_RECONCILE_ARG: &str = "__lterm-internal-managed-reconcile-test-v1";
 
+fn private_temp() -> TempDir {
+    let temp = TempDir::new().expect("temporary data directory");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .expect("private temporary data directory");
+    temp
+}
+
 fn slot_path(temp: &TempDir) -> std::path::PathBuf {
     temp.path()
         .join("speculation/process-registry-v1/slots/slot-0000.json")
@@ -53,7 +60,7 @@ fn reconcile_until_tombstone(temp: &TempDir) {
 }
 
 fn run_managed_launch_with_layout(close_stdin: bool) {
-    let temp = TempDir::new().expect("private temporary data directory");
+    let temp = private_temp();
     let marker = temp.path().join("target-ran");
     let slot = slot_path(&temp);
     let script = format!(
@@ -106,7 +113,7 @@ fn managed_launch_executes_when_sources_collide_with_reserved_descriptors() {
 
 #[test]
 fn failed_exec_is_observed_and_durably_tombstoned() {
-    let temp = TempDir::new().expect("private temporary data directory");
+    let temp = private_temp();
     let invalid = temp.path().join("invalid-executable");
     fs::write(&invalid, b"not an executable format").unwrap();
     fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
@@ -132,7 +139,7 @@ fn failed_exec_is_observed_and_durably_tombstoned() {
 
 #[test]
 fn terminate_and_wait_reaps_root_and_tombstones() {
-    let temp = TempDir::new().expect("private temporary data directory");
+    let temp = private_temp();
     let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
         .arg(INTERNAL_TEST_LAUNCH_ARG)
         .arg("/bin/sh")
@@ -156,7 +163,7 @@ fn terminate_and_wait_reaps_root_and_tombstones() {
 
 #[test]
 fn restart_reconciliation_cleans_detached_root() {
-    let temp = TempDir::new().expect("private temporary data directory");
+    let temp = private_temp();
     let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
         .arg(INTERNAL_TEST_LAUNCH_ARG)
         .arg("/bin/sh")
@@ -194,7 +201,7 @@ fn parent_and_gate_crash_boundaries_reconcile_without_early_target_execution() {
     ];
 
     for (failpoint, marker_must_be_absent) in cases {
-        let temp = TempDir::new().expect("private temporary data directory");
+        let temp = private_temp();
         let marker = temp.path().join("target-ran");
         let slot = slot_path(&temp);
         let script = format!(
@@ -235,7 +242,7 @@ fn cleanup_crash_boundaries_resume_to_tombstone() {
         "before_tombstone",
         "after_tombstone",
     ] {
-        let temp = TempDir::new().expect("private temporary data directory");
+        let temp = private_temp();
         let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
             .arg(INTERNAL_TEST_LAUNCH_ARG)
             .arg("/bin/sh")
