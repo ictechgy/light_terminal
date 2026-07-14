@@ -8081,9 +8081,28 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
     );
     assert_eq!(
         session_names_json(&env)?,
-        running_all_names,
-        "detached helper invoked from outside an lterm parent is a separate visible root while running"
+        before,
+        "an explicit detached split target should make the helper a hidden child while standalone sessions remain visible"
     );
+    assert_eq!(
+        helper_row.parent_pane_id.as_deref(),
+        Some(split_other_pane.as_str()),
+        "the helper must be recorded as the explicit live target's child"
+    );
+    let target_panes = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-panes",
+            "-t",
+            "split-other",
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()?;
+    assert!(target_panes.status.success(), "{target_panes:?}");
+    let target_panes_stdout = String::from_utf8_lossy(&target_panes.stdout);
+    assert_exact_line_set(&target_panes_stdout, &[&split_other_pane, helper_pane]);
     std::fs::write(&release, "release")?;
     wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
     let final_all = session_rows_json(&env, true)?;
@@ -8127,7 +8146,7 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     let child_payload = format!(
         "printf TEAM_WINDOW_TARGET_READY > {marker_arg}; \
          \"$LTERM_BIN\" tmux-compat split-window -v -d -P -F '#{{pane_id}}' \
-         -t team-window-parent:0 sh -lc {grandchild_payload_arg} > {grandchild_pane_file_arg}; \
+         -t \"$TMUX_PANE\" sh -lc {grandchild_payload_arg} > {grandchild_pane_file_arg}; \
          status=$?; printf %s \"$status\" > {grandchild_status_file_arg}; sleep 60"
     );
     let child_payload_arg = shlex::try_quote(&child_payload)?.into_owned();
@@ -8182,6 +8201,31 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     let parent_pane = parent_row
         .get(1)
         .ok_or_else(|| format!("team-window-parent row missing pane id: {parent_row:?}"))?;
+    let roots = session_rows_json(&env, false)?;
+    assert_eq!(
+        roots.iter().map(|row| row.pane_id.as_str()).collect::<Vec<_>>(),
+        vec![*parent_pane],
+        "nested detached splits should remain hidden from the default list: {roots:?}"
+    );
+    let all_rows = session_rows_json(&env, true)?;
+    let child_row = all_rows
+        .iter()
+        .find(|row| row.pane_id == child_pane)
+        .ok_or_else(|| format!("child pane missing from all sessions: {all_rows:?}"))?;
+    assert_eq!(
+        child_row.parent_pane_id.as_deref(),
+        Some(*parent_pane),
+        "first split should be a child of the explicit root target"
+    );
+    let grandchild_row = all_rows
+        .iter()
+        .find(|row| row.pane_id == grandchild_pane)
+        .ok_or_else(|| format!("grandchild pane missing from all sessions: {all_rows:?}"))?;
+    assert_eq!(
+        grandchild_row.parent_pane_id.as_deref(),
+        Some(child_pane.as_str()),
+        "nested split should be a child of its explicit child-pane target"
+    );
 
     let display = env
         .cmd()
