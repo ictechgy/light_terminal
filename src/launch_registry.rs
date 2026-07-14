@@ -21,6 +21,12 @@ const SLOT_COUNT: usize = 1_024;
 const MAX_RECORD_BYTES: usize = 8 * 1_024;
 const TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const INTERNAL_GATE_ARG: &str = "__lterm-internal-managed-launch-gate-v1";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_LAUNCH_ARG: &str = "__lterm-internal-managed-launch-test-v1";
+#[cfg(target_os = "linux")]
+const GATE_CONTROL_FD: RawFd = 3;
+#[cfg(target_os = "linux")]
+const GATE_GUARD_FD: RawFd = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "evidence", content = "value")]
@@ -986,10 +992,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     }
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(control_fd, 3) < 0 || libc::dup2(guard_fd, 4) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+            remap_gate_fds(control_fd, guard_fd)
         });
     }
     let child = command
@@ -1051,6 +1054,69 @@ pub(crate) fn dispatch_internal_gate() -> Result<bool> {
     }
 }
 
+#[cfg(debug_assertions)]
+pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new(INTERNAL_TEST_LAUNCH_ARG)) {
+        return Ok(false);
+    }
+    ensure!(
+        std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+            == Some(std::ffi::OsStr::new("1")),
+        "internal managed-launch test driver requires LTERM_INTERNAL_TEST_MODE=1"
+    );
+    let executable = arguments
+        .next()
+        .map(PathBuf::from)
+        .context("internal managed-launch test driver requires an executable")?;
+    let process = launch_managed_process(ManagedLaunchRequest {
+        executable,
+        arguments: arguments.collect(),
+        current_dir: None,
+        environment: std::env::vars_os().collect(),
+    })?;
+    println!(
+        "managed-launch slot={} generation={} pid={}",
+        process.slot, process.generation, process.identity.pid
+    );
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn remap_gate_fds(control_fd: RawFd, guard_fd: RawFd) -> std::io::Result<()> {
+    let control_copy = duplicate_for_gate_remap(control_fd)?;
+    let guard_copy = match duplicate_for_gate_remap(guard_fd) {
+        Ok(fd) => fd,
+        Err(err) => {
+            unsafe { libc::close(control_copy) };
+            return Err(err);
+        }
+    };
+    let result = if unsafe { libc::dup2(control_copy, GATE_CONTROL_FD) } < 0
+        || unsafe { libc::dup2(guard_copy, GATE_GUARD_FD) } < 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    unsafe {
+        libc::close(control_copy);
+        libc::close(guard_copy);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_for_gate_remap(fd: RawFd) -> std::io::Result<RawFd> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, GATE_GUARD_FD + 1) };
+    if duplicate < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(duplicate)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_gate(arguments: Vec<OsString>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -1064,8 +1130,8 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
     let target_argv = &arguments[4..];
     ensure!(!target_argv.is_empty());
 
-    let control = unsafe { File::from_raw_fd(3) };
-    let guard = unsafe { File::from_raw_fd(4) };
+    let control = unsafe { File::from_raw_fd(GATE_CONTROL_FD) };
+    let guard = unsafe { File::from_raw_fd(GATE_GUARD_FD) };
     validate_seqpacket(control.as_raw_fd())?;
     let registry = Registry::open_at(registry_root, SLOT_COUNT)?;
     validate_inherited_guard(&registry, slot, &guard)?;
