@@ -116,6 +116,35 @@ fn managed_launch_executes_when_sources_collide_with_reserved_descriptors() {
 }
 
 #[test]
+fn managed_launch_executes_pinned_shebang_script() {
+    let temp = private_temp();
+    let marker = temp.path().join("script-ran");
+    let script = temp.path().join("managed-target.sh");
+    fs::write(&script, "#!/bin/sh\nprintf executed > \"$1\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(&script)
+        .arg(&marker)
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run managed shebang target");
+    assert!(
+        output.status.success(),
+        "managed shebang launch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "executed");
+    assert_eq!(
+        slot_state(&slot_path(&temp)).as_deref(),
+        Some("resolved_tombstone")
+    );
+}
+
+#[test]
 fn failed_exec_is_observed_and_durably_tombstoned() {
     let temp = private_temp();
     let invalid = temp.path().join("invalid-executable");
