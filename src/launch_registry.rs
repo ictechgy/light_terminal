@@ -437,7 +437,9 @@ impl Registry {
                     let registration = sidecar.registration.expect("checked some");
                     match verify_exact_process(&registration.identity) {
                         Evidence::Present(_) => ReconcileOutcome::Live,
-                        Evidence::Absent => ReconcileOutcome::Absent,
+                        Evidence::Absent => ReconcileOutcome::UnknownOrphanRisk(
+                            "busy intent guard has an absent registered identity".into(),
+                        ),
                         Evidence::Unavailable(reason) => {
                             ReconcileOutcome::UnknownOrphanRisk(reason)
                         }
@@ -473,7 +475,12 @@ impl Registry {
             SlotState::ResolvedTombstone { .. } => {
                 return Ok(ReconcileOutcome::ResolvedTombstone);
             }
-            SlotState::IntentDurable { .. } => return Ok(self.reconcile_intent(&current)),
+            SlotState::IntentDurable { nonce, .. } => {
+                return match self.reconcile_intent(&current) {
+                    ReconcileOutcome::Absent => self.persist_tombstone(&current, *nonce, None),
+                    outcome => Ok(outcome),
+                };
+            }
             SlotState::Vacant => return Ok(ReconcileOutcome::Absent),
         };
 
@@ -991,9 +998,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         command.current_dir(current_dir);
     }
     unsafe {
-        command.pre_exec(move || {
-            remap_gate_fds(control_fd, guard_fd)
-        });
+        command.pre_exec(move || remap_gate_fds(control_fd, guard_fd));
     }
     let child = command
         .spawn()
@@ -1062,8 +1067,7 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
         return Ok(false);
     }
     ensure!(
-        std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
-            == Some(std::ffi::OsStr::new("1")),
+        std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1")),
         "internal managed-launch test driver requires LTERM_INTERNAL_TEST_MODE=1"
     );
     let executable = arguments
@@ -1610,6 +1614,71 @@ mod tests {
         let second = registry.allocate_intent(1).unwrap();
         assert!(registry.allocate_intent(1).is_err());
         drop((first, second));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unlocked_intent_is_durably_tombstoned() {
+        let (_temp, registry) = registry(1);
+        let intent = registry.allocate_intent(1).unwrap();
+        let slot = intent.record.slot;
+        let generation = intent.record.generation;
+        let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
+            unreachable!()
+        };
+        drop(intent);
+
+        assert_eq!(
+            registry.cleanup(slot, generation).unwrap(),
+            ReconcileOutcome::ResolvedTombstone
+        );
+        assert!(matches!(
+            registry.read_valid_slot(slot).unwrap().state,
+            SlotState::ResolvedTombstone {
+                nonce: value,
+                identity: None,
+                ..
+            } if value == nonce
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn busy_intent_with_absent_registered_identity_stays_unknown() {
+        let (_temp, registry) = registry(1);
+        let intent = registry.allocate_intent(1).unwrap();
+        let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
+            unreachable!()
+        };
+        registry
+            .replace_registration(
+                intent.record.slot,
+                &RegistrationRecord {
+                    schema_version: SCHEMA_VERSION,
+                    slot: intent.record.slot,
+                    generation: intent.record.generation,
+                    registration: Some(GateRegistration {
+                        schema_version: SCHEMA_VERSION,
+                        slot: intent.record.slot,
+                        generation: intent.record.generation,
+                        nonce,
+                        identity: identity(u32::MAX),
+                    }),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry
+                .cleanup(intent.record.slot, intent.record.generation)
+                .unwrap(),
+            ReconcileOutcome::UnknownOrphanRisk(reason)
+                if reason.contains("busy intent guard")
+        ));
+        assert!(matches!(
+            registry.read_valid_slot(intent.record.slot).unwrap().state,
+            SlotState::IntentDurable { .. }
+        ));
     }
 
     #[cfg(target_os = "linux")]
