@@ -770,7 +770,15 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?;
-            let info = client::new_session(name, command, cwd, HashMap::new(), status_theme, tmux)?;
+            let info = client::new_session(
+                name,
+                command,
+                cwd,
+                HashMap::new(),
+                status_theme,
+                tmux,
+                None,
+            )?;
             if detach {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())
@@ -799,8 +807,15 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?.context("run requires a command")?;
-            let info =
-                client::new_session(name, Some(command), cwd, HashMap::new(), status_theme, tmux)?;
+            let info = client::new_session(
+                name,
+                Some(command),
+                cwd,
+                HashMap::new(),
+                status_theme,
+                tmux,
+                None,
+            )?;
             client::attach_with_presence(
                 &info.pane_id,
                 status_presence_from_no_status(no_status),
@@ -3530,6 +3545,7 @@ fn run_agent_profile(
             env,
             launch.status_theme(),
             true,
+            None,
         );
         match created {
             Ok(info) => {

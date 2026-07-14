@@ -290,13 +290,18 @@ pub fn new_session(
     mut env: std::collections::HashMap<String, String>,
     status_theme: Option<StatusTheme>,
     tmux: bool,
+    tmux_parent_pane_id: Option<String>,
 ) -> Result<SessionInfo> {
     ensure_server()?;
     if status_theme.is_some() {
         require_status_theme_protocol()?;
     }
     let cwd = Some(resolve_client_cwd(cwd)?);
-    let parent = current_parent_request();
+    let parent = if tmux_parent_pane_id.is_some() {
+        None
+    } else {
+        current_parent_request()
+    };
     inherit_client_session_home_env(&mut env);
     inherit_terminal_capability_env(&mut env);
     inherit_child_color_policy_env_unless_agent(&mut env);
@@ -311,6 +316,7 @@ pub fn new_session(
         cols: terminal_cols(),
         parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
         parent_token: parent.map(|parent| parent.token),
+        tmux_parent_pane_id,
         env,
         status_theme,
         tmux,
