@@ -8104,6 +8104,7 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
     let target_panes_stdout = String::from_utf8_lossy(&target_panes.stdout);
     assert_exact_line_set(&target_panes_stdout, &[&split_other_pane, helper_pane]);
     std::fs::write(&release, "release")?;
+    wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
     poll_until(
         Duration::from_secs(10),
         Duration::from_millis(100),
