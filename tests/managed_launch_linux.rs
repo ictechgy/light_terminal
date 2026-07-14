@@ -17,6 +17,10 @@ fn private_temp() -> TempDir {
     temp
 }
 
+fn shell_executable() -> std::path::PathBuf {
+    fs::canonicalize("/bin/sh").expect("canonical shell executable")
+}
+
 fn slot_path(temp: &TempDir) -> std::path::PathBuf {
     temp.path()
         .join("speculation/process-registry-v1/slots/slot-0000.json")
@@ -72,7 +76,7 @@ fn run_managed_launch_with_layout(close_stdin: bool) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_lterm"));
     command
         .arg(INTERNAL_TEST_LAUNCH_ARG)
-        .arg("/bin/sh")
+        .arg(shell_executable())
         .arg("-c")
         .arg(script)
         .env("LTERM_INTERNAL_TEST_MODE", "1")
@@ -142,7 +146,7 @@ fn terminate_and_wait_reaps_root_and_tombstones() {
     let temp = private_temp();
     let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
         .arg(INTERNAL_TEST_LAUNCH_ARG)
-        .arg("/bin/sh")
+        .arg(shell_executable())
         .arg("-c")
         .arg("sleep 30")
         .env("LTERM_INTERNAL_TEST_MODE", "1")
@@ -166,7 +170,7 @@ fn restart_reconciliation_cleans_detached_root() {
     let temp = private_temp();
     let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
         .arg(INTERNAL_TEST_LAUNCH_ARG)
-        .arg("/bin/sh")
+        .arg(shell_executable())
         .arg("-c")
         .arg("sleep 30")
         .env("LTERM_INTERNAL_TEST_MODE", "1")
@@ -211,7 +215,7 @@ fn parent_and_gate_crash_boundaries_reconcile_without_early_target_execution() {
         );
         let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
             .arg(INTERNAL_TEST_LAUNCH_ARG)
-            .arg("/bin/sh")
+            .arg(shell_executable())
             .arg("-c")
             .arg(script)
             .env("LTERM_INTERNAL_TEST_MODE", "1")
@@ -245,7 +249,7 @@ fn cleanup_crash_boundaries_resume_to_tombstone() {
         let temp = private_temp();
         let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
             .arg(INTERNAL_TEST_LAUNCH_ARG)
-            .arg("/bin/sh")
+            .arg(shell_executable())
             .arg("-c")
             .arg("sleep 30")
             .env("LTERM_INTERNAL_TEST_MODE", "1")
