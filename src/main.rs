@@ -750,6 +750,10 @@ fn run() -> Result<()> {
     if launch_registry::dispatch_internal_gate()? {
         return Ok(());
     }
+    #[cfg(debug_assertions)]
+    if launch_registry::dispatch_internal_test_driver()? {
+        return Ok(());
+    }
     let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
     match cli.command {
         Commands::Daemon => server::serve_forever(),
