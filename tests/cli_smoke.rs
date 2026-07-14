@@ -8089,6 +8089,26 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
         Some(split_other_pane.as_str()),
         "the helper must be recorded as the explicit live target's child"
     );
+    let children = env.cmd().args(["ls", "--children"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let children_stdout = String::from_utf8_lossy(&children.stdout);
+    let child_list_row = list_row(&children_stdout, &helper_row.name)
+        .ok_or_else(|| format!("helper missing from child list: {children_stdout:?}"))?;
+    assert_eq!(child_list_row[1], helper_pane, "{children_stdout:?}");
+    assert_eq!(child_list_row[6], split_other_pane, "{children_stdout:?}");
+    assert!(
+        !children_stdout.lines().any(|line| {
+            line.starts_with("split-current\t") || line.starts_with("split-other\t")
+        }),
+        "standalone roots must not leak into the child-only list: {children_stdout:?}"
+    );
+    let tmux_sessions = env
+        .cmd()
+        .args(["tmux-compat", "list-sessions", "-F", "#{session_name}"])
+        .output()?;
+    assert!(tmux_sessions.status.success(), "{tmux_sessions:?}");
+    let tmux_sessions_stdout = String::from_utf8_lossy(&tmux_sessions.stdout);
+    assert_exact_line_set(&tmux_sessions_stdout, &["split-current", "split-other"]);
     let target_panes = env
         .cmd()
         .args([
