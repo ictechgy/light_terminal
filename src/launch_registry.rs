@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -214,10 +215,7 @@ impl Registry {
                 generation: 0,
                 registration: None,
             };
-            create_exact_json_file(
-                &registrations.join(registration_name(slot)),
-                &registration,
-            )?;
+            create_exact_json_file(&registrations.join(registration_name(slot)), &registration)?;
         }
 
         sync_dir(&slots)?;
@@ -265,8 +263,7 @@ impl Registry {
                         selected.get_or_insert(record);
                     }
                     SlotState::ResolvedTombstone {
-                        resolved_unix_secs,
-                        ..
+                        resolved_unix_secs, ..
                     } => {
                         if now_unix_secs
                             .checked_sub(*resolved_unix_secs)
@@ -377,11 +374,7 @@ impl Registry {
             ensure!(registration.slot == slot);
             ensure!(registration.generation == next.generation);
         }
-        atomic_replace_json(
-            &self.registrations,
-            &registration_name(slot),
-            next,
-        )?;
+        atomic_replace_json(&self.registrations, &registration_name(slot), next)?;
         ensure!(self.read_registration(slot)? == *next);
         Ok(())
     }
@@ -433,16 +426,17 @@ impl Registry {
                             registration.nonce == nonce
                                 && registration.slot == record.slot
                                 && registration.generation == record.generation
-                        }) => {
-                            let registration = sidecar.registration.expect("checked some");
-                            match verify_exact_process(&registration.identity) {
-                                Evidence::Present(_) => ReconcileOutcome::Live,
-                                Evidence::Absent => ReconcileOutcome::Absent,
-                                Evidence::Unavailable(reason) => {
-                                    ReconcileOutcome::UnknownOrphanRisk(reason)
-                                }
-                            }
+                        }) =>
+                {
+                    let registration = sidecar.registration.expect("checked some");
+                    match verify_exact_process(&registration.identity) {
+                        Evidence::Present(_) => ReconcileOutcome::Live,
+                        Evidence::Absent => ReconcileOutcome::Absent,
+                        Evidence::Unavailable(reason) => {
+                            ReconcileOutcome::UnknownOrphanRisk(reason)
                         }
+                    }
+                }
                 Ok(_) => ReconcileOutcome::UnknownOrphanRisk(
                     "busy intent guard has missing or stale registration sidecar".into(),
                 ),
@@ -545,13 +539,14 @@ fn validate_transition(current: &SlotRecord, next: &SlotRecord) -> Result<()> {
     ensure!(next.schema_version == SCHEMA_VERSION);
     ensure!(current.slot == next.slot);
     let legal = match (&current.state, &next.state) {
-        (SlotState::Vacant, SlotState::IntentDurable { .. }) => {
-            current
-                .generation
-                .checked_add(1)
-                .is_some_and(|generation| generation == next.generation)
-        }
-        (SlotState::IntentDurable { nonce: a, .. }, SlotState::IdentityDurable { nonce: b, .. })
+        (SlotState::Vacant, SlotState::IntentDurable { .. }) => current
+            .generation
+            .checked_add(1)
+            .is_some_and(|generation| generation == next.generation),
+        (
+            SlotState::IntentDurable { nonce: a, .. },
+            SlotState::IdentityDurable { nonce: b, .. },
+        )
         | (
             SlotState::IdentityDurable { nonce: a, .. },
             SlotState::CleanupPending { nonce: b, .. },
@@ -560,9 +555,10 @@ fn validate_transition(current: &SlotRecord, next: &SlotRecord) -> Result<()> {
             SlotState::CleanupPending { nonce: a, .. },
             SlotState::ResolvedTombstone { nonce: b, .. },
         ) => current.generation == next.generation && a == b,
-        (SlotState::IntentDurable { nonce: a, .. }, SlotState::ResolvedTombstone { nonce: b, .. }) => {
-            current.generation == next.generation && a == b
-        }
+        (
+            SlotState::IntentDurable { nonce: a, .. },
+            SlotState::ResolvedTombstone { nonce: b, .. },
+        ) => current.generation == next.generation && a == b,
         (SlotState::ResolvedTombstone { .. }, SlotState::Vacant) => {
             current.generation == next.generation
         }
@@ -639,7 +635,10 @@ fn atomic_replace_json<T: Serialize>(directory: &Path, name: &str, value: &T) ->
     validate_exact_dir(directory)?;
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    ensure!(bytes.len() <= MAX_RECORD_BYTES, "record exceeds 8 KiB bound");
+    ensure!(
+        bytes.len() <= MAX_RECORD_BYTES,
+        "record exceeds 8 KiB bound"
+    );
     let temp_name = format!(".{name}.{}.tmp", Uuid::new_v4());
     let temp = directory.join(&temp_name);
     create_exact_file(&temp, &bytes)?;
@@ -650,13 +649,19 @@ fn atomic_replace_json<T: Serialize>(directory: &Path, name: &str, value: &T) ->
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let mut file = open_exact_file(path, false)?;
+    let file = open_exact_file(path, false)?;
     let length = file.metadata()?.len();
-    ensure!(length <= MAX_RECORD_BYTES as u64, "record exceeds 8 KiB bound");
+    ensure!(
+        length <= MAX_RECORD_BYTES as u64,
+        "record exceeds 8 KiB bound"
+    );
     let mut bytes = Vec::with_capacity(length as usize);
     file.take((MAX_RECORD_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= MAX_RECORD_BYTES, "record exceeds 8 KiB bound");
+    ensure!(
+        bytes.len() <= MAX_RECORD_BYTES,
+        "record exceeds 8 KiB bound"
+    );
     serde_json::from_slice(&bytes).context("parse durable JSON record")
 }
 
@@ -679,9 +684,17 @@ fn validate_exact_file(path: &Path) -> Result<()> {
 
 fn validate_file_handle(file: &File, path: &Path) -> Result<()> {
     let metadata = file.metadata()?;
-    ensure!(metadata.is_file(), "{} is not a regular file", path.display());
+    ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
     ensure!(metadata.uid() == crate::paths::current_euid());
-    ensure!(metadata.nlink() == 1, "{} must have nlink=1", path.display());
+    ensure!(
+        metadata.nlink() == 1,
+        "{} must have nlink=1",
+        path.display()
+    );
     ensure!(metadata.permissions().mode() & 0o777 == 0o600);
     Ok(())
 }
@@ -979,7 +992,9 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
             Ok(())
         });
     }
-    let child = command.spawn().context("spawn trusted managed launch gate")?;
+    let child = command
+        .spawn()
+        .context("spawn trusted managed launch gate")?;
     drop(child_control);
 
     set_socket_timeout(parent_control.as_raw_fd(), Duration::from_secs(10))?;
@@ -1143,7 +1158,11 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
             libc::AT_EMPTY_PATH,
         )
     };
-    ensure!(result == 0, "execveat failed: {}", std::io::Error::last_os_error());
+    ensure!(
+        result == 0,
+        "execveat failed: {}",
+        std::io::Error::last_os_error()
+    );
     Ok(())
 }
 
@@ -1172,8 +1191,14 @@ fn open_pinned_executable(path: &Path) -> Result<File> {
 #[cfg(target_os = "linux")]
 fn validate_pinned_executable(file: &File) -> Result<()> {
     let metadata = file.metadata()?;
-    ensure!(metadata.is_file(), "target executable is not a regular file");
-    ensure!(metadata.permissions().mode() & 0o111 != 0, "target is not executable");
+    ensure!(
+        metadata.is_file(),
+        "target executable is not a regular file"
+    );
+    ensure!(
+        metadata.permissions().mode() & 0o111 != 0,
+        "target is not executable"
+    );
     Ok(())
 }
 
@@ -1209,7 +1234,10 @@ fn validate_seqpacket(fd: RawFd) -> Result<()> {
         )
     };
     ensure!(result == 0, "SO_TYPE unavailable");
-    ensure!(kind == libc::SOCK_SEQPACKET, "control FD is not SOCK_SEQPACKET");
+    ensure!(
+        kind == libc::SOCK_SEQPACKET,
+        "control FD is not SOCK_SEQPACKET"
+    );
     Ok(())
 }
 
@@ -1240,16 +1268,23 @@ fn send_packet<T: Serialize>(fd: RawFd, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(bytes.len() <= MAX_RECORD_BYTES);
     let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
-    ensure!(sent == bytes.len() as isize, "short or failed seqpacket send");
+    ensure!(
+        sent == bytes.len() as isize,
+        "short or failed seqpacket send"
+    );
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn recv_packet<T: for<'de> Deserialize<'de>>(fd: RawFd) -> Result<T> {
     let mut bytes = [0u8; MAX_RECORD_BYTES + 1];
-    let received = unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), libc::MSG_TRUNC) };
+    let received =
+        unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), libc::MSG_TRUNC) };
     ensure!(received > 0, "gate control EOF or receive failure");
-    ensure!(received as usize <= MAX_RECORD_BYTES, "oversized gate packet");
+    ensure!(
+        received as usize <= MAX_RECORD_BYTES,
+        "oversized gate packet"
+    );
     serde_json::from_slice(&bytes[..received as usize]).context("malformed gate packet")
 }
 
@@ -1297,7 +1332,8 @@ fn recv_commit_with_fd(fd: RawFd) -> Result<(GateCommit, File)> {
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = control.len();
-    let received = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC | libc::MSG_TRUNC) };
+    let received =
+        unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC | libc::MSG_TRUNC) };
     ensure!(received > 0, "COMMIT EOF or receive failure");
     ensure!(received as usize <= MAX_RECORD_BYTES, "oversized COMMIT");
     ensure!(message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) == 0);
@@ -1354,7 +1390,10 @@ mod tests {
         assert_eq!(fs::read_dir(&registry.guards).unwrap().count(), 4);
         assert_eq!(fs::read_dir(&registry.registrations).unwrap().count(), 4);
         let reopened = Registry::open_at(registry.root.clone(), 4).expect("reopen");
-        assert_eq!(reopened.read_valid_slot(0).unwrap().state, SlotState::Vacant);
+        assert_eq!(
+            reopened.read_valid_slot(0).unwrap().state,
+            SlotState::Vacant
+        );
     }
 
     #[test]

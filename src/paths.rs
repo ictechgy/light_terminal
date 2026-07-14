@@ -51,10 +51,9 @@ pub fn data_dir() -> Result<PathBuf> {
 /// Creation and exact metadata validation belong to `launch_registry`: unlike
 /// ordinary application directories, registry genesis must be an all-or-
 /// nothing, no-replace transaction.
+#[cfg(target_os = "linux")]
 pub(crate) fn process_registry_dir() -> Result<PathBuf> {
-    Ok(data_dir()?
-        .join("speculation")
-        .join("process-registry-v1"))
+    Ok(data_dir()?.join("speculation").join("process-registry-v1"))
 }
 
 pub fn socket_path() -> Result<PathBuf> {
