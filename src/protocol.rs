@@ -11,7 +11,7 @@ pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_METADATA_JOURNAL_ENTRIES: usize = 1024;
 pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WORKSPACE_ID",
@@ -325,6 +325,8 @@ pub enum Request {
         parent_pane_id: Option<String>,
         #[serde(default)]
         parent_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_parent_pane_id: Option<String>,
         #[serde(default)]
         env: HashMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
