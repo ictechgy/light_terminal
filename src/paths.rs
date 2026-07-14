@@ -46,6 +46,17 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Private root of the Linux managed-process registry.
+///
+/// Creation and exact metadata validation belong to `launch_registry`: unlike
+/// ordinary application directories, registry genesis must be an all-or-
+/// nothing, no-replace transaction.
+pub(crate) fn process_registry_dir() -> Result<PathBuf> {
+    Ok(data_dir()?
+        .join("speculation")
+        .join("process-registry-v1"))
+}
+
 pub fn socket_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("LTERM_SOCKET") {
         let path = PathBuf::from(path);

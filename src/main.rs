@@ -1,4 +1,6 @@
 mod client;
+#[allow(dead_code)]
+mod launch_registry;
 mod paths;
 mod protocol;
 mod sanitize;
@@ -745,6 +747,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if launch_registry::dispatch_internal_gate()? {
+        return Ok(());
+    }
     let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
     match cli.command {
         Commands::Daemon => server::serve_forever(),
