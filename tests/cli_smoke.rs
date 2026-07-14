@@ -4110,6 +4110,119 @@ fn metadata_rejects_protocol_five_before_sending_metadata_request() -> TestResul
 
 #[test]
 #[cfg(unix)]
+fn explicit_tmux_parent_rejects_protocol_six_before_sending_new() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let thread_requests = requests.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let request_type = request["type"]
+                    .as_str()
+                    .ok_or("fake daemon request missing type")?
+                    .to_string();
+                thread_requests
+                    .lock()
+                    .map_err(|_| "fake daemon requests lock poisoned")?
+                    .push(request_type.clone());
+                let response = match request_type.as_str() {
+                    "ping" => serde_json::json!({"ok": true, "result": {"pong": true}}),
+                    "status" => serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "version": "1.0.31",
+                            "protocol_version": 6,
+                            "session_count": 1,
+                            "active_connections": 1,
+                            "shutting_down": false
+                        }
+                    }),
+                    "info" => serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "id": "stale-parent-id",
+                            "name": "stale-parent",
+                            "pane_id": "%7",
+                            "command": "sleep 30",
+                            "cwd": "/tmp",
+                            "created_unix_ms": 1,
+                            "alive": true,
+                            "exit_code": null,
+                            "rows": 24,
+                            "cols": 80
+                        }
+                    }),
+                    other => {
+                        return Err(format!("unexpected request before preflight: {other}").into());
+                    }
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        return Err(format!(
+                            "unexpected request after protocol rejection: {request}"
+                        )
+                        .into());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let output = env
+        .cmd()
+        .env("LTERM_PANE", "%99")
+        .env("LTERM_PARENT_TOKEN", "ambient-parent-token")
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-t",
+            "stale-parent",
+            "sh",
+            "-lc",
+            "printf helper-should-not-run",
+        ])
+        .output()?;
+    assert!(!output.status.success(), "protocol 6 must be rejected");
+    assert_stderr_contains(&output, "does not support explicit tmux parent panes");
+    assert_stderr_contains(&output, "requires protocol 7");
+    assert_stderr_contains(&output, "lterm shutdown");
+    server
+        .join()
+        .map_err(|_| "fake protocol-six daemon panicked")??;
+    assert_eq!(
+        *requests
+            .lock()
+            .map_err(|_| "fake daemon requests lock poisoned")?,
+        ["ping", "status", "info", "ping", "status"]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn capability_daemon_swap_sends_only_nonsecret_hello_before_ready() -> TestResult {
     let env = TestEnv::new()?;
     let run_dir = env.temp.path().join("run");
