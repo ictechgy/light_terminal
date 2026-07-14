@@ -11,6 +11,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1467,6 +1469,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         Evidence::Present(ref actual) if actual == &identity
     ));
     validate_pinned_executable(&target)?;
+    prepare_target_fd_for_exec(&target)?;
     set_cloexec(control.as_raw_fd())?;
     set_cloexec(guard.as_raw_fd())?;
     managed_test_failpoint("gate_before_exec");
@@ -1551,6 +1554,28 @@ fn validate_pinned_executable(file: &File) -> Result<()> {
         metadata.permissions().mode() & 0o111 != 0,
         "target is not executable"
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_shebang_script(file: &File) -> Result<bool> {
+    let mut magic = [0u8; 2];
+    let read = file
+        .read_at(&mut magic, 0)
+        .context("read pinned target executable header")?;
+    Ok(read == magic.len() && magic == *b"#!")
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_target_fd_for_exec(file: &File) -> Result<()> {
+    if is_shebang_script(file)? {
+        // Linux resolves an AT_EMPTY_PATH shebang through the target FD when
+        // starting the interpreter. A CLOEXEC target therefore makes execveat
+        // fail with ENOENT. Keep native binaries CLOEXEC, but let this one FD
+        // survive into the interpreter for scripts; its lifetime there is an
+        // unavoidable consequence of descriptor-backed shebang execution.
+        clear_cloexec(file.as_raw_fd())?;
+    }
     Ok(())
 }
 
@@ -1707,6 +1732,15 @@ fn set_cloexec(fd: RawFd) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     ensure!(flags >= 0);
     let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    ensure!(result == 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_cloexec(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    ensure!(flags >= 0);
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
     ensure!(result == 0);
     Ok(())
 }
@@ -1883,6 +1917,31 @@ mod tests {
         assert!(OfdLock::try_acquire(&registry.guards.join(guard_name(0))).is_err());
         drop(first);
         OfdLock::try_acquire(&registry.guards.join(guard_name(0))).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_target_fd_survives_only_for_shebang_scripts() {
+        for (contents, should_survive) in [
+            (b"\x7fELF".as_slice(), false),
+            (b"#!/bin/sh\n".as_slice(), true),
+        ] {
+            let temp = tempfile::NamedTempFile::new().unwrap();
+            fs::write(temp.path(), contents).unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let target = open_pinned_executable(temp.path()).unwrap();
+            assert_ne!(
+                unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+
+            prepare_target_fd_for_exec(&target).unwrap();
+
+            assert_eq!(
+                unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC == 0,
+                should_survive
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
