@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1133,8 +1133,11 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         .iter()
         .map(|argument| std::ffi::CString::new(argument.as_bytes()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut argv_ptrs = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
-    argv_ptrs.push(std::ptr::null());
+    let mut argv_ptrs = argv
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argv_ptrs.push(std::ptr::null_mut());
     let environment = std::env::vars_os()
         .map(|(key, value)| {
             let mut bytes = key.as_bytes().to_vec();
@@ -1145,9 +1148,9 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut env_ptrs = environment
         .iter()
-        .map(|value| value.as_ptr())
+        .map(|value| value.as_ptr().cast_mut())
         .collect::<Vec<_>>();
-    env_ptrs.push(std::ptr::null());
+    env_ptrs.push(std::ptr::null_mut());
     let empty = c"";
     let result = unsafe {
         libc::execveat(
