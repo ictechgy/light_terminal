@@ -1260,9 +1260,15 @@ fn reap_child_until(child: &mut std::process::Child, timeout: Duration) -> Resul
 }
 
 #[cfg(target_os = "linux")]
+<<<<<<< HEAD
 fn managed_test_failpoint(name: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("LTERM_INTERNAL_MANAGED_FAILPOINT").as_deref() == Ok(name) {
+=======
+fn managed_test_failpoint(_name: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("LTERM_INTERNAL_MANAGED_FAILPOINT").as_deref() == Ok(_name) {
+>>>>>>> 6b51e05
         unsafe { libc::_exit(86) };
     }
 }
