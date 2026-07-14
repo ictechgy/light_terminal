@@ -8104,7 +8104,19 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
     let target_panes_stdout = String::from_utf8_lossy(&target_panes.stdout);
     assert_exact_line_set(&target_panes_stdout, &[&split_other_pane, helper_pane]);
     std::fs::write(&release, "release")?;
-    wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        "detached helper cleanup",
+        || {
+            let names = session_row_names(&session_rows_json(&env, true)?);
+            if names == before_all_names {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("{names:?}")))
+            }
+        },
+    )?;
     let final_all = session_rows_json(&env, true)?;
     assert_eq!(
         session_row_names(&final_all),
@@ -8203,7 +8215,10 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
         .ok_or_else(|| format!("team-window-parent row missing pane id: {parent_row:?}"))?;
     let roots = session_rows_json(&env, false)?;
     assert_eq!(
-        roots.iter().map(|row| row.pane_id.as_str()).collect::<Vec<_>>(),
+        roots
+            .iter()
+            .map(|row| row.pane_id.as_str())
+            .collect::<Vec<_>>(),
         vec![*parent_pane],
         "nested detached splits should remain hidden from the default list: {roots:?}"
     );

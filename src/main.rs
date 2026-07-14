@@ -770,15 +770,8 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?;
-            let info = client::new_session(
-                name,
-                command,
-                cwd,
-                HashMap::new(),
-                status_theme,
-                tmux,
-                None,
-            )?;
+            let info =
+                client::new_session(name, command, cwd, HashMap::new(), status_theme, tmux, None)?;
             if detach {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())

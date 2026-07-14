@@ -1010,15 +1010,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     };
     let mut env = cmux_session_env(cmux_surface.as_ref());
     env.extend(pane_env);
-    let info = match client::new_session(
-        None,
-        command,
-        cwd,
-        env,
-        None,
-        true,
-        tmux_parent_pane_id,
-    ) {
+    let info = match client::new_session(None, command, cwd, env, None, true, tmux_parent_pane_id) {
         Ok(info) => info,
         Err(err) => {
             rollback_cmux_split(cmux_surface.as_ref());
