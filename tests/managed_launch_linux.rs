@@ -300,3 +300,38 @@ fn cleanup_crash_boundaries_resume_to_tombstone() {
         reconcile_until_tombstone(&temp);
     }
 }
+
+#[test]
+fn concurrent_reconcilers_fail_closed_and_converge() {
+    let temp = private_temp();
+    let status = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg("sleep 30")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_MANAGED_LAUNCH_NO_WAIT", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    wait_for_slot_state(&slot_path(&temp), "identity_durable");
+
+    let spawn_reconciler = || {
+        Command::new(env!("CARGO_BIN_EXE_lterm"))
+            .arg(INTERNAL_TEST_RECONCILE_ARG)
+            .env("LTERM_INTERNAL_TEST_MODE", "1")
+            .env("LTERM_DATA_DIR", temp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn concurrent reconciler")
+    };
+    let mut first = spawn_reconciler();
+    let mut second = spawn_reconciler();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    reconcile_until_tombstone(&temp);
+}
