@@ -7896,6 +7896,7 @@ mod tests {
             process_group_id: None,
             status_theme: None,
             agent_name: agent_name.map(str::to_string),
+            lifecycle_state: None,
         }
     }
 

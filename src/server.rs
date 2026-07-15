@@ -465,6 +465,9 @@ impl Session {
             process_group_id: self.process_group_id,
             status_theme: metadata.status_theme,
             agent_name: self.agent_name.clone(),
+            // Protocol-v8 compatibility placeholder. Task 4 replaces this with
+            // the server's authoritative lifecycle presentation conversion.
+            lifecycle_state: None,
         }
     }
 
@@ -1731,6 +1734,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             infos.sort_by_key(|info| info.created_unix_ms);
             Ok(Response::ok(infos))
         }
+        // Protocol-v8 compile bridge for task 5's client/DTO tests. Task 4
+        // replaces this arm with the private lifecycle journal query.
+        Request::RecentExits { .. } => Ok(Response::err(
+            "recent exit evidence is unavailable until lifecycle storage is integrated",
+        )),
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Instrument { target } => Ok(Response::ok(
             resolve_session(state, &target)?.instrument_snapshot_relaxed(),

@@ -5561,6 +5561,7 @@ mod tests {
             process_id: None,
             process_group_id: None,
             status_theme: None,
+            lifecycle_state: None,
         };
 
         assert!(target_matches_info("main", &info));
@@ -5778,6 +5779,7 @@ mod tests {
             process_id: None,
             process_group_id: None,
             status_theme: None,
+            lifecycle_state: None,
         };
         assert_eq!(
             expand_format("#{pane_id} #S #{pane_current_command}", &info),
@@ -6508,6 +6510,7 @@ mod tests {
             process_id: None,
             process_group_id: None,
             status_theme: None,
+            lifecycle_state: None,
         };
         remember_pane(&info, Some(&stored)).expect("seed stored cmux surface");
 
