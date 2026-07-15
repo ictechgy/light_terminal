@@ -35,6 +35,12 @@ const MAX_NAME_BYTES: usize = 128;
 const MAX_PANE_BYTES: usize = 64;
 const MAX_AGENT_BYTES: usize = 64;
 const MAX_SIGNAL_BYTES: usize = 64;
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_MODE_ENV: &str = "LTERM_INTERNAL_TEST_MODE";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_WRITER_ENTERED_ENV: &str = "LTERM_INTERNAL_TEST_LIFECYCLE_WRITER_ENTERED";
+#[cfg(debug_assertions)]
+const INTERNAL_TEST_WRITER_RELEASE_ENV: &str = "LTERM_INTERNAL_TEST_LIFECYCLE_WRITER_RELEASE";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -855,6 +861,7 @@ fn writer_loop(
     snapshot: Arc<RwLock<JournalSnapshot>>,
 ) {
     while let Ok(request) = receiver.recv() {
+        internal_test_block_lifecycle_writer();
         let result = storage.append(&request.event);
         match result {
             Ok(rotated) => {
@@ -886,6 +893,28 @@ fn writer_loop(
         }
     }
 }
+
+#[cfg(debug_assertions)]
+fn internal_test_block_lifecycle_writer() {
+    if !super::env_bool(INTERNAL_TEST_MODE_ENV) {
+        return;
+    }
+    let Some(entered) = std::env::var_os(INTERNAL_TEST_WRITER_ENTERED_ENV) else {
+        return;
+    };
+    let Some(release) = std::env::var_os(INTERNAL_TEST_WRITER_RELEASE_ENV) else {
+        return;
+    };
+    if std::fs::write(&entered, b"entered\n").is_err() {
+        return;
+    }
+    while !Path::new(&release).exists() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn internal_test_block_lifecycle_writer() {}
 
 fn mark_snapshot_degraded(snapshot: &RwLock<JournalSnapshot>) {
     snapshot

@@ -62,13 +62,36 @@ fn command_output_with_timeout(
 
 struct LifecycleEnv {
     temp: tempfile::TempDir,
+    daemon_env: Vec<(String, String)>,
 }
 
 impl LifecycleEnv {
     fn new() -> TestResult<Self> {
         let temp = tempfile::tempdir()?;
         fs::create_dir_all(temp.path().join("tmp"))?;
-        Ok(Self { temp })
+        Ok(Self {
+            temp,
+            daemon_env: Vec::new(),
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn with_blocked_lifecycle_writer() -> TestResult<(Self, PathBuf, PathBuf)> {
+        let mut env = Self::new()?;
+        let entered = env.temp.path().join("lifecycle-writer-entered");
+        let release = env.temp.path().join("lifecycle-writer-release");
+        env.daemon_env = vec![
+            ("LTERM_INTERNAL_TEST_MODE".to_string(), "1".to_string()),
+            (
+                "LTERM_INTERNAL_TEST_LIFECYCLE_WRITER_ENTERED".to_string(),
+                entered.to_string_lossy().into_owned(),
+            ),
+            (
+                "LTERM_INTERNAL_TEST_LIFECYCLE_WRITER_RELEASE".to_string(),
+                release.to_string_lossy().into_owned(),
+            ),
+        ];
+        Ok((env, entered, release))
     }
 
     fn runtime_dir(&self) -> PathBuf {
@@ -87,7 +110,34 @@ impl LifecycleEnv {
             .env("LTERM_RUNTIME_DIR", self.runtime_dir())
             .env("LTERM_DATA_DIR", self.data_dir())
             .env("TMPDIR", self.temp.path().join("tmp"));
+        for (name, value) in &self.daemon_env {
+            cmd.env(name, value);
+        }
         cmd
+    }
+
+    #[cfg(debug_assertions)]
+    fn raw_rpc_stream(&self) -> TestResult<UnixStream> {
+        let stream = UnixStream::connect(self.runtime_dir().join("lterm.sock"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        Ok(stream)
+    }
+
+    #[cfg(debug_assertions)]
+    fn begin_raw_rpc(&self, request: &Value) -> TestResult<UnixStream> {
+        let mut stream = self.raw_rpc_stream()?;
+        serde_json::to_writer(&mut stream, request)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        Ok(stream)
+    }
+
+    #[cfg(debug_assertions)]
+    fn read_raw_rpc_response(&self, stream: UnixStream) -> TestResult<Value> {
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line)?;
+        Ok(serde_json::from_str(&line)?)
     }
 
     fn doctor_json(&self) -> TestResult<Value> {
@@ -302,6 +352,187 @@ impl Drop for LifecycleEnv {
         let socket = self.runtime_dir().join("lterm.sock");
         let _ = fs::remove_file(&socket);
     }
+}
+
+#[cfg(debug_assertions)]
+fn wait_until(label: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) -> TestResult {
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {label} after {timeout:?}").into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn process_or_group_exists(id: i32) -> bool {
+    let rc = unsafe { libc::kill(id, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(debug_assertions)]
+fn assert_process_identity_gone(pid: i32, pgid: i32) -> TestResult {
+    wait_until("session pid/pgid cleanup", Duration::from_secs(2), || {
+        !process_or_group_exists(pid) && !process_or_group_exists(-pgid)
+    })
+}
+
+#[cfg(debug_assertions)]
+fn assert_attach_reaches_eof(mut attach: UnixStream) -> TestResult {
+    if let Err(err) = attach.set_read_timeout(Some(Duration::from_secs(5))) {
+        // macOS may report EINVAL when the peer has already completed
+        // SHUT_RDWR. That state is at least as strong as the EOF this helper
+        // is waiting for; every still-open socket keeps the explicit bound.
+        if err.kind() == std::io::ErrorKind::InvalidInput {
+            return Ok(());
+        }
+        return Err(err.into());
+    }
+    let mut buf = [0_u8; 8192];
+    loop {
+        match attach.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(err) => return Err(format!("attach did not reach EOF after close: {err}").into()),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn blocked_lifecycle_writer_close_rejects_ending_uuid_rename_and_cleans_up() -> TestResult {
+    let (env, writer_entered, writer_release) = LifecycleEnv::with_blocked_lifecycle_writer()?;
+    let before = env.create_long_lived_session("blocked-writer-close", "exec sleep 30")?;
+    let session_id = before
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("session missing id")?
+        .to_string();
+    let pid = i32::try_from(
+        before
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .ok_or("session missing process_id")?,
+    )?;
+    let pgid = i32::try_from(
+        before
+            .get("process_group_id")
+            .and_then(Value::as_i64)
+            .ok_or("session missing process_group_id")?,
+    )?;
+    let attach = env.open_raw_attach(&session_id)?;
+    env.wait_for_attached_clients(&session_id, 1)?;
+
+    // Pre-connect the contender so the post-claim request does not spend the
+    // fixed publication window on process startup or socket discovery.
+    let mut rename_stream = env.raw_rpc_stream()?;
+    let close_stream = env.begin_raw_rpc(&serde_json::json!({
+        "type":"kill",
+        "target":session_id,
+    }))?;
+    wait_until(
+        "blocked lifecycle writer entry",
+        Duration::from_secs(2),
+        || writer_entered.exists(),
+    )?;
+
+    serde_json::to_writer(
+        &mut rename_stream,
+        &serde_json::json!({
+            "type":"rename",
+            "target":session_id,
+            "name":"blocked-writer-renamed",
+        }),
+    )?;
+    rename_stream.write_all(b"\n")?;
+    rename_stream.flush()?;
+    let rename_response = env.read_raw_rpc_response(rename_stream)?;
+    assert_eq!(
+        rename_response.get("ok").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        rename_response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("session is ending")),
+        "Ending UUID rename must fail at the daemon boundary: {rename_response}"
+    );
+
+    let close_response = env.read_raw_rpc_response(close_stream)?;
+    assert_eq!(
+        close_response.get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    let info_response = env.read_raw_rpc_response(env.begin_raw_rpc(&serde_json::json!({
+        "type":"info",
+        "target":session_id,
+    }))?)?;
+    assert_eq!(
+        info_response.get("ok").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_attach_reaches_eof(attach)?;
+    assert_process_identity_gone(pid, pgid)?;
+
+    // Let the dedicated writer drain only after cleanup assertions. Its late
+    // ACK cannot reopen the already-timed-out publication barrier.
+    fs::write(writer_release, b"release\n")?;
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn daemon_shutdown_progresses_all_sessions_without_joining_blocked_writer() -> TestResult {
+    let (env, writer_entered, writer_release) = LifecycleEnv::with_blocked_lifecycle_writer()?;
+    let first = env.create_long_lived_session("shutdown-blocked-writer-a", "exec sleep 30")?;
+    let second = env.create_long_lived_session("shutdown-blocked-writer-b", "exec sleep 30")?;
+    let identities = [&first, &second]
+        .into_iter()
+        .map(|session| {
+            Ok((
+                i32::try_from(
+                    session
+                        .get("process_id")
+                        .and_then(Value::as_u64)
+                        .ok_or("session missing process_id")?,
+                )?,
+                i32::try_from(
+                    session
+                        .get("process_group_id")
+                        .and_then(Value::as_i64)
+                        .ok_or("session missing process_group_id")?,
+                )?,
+            ))
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+
+    let shutdown_stream = env.begin_raw_rpc(&serde_json::json!({"type":"shutdown"}))?;
+    wait_until(
+        "blocked lifecycle writer entry",
+        Duration::from_secs(2),
+        || writer_entered.exists(),
+    )?;
+    let shutdown_response = env.read_raw_rpc_response(shutdown_stream)?;
+    assert_eq!(
+        shutdown_response.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "multi-session shutdown must complete past the publication deadline: {shutdown_response}"
+    );
+    assert!(
+        !writer_release.exists(),
+        "the writer must remain blocked while shutdown proves it does not join"
+    );
+    let socket = env.runtime_dir().join("lterm.sock");
+    wait_until("daemon exit after shutdown", Duration::from_secs(2), || {
+        UnixStream::connect(&socket).is_err()
+    })?;
+    for (pid, pgid) in identities {
+        assert_process_identity_gone(pid, pgid)?;
+    }
+    Ok(())
 }
 
 // US-004 case 1: socket 경로에 사전 존재하는 비-소켓 파일은 silently 덮어쓰지 않고
