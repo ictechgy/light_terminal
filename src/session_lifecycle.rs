@@ -330,7 +330,7 @@ impl LifecycleIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct StoredIdentity {
     session_id: String,
     name: String,
@@ -407,7 +407,7 @@ impl StoredIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum LifecycleEvent {
     TriggerClaimed {
@@ -520,25 +520,7 @@ impl LifecycleEvent {
         Ok(line)
     }
 
-    fn has_valid_shape(&self) -> bool {
-        match self {
-            Self::TriggerClaimed {
-                schema_version,
-                event_seq,
-                ..
-            } => schema_version == JOURNAL_SCHEMA_VERSION && *event_seq == 1,
-            Self::LeaderReaped {
-                schema_version,
-                event_seq,
-                ..
-            } => schema_version == JOURNAL_SCHEMA_VERSION && *event_seq == 2,
-        }
-    }
-
     fn validate_and_sanitize_loaded(mut self) -> Option<(Self, bool)> {
-        if !self.has_valid_shape() {
-            return None;
-        }
         let changed = match &mut self {
             Self::TriggerClaimed {
                 schema_version,
@@ -610,8 +592,7 @@ pub(crate) fn fold_events(
     let mut buckets: BTreeMap<String, FoldBucket> = BTreeMap::new();
     let mut seen = HashSet::new();
     for event in events {
-        let fingerprint = serde_json::to_string(event).unwrap_or_default();
-        if !seen.insert(fingerprint) {
+        if !seen.insert(event) {
             continue;
         }
         let bucket = buckets.entry(event.session_id().to_string()).or_default();
@@ -620,11 +601,6 @@ pub(crate) fn fold_events(
             LifecycleEvent::LeaderReaped { .. } => bucket.reaps.push(event.clone()),
         }
     }
-    for bucket in buckets.values_mut() {
-        bucket.triggers.sort_by_key(event_sort_key);
-        bucket.reaps.sort_by_key(event_sort_key);
-    }
-
     let mut exits: Vec<_> = buckets
         .into_iter()
         .filter_map(|(session_id, bucket)| fold_bucket(&session_id, bucket, storage_degraded))
@@ -647,10 +623,6 @@ pub(crate) fn fold_events(
     });
     exits.truncate(usize::from(limit));
     exits
-}
-
-fn event_sort_key(event: &LifecycleEvent) -> Vec<u8> {
-    serde_json::to_vec(event).unwrap_or_default()
 }
 
 fn fold_bucket(
@@ -1460,13 +1432,21 @@ mod tests {
             ExitListScope::All,
         );
         let reverse = fold_events(
-            &[reap.clone(), trigger],
+            &[reap.clone(), trigger.clone()],
             false,
             None,
             10,
             ExitListScope::All,
         );
         assert_eq!(forward, reverse);
+        let duplicated = fold_events(
+            &[trigger.clone(), reap.clone(), trigger, reap.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::All,
+        );
+        assert_eq!(forward, duplicated);
         assert_eq!(forward[0].exit_code, Some(37));
         assert_eq!(forward[0].evidence_state, ExitEvidenceState::Complete);
 
