@@ -1,8 +1,13 @@
-// tests/lifecycle.rs — 7 결정적 daemon lifecycle regression 케이스.
+// tests/lifecycle.rs — deterministic daemon lifecycle regression coverage.
 //
 // 목적: alpha-MVP → 안정 1.x 약속을 PR마다 빠르게 검증한다. release-gate soak
 // (tests/soak.rs)와 upgrade matrix(tests/upgrade_matrix.rs)는 무겁고 별도 트리거를
 // 갖는 반면, 본 suite는 기본 `cargo test`에 포함되며 결정적·짧다.
+//
+// G001 session-lifecycle resilience adds attach-only fault characterization:
+// abrupt attach process death, stdin EOF, Unix socket half/full closure, stale
+// geometry/protocol skew, immutable UUID/PID preservation, and successful
+// reattach must never remove or finalize a still-live leader.
 //
 // 각 테스트는 LTERM_RUNTIME_DIR / LTERM_DATA_DIR을 tempdir로 격리하므로 사용자의
 // 실제 데몬이나 다른 테스트와 충돌하지 않는다. tempdir Drop이 socket·data 파일을
