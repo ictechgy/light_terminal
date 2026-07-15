@@ -4804,7 +4804,7 @@ fn format_attach_failure_diagnosis(
             }
             SessionLifecycleState::Ending { trigger } => {
                 let mut message = format!(
-                    "session {} is ending and is not reconnectable (trigger={})",
+                    "session is ending and is not reconnectable (session_id={}, trigger={})",
                     sanitize::terminal_text(&original.id),
                     sanitize::terminal_text(&trigger.to_string())
                 );
@@ -7437,15 +7437,14 @@ mod tests {
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
         apply_pending_status_command, attach_pty_rows, automatic_reconnect_candidate,
         build_process_tree_from_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled,
-        create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_automatic_reconnect_candidate,
-        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private,
-        extract_search_matches, extract_urls,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
+        compute_sink_enabled, create_private_capability_file, current_unix_ms,
+        cursor_clamp_into_scroll_region, dectcem_param_matches,
+        ensure_automatic_reconnect_candidate, ensure_panic_terminal_cleanup_hook,
+        ensure_trace_force_target_private, extract_search_matches, extract_urls,
         finish_attach_results, format_attach_failure_diagnosis, format_status_line,
         forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
         heartbeat_due, hex_decode, hex_encode, hex_encoded_len, instrument_protocol_error,
@@ -7460,13 +7459,12 @@ mod tests {
         read_trace_jsonl_line, recent_exits_protocol_error,
         remember_reconnect_target_best_effort_at_path, reset_raw_attach_initial_sgr_if_needed,
         resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
-        run_nested_agent_detection_loop, run_status_command,
-        select_status_backend, should_mobile_transcript_auto, status_sgr_stack_supported,
-        status_theme_protocol_error, tmux_parent_pane_protocol_error, trace_file_summary,
-        trace_output_open_context, trace_summary_text, unlink_capability_path_if_identity_matches,
-        validate_trace_replay, write_lterm_agent_presence_banner, write_lterm_title_cue,
-        write_mobile_transcript_update, write_mobile_transcript_urls,
-        write_numbered_search_matches,
+        run_nested_agent_detection_loop, run_status_command, select_status_backend,
+        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        tmux_parent_pane_protocol_error, trace_file_summary, trace_output_open_context,
+        trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
+        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
+        write_mobile_transcript_urls, write_numbered_search_matches,
     };
     use crate::protocol::{
         ExitEvidenceState, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
@@ -8159,7 +8157,10 @@ mod tests {
         };
         let message = recent_exits_protocol_error(&old).expect("protocol 7 must be rejected");
         assert!(message.contains("upgrade/restart is required"), "{message}");
-        assert!(message.contains("no live session was modified"), "{message}");
+        assert!(
+            message.contains("no live session was modified"),
+            "{message}"
+        );
         assert!(!message.contains("lterm shutdown"), "{message}");
 
         let current = DaemonStatus {

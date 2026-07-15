@@ -4113,6 +4113,87 @@ mod tests {
     }
 
     #[test]
+    fn exits_parses_bounded_scope_and_json_flags() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "exits",
+            "opaque-id",
+            "--limit",
+            "100",
+            "--all",
+            "--json",
+        ])
+        .expect("exits flags should parse");
+        let Commands::Exits {
+            target,
+            limit,
+            json,
+            all,
+            children,
+        } = cli.command
+        else {
+            panic!("expected exits command");
+        };
+        assert_eq!(target.as_deref(), Some("opaque-id"));
+        assert_eq!(limit, 100);
+        assert!(json);
+        assert!(all);
+        assert!(!children);
+        assert!(Cli::try_parse_from(["lterm", "exits", "--limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "exits", "--limit", "101"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "exits", "--all", "--children"]).is_err());
+    }
+
+    #[test]
+    fn live_list_filters_ending_but_keeps_monitor_failed_degraded() {
+        let mut healthy = sample_status_session_info("healthy", "sh", None);
+        healthy.pane_id = "%1".to_string();
+        let mut degraded = sample_status_session_info("degraded", "sh", None);
+        degraded.pane_id = "%2".to_string();
+        degraded.lifecycle_state = Some(protocol::SessionLifecycleState::MonitorFailed);
+        let mut ending = sample_status_session_info("ending", "sh", None);
+        ending.pane_id = "%3".to_string();
+        ending.alive = false;
+        ending.lifecycle_state = Some(protocol::SessionLifecycleState::Ending {
+            trigger: protocol::SessionExitTrigger::CloseRequested,
+        });
+
+        let listed = filter_list_sessions(vec![healthy, degraded.clone(), ending], ListScope::All);
+        assert_eq!(listed.len(), 2, "ending sessions must be absent");
+        assert!(listed.iter().any(|session| session.name == "healthy"));
+        assert_eq!(degraded.lifecycle_state_label(), "degraded");
+    }
+
+    #[test]
+    fn recent_exit_text_is_single_line_raw_free_and_uuid_disambiguated() {
+        let exit = protocol::RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: "opaque-id".to_string(),
+            name: "agent\nname".to_string(),
+            pane_id: "%7".to_string(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 1,
+            trigger_claimed_unix_ms: 2,
+            reaped_unix_ms: Some(3),
+            trigger: protocol::SessionExitTrigger::LeaderExited,
+            outcome_state: protocol::ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: Some("signal\ntext".to_string()),
+            evidence_state: protocol::ExitEvidenceState::Complete,
+        };
+        let line = recent_exit_output_line(&exit);
+        assert_eq!(line.matches('\t').count(), 7, "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("opaque-id"), "{line:?}");
+        assert!(line.contains("leader_exited"), "{line:?}");
+        assert!(line.contains("37"), "{line:?}");
+        assert!(!line.contains("command"), "{line:?}");
+        assert!(!line.contains("cwd"), "{line:?}");
+    }
+
+    #[test]
     fn expand_attach_short_flag_rewrites_only_first_exact_dash_a() {
         assert_eq!(
             expand_attach_short_flag(os_args(&["lterm", "-a", "api"])),
