@@ -329,7 +329,7 @@ impl LifecycleIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredIdentity {
+pub(crate) struct StoredIdentity {
     session_id: String,
     name: String,
     pane_id: String,
@@ -759,7 +759,8 @@ struct SecureStorage {
 
 impl SecureStorage {
     fn open(path: &Path) -> Result<Self> {
-        let path = CString::new(path.as_os_str().as_bytes()).context("journal path contains NUL")?;
+        let path =
+            CString::new(path.as_os_str().as_bytes()).context("journal path contains NUL")?;
         let dir_fd = unsafe {
             libc::open(
                 path.as_ptr(),
@@ -767,15 +768,20 @@ impl SecureStorage {
             )
         };
         if dir_fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("open lifecycle journal directory {}", path.to_string_lossy()));
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "open lifecycle journal directory {}",
+                    path.to_string_lossy()
+                )
+            });
         }
         let dir = unsafe { File::from_raw_fd(dir_fd) };
         validate_dir(&dir).context("validate lifecycle journal directory")?;
 
         let lock_file = open_regular_at(dir.as_raw_fd(), leaf(LOCK_FILE), true, true)?
             .context("open lifecycle journal lock")?;
-        let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let lock_result =
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_result != 0 {
             return Err(std::io::Error::last_os_error()).context("lock lifecycle journal");
         }
@@ -810,16 +816,12 @@ impl SecureStorage {
     }
 
     fn rotate(&mut self) -> Result<()> {
-        if let Some(previous) = open_regular_at(
-            self.dir.as_raw_fd(),
-            leaf(PREVIOUS_SEGMENT),
-            false,
-            false,
-        )? {
+        if let Some(previous) =
+            open_regular_at(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT), false, false)?
+        {
             drop(previous);
-            let result = unsafe {
-                libc::unlinkat(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT).as_ptr(), 0)
-            };
+            let result =
+                unsafe { libc::unlinkat(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT).as_ptr(), 0) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error())
                     .context("remove previous lifecycle journal segment");
@@ -837,13 +839,8 @@ impl SecureStorage {
             return Err(std::io::Error::last_os_error())
                 .context("rotate lifecycle journal segment");
         }
-        self.current = open_regular_at(
-            self.dir.as_raw_fd(),
-            leaf(CURRENT_SEGMENT),
-            true,
-            true,
-        )?
-        .context("create current lifecycle journal segment")?;
+        self.current = open_regular_at(self.dir.as_raw_fd(), leaf(CURRENT_SEGMENT), true, true)?
+            .context("create current lifecycle journal segment")?;
         self.current_bytes = 0;
         Ok(())
     }
@@ -897,7 +894,11 @@ fn open_regular_at(
     writable: bool,
 ) -> Result<Option<File>> {
     let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    flags |= if writable { libc::O_RDWR } else { libc::O_RDONLY };
+    flags |= if writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
     if create {
         flags |= libc::O_CREAT | libc::O_APPEND;
     }
@@ -933,7 +934,10 @@ fn validate_regular(file: &File, name: &CStr) -> Result<()> {
     }
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        bail!("journal leaf {} is not a regular file", name.to_string_lossy());
+        bail!(
+            "journal leaf {} is not a regular file",
+            name.to_string_lossy()
+        );
     }
     if stat.st_nlink != 1 {
         bail!(
@@ -971,8 +975,25 @@ fn sanitized_field(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::thread;
+
+    fn identity(id: &str) -> LifecycleIdentity {
+        LifecycleIdentity {
+            session_id: id.to_string(),
+            name: "agent\u{1b}]52;c;secret\u{7}".to_string(),
+            pane_id: "%1".to_string(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 10,
+            process_id: Some(123),
+            process_group_id: Some(123),
+            attached_clients: 1,
+        }
+    }
 
     #[test]
     fn first_trigger_is_authoritative_and_immediately_marks_ending() {
@@ -1041,5 +1062,106 @@ mod tests {
             WriteOutcome::IoFailed
         );
         assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn journal_serialization_is_bounded_raw_free_and_sanitized() {
+        let event = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity("session-1"),
+            20,
+            SessionExitTrigger::CloseRequested,
+        );
+        let line = event.to_json_line().expect("serialize lifecycle event");
+        let text = String::from_utf8(line).expect("json utf8");
+        assert!(text.len() <= MAX_EVENT_LINE_BYTES);
+        for forbidden in [
+            "command",
+            "cwd",
+            "environment",
+            "scrollback",
+            "token",
+            "secret",
+        ] {
+            assert!(!text.contains(forbidden), "leaked forbidden field: {text}");
+        }
+    }
+
+    #[test]
+    fn folding_is_order_independent_and_reap_recovers_missing_trigger() {
+        let event_id = Uuid::new_v4();
+        let trigger = LifecycleEvent::trigger_claimed(
+            event_id,
+            identity("session-1"),
+            20,
+            SessionExitTrigger::LeaderExited,
+        );
+        let reap = LifecycleEvent::leader_reaped(
+            event_id,
+            identity("session-1"),
+            20,
+            30,
+            SessionExitTrigger::LeaderExited,
+            37,
+            Some("TERM".to_string()),
+        );
+        let forward = fold_events(
+            &[trigger.clone(), reap.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::All,
+        );
+        let reverse = fold_events(
+            &[reap.clone(), trigger],
+            false,
+            None,
+            10,
+            ExitListScope::All,
+        );
+        assert_eq!(forward, reverse);
+        assert_eq!(forward[0].exit_code, Some(37));
+        assert_eq!(forward[0].evidence_state, ExitEvidenceState::Complete);
+
+        let recovered = fold_events(&[reap], false, None, 10, ExitListScope::All);
+        assert_eq!(
+            recovered[0].evidence_state,
+            ExitEvidenceState::DegradedMissingTriggerEvent
+        );
+        assert_eq!(recovered[0].trigger, SessionExitTrigger::LeaderExited);
+    }
+
+    #[test]
+    fn conflicting_same_sequence_rows_fail_closed() {
+        let first = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity("session-1"),
+            20,
+            SessionExitTrigger::LeaderExited,
+        );
+        let second = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity("session-1"),
+            20,
+            SessionExitTrigger::CloseRequested,
+        );
+        let folded = fold_events(&[first, second], false, None, 10, ExitListScope::All);
+        assert_eq!(folded[0].evidence_state, ExitEvidenceState::Conflicted);
+        assert_eq!(folded[0].trigger, SessionExitTrigger::Unknown);
+    }
+
+    #[test]
+    fn secure_storage_rejects_symlink_and_hardlink_leaves() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        let target = temp.path().join("target");
+        fs::write(&target, b"target").expect("target");
+        symlink(&target, temp.path().join("current.jsonl")).expect("journal symlink");
+        assert!(LifecycleJournal::open(temp.path()).is_err());
+
+        fs::remove_file(temp.path().join("current.jsonl")).expect("remove symlink");
+        fs::hard_link(&target, temp.path().join("current.jsonl")).expect("journal hardlink");
+        assert!(LifecycleJournal::open(temp.path()).is_err());
     }
 }
