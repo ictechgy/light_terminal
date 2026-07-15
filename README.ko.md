@@ -17,13 +17,15 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
-## 현재 릴리스: 1.0.30
+## 현재 릴리스: 1.0.31
 
-1.0.30 릴리스는 OMC madmax 실행에서 명시적으로 요청한 status row가 보이도록 복구하는 데 집중합니다.
+1.0.31 릴리스는 raw PTY 동작을 유지하면서 상한이 있는 control/measurement surface와 crash-safe Linux launch 기반을 추가합니다.
 
-- **OMC madmax status 복구** — `lterm omc --status --madmax`가 OMC 시작 중 alt-screen 진입과 화면 clear를 수행한 뒤에도 요청한 lterm status row를 다시 그립니다.
-- **보수적인 기본값 유지** — 내장 agent launcher는 `--status`를 명시하지 않는 한 기존처럼 전체 높이 raw attach를 기본으로 유지합니다.
-- **회귀 테스트 추가** — PTY smoke test가 `--madmax` 인자 전달과 explicit status 경로의 post-alt-screen status repaint를 검증합니다.
+- **Raw-free instrument snapshot (#159)** — `lterm instrument <target> --json`은 attach하거나 PTY byte를 읽지 않고 opaque liveness, output progress, client count, geometry 측정값을 제공합니다.
+- **Cooperative input capability (#160)** — 유한 byte budget을 가진 bearer file로 exact binary input을 위임하며 기존 ambient input, Send, raw Attach 동작은 바꾸지 않습니다.
+- **되돌릴 수 있는 live metadata (#161)** — 상한이 있는 name/theme history에 guarded undo/redo를 제공하고, evidence를 버려야 할 때는 명시적인 irreversible purge gate를 요구합니다.
+- **Durable managed Linux launch (#162)** — pre-spawn intent, 정확한 process-birth identity, inherited OFD guard, pidfd cleanup, durable tombstone으로 future managed root process의 daemon crash window를 닫습니다.
+- **더 깔끔한 기본 session 목록 (#162)** — 명시적 target에 연결된 detached tmux review/helper child는 기본 `lterm ls`에서 숨기고 `--children`과 `--all`로 계속 확인할 수 있습니다.
 
 ## 왜 tmux 대신 lterm인가요?
 
@@ -86,7 +88,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.30
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.31
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.
