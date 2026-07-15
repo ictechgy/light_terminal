@@ -2246,7 +2246,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                 session_for_waiter
                     .leader_reaped
                     .store(true, Ordering::SeqCst);
-                let exit_code = status.exit_code().min(i32::MAX as u32) as i32;
+                let (exit_code, signal) = portable_exit_evidence(&status);
                 session_for_waiter
                     .exit_code
                     .store(exit_code, Ordering::SeqCst);
@@ -2257,7 +2257,13 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                         session_lifecycle::FinalizeTrigger::LeaderExited,
                     )
                 });
-                publish_leader_reaped(&state_for_waiter, &session_for_waiter, &claim, exit_code);
+                publish_leader_reaped(
+                    &state_for_waiter,
+                    &session_for_waiter,
+                    &claim,
+                    exit_code,
+                    signal,
+                );
                 finalize_session(
                     &state_for_waiter,
                     &session_for_waiter,
@@ -3082,6 +3088,7 @@ fn publish_leader_reaped(
     session: &Session,
     claim: &session_lifecycle::ClaimAttempt,
     exit_code: i32,
+    signal: Option<String>,
 ) {
     let Some(claimed_at) = *lock(&session.trigger_claimed_unix_ms) else {
         return;
@@ -3096,7 +3103,7 @@ fn publish_leader_reaped(
         now_unix_ms(),
         public_trigger(&claim.authoritative_trigger),
         exit_code,
-        None,
+        signal,
     );
     let outcome = journal.enqueue_event(event);
     if outcome != session_lifecycle::WriteOutcome::Persisted {
@@ -3106,6 +3113,12 @@ fn publish_leader_reaped(
             outcome
         );
     }
+}
+
+fn portable_exit_evidence(status: &portable_pty::ExitStatus) -> (i32, Option<String>) {
+    let exit_code = status.exit_code().min(i32::MAX as u32) as i32;
+    let signal = status.signal().map(session_lifecycle::sanitize_exit_signal);
+    (exit_code, signal)
 }
 
 struct CleanupCompletionGuard<'a> {
@@ -4406,7 +4419,7 @@ mod tests {
         apply_capability_input, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
         forward_attach_output, handle_capability_channel, initial_pty_size, issue_input_capability,
         metadata_history, metadata_purge_history, metadata_step, os_key_is_private_multiplexer_env,
-        os_key_starts_with_cmux_prefix, process_group_still_owns_child,
+        os_key_starts_with_cmux_prefix, portable_exit_evidence, process_group_still_owns_child,
         read_request_frame_with_limit, read_request_frame_with_timeout, remove_session,
         rename_session, request_frame_from_chunk, revoke_input_capability, sanitize_child_env,
         sanitized_tail_for_needle, set_status_theme, validate_terminal_geometry,
@@ -4417,7 +4430,7 @@ mod tests {
         MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request, SessionExitTrigger,
         SessionLifecycleState, StatusTheme,
     };
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -6153,6 +6166,30 @@ mod tests {
         assert_eq!(exits.len(), 1);
         assert_eq!(exits[0].session_id, session.id);
         assert_eq!(exits[0].trigger, SessionExitTrigger::CloseRequested);
+    }
+
+    #[test]
+    fn portable_pty_signal_evidence_is_optional_bounded_and_sanitized() {
+        let clean = ExitStatus::with_exit_code(37);
+        assert_eq!(portable_exit_evidence(&clean), (37, None));
+
+        let unsafe_signal = format!("TERM\u{1b}]52;c;secret\u{7}{}", "x".repeat(256));
+        let signaled = ExitStatus::with_signal(&unsafe_signal);
+        let (exit_code, signal) = portable_exit_evidence(&signaled);
+        let signal = signal.expect("portable-pty signal must be retained when available");
+        assert_eq!(exit_code, 1);
+        assert!(
+            signal.len() <= 64,
+            "signal must be byte bounded: {signal:?}"
+        );
+        assert!(
+            !signal.contains("secret"),
+            "signal must be sanitized: {signal:?}"
+        );
+        assert!(
+            !signal.contains('\u{1b}'),
+            "signal must be terminal safe: {signal:?}"
+        );
     }
 
     #[test]
