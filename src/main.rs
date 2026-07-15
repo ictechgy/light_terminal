@@ -3863,6 +3863,7 @@ mod tests {
             process_group_id: None,
             status_theme: None,
             agent_name: agent_name.map(str::to_string),
+            lifecycle_state: None,
         }
     }
 
@@ -5146,6 +5147,7 @@ mod tests {
             process_id: None,
             process_group_id: None,
             status_theme: None,
+            lifecycle_state: None,
         });
         assert_eq!(line.matches('\t').count(), 2, "{line:?}");
         assert!(line.ends_with('\n'), "{line:?}");
