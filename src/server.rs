@@ -4413,12 +4413,14 @@ mod tests {
         verify_linux_peercred_len, verify_peer_uid, wait_for_session_contains,
     };
     use crate::protocol::{
-        CapabilityAction, CapabilityToken, MAX_METADATA_JOURNAL_ENTRIES, MetadataStepDirection,
-        Request, StatusTheme,
+        CapabilityAction, CapabilityToken, ExitListScope, MAX_METADATA_JOURNAL_ENTRIES,
+        MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request, SessionExitTrigger,
+        SessionLifecycleState, StatusTheme,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -6119,6 +6121,55 @@ mod tests {
         assert!(!sessions.by_name.contains_key(&session.name()));
         assert!(!sessions.by_pane.contains_key(&session.pane_id));
         assert!(!sessions.by_id.contains_key(&session.id));
+    }
+
+    #[test]
+    fn close_trigger_is_presented_and_queryable_from_private_journal() {
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+        let session = build_test_session("close-journal");
+        register_test_session(&state, &session);
+
+        super::terminate_session(&state, &session);
+
+        assert_eq!(
+            session.info().lifecycle_state,
+            Some(SessionLifecycleState::Ending {
+                trigger: SessionExitTrigger::CloseRequested,
+            })
+        );
+        let exits = state
+            .lifecycle_journal
+            .as_ref()
+            .expect("journal")
+            .recent_exits(None, 10, ExitListScope::All);
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].session_id, session.id);
+        assert_eq!(exits[0].trigger, SessionExitTrigger::CloseRequested);
+    }
+
+    #[test]
+    fn recent_exits_rejects_raw_limits_outside_protocol_bound() {
+        let state = Arc::new(State::default());
+        for limit in [0, MAX_RECENT_EXITS_LIMIT + 1] {
+            let err = super::handle_request(
+                &state,
+                Request::RecentExits {
+                    target: None,
+                    limit,
+                    scope: ExitListScope::All,
+                },
+            )
+            .expect_err("invalid raw limit must fail");
+            assert!(err.to_string().contains("recent exit limit"));
+        }
     }
 
     #[test]

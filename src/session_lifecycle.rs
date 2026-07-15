@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -253,6 +253,7 @@ impl LifecyclePublication {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn conflict_count(&self) -> u64 {
         self.conflicts.load(Ordering::Relaxed)
     }
@@ -339,7 +340,7 @@ pub(crate) struct StoredIdentity {
     parent_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_name: Option<String>,
-    created_unix_ms: u128,
+    created_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,11 +358,51 @@ impl From<LifecycleIdentity> for StoredIdentity {
             parent_session_id: identity.parent_session_id,
             parent_pane_id: identity.parent_pane_id,
             agent_name: identity.agent_name,
-            created_unix_ms: identity.created_unix_ms,
+            created_unix_ms: u64::try_from(identity.created_unix_ms).unwrap_or(u64::MAX),
             process_id: identity.process_id,
             process_group_id: identity.process_group_id,
             attached_clients: identity.attached_clients,
         }
+    }
+}
+
+impl StoredIdentity {
+    fn sanitize_loaded(&mut self) -> bool {
+        let before = self.clone();
+        self.session_id = sanitized_field(&self.session_id, MAX_PANE_BYTES);
+        self.name = sanitized_field(&self.name, MAX_NAME_BYTES);
+        self.pane_id = sanitized_field(&self.pane_id, MAX_PANE_BYTES);
+        self.parent_session_id = self
+            .parent_session_id
+            .take()
+            .map(|value| sanitized_field(&value, MAX_PANE_BYTES));
+        self.parent_pane_id = self
+            .parent_pane_id
+            .take()
+            .map(|value| sanitized_field(&value, MAX_PANE_BYTES));
+        self.agent_name = self
+            .agent_name
+            .take()
+            .map(|value| sanitized_field(&value, MAX_AGENT_BYTES));
+        *self != before
+    }
+
+    fn has_valid_shape(&self) -> bool {
+        Uuid::parse_str(&self.session_id).is_ok()
+            && !self.name.is_empty()
+            && self.pane_id.starts_with('%')
+            && self
+                .parent_session_id
+                .as_deref()
+                .is_none_or(|id| Uuid::parse_str(id).is_ok())
+            && self
+                .parent_pane_id
+                .as_deref()
+                .is_none_or(|pane| pane.starts_with('%'))
+            && self
+                .agent_name
+                .as_deref()
+                .is_none_or(|name| !name.is_empty())
     }
 }
 
@@ -374,7 +415,7 @@ pub(crate) enum LifecycleEvent {
         event_seq: u8,
         #[serde(flatten)]
         identity: StoredIdentity,
-        trigger_claimed_unix_ms: u128,
+        trigger_claimed_unix_ms: u64,
         trigger: SessionExitTrigger,
     },
     LeaderReaped {
@@ -383,8 +424,8 @@ pub(crate) enum LifecycleEvent {
         event_seq: u8,
         #[serde(flatten)]
         identity: StoredIdentity,
-        trigger_claimed_unix_ms: u128,
-        reaped_unix_ms: u128,
+        trigger_claimed_unix_ms: u64,
+        reaped_unix_ms: u64,
         trigger: SessionExitTrigger,
         exit_code: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,7 +445,7 @@ impl LifecycleEvent {
             event_id,
             event_seq: 1,
             identity: identity.into(),
-            trigger_claimed_unix_ms,
+            trigger_claimed_unix_ms: u64::try_from(trigger_claimed_unix_ms).unwrap_or(u64::MAX),
             trigger,
         }
     }
@@ -424,8 +465,8 @@ impl LifecycleEvent {
             event_id,
             event_seq: 2,
             identity: identity.into(),
-            trigger_claimed_unix_ms,
-            reaped_unix_ms,
+            trigger_claimed_unix_ms: u64::try_from(trigger_claimed_unix_ms).unwrap_or(u64::MAX),
+            reaped_unix_ms: u64::try_from(reaped_unix_ms).unwrap_or(u64::MAX),
             trigger,
             exit_code,
             signal: signal.map(|value| sanitized_field(&value, MAX_SIGNAL_BYTES)),
@@ -459,7 +500,7 @@ impl LifecycleEvent {
             | Self::LeaderReaped {
                 trigger_claimed_unix_ms,
                 ..
-            } => *trigger_claimed_unix_ms,
+            } => u128::from(*trigger_claimed_unix_ms),
         }
     }
 
@@ -476,6 +517,79 @@ impl LifecycleEvent {
         }
         line.push(b'\n');
         Ok(line)
+    }
+
+    fn has_valid_shape(&self) -> bool {
+        match self {
+            Self::TriggerClaimed {
+                schema_version,
+                event_seq,
+                ..
+            } => schema_version == JOURNAL_SCHEMA_VERSION && *event_seq == 1,
+            Self::LeaderReaped {
+                schema_version,
+                event_seq,
+                ..
+            } => schema_version == JOURNAL_SCHEMA_VERSION && *event_seq == 2,
+        }
+    }
+
+    fn validate_and_sanitize_loaded(mut self) -> Option<(Self, bool)> {
+        if !self.has_valid_shape() {
+            return None;
+        }
+        let changed = match &mut self {
+            Self::TriggerClaimed {
+                schema_version,
+                event_seq,
+                identity,
+                trigger,
+                ..
+            } => {
+                if schema_version != JOURNAL_SCHEMA_VERSION || *event_seq != 1 {
+                    return None;
+                }
+                identity.sanitize_loaded() | sanitize_loaded_trigger(trigger)?
+            }
+            Self::LeaderReaped {
+                schema_version,
+                event_seq,
+                identity,
+                trigger,
+                signal,
+                ..
+            } => {
+                if schema_version != JOURNAL_SCHEMA_VERSION || *event_seq != 2 {
+                    return None;
+                }
+                let mut changed = identity.sanitize_loaded() | sanitize_loaded_trigger(trigger)?;
+                if let Some(value) = signal {
+                    let sanitized = sanitized_field(value, MAX_SIGNAL_BYTES);
+                    changed |= *value != sanitized;
+                    *value = sanitized;
+                }
+                changed
+            }
+        };
+        if !self.identity().has_valid_shape() {
+            return None;
+        }
+        Some((self, changed))
+    }
+}
+
+fn sanitize_loaded_trigger(trigger: &mut SessionExitTrigger) -> Option<bool> {
+    match trigger {
+        SessionExitTrigger::LeaderExited
+        | SessionExitTrigger::CloseRequested
+        | SessionExitTrigger::DaemonShutdown => Some(false),
+        SessionExitTrigger::ParentCascade { parent_session_id } => {
+            let sanitized = sanitized_field(parent_session_id, MAX_PANE_BYTES);
+            let changed = *parent_session_id != sanitized;
+            *parent_session_id = sanitized;
+            Uuid::parse_str(parent_session_id).ok().map(|_| changed)
+        }
+        SessionExitTrigger::Unknown => None,
     }
 }
 
@@ -505,6 +619,10 @@ pub(crate) fn fold_events(
             LifecycleEvent::LeaderReaped { .. } => bucket.reaps.push(event.clone()),
         }
     }
+    for bucket in buckets.values_mut() {
+        bucket.triggers.sort_by_key(event_sort_key);
+        bucket.reaps.sort_by_key(event_sort_key);
+    }
 
     let mut exits: Vec<_> = buckets
         .into_values()
@@ -530,6 +648,10 @@ pub(crate) fn fold_events(
     exits
 }
 
+fn event_sort_key(event: &LifecycleEvent) -> Vec<u8> {
+    serde_json::to_vec(event).unwrap_or_default()
+}
+
 fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessionExit> {
     let trigger = bucket.triggers.first();
     let reap = bucket.reaps.first();
@@ -538,7 +660,7 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
     let cross_conflict = match (trigger, reap) {
         (Some(trigger), Some(reap)) => {
             trigger.event_id() != reap.event_id()
-                || trigger.identity() != reap.identity()
+                || !stable_identity_matches(trigger.identity(), reap.identity())
                 || trigger.trigger_claimed_at() != reap.trigger_claimed_at()
                 || trigger.trigger() != reap.trigger()
         }
@@ -581,7 +703,7 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
     {
         (
             ExitOutcomeState::Complete,
-            Some(*reaped_unix_ms),
+            Some(u128::from(*reaped_unix_ms)),
             Some(*exit_code),
             signal.clone(),
         )
@@ -597,7 +719,7 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
         parent_session_id: identity.parent_session_id.clone(),
         parent_pane_id: identity.parent_pane_id.clone(),
         agent_name: identity.agent_name.clone(),
-        created_unix_ms: identity.created_unix_ms,
+        created_unix_ms: u128::from(identity.created_unix_ms),
         trigger_claimed_unix_ms: source.trigger_claimed_at(),
         reaped_unix_ms,
         trigger: public_trigger,
@@ -606,6 +728,18 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
         signal,
         evidence_state,
     })
+}
+
+fn stable_identity_matches(left: &StoredIdentity, right: &StoredIdentity) -> bool {
+    left.session_id == right.session_id
+        && left.name == right.name
+        && left.pane_id == right.pane_id
+        && left.parent_session_id == right.parent_session_id
+        && left.parent_pane_id == right.parent_pane_id
+        && left.agent_name == right.agent_name
+        && left.created_unix_ms == right.created_unix_ms
+        && left.process_id == right.process_id
+        && left.process_group_id == right.process_group_id
 }
 
 #[derive(Default)]
@@ -861,26 +995,80 @@ impl SecureStorage {
 }
 
 fn load_segment(file: File, loaded: &mut LoadedEvents) -> Result<()> {
-    let mut reader = BufReader::new(file);
+    if file
+        .metadata()
+        .context("stat lifecycle journal segment")?
+        .len()
+        > MAX_SEGMENT_BYTES
+    {
+        loaded.degraded = true;
+    }
+    let mut reader = BufReader::new(file.take(MAX_SEGMENT_BYTES));
     loop {
-        let mut line = Vec::new();
-        let bytes = reader
-            .read_until(b'\n', &mut line)
-            .context("read lifecycle journal segment")?;
-        if bytes == 0 {
-            break;
-        }
-        if line.last() != Some(&b'\n') || line.len() > MAX_EVENT_LINE_BYTES {
-            loaded.degraded = true;
-            continue;
-        }
-        line.pop();
-        match serde_json::from_slice::<LifecycleEvent>(&line) {
-            Ok(event) => loaded.events.push(event),
-            Err(_) => loaded.degraded = true,
+        match read_bounded_line(&mut reader)? {
+            BoundedLine::Eof => break,
+            BoundedLine::Invalid => loaded.degraded = true,
+            BoundedLine::Complete(line) => match serde_json::from_slice::<LifecycleEvent>(&line) {
+                Ok(event) => match event.validate_and_sanitize_loaded() {
+                    Some((event, changed)) => {
+                        loaded.degraded |= changed;
+                        loaded.events.push(event);
+                    }
+                    None => loaded.degraded = true,
+                },
+                Err(_) => loaded.degraded = true,
+            },
         }
     }
     Ok(())
+}
+
+enum BoundedLine {
+    Eof,
+    Complete(Vec<u8>),
+    Invalid,
+}
+
+fn read_bounded_line(reader: &mut impl BufRead) -> Result<BoundedLine> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader
+            .fill_buf()
+            .context("read lifecycle journal segment")?;
+        if available.is_empty() {
+            return if line.is_empty() && !oversized {
+                Ok(BoundedLine::Eof)
+            } else {
+                Ok(BoundedLine::Invalid)
+            };
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if !oversized
+                && line.len().saturating_add(newline).saturating_add(1) <= MAX_EVENT_LINE_BYTES
+            {
+                line.extend_from_slice(&available[..newline]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(newline + 1);
+            return if oversized {
+                Ok(BoundedLine::Invalid)
+            } else {
+                Ok(BoundedLine::Complete(line))
+            };
+        }
+
+        if !oversized
+            && line.len().saturating_add(available.len()).saturating_add(1) <= MAX_EVENT_LINE_BYTES
+        {
+            line.extend_from_slice(available);
+        } else {
+            oversized = true;
+        }
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
 }
 
 fn leaf(bytes: &'static [u8]) -> &'static CStr {
@@ -976,6 +1164,7 @@ fn sanitized_field(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Arc;
     use std::thread;
@@ -993,6 +1182,18 @@ mod tests {
             process_group_id: Some(123),
             attached_clients: 1,
         }
+    }
+
+    fn load_bytes(bytes: &[u8]) -> LoadedEvents {
+        let mut file = tempfile::tempfile().expect("journal tempfile");
+        file.write_all(bytes).expect("write journal bytes");
+        file.seek(SeekFrom::Start(0)).expect("rewind journal");
+        let mut loaded = LoadedEvents {
+            events: Vec::new(),
+            degraded: false,
+        };
+        load_segment(file, &mut loaded).expect("load journal segment");
+        loaded
     }
 
     #[test]
@@ -1145,9 +1346,101 @@ mod tests {
             20,
             SessionExitTrigger::CloseRequested,
         );
-        let folded = fold_events(&[first, second], false, None, 10, ExitListScope::All);
+        let folded = fold_events(
+            &[first.clone(), second.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::All,
+        );
+        let reversed = fold_events(&[second, first], false, None, 10, ExitListScope::All);
+        assert_eq!(folded, reversed);
         assert_eq!(folded[0].evidence_state, ExitEvidenceState::Conflicted);
         assert_eq!(folded[0].trigger, SessionExitTrigger::Unknown);
+    }
+
+    #[test]
+    fn corrupt_reads_are_line_and_segment_bounded_and_ignore_truncated_tail() {
+        let id = Uuid::new_v4();
+        let valid = LifecycleEvent::trigger_claimed(
+            id,
+            identity(&id.to_string()),
+            20,
+            SessionExitTrigger::LeaderExited,
+        )
+        .to_json_line()
+        .expect("valid line");
+        let parsed: LifecycleEvent =
+            serde_json::from_slice(&valid[..valid.len() - 1]).expect("parse valid line");
+        assert!(parsed.validate_and_sanitize_loaded().is_some());
+        assert_eq!(load_bytes(&valid).events.len(), 1);
+
+        let mut oversized_line = vec![b'x'; MAX_EVENT_LINE_BYTES + 128];
+        oversized_line.push(b'\n');
+        oversized_line.extend_from_slice(&valid);
+        oversized_line.extend_from_slice(br#"{"kind":"trigger_claimed"}"#);
+        let loaded = load_bytes(&oversized_line);
+        assert!(loaded.degraded);
+        assert_eq!(
+            loaded.events.len(),
+            1,
+            "valid row after oversized row survives"
+        );
+
+        let oversized_segment = vec![b'x'; usize::try_from(MAX_SEGMENT_BYTES).unwrap() + 128];
+        let loaded = load_bytes(&oversized_segment);
+        assert!(loaded.degraded);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[test]
+    fn load_rejects_invalid_schema_sequence_and_identity_and_resanitizes_fields() {
+        let id = Uuid::new_v4();
+        let event = LifecycleEvent::trigger_claimed(
+            id,
+            identity(&id.to_string()),
+            20,
+            SessionExitTrigger::LeaderExited,
+        );
+        let base = serde_json::to_value(&event).expect("event value");
+        let mut rows = Vec::new();
+        for (field, value) in [
+            ("schema_version", serde_json::json!("999")),
+            ("event_seq", serde_json::json!(9)),
+            ("session_id", serde_json::json!("not-a-uuid")),
+        ] {
+            let mut invalid = base.clone();
+            invalid[field] = value;
+            serde_json::to_writer(&mut rows, &invalid).expect("invalid row");
+            rows.push(b'\n');
+        }
+        let mut unsafe_fields = base;
+        unsafe_fields["name"] = serde_json::json!(format!(
+            "safe\u{1b}]52;c;secret\u{7}{}",
+            "x".repeat(MAX_NAME_BYTES + 32)
+        ));
+        unsafe_fields["agent_name"] = serde_json::json!(format!(
+            "agent\u{1b}[31m{}",
+            "y".repeat(MAX_AGENT_BYTES + 32)
+        ));
+        serde_json::to_writer(&mut rows, &unsafe_fields).expect("unsafe row");
+        rows.push(b'\n');
+
+        let loaded = load_bytes(&rows);
+        assert!(loaded.degraded);
+        assert_eq!(loaded.events.len(), 1);
+        let folded = fold_events(
+            &loaded.events,
+            loaded.degraded,
+            None,
+            10,
+            ExitListScope::All,
+        );
+        assert_eq!(folded.len(), 1);
+        assert!(folded[0].name.len() <= MAX_NAME_BYTES);
+        assert!(folded[0].agent_name.as_ref().unwrap().len() <= MAX_AGENT_BYTES);
+        assert!(!folded[0].name.contains("secret"));
+        assert_eq!(folded[0].evidence_state, ExitEvidenceState::StorageDegraded);
     }
 
     #[test]
@@ -1162,6 +1455,15 @@ mod tests {
 
         fs::remove_file(temp.path().join("current.jsonl")).expect("remove symlink");
         fs::hard_link(&target, temp.path().join("current.jsonl")).expect("journal hardlink");
+        assert!(LifecycleJournal::open(temp.path()).is_err());
+
+        fs::remove_file(temp.path().join("current.jsonl")).expect("remove hardlink");
+        fs::write(temp.path().join("current.jsonl"), b"").expect("journal leaf");
+        fs::set_permissions(
+            temp.path().join("current.jsonl"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("broaden journal leaf");
         assert!(LifecycleJournal::open(temp.path()).is_err());
     }
 }
