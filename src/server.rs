@@ -71,6 +71,8 @@ const MAX_INPUT_CAPABILITIES_PER_SESSION: usize = 64;
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type LifecycleTestHook = Arc<dyn Fn() + Send + Sync>;
 
 /// attach 클라이언트 한 명의 lifecycle 단위.
 ///
@@ -414,6 +416,14 @@ struct Session {
     /// and backpressure eviction paths.
     #[cfg(test)]
     finalization_attempts: AtomicU64,
+    #[cfg(test)]
+    force_waitid_failure: AtomicBool,
+    #[cfg(test)]
+    fallback_wait_poll_hook: Mutex<Option<LifecycleTestHook>>,
+    #[cfg(test)]
+    terminate_child_boundary_hook: Mutex<Option<LifecycleTestHook>>,
+    #[cfg(test)]
+    process_identity_signal_attempts: AtomicU64,
     cleanup_completion: (Mutex<bool>, Condvar),
     cleanup_complete: AtomicBool,
     /// Set after `waitid(..., WNOWAIT)` observes leader exit but before the
@@ -2185,6 +2195,14 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cleanup_started: AtomicBool::new(false),
         #[cfg(test)]
         finalization_attempts: AtomicU64::new(0),
+        #[cfg(test)]
+        force_waitid_failure: AtomicBool::new(false),
+        #[cfg(test)]
+        fallback_wait_poll_hook: Mutex::new(None),
+        #[cfg(test)]
+        terminate_child_boundary_hook: Mutex::new(None),
+        #[cfg(test)]
+        process_identity_signal_attempts: AtomicU64::new(0),
         cleanup_completion: (Mutex::new(false), Condvar::new()),
         cleanup_complete: AtomicBool::new(false),
         leader_exit_observed: AtomicBool::new(false),
@@ -2277,16 +2295,34 @@ fn wait_for_child_and_publish_reaped(
     session: &Session,
     leader_exit_observed: bool,
 ) -> std::io::Result<portable_pty::ExitStatus> {
-    let mut child = lock(&session.child);
-    if leader_exit_observed {
-        terminate_unreaped_process_group(session, &child);
+    let mut cleanup_unreaped_group = leader_exit_observed;
+    loop {
+        {
+            let mut child = lock(&session.child);
+            if cleanup_unreaped_group {
+                terminate_unreaped_process_group(session, &child);
+                cleanup_unreaped_group = false;
+            }
+            if let Some(status) = child.try_wait()? {
+                // `try_wait` reaps on success. Publish that fact before releasing
+                // `child`, so a close/shutdown contender either signals while the
+                // leader still anchors its pid/pgid or observes `leader_reaped`
+                // and skips every stored-identity signal.
+                session.leader_reaped.store(true, Ordering::SeqCst);
+                return Ok(status);
+            }
+        }
+
+        // A failed waitid probe must not turn the portable blocking `Child::wait`
+        // fallback into ownership of the signaling mutex. Polling `try_wait`
+        // keeps each ownership interval bounded while preserving the atomic
+        // reap-publication handoff above.
+        #[cfg(test)]
+        if let Some(hook) = lock(&session.fallback_wait_poll_hook).take() {
+            hook();
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    let status = child.wait()?;
-    // Writer-side half of the stored-PGID invariant: publish the successful
-    // reap before releasing `child`, so an explicit-close contender cannot
-    // acquire the mutex and act on a recycled pid/pgid in the fallback window.
-    session.leader_reaped.store(true, Ordering::SeqCst);
-    Ok(status)
 }
 
 struct SpawnedChildGuard {
@@ -3447,6 +3483,10 @@ fn terminate_process_group_for_request(session: &Session) {
     // Hold the child lock while signaling so the waiter cannot reap the leader
     // and release the pgid anchor between an unreaped-pgid check and `kill`.
     let reap_guard = lock(&session.child);
+    #[cfg(test)]
+    if let Some(hook) = lock(&session.terminate_child_boundary_hook).take() {
+        hook();
+    }
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
@@ -3491,6 +3531,10 @@ fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
 }
 
 fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
+    #[cfg(test)]
+    if session.force_waitid_failure.load(Ordering::SeqCst) {
+        return false;
+    }
     let Some(pid) = session
         .process_id
         .and_then(|pid| libc::pid_t::try_from(pid).ok())
@@ -3590,6 +3634,10 @@ fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
     let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
         return;
     };
+    #[cfg(test)]
+    session
+        .process_identity_signal_attempts
+        .fetch_add(1, Ordering::SeqCst);
     let rc = unsafe { libc::kill(-pgid, signal) };
     if rc == 0 {
         return;
@@ -3607,6 +3655,10 @@ fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
     if let Some(pgid) = verified_session_process_group_id(session) {
+        #[cfg(test)]
+        session
+            .process_identity_signal_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let rc = unsafe { libc::kill(-pgid, signal) };
         if rc == 0 {
             return;
@@ -3627,6 +3679,10 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
         .process_id
         .and_then(|pid| libc::pid_t::try_from(pid).ok())
     {
+        #[cfg(test)]
+        session
+            .process_identity_signal_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let rc = unsafe { libc::kill(pid, signal) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
@@ -4435,9 +4491,7 @@ mod tests {
         MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request, SessionExitTrigger,
         SessionLifecycleState, StatusTheme,
     };
-    use portable_pty::{
-        Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system,
-    };
+    use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -4946,7 +5000,11 @@ mod tests {
     /// 검증하려는 것은 `subscribe_with_snapshot`/`append_output` 의 채널 기반 의미
     /// 이지 PTY 실제 동작이 아니다. 호출자는 명시적으로 `terminate` 같은 정리를 할
     /// 필요가 없도록 child 가 자동 종료되는 짧은 명령 (`true`) 을 띄운다.
-    fn build_test_session(name: &str) -> Arc<Session> {
+    fn build_test_session_with_command(
+        name: &str,
+        mut command: CommandBuilder,
+        retain_process_identity: bool,
+    ) -> Arc<Session> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -4956,19 +5014,18 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("openpty for test session");
-        // `true` 는 즉시 종료되지만 PTY 마스터/슬레이브 fd 는 살아 있어 Session 구조에
-        // 필요한 trait object 들을 채울 수 있다. process_id 는 보장되지 않으므로 None
-        // 으로 두어도 본 단위테스트가 사용하는 어떤 경로도 process_id 에 의존하지 않는다.
-        let true_path = ["/bin/true", "/usr/bin/true"]
-            .into_iter()
-            .find(|path| std::path::Path::new(path).is_file())
-            .expect("absolute true for test session");
-        let mut cmd = CommandBuilder::new(true_path);
-        cmd.cwd(std::env::current_dir().expect("test session cwd"));
+        command.cwd(std::env::current_dir().expect("test session cwd"));
         let child = pair
             .slave
-            .spawn_command(cmd)
-            .expect("spawn `true` for test session");
+            .spawn_command(command)
+            .expect("spawn test session command");
+        let process_id =
+            retain_process_identity.then(|| child.process_id().expect("test child process id"));
+        let process_group_id = retain_process_identity.then(|| {
+            pair.master
+                .process_group_leader()
+                .expect("test child process group")
+        });
         let killer = child.clone_killer();
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("take pty writer");
@@ -4983,8 +5040,8 @@ mod tests {
             cwd: ".".to_string(),
             agent_name: None,
             created_unix_ms: 0,
-            process_id: None,
-            process_group_id: None,
+            process_id,
+            process_group_id,
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             master: Mutex::new(pair.master),
@@ -5009,6 +5066,10 @@ mod tests {
             trigger_claimed_unix_ms: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
             finalization_attempts: AtomicU64::new(0),
+            force_waitid_failure: AtomicBool::new(false),
+            fallback_wait_poll_hook: Mutex::new(None),
+            terminate_child_boundary_hook: Mutex::new(None),
+            process_identity_signal_attempts: AtomicU64::new(0),
             cleanup_completion: (Mutex::new(false), Condvar::new()),
             cleanup_complete: AtomicBool::new(false),
             leader_exit_observed: AtomicBool::new(false),
@@ -5020,49 +5081,25 @@ mod tests {
         })
     }
 
-    #[derive(Debug)]
-    struct BlockingSuccessfulChild {
-        wait_entered: Arc<Barrier>,
-        release_wait: Arc<Barrier>,
+    fn build_test_session(name: &str) -> Arc<Session> {
+        // `true` exits immediately while the PTY descriptors remain valid for
+        // unit tests that need a fully populated Session.
+        let true_path = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("absolute true for test session");
+        build_test_session_with_command(name, CommandBuilder::new(true_path), false)
     }
 
-    #[derive(Debug)]
-    struct NoopChildKiller;
-
-    impl ChildKiller for NoopChildKiller {
-        fn kill(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(Self)
-        }
-    }
-
-    impl ChildKiller for BlockingSuccessfulChild {
-        fn kill(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-            Box::new(NoopChildKiller)
-        }
-    }
-
-    impl Child for BlockingSuccessfulChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-            Ok(None)
-        }
-
-        fn wait(&mut self) -> std::io::Result<ExitStatus> {
-            self.wait_entered.wait();
-            self.release_wait.wait();
-            Ok(ExitStatus::with_exit_code(37))
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            None
-        }
+    fn build_long_lived_test_session(name: &str) -> Arc<Session> {
+        let shell_path = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("absolute shell for test session");
+        let mut command = CommandBuilder::new(shell_path);
+        command.arg("-c");
+        command.arg("trap 'exit 0' HUP TERM; while :; do sleep 1; done");
+        build_test_session_with_command(name, command, true)
     }
 
     fn install_test_capability(
@@ -6148,67 +6185,76 @@ mod tests {
     }
 
     #[test]
-    fn failed_waitid_fallback_marks_reaped_before_explicit_close_lock_handoff() {
+    fn failed_waitid_fallback_allows_actual_close_without_post_reap_signaling() {
         let state = Arc::new(State::default());
-        let session = build_test_session("fallback-close-race");
-        assert_eq!(
-            session.process_id, None,
-            "test must use the waitid fallback"
-        );
-        assert!(!session.leader_exit_observed.load(Ordering::SeqCst));
+        let session = build_long_lived_test_session("fallback-actual-close");
+        register_test_session(&state, &session);
+        session.force_waitid_failure.store(true, Ordering::SeqCst);
+        let pid = session.process_id.expect("long-lived leader pid") as libc::pid_t;
+        let pgid = session
+            .process_group_id
+            .expect("long-lived leader process group");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "leader must start live");
 
-        let wait_entered = Arc::new(Barrier::new(2));
-        let release_wait = Arc::new(Barrier::new(2));
-        *super::lock(&session.child) = Box::new(BlockingSuccessfulChild {
-            wait_entered: Arc::clone(&wait_entered),
-            release_wait: Arc::clone(&release_wait),
-        });
+        let fallback_polled = Arc::new(Barrier::new(2));
+        let fallback_polled_for_hook = Arc::clone(&fallback_polled);
+        *super::lock(&session.fallback_wait_poll_hook) = Some(Arc::new(move || {
+            fallback_polled_for_hook.wait();
+        }));
 
+        let close_reached_child_boundary = Arc::new(Barrier::new(2));
+        let release_close_boundary = Arc::new(Barrier::new(2));
+        let close_reached_for_hook = Arc::clone(&close_reached_child_boundary);
+        let release_close_for_hook = Arc::clone(&release_close_boundary);
+        *super::lock(&session.terminate_child_boundary_hook) = Some(Arc::new(move || {
+            close_reached_for_hook.wait();
+            release_close_for_hook.wait();
+        }));
+
+        let (waiter_done_tx, waiter_done_rx) = mpsc::sync_channel(1);
         let session_for_waiter = Arc::clone(&session);
         let waiter = thread::spawn(move || {
-            super::wait_for_child_and_publish_reaped(&session_for_waiter, false)
+            let observed = super::wait_for_leader_exit_without_reaping(&session_for_waiter);
+            let result = super::wait_for_child_and_publish_reaped(&session_for_waiter, observed);
+            waiter_done_tx
+                .send((observed, result))
+                .expect("report fallback waiter result");
         });
-        wait_entered.wait();
+        fallback_polled.wait();
 
-        let close_claim = super::publish_lifecycle_trigger(
-            &state,
-            &session,
-            super::session_lifecycle::FinalizeTrigger::CloseRequested,
-        );
-        assert_eq!(
-            close_claim.authoritative_trigger,
-            super::session_lifecycle::FinalizeTrigger::CloseRequested
-        );
-
-        let close_started = Arc::new(Barrier::new(2));
-        let reaped_at_close_lock = Arc::new(AtomicBool::new(false));
+        let (close_done_tx, close_done_rx) = mpsc::sync_channel(1);
+        let state_for_close = Arc::clone(&state);
         let session_for_close = Arc::clone(&session);
-        let close_started_for_thread = Arc::clone(&close_started);
-        let reaped_for_thread = Arc::clone(&reaped_at_close_lock);
-        let close_racer = thread::spawn(move || {
-            close_started_for_thread.wait();
-            // This is the same child-mutex handoff used by explicit-close
-            // process-group termination before it trusts stored pid/pgid data.
-            let _child = super::lock(&session_for_close.child);
-            reaped_for_thread.store(
-                session_for_close.leader_reaped.load(Ordering::SeqCst),
-                Ordering::SeqCst,
-            );
+        let close = thread::spawn(move || {
+            super::terminate_session(&state_for_close, &session_for_close);
+            close_done_tx.send(()).expect("report close completion");
         });
-        close_started.wait();
-        release_wait.wait();
-
-        let status = waiter
-            .join()
-            .expect("fallback waiter thread")
-            .expect("successful fallback wait");
-        close_racer.join().expect("explicit-close contender");
-
-        assert_eq!(status.exit_code(), 37);
-        assert!(
-            reaped_at_close_lock.load(Ordering::SeqCst),
-            "explicit close must observe leader_reaped before acquiring the child lock"
+        close_reached_child_boundary.wait();
+        assert_eq!(
+            session.lifecycle.authoritative_trigger(),
+            Some(super::session_lifecycle::FinalizeTrigger::CloseRequested),
+            "actual close must claim authority before crossing the signaling boundary"
         );
+        assert!(
+            !session.leader_reaped.load(Ordering::SeqCst),
+            "the long-lived leader must still be anchored at the close boundary"
+        );
+        release_close_boundary.wait();
+
+        close_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actual close must finish within bounds");
+        let (observed, status) = waiter_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("fallback waiter must reap the signaled leader within bounds");
+        let _status = status.expect("fallback try_wait must reap successfully");
+        assert!(
+            !observed,
+            "test must exercise the forced waitid failure path"
+        );
+        close.join().expect("actual close thread");
+        waiter.join().expect("fallback waiter thread");
+
         let fallback_claim = super::publish_lifecycle_trigger(
             &state,
             &session,
@@ -6218,6 +6264,27 @@ mod tests {
             fallback_claim.authoritative_trigger,
             super::session_lifecycle::FinalizeTrigger::CloseRequested,
             "the earlier explicit-close trigger remains authoritative"
+        );
+        assert!(session.leader_reaped.load(Ordering::SeqCst));
+        assert!(
+            !super::process_group_still_owns_child(Some(pid as u32), pgid),
+            "the reaped leader pid must no longer verify the stored process group"
+        );
+
+        let signals_before_reaped_retry = session
+            .process_identity_signal_attempts
+            .load(Ordering::SeqCst);
+        assert!(
+            signals_before_reaped_retry > 0,
+            "actual close must signal the long-lived leader or its process group"
+        );
+        super::terminate_process_group_for_request(&session);
+        assert_eq!(
+            session
+                .process_identity_signal_attempts
+                .load(Ordering::SeqCst),
+            signals_before_reaped_retry,
+            "after atomic reaped publication no recycled pid or pgid may be signaled"
         );
     }
 
