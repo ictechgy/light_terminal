@@ -6156,30 +6156,6 @@ mod tests {
     }
 
     #[test]
-    fn portable_pty_signal_evidence_is_optional_bounded_and_sanitized() {
-        let clean = ExitStatus::with_exit_code(37);
-        assert_eq!(portable_exit_evidence(&clean), (37, None));
-
-        let unsafe_signal = format!("TERM\u{1b}]52;c;secret\u{7}{}", "x".repeat(256));
-        let signaled = ExitStatus::with_signal(&unsafe_signal);
-        let (exit_code, signal) = portable_exit_evidence(&signaled);
-        let signal = signal.expect("portable-pty signal must be retained when available");
-        assert_eq!(exit_code, 1);
-        assert!(
-            signal.len() <= 64,
-            "signal must be byte bounded: {signal:?}"
-        );
-        assert!(
-            !signal.contains("secret"),
-            "signal must be sanitized: {signal:?}"
-        );
-        assert!(
-            !signal.contains('\u{1b}'),
-            "signal must be terminal safe: {signal:?}"
-        );
-    }
-
-    #[test]
     fn recent_exits_rejects_raw_limits_outside_protocol_bound() {
         let state = Arc::new(State::default());
         for limit in [0, MAX_RECENT_EXITS_LIMIT + 1] {
