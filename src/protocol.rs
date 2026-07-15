@@ -755,9 +755,11 @@ impl Response {
 mod tests {
     use super::{
         CapabilityAction, CapabilityToken, InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES,
-        MAX_METADATA_JOURNAL_ENTRIES, MAX_SEND_DATA_BYTES, MetadataHistoryResult,
-        MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate, MetadataValue, Request,
-        SensitiveCapabilityRequest, SessionInfo, StatusTheme,
+        MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES,
+        ExitEvidenceState, ExitListScope, ExitOutcomeState, MetadataHistoryResult,
+        MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate, MetadataValue,
+        RecentSessionExit, Request, SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo,
+        SessionLifecycleState, StatusTheme,
     };
 
     #[test]
@@ -804,6 +806,86 @@ mod tests {
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
         assert_eq!(info.status_theme, None);
+        assert_eq!(info.lifecycle_state, None);
+    }
+
+    #[test]
+    fn lifecycle_request_and_raw_free_exit_summary_round_trip() {
+        let request = Request::RecentExits {
+            target: Some("opaque-session-id".to_string()),
+            limit: MAX_RECENT_EXITS_LIMIT,
+            scope: ExitListScope::All,
+        };
+        let request_value = serde_json::to_value(&request).expect("serialize recent exits request");
+        assert_eq!(
+            request_value,
+            serde_json::json!({
+                "type": "recent_exits",
+                "target": "opaque-session-id",
+                "limit": 100,
+                "scope": "all"
+            })
+        );
+
+        let exit = RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: "opaque-session-id".to_string(),
+            name: "agent".to_string(),
+            pane_id: "%7".to_string(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 10,
+            trigger_claimed_unix_ms: 20,
+            reaped_unix_ms: Some(30),
+            trigger: SessionExitTrigger::LeaderExited,
+            outcome_state: ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: None,
+            evidence_state: ExitEvidenceState::Complete,
+        };
+        let value = serde_json::to_value(&exit).expect("serialize recent exit");
+        let object = value.as_object().expect("recent exit object");
+        for forbidden in [
+            "command",
+            "cwd",
+            "environment",
+            "output",
+            "scrollback",
+            "capability_token",
+            "parent_token",
+            "process_id",
+            "process_group_id",
+        ] {
+            assert!(!object.contains_key(forbidden), "forbidden key {forbidden}");
+        }
+        let decoded: RecentSessionExit =
+            serde_json::from_value(value).expect("round trip recent exit");
+        assert_eq!(decoded, exit);
+    }
+
+    #[test]
+    fn session_lifecycle_state_is_optional_and_controls_live_work_presentation() {
+        let mut info: SessionInfo = serde_json::from_str(
+            r#"{
+                "id":"id","name":"name","pane_id":"%1","command":"sh","cwd":"/tmp",
+                "created_unix_ms":1,"alive":true,"exit_code":null,"rows":24,"cols":80
+            }"#,
+        )
+        .expect("legacy session info");
+        assert!(info.is_live_work());
+        assert_eq!(info.lifecycle_state(), SessionLifecycleState::Healthy);
+
+        info.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        assert!(info.is_live_work(), "monitor-failed work remains listable");
+        assert_eq!(info.lifecycle_state_label(), "degraded");
+
+        info.alive = false;
+        info.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::CloseRequested,
+        });
+        assert!(!info.is_live_work(), "ending work is never reconnectable/listable");
+        assert_eq!(info.lifecycle_state_label(), "ending");
     }
 
     #[test]
