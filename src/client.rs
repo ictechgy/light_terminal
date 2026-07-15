@@ -8121,6 +8121,55 @@ mod tests {
     }
 
     #[test]
+    fn automatic_reconnect_accepts_only_healthy_live_sessions() {
+        let mut info = sample_session_info("agent", "sh", None);
+        assert!(automatic_reconnect_candidate(&info));
+        assert!(ensure_automatic_reconnect_candidate(&info).is_ok());
+
+        info.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        assert!(!automatic_reconnect_candidate(&info));
+        let error = ensure_automatic_reconnect_candidate(&info)
+            .expect_err("monitor-failed reconnect must require explicit selection")
+            .to_string();
+        assert!(error.contains("leader state is unknown"), "{error}");
+        assert!(error.contains("lterm resume"), "{error}");
+
+        info.alive = false;
+        info.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::DaemonShutdown,
+        });
+        assert!(!automatic_reconnect_candidate(&info));
+        let error = ensure_automatic_reconnect_candidate(&info)
+            .expect_err("ending reconnect must be rejected")
+            .to_string();
+        assert!(error.contains("ending session"), "{error}");
+        assert!(!error.contains("lterm resume"), "{error}");
+    }
+
+    #[test]
+    fn recent_exits_protocol_guard_is_non_destructive_and_explicit() {
+        let old = DaemonStatus {
+            version: "1.0.31".to_string(),
+            protocol_version: 7,
+            session_count: 1,
+            active_connections: 0,
+            shutting_down: false,
+            daemon_uid: None,
+            started_at_unix_secs: None,
+        };
+        let message = recent_exits_protocol_error(&old).expect("protocol 7 must be rejected");
+        assert!(message.contains("upgrade/restart is required"), "{message}");
+        assert!(message.contains("no live session was modified"), "{message}");
+        assert!(!message.contains("lterm shutdown"), "{message}");
+
+        let current = DaemonStatus {
+            protocol_version: super::RECENT_EXITS_PROTOCOL_VERSION,
+            ..old
+        };
+        assert_eq!(recent_exits_protocol_error(&current), None);
+    }
+
+    #[test]
     fn reconnect_state_minimal_round_trip_uses_exact_private_keys() {
         let dir = tempfile::tempdir().expect("reconnect state tempdir");
         let path = dir.path().join("reconnect-state.json");
