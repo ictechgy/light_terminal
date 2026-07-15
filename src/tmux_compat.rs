@@ -244,7 +244,15 @@ fn strip_global_flags(raw_args: Vec<String>) -> Result<Vec<String>> {
 fn new_session(args: &[String]) -> Result<i32> {
     let (parsed, command) = parse_new_session_args(args)?;
     let command = tmux_shell_command(&command)?;
-    let info = client::new_session(parsed.name, command, parsed.cwd, HashMap::new(), None, true)?;
+    let info = client::new_session(
+        parsed.name,
+        command,
+        parsed.cwd,
+        HashMap::new(),
+        None,
+        true,
+        None,
+    )?;
     remember_pane(&info, None)?;
     if parsed.print {
         println!("{}", expand_format(&parsed.format, &info));
@@ -419,7 +427,15 @@ fn new_window(args: &[String]) -> Result<i32> {
     })?;
 
     let command = tmux_shell_command(&command)?;
-    let info = client::new_session(parsed.name, command, parsed.cwd, HashMap::new(), None, true)?;
+    let info = client::new_session(
+        parsed.name,
+        command,
+        parsed.cwd,
+        HashMap::new(),
+        None,
+        true,
+        None,
+    )?;
     remember_pane(&info, None)?;
     if parsed.print {
         println!("{}", expand_format(&parsed.format, &info));
@@ -971,10 +987,10 @@ fn split_window(args: &[String]) -> Result<i32> {
     }
     let direction = split_direction(horizontal, backward);
 
-    if let Some(target) = target.as_deref() {
+    let tmux_parent_pane_id = if let Some(target) = target.as_deref() {
         reject_unsupported_tmux_window_target(target)?;
         if detached {
-            ensure_detached_split_target_exists(target)?;
+            Some(detached_split_parent_pane(target)?)
         } else {
             let target = sanitize::terminal_text(target);
             bail!(
@@ -983,7 +999,9 @@ fn split_window(args: &[String]) -> Result<i32> {
                  or run `lterm tmux-compat list-commands` for supported commands."
             );
         }
-    }
+    } else {
+        None
+    };
 
     let cmux_surface = if detached {
         None
@@ -992,7 +1010,7 @@ fn split_window(args: &[String]) -> Result<i32> {
     };
     let mut env = cmux_session_env(cmux_surface.as_ref());
     env.extend(pane_env);
-    let info = match client::new_session(None, command, cwd, env, None, true) {
+    let info = match client::new_session(None, command, cwd, env, None, true, tmux_parent_pane_id) {
         Ok(info) => info,
         Err(err) => {
             rollback_cmux_split(cmux_surface.as_ref());
@@ -1028,14 +1046,15 @@ fn split_direction(horizontal: bool, backward: bool) -> &'static str {
     }
 }
 
-fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
+fn detached_split_parent_pane(target: &str) -> Result<String> {
     let safe_target = sanitize::terminal_text(target);
     // Detached split-window is commonly used by agent HUD/status helpers with
     // `-t <session-name>`. A real tmux accepts an existing live session/window
     // target even when the command is issued from a different current pane. The
     // lterm compat layer creates a separate helper session instead of a visible
-    // split inside the requested target pane, so this shim intentionally checks
-    // for existence rather than current-pane equality.
+    // split inside the requested target pane, so this shim resolves the target
+    // to its pane id instead of requiring current-pane equality. The daemon
+    // revalidates that pane as live while committing the child relationship.
     //
     // Security boundary: lterm's daemon socket already enforces same-OS-user
     // peer credentials on every request. Within that same-owner socket boundary,
@@ -1043,8 +1062,8 @@ fn ensure_detached_split_target_exists(target: &str) -> Result<()> {
     // target can launch a detached helper for orchestration. The helper runs as
     // a separate lterm session and is not attached into the target pane.
     info_for_tmux_target(target)
-        .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))?;
-    Ok(())
+        .map(|info| info.pane_id)
+        .with_context(|| format!("tmux split-window -d target not found: {safe_target}"))
 }
 
 fn is_omx_hud_watch_command(command: Option<&str>, pane_env: &HashMap<String, String>) -> bool {

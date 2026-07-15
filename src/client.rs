@@ -102,6 +102,7 @@ const STATUS_THEME_PROTOCOL_VERSION: u32 = 2;
 const WAIT_PROTOCOL_VERSION: u32 = 3;
 const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
 const METADATA_PROTOCOL_VERSION: u32 = 6;
+const TMUX_PARENT_PANE_PROTOCOL_VERSION: u32 = 7;
 const CAPABILITY_FILE_PREFIX: &[u8] = b"lterm-input-capability-v1\n";
 const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
 const CAPABILITY_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
@@ -290,13 +291,21 @@ pub fn new_session(
     mut env: std::collections::HashMap<String, String>,
     status_theme: Option<StatusTheme>,
     tmux: bool,
+    tmux_parent_pane_id: Option<String>,
 ) -> Result<SessionInfo> {
     ensure_server()?;
+    if tmux_parent_pane_id.is_some() {
+        require_tmux_parent_pane_protocol()?;
+    }
     if status_theme.is_some() {
         require_status_theme_protocol()?;
     }
     let cwd = Some(resolve_client_cwd(cwd)?);
-    let parent = current_parent_request();
+    let parent = if tmux_parent_pane_id.is_some() {
+        None
+    } else {
+        current_parent_request()
+    };
     inherit_client_session_home_env(&mut env);
     inherit_terminal_capability_env(&mut env);
     inherit_child_color_policy_env_unless_agent(&mut env);
@@ -311,6 +320,7 @@ pub fn new_session(
         cols: terminal_cols(),
         parent_pane_id: parent.as_ref().map(|parent| parent.pane_id.clone()),
         parent_token: parent.map(|parent| parent.token),
+        tmux_parent_pane_id,
         env,
         status_theme,
         tmux,
@@ -504,6 +514,15 @@ fn require_metadata_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_tmux_parent_pane_protocol() -> Result<()> {
+    let status =
+        daemon_status().context("check lterm daemon protocol for explicit tmux parent panes")?;
+    if let Some(message) = tmux_parent_pane_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -527,6 +546,15 @@ fn instrument_protocol_error(status: &DaemonStatus) -> Option<String> {
         format!(
             "lterm daemon protocol {} does not support instrument snapshots (requires protocol {}); run `lterm shutdown` and retry after upgrading",
             status.protocol_version, INSTRUMENT_PROTOCOL_VERSION
+        )
+    })
+}
+
+fn tmux_parent_pane_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < TMUX_PARENT_PANE_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support explicit tmux parent panes (requires protocol {}); run `lterm shutdown` and retry after upgrading",
+            status.protocol_version, TMUX_PARENT_PANE_PROTOCOL_VERSION
         )
     })
 }
@@ -7219,8 +7247,8 @@ mod tests {
         resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
         run_nested_agent_detection_loop, run_status_command, select_status_backend,
         should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        trace_file_summary, trace_output_open_context, trace_summary_text,
-        unlink_capability_path_if_identity_matches, validate_trace_replay,
+        tmux_parent_pane_protocol_error, trace_file_summary, trace_output_open_context,
+        trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
     };
@@ -12351,6 +12379,29 @@ mod tests {
         assert!(message.contains("does not support instrument snapshots"));
         assert!(message.contains("lterm shutdown"));
         assert_eq!(instrument_protocol_error(&current), None);
+    }
+
+    #[test]
+    fn explicit_tmux_parent_protocol_guard_rejects_protocol_six() {
+        let old = DaemonStatus {
+            version: "1.0.31".to_string(),
+            protocol_version: 6,
+            session_count: 0,
+            active_connections: 0,
+            shutting_down: false,
+            daemon_uid: None,
+            started_at_unix_secs: None,
+        };
+        let current = DaemonStatus {
+            protocol_version: super::TMUX_PARENT_PANE_PROTOCOL_VERSION,
+            ..old.clone()
+        };
+
+        let message = tmux_parent_pane_protocol_error(&old).expect("protocol 6 should be rejected");
+        assert!(message.contains("explicit tmux parent panes"));
+        assert!(message.contains("requires protocol 7"));
+        assert!(message.contains("lterm shutdown"));
+        assert_eq!(tmux_parent_pane_protocol_error(&current), None);
     }
 
     #[test]

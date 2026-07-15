@@ -1659,6 +1659,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             cols,
             parent_pane_id,
             parent_token,
+            tmux_parent_pane_id,
             env,
             status_theme,
             tmux,
@@ -1673,6 +1674,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cols,
                     parent_pane_id,
                     parent_token,
+                    tmux_parent_pane_id,
                     env,
                     status_theme,
                     tmux,
@@ -1707,6 +1709,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     cols: None,
                     parent_pane_id,
                     parent_token,
+                    tmux_parent_pane_id: None,
                     env,
                     status_theme,
                     tmux: false,
@@ -1880,34 +1883,73 @@ struct ParentSession {
     pane_id: String,
 }
 
-struct ParentRequest {
-    pane_id: String,
-    token: String,
+// Requests reach this point only after the Unix-socket peer is verified as the
+// daemon's OS user. A same-UID peer can already launch sessions and kill any
+// named live target; allowing tmux compatibility to record a detached helper
+// under such a target changes list/lifecycle semantics, not authority. Ambient
+// parent inheritance remains capability-token protected.
+enum ParentRequest {
+    Capability { pane_id: String, token: String },
+    TmuxTarget { pane_id: String },
+}
+
+impl ParentRequest {
+    fn pane_id(&self) -> &str {
+        match self {
+            Self::Capability { pane_id, .. } | Self::TmuxTarget { pane_id } => pane_id,
+        }
+    }
 }
 
 fn parent_request(
     parent_pane_id: Option<String>,
     parent_token: Option<String>,
-) -> Option<ParentRequest> {
-    let parent_pane_id = parent_pane_id?;
+    tmux_parent_pane_id: Option<String>,
+    tmux: bool,
+) -> Result<Option<ParentRequest>> {
+    if let Some(tmux_parent_pane_id) = tmux_parent_pane_id {
+        if !tmux {
+            bail!("tmux parent pane requires a tmux-compatible new session");
+        }
+        if parent_pane_id.is_some() || parent_token.is_some() {
+            bail!("tmux parent pane cannot be combined with a parent capability");
+        }
+        let pane_id = normalize_target(&tmux_parent_pane_id);
+        if !pane_id.strip_prefix('%').is_some_and(|digits| {
+            !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+        }) {
+            bail!("tmux parent pane must be a pane id");
+        }
+        return Ok(Some(ParentRequest::TmuxTarget { pane_id }));
+    }
+
+    let Some(parent_pane_id) = parent_pane_id else {
+        return Ok(None);
+    };
     let parent_pane_id = normalize_target(&parent_pane_id);
     if !parent_pane_id.starts_with('%') {
-        return None;
+        return Ok(None);
     }
-    let token = parent_token.filter(|token| !token.is_empty())?;
-    Some(ParentRequest {
+    let Some(token) = parent_token.filter(|token| !token.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(ParentRequest::Capability {
         pane_id: parent_pane_id,
         token,
-    })
+    }))
 }
 
 fn resolve_parent_session_locked(
     sessions: &SessionMaps,
     request: &ParentRequest,
 ) -> Option<ParentSession> {
-    let session = sessions.by_pane.get(&request.pane_id)?;
-    if !session.alive.load(Ordering::SeqCst) || session.parent_token != request.token {
+    let session = sessions.by_pane.get(request.pane_id())?;
+    if !session.alive.load(Ordering::SeqCst) {
         return None;
+    }
+    match request {
+        ParentRequest::Capability { token, .. } if session.parent_token != *token => return None,
+        ParentRequest::Capability { .. } | ParentRequest::TmuxTarget { .. } => {}
     }
     Some(ParentSession {
         id: session.id.clone(),
@@ -1919,7 +1961,7 @@ fn validate_parent_request(state: &Arc<State>, request: &ParentRequest) -> Resul
     let sessions = lock(&state.sessions);
     resolve_parent_session_locked(&sessions, request)
         .map(|_| ())
-        .with_context(|| format!("parent session no longer available: {}", request.pane_id))
+        .with_context(|| format!("parent session no longer available: {}", request.pane_id()))
 }
 
 struct NewSessionParams {
@@ -1930,13 +1972,19 @@ struct NewSessionParams {
     cols: Option<u16>,
     parent_pane_id: Option<String>,
     parent_token: Option<String>,
+    tmux_parent_pane_id: Option<String>,
     env: HashMap<String, String>,
     status_theme: Option<StatusTheme>,
     tmux: bool,
 }
 
 fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
-    let parent_request = parent_request(params.parent_pane_id, params.parent_token);
+    let parent_request = parent_request(
+        params.parent_pane_id,
+        params.parent_token,
+        params.tmux_parent_pane_id,
+        params.tmux,
+    )?;
     if let Some(parent_request) = parent_request.as_ref() {
         validate_parent_request(state, parent_request)?;
     }
@@ -2218,7 +2266,7 @@ impl SessionReservation {
         let parent_session = match parent_request {
             Some(request) => Some(
                 resolve_parent_session_locked(&sessions, request).with_context(|| {
-                    format!("parent session no longer available: {}", request.pane_id)
+                    format!("parent session no longer available: {}", request.pane_id())
                 })?,
             ),
             None => None,

@@ -1,4 +1,6 @@
 mod client;
+#[allow(dead_code)]
+mod launch_registry;
 mod paths;
 mod protocol;
 mod sanitize;
@@ -745,6 +747,13 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if launch_registry::dispatch_internal_gate()? {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if launch_registry::dispatch_internal_test_driver()? {
+        return Ok(());
+    }
     let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
     match cli.command {
         Commands::Daemon => server::serve_forever(),
@@ -761,7 +770,8 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?;
-            let info = client::new_session(name, command, cwd, HashMap::new(), status_theme, tmux)?;
+            let info =
+                client::new_session(name, command, cwd, HashMap::new(), status_theme, tmux, None)?;
             if detach {
                 println!("{}\t{}\t{}", info.name, info.pane_id, info.command);
                 Ok(())
@@ -790,8 +800,15 @@ fn run() -> Result<()> {
                 tmux_compat::ensure_shim()?;
             }
             let command = normalize_command(command)?.context("run requires a command")?;
-            let info =
-                client::new_session(name, Some(command), cwd, HashMap::new(), status_theme, tmux)?;
+            let info = client::new_session(
+                name,
+                Some(command),
+                cwd,
+                HashMap::new(),
+                status_theme,
+                tmux,
+                None,
+            )?;
             client::attach_with_presence(
                 &info.pane_id,
                 status_presence_from_no_status(no_status),
@@ -3521,6 +3538,7 @@ fn run_agent_profile(
             env,
             launch.status_theme(),
             true,
+            None,
         );
         match created {
             Ok(info) => {

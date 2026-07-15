@@ -4110,6 +4110,119 @@ fn metadata_rejects_protocol_five_before_sending_metadata_request() -> TestResul
 
 #[test]
 #[cfg(unix)]
+fn explicit_tmux_parent_rejects_protocol_six_before_sending_new() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let thread_requests = requests.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let request_type = request["type"]
+                    .as_str()
+                    .ok_or("fake daemon request missing type")?
+                    .to_string();
+                thread_requests
+                    .lock()
+                    .map_err(|_| "fake daemon requests lock poisoned")?
+                    .push(request_type.clone());
+                let response = match request_type.as_str() {
+                    "ping" => serde_json::json!({"ok": true, "result": {"pong": true}}),
+                    "status" => serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "version": "1.0.31",
+                            "protocol_version": 6,
+                            "session_count": 1,
+                            "active_connections": 1,
+                            "shutting_down": false
+                        }
+                    }),
+                    "info" => serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "id": "stale-parent-id",
+                            "name": "stale-parent",
+                            "pane_id": "%7",
+                            "command": "sleep 30",
+                            "cwd": "/tmp",
+                            "created_unix_ms": 1,
+                            "alive": true,
+                            "exit_code": null,
+                            "rows": 24,
+                            "cols": 80
+                        }
+                    }),
+                    other => {
+                        return Err(format!("unexpected request before preflight: {other}").into());
+                    }
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            listener.set_nonblocking(true)?;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        return Err(format!(
+                            "unexpected request after protocol rejection: {request}"
+                        )
+                        .into());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let output = env
+        .cmd()
+        .env("LTERM_PANE", "%99")
+        .env("LTERM_PARENT_TOKEN", "ambient-parent-token")
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-t",
+            "stale-parent",
+            "sh",
+            "-lc",
+            "printf helper-should-not-run",
+        ])
+        .output()?;
+    assert!(!output.status.success(), "protocol 6 must be rejected");
+    assert_stderr_contains(&output, "does not support explicit tmux parent panes");
+    assert_stderr_contains(&output, "requires protocol 7");
+    assert_stderr_contains(&output, "lterm shutdown");
+    server
+        .join()
+        .map_err(|_| "fake protocol-six daemon panicked")??;
+    assert_eq!(
+        *requests
+            .lock()
+            .map_err(|_| "fake daemon requests lock poisoned")?,
+        ["ping", "status", "info", "ping", "status"]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn capability_daemon_swap_sends_only_nonsecret_hello_before_ready() -> TestResult {
     let env = TestEnv::new()?;
     let run_dir = env.temp.path().join("run");
@@ -8081,11 +8194,63 @@ fn tmux_compat_split_window_detached_accepts_existing_non_current_target() -> Te
     );
     assert_eq!(
         session_names_json(&env)?,
-        running_all_names,
-        "detached helper invoked from outside an lterm parent is a separate visible root while running"
+        before,
+        "an explicit detached split target should make the helper a hidden child while standalone sessions remain visible"
     );
+    assert_eq!(
+        helper_row.parent_pane_id.as_deref(),
+        Some(split_other_pane.as_str()),
+        "the helper must be recorded as the explicit live target's child"
+    );
+    let children = env.cmd().args(["ls", "--children"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let children_stdout = String::from_utf8_lossy(&children.stdout);
+    let child_list_row = list_row(&children_stdout, &helper_row.name)
+        .ok_or_else(|| format!("helper missing from child list: {children_stdout:?}"))?;
+    assert_eq!(child_list_row[1], helper_pane, "{children_stdout:?}");
+    assert_eq!(child_list_row[6], split_other_pane, "{children_stdout:?}");
+    assert!(
+        !children_stdout.lines().any(|line| {
+            line.starts_with("split-current\t") || line.starts_with("split-other\t")
+        }),
+        "standalone roots must not leak into the child-only list: {children_stdout:?}"
+    );
+    let tmux_sessions = env
+        .cmd()
+        .args(["tmux-compat", "list-sessions", "-F", "#{session_name}"])
+        .output()?;
+    assert!(tmux_sessions.status.success(), "{tmux_sessions:?}");
+    let tmux_sessions_stdout = String::from_utf8_lossy(&tmux_sessions.stdout);
+    assert_exact_line_set(&tmux_sessions_stdout, &["split-current", "split-other"]);
+    let target_panes = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "list-panes",
+            "-t",
+            "split-other",
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()?;
+    assert!(target_panes.status.success(), "{target_panes:?}");
+    let target_panes_stdout = String::from_utf8_lossy(&target_panes.stdout);
+    assert_exact_line_set(&target_panes_stdout, &[&split_other_pane, helper_pane]);
     std::fs::write(&release, "release")?;
     wait_for_session_names_eq(&env, &before, Duration::from_secs(10))?;
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        "detached helper cleanup",
+        || {
+            let names = session_row_names(&session_rows_json(&env, true)?);
+            if names == before_all_names {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("{names:?}")))
+            }
+        },
+    )?;
     let final_all = session_rows_json(&env, true)?;
     assert_eq!(
         session_row_names(&final_all),
@@ -8127,7 +8292,7 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     let child_payload = format!(
         "printf TEAM_WINDOW_TARGET_READY > {marker_arg}; \
          \"$LTERM_BIN\" tmux-compat split-window -v -d -P -F '#{{pane_id}}' \
-         -t team-window-parent:0 sh -lc {grandchild_payload_arg} > {grandchild_pane_file_arg}; \
+         -t \"$TMUX_PANE\" sh -lc {grandchild_payload_arg} > {grandchild_pane_file_arg}; \
          status=$?; printf %s \"$status\" > {grandchild_status_file_arg}; sleep 60"
     );
     let child_payload_arg = shlex::try_quote(&child_payload)?.into_owned();
@@ -8182,6 +8347,34 @@ fn tmux_compat_split_window_accepts_omx_team_window_target_and_full_size_flag() 
     let parent_pane = parent_row
         .get(1)
         .ok_or_else(|| format!("team-window-parent row missing pane id: {parent_row:?}"))?;
+    let roots = session_rows_json(&env, false)?;
+    assert_eq!(
+        roots
+            .iter()
+            .map(|row| row.pane_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![*parent_pane],
+        "nested detached splits should remain hidden from the default list: {roots:?}"
+    );
+    let all_rows = session_rows_json(&env, true)?;
+    let child_row = all_rows
+        .iter()
+        .find(|row| row.pane_id == child_pane)
+        .ok_or_else(|| format!("child pane missing from all sessions: {all_rows:?}"))?;
+    assert_eq!(
+        child_row.parent_pane_id.as_deref(),
+        Some(*parent_pane),
+        "first split should be a child of the explicit root target"
+    );
+    let grandchild_row = all_rows
+        .iter()
+        .find(|row| row.pane_id == grandchild_pane)
+        .ok_or_else(|| format!("grandchild pane missing from all sessions: {all_rows:?}"))?;
+    assert_eq!(
+        grandchild_row.parent_pane_id.as_deref(),
+        Some(child_pane.as_str()),
+        "nested split should be a child of its explicit child-pane target"
+    );
 
     let display = env
         .cmd()
