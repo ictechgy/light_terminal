@@ -149,9 +149,8 @@ impl LifecycleEnv {
 
     fn wait_for_attached_clients(&self, target: &str, expected: u64) -> TestResult<Value> {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut last = Value::Null;
         loop {
-            last = self.session_info(target)?;
+            let last = self.session_info(target)?;
             if last.get("attached_clients").and_then(Value::as_u64) == Some(expected) {
                 return Ok(last);
             }
@@ -774,6 +773,21 @@ fn attach_eof_socket_shutdown_and_protocol_skew_are_non_destructive() -> TestRes
         let attach = env.open_raw_attach("attach-fault-matrix")?;
         env.wait_for_attached_clients("attach-fault-matrix", 1)?;
         attach.shutdown(shutdown)?;
+        if shutdown == Shutdown::Read {
+            // SHUT_RD is local-only on some Unix-domain socket implementations:
+            // the peer may retain the subscriber until its next observable
+            // write failure. Characterize that platform behavior without
+            // mistaking it for permission to finalize the live session, then
+            // close the socket fully so the fixture cannot leak a subscriber.
+            thread::sleep(Duration::from_millis(100));
+            let after_read_half_close = env.session_info("attach-fault-matrix")?;
+            assert_same_live_session(&before, &after_read_half_close);
+            if let Err(err) = attach.shutdown(Shutdown::Both)
+                && err.kind() != std::io::ErrorKind::NotConnected
+            {
+                return Err(err.into());
+            }
+        }
         let after = env.wait_for_attached_clients("attach-fault-matrix", 0)?;
         assert_same_live_session(&before, &after);
         drop(attach);
