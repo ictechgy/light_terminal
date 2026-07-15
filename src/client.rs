@@ -1063,11 +1063,13 @@ fn reconnect_target(fallback_target: &str, create_fallback: bool) -> Result<Sess
             return Ok(info);
         }
     }
-    if create_fallback {
+    let fallback = if create_fallback {
         attach_or_new(fallback_target)
     } else {
         info(fallback_target)
-    }
+    }?;
+    ensure_automatic_reconnect_candidate(&fallback)?;
+    Ok(fallback)
 }
 
 fn resolve_reconnect_state(state: &ReconnectState) -> Option<SessionInfo> {
@@ -1075,11 +1077,34 @@ fn resolve_reconnect_state(state: &ReconnectState) -> Option<SessionInfo> {
         let Ok(info) = info(target) else {
             continue;
         };
-        if info.id == state.session_id {
+        if info.id == state.session_id && automatic_reconnect_candidate(&info) {
             return Some(info);
         }
     }
     None
+}
+
+fn automatic_reconnect_candidate(info: &SessionInfo) -> bool {
+    matches!(info.lifecycle_state(), SessionLifecycleState::Healthy) && info.is_live_work()
+}
+
+fn ensure_automatic_reconnect_candidate(info: &SessionInfo) -> Result<()> {
+    match info.lifecycle_state() {
+        SessionLifecycleState::Healthy if info.is_live_work() => Ok(()),
+        SessionLifecycleState::MonitorFailed => bail!(
+            "automatic reconnect skipped session {} because leader state is unknown; use `lterm resume -- {}` for an explicit best-effort attach",
+            sanitize::terminal_text(&info.id),
+            sanitize::terminal_text(&info.name)
+        ),
+        SessionLifecycleState::Ending { trigger } => bail!(
+            "automatic reconnect skipped ending session {} ({trigger}); select another live target",
+            sanitize::terminal_text(&info.id)
+        ),
+        SessionLifecycleState::Healthy => bail!(
+            "automatic reconnect skipped session {} because its lifecycle fields are inconsistent",
+            sanitize::terminal_text(&info.id)
+        ),
+    }
 }
 
 fn remember_reconnect_target_best_effort(info: &SessionInfo) {
@@ -2779,6 +2804,22 @@ pub fn attach_info_with_policy(
     options: AttachPolicyOptions,
     explicit_no_status: bool,
 ) -> Result<()> {
+    match info.lifecycle_state() {
+        SessionLifecycleState::Healthy if info.is_live_work() => {}
+        SessionLifecycleState::MonitorFailed if info.is_live_work() => eprintln!(
+            "warning: session {} leader state is unknown; attempting an explicit best-effort attach",
+            sanitize::terminal_text(&info.id)
+        ),
+        SessionLifecycleState::Ending { trigger } => bail!(
+            "session {} is ending ({trigger}) and is not reconnectable; inspect `lterm exits -- {}`",
+            sanitize::terminal_text(&info.id),
+            sanitize::terminal_text(&info.id)
+        ),
+        _ => bail!(
+            "session {} has inconsistent lifecycle fields and is not safe to attach",
+            sanitize::terminal_text(&info.id)
+        ),
+    }
     remember_reconnect_target_best_effort(info);
     let use_mobile = match options.mode {
         AttachMode::Raw => false,
@@ -2798,6 +2839,7 @@ pub fn attach_info_with_policy(
             &info.pane_id,
             presence_policy,
             stdin_eof,
+            info,
             agent_presence_cue,
             explicit_no_status,
         )
@@ -4055,13 +4097,22 @@ pub fn attach_with_presence(
     stdin_eof: AttachStdinEof,
     explicit_no_status: bool,
 ) -> Result<()> {
-    attach_with_presence_and_cue(target, presence_policy, stdin_eof, None, explicit_no_status)
+    let original_info = info(target)?;
+    attach_with_presence_and_cue(
+        &original_info.pane_id,
+        presence_policy,
+        stdin_eof,
+        &original_info,
+        None,
+        explicit_no_status,
+    )
 }
 
 fn attach_with_presence_and_cue(
     target: &str,
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
+    original_info: &SessionInfo,
     agent_presence_cue: Option<AgentPresenceCue>,
     // 사용자가 `--no-status`를 명시했는지. 정책 `RowOff`는 "agent 기본"과 "--no-status"를
     // 구분 못 하므로, cmux pill sink 게이트(`sink_enabled`)는 이 신호로 명시적 비활성을 존중한다.
@@ -4110,7 +4161,7 @@ fn attach_with_presence_and_cue(
     // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
     // smallest 로 사이즈 정책을 결정한다 (PR #15).
     let status_info = if content_active {
-        Some(info(target)?)
+        Some(original_info.clone())
     } else {
         None
     };
