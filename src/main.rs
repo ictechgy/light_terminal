@@ -937,7 +937,7 @@ fn run() -> Result<()> {
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         sanitize::terminal_text(&s.name),
                         sanitize::terminal_text(&s.pane_id),
-                        if s.alive { "alive" } else { "dead" },
+                        s.lifecycle_state_label(),
                         sanitize::terminal_text(&s.cwd),
                         sanitize::terminal_text(&s.command),
                         format_attach_state(s.attached_clients),
@@ -2096,6 +2096,8 @@ struct DiagnosticSession {
     process_group_id: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_theme: Option<protocol::StatusTheme>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_state: Option<protocol::SessionLifecycleState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2126,6 +2128,9 @@ struct DiagnosticBundle {
     sessions: Option<Vec<DiagnosticSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
+    recent_exits: Option<Vec<protocol::RecentSessionExit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_exits_error: Option<String>,
     processes: Option<Vec<DiagnosticProcess>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     processes_error: Option<String>,
@@ -2375,9 +2380,22 @@ fn print_diagnose_bundle() -> Result<()> {
         (None, None)
     };
 
+    let (recent_exits, recent_exits_error) = if doctor.daemon_reachable {
+        match client::recent_exits(
+            None,
+            protocol::MAX_RECENT_EXITS_LIMIT,
+            protocol::ExitListScope::All,
+        ) {
+            Ok(exits) => (Some(exits), None),
+            Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
+        }
+    } else {
+        (None, None)
+    };
+
     let environment = diagnostic_environment(&doctor);
     let bundle = DiagnosticBundle {
-        schema_version: "1.0",
+        schema_version: "1.1",
         generated_at_unix_secs: current_unix_secs(),
         privacy: DiagnosticPrivacy {
             raw_pty_streams_included: false,
@@ -2392,6 +2410,7 @@ fn print_diagnose_bundle() -> Result<()> {
                 "session/process command fields keep only the executable basename plus an argument-redaction marker",
                 "tmux compatibility diagnostics are derived from local lterm metadata and PATH-order boolean/null indicators; no real tmux commands are executed",
                 "no raw terminal scrollback or PTY bytes are included",
+                "recent exit summaries are raw-free lifecycle metadata without commands, paths, process identifiers, or terminal content",
             ],
         },
         doctor: redact_doctor_report(&doctor),
@@ -2399,6 +2418,8 @@ fn print_diagnose_bundle() -> Result<()> {
         tmux_compat: build_diagnostic_tmux_compat(&doctor.tmux_compat),
         sessions,
         sessions_error,
+        recent_exits,
+        recent_exits_error,
         processes,
         processes_error,
         notes,
@@ -2600,6 +2621,7 @@ fn redact_session_info(session: protocol::SessionInfo) -> DiagnosticSession {
         process_id: session.process_id,
         process_group_id: session.process_group_id,
         status_theme: session.status_theme,
+        lifecycle_state: session.lifecycle_state,
     }
 }
 
@@ -2918,6 +2940,7 @@ fn filter_list_sessions(
 ) -> Vec<protocol::SessionInfo> {
     sessions
         .into_iter()
+        .filter(|session| session.is_live_work())
         .filter(|session| match scope {
             ListScope::Roots => session.parent_pane_id.is_none(),
             ListScope::Children => session.parent_pane_id.is_some(),

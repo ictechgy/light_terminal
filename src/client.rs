@@ -4752,10 +4752,7 @@ fn diagnose_attach_failure(primary: anyhow::Error, original: &SessionInfo) -> an
     let matching_live = live.as_ref().filter(|info| info.id == original.id);
     let needs_exit_lookup = matching_live.is_none()
         || matching_live.is_some_and(|info| {
-            matches!(
-                info.lifecycle_state(),
-                SessionLifecycleState::Ending { .. }
-            )
+            matches!(info.lifecycle_state(), SessionLifecycleState::Ending { .. })
         });
     let recent = if needs_exit_lookup {
         rpc::<Vec<RecentSessionExit>>(&Request::RecentExits {
@@ -4791,7 +4788,7 @@ fn format_attach_failure_diagnosis(
                 ])
                 .ok();
                 let mut message = format!(
-                    "attach transport was lost, but session {} remains alive",
+                    "attach transport lost; session remains alive (session_id={})",
                     sanitize::terminal_text(&original.id)
                 );
                 if let Some(hint) = hint {
@@ -4801,7 +4798,7 @@ fn format_attach_failure_diagnosis(
             }
             SessionLifecycleState::MonitorFailed if info.is_live_work() => {
                 return Some(format!(
-                    "attach transport was lost and session {} leader state is unknown",
+                    "attach transport lost; leader state is unknown (session_id={})",
                     sanitize::terminal_text(&original.id)
                 ));
             }
@@ -4818,7 +4815,7 @@ fn format_attach_failure_diagnosis(
             }
             _ => {
                 return Some(format!(
-                    "attach transport was lost and session {} leader state is unknown",
+                    "attach transport lost; leader state is unknown (session_id={})",
                     sanitize::terminal_text(&original.id)
                 ));
             }
@@ -7438,35 +7435,38 @@ mod tests {
         StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
         TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_process_tree_from_rows,
-        build_status_payload, compose_commit_bytes, compose_display_line,
+        apply_pending_status_command, attach_pty_rows, automatic_reconnect_candidate,
+        build_process_tree_from_rows, build_status_payload, compose_commit_bytes,
+        compose_display_line,
         compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
         compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
         compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
         compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled,
         create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, extract_search_matches, extract_urls,
+        dectcem_param_matches, ensure_automatic_reconnect_candidate,
+        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private,
+        extract_search_matches, extract_urls,
         finish_attach_results, format_attach_failure_diagnosis, format_status_line,
-        forward_pty_output_frame_or_detached,
-        handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
-        hex_encoded_len, instrument_protocol_error, interruptible_sleep, is_self_provided_tmux,
-        join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
-        mobile_transcript_grep_query, nested_known_agent_present_in_processes,
-        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
-        parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_private_capability_file, read_reconnect_state_best_effort_from_path,
-        read_reconnect_state_from_path, read_trace_jsonl_line,
+        forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
+        heartbeat_due, hex_decode, hex_encode, hex_encoded_len, instrument_protocol_error,
+        interruptible_sleep, is_self_provided_tmux, join_attach_input_thread,
+        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
+        mobile_client_detected, mobile_transcript_capture_changed, mobile_transcript_grep_query,
+        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_private_capability_file,
+        read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
+        read_trace_jsonl_line, recent_exits_protocol_error,
         remember_reconnect_target_best_effort_at_path, reset_raw_attach_initial_sgr_if_needed,
         resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
-        run_nested_agent_detection_loop, run_status_command, select_status_backend,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
-        tmux_parent_pane_protocol_error, trace_file_summary, trace_output_open_context,
-        trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
-        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
-        write_mobile_transcript_urls, write_numbered_search_matches,
+        run_nested_agent_detection_loop, run_status_command,
+        select_status_backend, should_mobile_transcript_auto, status_sgr_stack_supported,
+        status_theme_protocol_error, tmux_parent_pane_protocol_error, trace_file_summary,
+        trace_output_open_context, trace_summary_text, unlink_capability_path_if_identity_matches,
+        validate_trace_replay, write_lterm_agent_presence_banner, write_lterm_title_cue,
+        write_mobile_transcript_update, write_mobile_transcript_urls,
+        write_numbered_search_matches,
     };
     use crate::protocol::{
         ExitEvidenceState, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
@@ -12312,7 +12312,10 @@ mod tests {
         };
         let diagnosis = format_attach_failure_diagnosis(&original, Some(&reused), &[exit])
             .expect("recorded exit diagnosis");
-        assert!(diagnosis.contains("session ended during attach"), "{diagnosis}");
+        assert!(
+            diagnosis.contains("session ended during attach"),
+            "{diagnosis}"
+        );
         assert!(diagnosis.contains("exit_code=37"), "{diagnosis}");
         assert!(!diagnosis.contains("session remains alive"), "{diagnosis}");
     }
