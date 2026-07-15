@@ -604,16 +604,6 @@ pub(crate) fn fold_events(
     let mut exits: Vec<_> = buckets
         .into_iter()
         .filter_map(|(session_id, bucket)| fold_bucket(&session_id, bucket, storage_degraded))
-        .filter(|exit| match scope {
-            ExitListScope::TopLevel => exit.parent_session_id.is_none(),
-            ExitListScope::Children => exit.parent_session_id.is_some(),
-            ExitListScope::All => true,
-        })
-        .filter(|exit| {
-            target.is_none_or(|target| {
-                exit.session_id == target || exit.name == target || exit.pane_id == target
-            })
-        })
         .collect();
     exits.sort_by(|left, right| {
         right
@@ -621,8 +611,40 @@ pub(crate) fn fold_events(
             .cmp(&left.trigger_claimed_unix_ms)
             .then_with(|| right.session_id.cmp(&left.session_id))
     });
+
+    if let Some(target) = target
+        && let Some(exact) = exits.iter().find(|exit| exit.session_id == target).cloned()
+    {
+        exits = if exit_matches_scope(&exact, scope) {
+            vec![exact]
+        } else {
+            Vec::new()
+        };
+        exits.truncate(usize::from(limit));
+        return exits;
+    }
+
+    exits.retain(|exit| exit_matches_scope(exit, scope));
+    if let Some(target) = target {
+        exits.retain(|exit| exit.name == target || exit.pane_id == target);
+        exits.truncate(1);
+    }
     exits.truncate(usize::from(limit));
     exits
+}
+
+fn exit_matches_scope(exit: &RecentSessionExit, scope: ExitListScope) -> bool {
+    match scope {
+        // A conflicted DTO intentionally contains no candidate identity. Do
+        // not reinterpret its fail-closed `None` parent as top-level truth.
+        ExitListScope::TopLevel => {
+            exit.evidence_state != ExitEvidenceState::Conflicted && exit.parent_session_id.is_none()
+        }
+        ExitListScope::Children => {
+            exit.evidence_state != ExitEvidenceState::Conflicted && exit.parent_session_id.is_some()
+        }
+        ExitListScope::All => true,
+    }
 }
 
 fn fold_bucket(
@@ -1461,13 +1483,18 @@ mod tests {
     #[test]
     fn conflicting_same_sequence_rows_fail_closed() {
         let session_id = Uuid::new_v4().to_string();
+        let parent_session_id = Uuid::new_v4().to_string();
         let mut first_identity = identity(&session_id);
         first_identity.name = "candidate-a".to_string();
         first_identity.pane_id = "%1".to_string();
+        first_identity.parent_session_id = Some(parent_session_id.clone());
+        first_identity.parent_pane_id = Some("%parent".to_string());
         first_identity.created_unix_ms = 10;
         let mut second_identity = identity(&session_id);
         second_identity.name = "candidate-b".to_string();
         second_identity.pane_id = "%9".to_string();
+        second_identity.parent_session_id = Some(parent_session_id);
+        second_identity.parent_pane_id = Some("%parent".to_string());
         second_identity.created_unix_ms = 99;
         let first = LifecycleEvent::trigger_claimed(
             Uuid::new_v4(),
@@ -1488,7 +1515,13 @@ mod tests {
             10,
             ExitListScope::All,
         );
-        let reversed = fold_events(&[second, first], false, None, 10, ExitListScope::All);
+        let reversed = fold_events(
+            &[second.clone(), first.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::All,
+        );
         assert_eq!(folded, reversed);
         assert_eq!(folded[0].evidence_state, ExitEvidenceState::Conflicted);
         assert_eq!(folded[0].trigger, SessionExitTrigger::Unknown);
@@ -1498,6 +1531,149 @@ mod tests {
         assert_eq!(folded[0].created_unix_ms, 0);
         assert_eq!(folded[0].trigger_claimed_unix_ms, 0);
         assert_eq!(folded[0].outcome_state, ExitOutcomeState::Unknown);
+
+        let default = fold_events(
+            &[first.clone(), second.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::TopLevel,
+        );
+        assert!(
+            default.is_empty(),
+            "candidate-free conflict DTO must not become top-level merely because parent identity was removed"
+        );
+        let children = fold_events(
+            &[first.clone(), second.clone()],
+            false,
+            None,
+            10,
+            ExitListScope::Children,
+        );
+        assert!(
+            children.is_empty(),
+            "conflicted identity is not authoritative enough for a scoped child view"
+        );
+        let all = fold_events(&[first, second], false, None, 10, ExitListScope::All);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].evidence_state, ExitEvidenceState::Conflicted);
+        assert_eq!(all[0].parent_session_id, None);
+    }
+
+    #[test]
+    fn target_resolution_prefers_exact_uuid_and_one_newest_eligible_tombstone() {
+        let old_id = "00000000-0000-4000-8000-000000000001";
+        let top_new_id = "00000000-0000-4000-8000-000000000002";
+        let child_new_id = "00000000-0000-4000-8000-000000000003";
+        let uuid_shadow_id = "00000000-0000-4000-8000-000000000004";
+        let scoped_shadow_id = "00000000-0000-4000-8000-000000000005";
+        let parent_id = "00000000-0000-4000-8000-000000000099";
+
+        let mut old = identity(old_id);
+        old.name = "reused".to_string();
+        old.pane_id = "%7".to_string();
+        let old = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            old,
+            100,
+            SessionExitTrigger::LeaderExited,
+        );
+
+        let mut top_new = identity(top_new_id);
+        top_new.name = "reused".to_string();
+        top_new.pane_id = "%8".to_string();
+        let top_new = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            top_new,
+            200,
+            SessionExitTrigger::LeaderExited,
+        );
+
+        let mut child_new = identity(child_new_id);
+        child_new.name = "reused".to_string();
+        child_new.pane_id = "%7".to_string();
+        child_new.parent_session_id = Some(parent_id.to_string());
+        child_new.parent_pane_id = Some("%parent".to_string());
+        let child_new = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            child_new,
+            300,
+            SessionExitTrigger::ParentCascade {
+                parent_session_id: parent_id.to_string(),
+            },
+        );
+
+        let mut uuid_shadow = identity(uuid_shadow_id);
+        uuid_shadow.name = old_id.to_string();
+        uuid_shadow.pane_id = "%9".to_string();
+        let uuid_shadow = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            uuid_shadow,
+            400,
+            SessionExitTrigger::LeaderExited,
+        );
+
+        let mut scoped_shadow = identity(scoped_shadow_id);
+        scoped_shadow.name = child_new_id.to_string();
+        scoped_shadow.pane_id = "%10".to_string();
+        let scoped_shadow = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            scoped_shadow,
+            500,
+            SessionExitTrigger::LeaderExited,
+        );
+
+        let events = [top_new, uuid_shadow, old, scoped_shadow, child_new];
+        let by_name = fold_events(&events, false, Some("reused"), 10, ExitListScope::TopLevel);
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].session_id, top_new_id);
+
+        let by_name_all = fold_events(&events, false, Some("reused"), 10, ExitListScope::All);
+        assert_eq!(by_name_all.len(), 1);
+        assert_eq!(by_name_all[0].session_id, child_new_id);
+
+        let by_pane = fold_events(&events, false, Some("%7"), 10, ExitListScope::All);
+        assert_eq!(by_pane.len(), 1);
+        assert_eq!(by_pane[0].session_id, child_new_id);
+
+        let exact = fold_events(&events, false, Some(old_id), 10, ExitListScope::All);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].session_id, old_id);
+
+        let scoped_exact = fold_events(
+            &events,
+            false,
+            Some(child_new_id),
+            10,
+            ExitListScope::TopLevel,
+        );
+        assert!(
+            scoped_exact.is_empty(),
+            "an out-of-scope exact UUID must not fall back to a mutable name collision"
+        );
+    }
+
+    #[test]
+    fn newest_first_order_uses_descending_uuid_as_stable_tie_break() {
+        let lower_id = "00000000-0000-4000-8000-000000000010";
+        let higher_id = "00000000-0000-4000-8000-000000000011";
+        let lower = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity(lower_id),
+            500,
+            SessionExitTrigger::LeaderExited,
+        );
+        let higher = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity(higher_id),
+            500,
+            SessionExitTrigger::LeaderExited,
+        );
+
+        let folded = fold_events(&[lower, higher], false, None, 10, ExitListScope::TopLevel);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].session_id, higher_id);
+        assert_eq!(folded[1].session_id, lower_id);
     }
 
     #[test]
