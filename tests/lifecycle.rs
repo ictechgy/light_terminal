@@ -11,7 +11,8 @@
 
 use serde_json::Value;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -102,6 +103,107 @@ impl LifecycleEnv {
             .and_then(|v| v.as_str())
             .ok_or("doctor --json missing socket_path field")?;
         Ok(PathBuf::from(path))
+    }
+
+    fn rpc(&self, request: Value) -> TestResult<Value> {
+        let mut stream = UnixStream::connect(self.socket_path()?)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        serde_json::to_writer(&mut stream, &request)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line)?;
+        let response: Value = serde_json::from_str(&line)?;
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(format!(
+                "lterm RPC failed for {request}: {}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown daemon error")
+            )
+            .into());
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn session_info(&self, target: &str) -> TestResult<Value> {
+        self.rpc(serde_json::json!({"type":"info","target":target}))
+    }
+
+    fn create_long_lived_session(&self, name: &str, script: &str) -> TestResult<Value> {
+        let output = self
+            .cmd()
+            .args(["new", "--detach", "--name", name, "--", "sh", "-lc", script])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "create session {name} failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.wait_for_attached_clients(name, 0)
+    }
+
+    fn wait_for_attached_clients(&self, target: &str, expected: u64) -> TestResult<Value> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut last = Value::Null;
+        loop {
+            last = self.session_info(target)?;
+            if last.get("attached_clients").and_then(Value::as_u64) == Some(expected) {
+                return Ok(last);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for {target} attached_clients={expected}; last={last}"
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn attach_exchange(&self, request: Value) -> TestResult<(UnixStream, Value)> {
+        let mut stream = UnixStream::connect(self.socket_path()?)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        serde_json::to_writer(&mut stream, &request)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+
+        // Read exactly through the response newline so any immediately queued
+        // PTY snapshot/live bytes remain on the socket for the attach fault.
+        let mut header = Vec::new();
+        let mut byte = [0_u8; 1];
+        while header.len() <= 64 * 1024 {
+            stream.read_exact(&mut byte)?;
+            header.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if header.last() != Some(&b'\n') {
+            return Err("attach response header exceeded 64 KiB".into());
+        }
+        let response = serde_json::from_slice(&header)?;
+        Ok((stream, response))
+    }
+
+    fn open_raw_attach(&self, target: &str) -> TestResult<UnixStream> {
+        let (stream, response) = self.attach_exchange(serde_json::json!({
+            "type":"attach",
+            "target":target,
+            "rows":24,
+            "cols":80
+        }))?;
+        assert_eq!(
+            response.get("ok").and_then(Value::as_bool),
+            Some(true),
+            "raw attach failed: {response}"
+        );
+        Ok(stream)
     }
 
     // `lterm new --detach`는 client::ensure_server() 경로를 거치므로 데몬을 강제
@@ -568,5 +670,133 @@ fn processes_orphans_does_not_mutate_observable_state() -> TestResult {
         before_conns,
         "active_connections must not change across processes --orphans"
     );
+    Ok(())
+}
+
+fn assert_same_live_session(before: &Value, after: &Value) {
+    for field in ["id", "name", "pane_id", "process_id"] {
+        assert_eq!(
+            after.get(field),
+            before.get(field),
+            "attach-only fault changed immutable/live identity field {field}: before={before}, after={after}"
+        );
+    }
+    assert_eq!(
+        after.get("alive").and_then(Value::as_bool),
+        Some(true),
+        "attach-only fault must leave the session alive: {after}"
+    );
+    let pid = after
+        .get("process_id")
+        .and_then(Value::as_u64)
+        .expect("long-lived session should expose process_id");
+    let pid = i32::try_from(pid).expect("process_id fits pid_t");
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "leader PID {pid} must remain alive after attach-only fault"
+    );
+}
+
+#[test]
+fn abrupt_attach_client_death_preserves_uuid_pid_and_live_indexes() -> TestResult {
+    let env = LifecycleEnv::new()?;
+    let before = env.create_long_lived_session("attach-sigkill", "exec sleep 30")?;
+
+    let mut attach = env
+        .cmd()
+        .args(["attach", "attach-sigkill", "--raw", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    env.wait_for_attached_clients("attach-sigkill", 1)?;
+
+    attach.kill()?;
+    attach.wait()?;
+    let after_kill = env.wait_for_attached_clients("attach-sigkill", 0)?;
+    assert_same_live_session(&before, &after_kill);
+
+    let reattach = env.open_raw_attach("attach-sigkill")?;
+    env.wait_for_attached_clients("attach-sigkill", 1)?;
+    reattach.shutdown(Shutdown::Both)?;
+    drop(reattach);
+    let after_reattach = env.wait_for_attached_clients("attach-sigkill", 0)?;
+    assert_same_live_session(&before, &after_reattach);
+
+    let listed = env.cmd().args(["sessions", "--json"]).output()?;
+    assert!(listed.status.success(), "default list failed: {listed:?}");
+    let sessions: Vec<Value> = serde_json::from_slice(&listed.stdout)?;
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session.get("id") == before.get("id")),
+        "default live list lost the session UUID after attach death: {sessions:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn attach_eof_socket_shutdown_and_protocol_skew_are_non_destructive() -> TestResult {
+    let env = LifecycleEnv::new()?;
+    let before = env.create_long_lived_session(
+        "attach-fault-matrix",
+        "while :; do printf 'lifecycle-tick\\n'; sleep 0.05; done",
+    )?;
+
+    let mut eof_attach = env
+        .cmd()
+        .args(["attach", "attach-fault-matrix", "--raw", "--no-status"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let eof_stdin = eof_attach.stdin.take().ok_or("missing attach stdin")?;
+    env.wait_for_attached_clients("attach-fault-matrix", 1)?;
+    drop(eof_stdin);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = eof_attach.try_wait()? {
+            assert!(status.success(), "stdin EOF attach failed: {status:?}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = eof_attach.kill();
+            let _ = eof_attach.wait();
+            return Err("stdin EOF attach did not detach within 2 seconds".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let after_eof = env.wait_for_attached_clients("attach-fault-matrix", 0)?;
+    assert_same_live_session(&before, &after_eof);
+
+    for shutdown in [Shutdown::Read, Shutdown::Write, Shutdown::Both] {
+        let attach = env.open_raw_attach("attach-fault-matrix")?;
+        env.wait_for_attached_clients("attach-fault-matrix", 1)?;
+        attach.shutdown(shutdown)?;
+        let after = env.wait_for_attached_clients("attach-fault-matrix", 0)?;
+        assert_same_live_session(&before, &after);
+        drop(attach);
+    }
+
+    let (legacy_attach, response) = env.attach_exchange(serde_json::json!({
+        "type":"attach",
+        "target":"attach-fault-matrix"
+    }))?;
+    assert_eq!(
+        response.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "old attach payload without geometry must fail explicitly: {response}"
+    );
+    assert!(
+        response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("version mismatch")),
+        "protocol-skew rejection should be actionable: {response}"
+    );
+    drop(legacy_attach);
+    let after_skew = env.wait_for_attached_clients("attach-fault-matrix", 0)?;
+    assert_same_live_session(&before, &after_skew);
     Ok(())
 }

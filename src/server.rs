@@ -4865,7 +4865,10 @@ mod tests {
             sessions.by_id.get(&session.id),
         ] {
             let indexed = indexed.expect("session must remain present in every live index");
-            assert_eq!(indexed.id, session.id, "live index must retain the same UUID");
+            assert_eq!(
+                indexed.id, session.id,
+                "live index must retain the same UUID"
+            );
         }
     }
 
