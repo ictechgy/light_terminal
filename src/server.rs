@@ -2682,6 +2682,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
         })?;
 
         let mut metadata = lock(&session.metadata);
+        reject_identity_mutation_while_ending(&session)?;
         if metadata.current.name == new_name {
             if sessions
                 .by_name
@@ -2758,6 +2759,16 @@ fn validate_metadata_append(metadata: &SessionMetadata) -> Result<()> {
     Ok(())
 }
 
+fn reject_identity_mutation_while_ending(session: &Session) -> Result<()> {
+    if matches!(
+        session.lifecycle.presentation(),
+        session_lifecycle::SessionPresentation::Ending { .. }
+    ) {
+        bail!("session is ending; identity metadata cannot be changed");
+    }
+    Ok(())
+}
+
 fn metadata_history(state: &Arc<State>, target: &str) -> Result<MetadataHistoryResult> {
     let target = normalize_target(target);
     let sessions = lock(&state.sessions);
@@ -2794,6 +2805,7 @@ fn metadata_step(
         )
     })?;
     let mut metadata = lock(&session.metadata);
+    reject_identity_mutation_while_ending(&session)?;
     let (entry, expected, next, next_cursor) = match direction {
         MetadataStepDirection::Undo => {
             let index = metadata
@@ -4487,9 +4499,9 @@ mod tests {
         verify_linux_peercred_len, verify_peer_uid, wait_for_session_contains,
     };
     use crate::protocol::{
-        CapabilityAction, CapabilityToken, ExitListScope, MAX_METADATA_JOURNAL_ENTRIES,
-        MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request, SessionExitTrigger,
-        SessionLifecycleState, StatusTheme,
+        CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
+        MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request,
+        SessionExitTrigger, SessionLifecycleState, StatusTheme,
     };
     use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -5225,6 +5237,79 @@ mod tests {
         assert_eq!(redone.current, final_state.current);
         assert_eq!(redone.cursor, 1000);
         assert_eq!(redone.entries, final_state.entries);
+    }
+
+    #[test]
+    fn ending_rejects_uuid_rename_undo_and_redo_without_conflicting_reap_identity() {
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+        let session = build_test_session("ending-identity-a");
+        register_test_session(&state, &session);
+
+        rename_session(&state, &session.id, "ending-identity-b".to_string())
+            .expect("first pre-claim rename");
+        rename_session(&state, &session.id, "ending-identity-c".to_string())
+            .expect("second pre-claim rename");
+        metadata_step(&state, &session.id, MetadataStepDirection::Undo)
+            .expect("prepare both undo and redo history");
+        let claimed_identity = metadata_five_state(&state, &session);
+        assert_eq!(claimed_identity.current.name, "ending-identity-b");
+
+        let claim = super::publish_lifecycle_trigger(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested,
+        );
+        assert!(claim.claimant, "test must own the lifecycle claim");
+
+        let rename_err = rename_session(
+            &state,
+            &session.id,
+            "ending-identity-after-claim".to_string(),
+        )
+        .expect_err("UUID-targeted rename must reject Ending sessions");
+        assert!(rename_err.to_string().contains("session is ending"));
+        for direction in [MetadataStepDirection::Undo, MetadataStepDirection::Redo] {
+            let err = metadata_step(&state, &session.id, direction)
+                .expect_err("undo/redo must reject Ending sessions");
+            assert!(err.to_string().contains("session is ending"));
+        }
+        assert_eq!(
+            metadata_five_state(&state, &session),
+            claimed_identity,
+            "rejected Ending mutations must leave every metadata field unchanged"
+        );
+
+        super::publish_leader_reaped(&state, &session, &claim, 37, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let exit = loop {
+            let exits = state
+                .lifecycle_journal
+                .as_ref()
+                .expect("journal")
+                .recent_exits(Some(&session.id), 10, ExitListScope::All);
+            if let Some(exit) = exits
+                .into_iter()
+                .find(|exit| exit.outcome_state == ExitOutcomeState::Complete)
+            {
+                break exit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for complete reap evidence"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(exit.name, "ending-identity-b");
+        assert_eq!(exit.exit_code, Some(37));
+        assert_eq!(exit.evidence_state, ExitEvidenceState::Complete);
     }
 
     #[test]
@@ -6196,10 +6281,13 @@ mod tests {
             .expect("long-lived leader process group");
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "leader must start live");
 
-        let fallback_polled = Arc::new(Barrier::new(2));
-        let fallback_polled_for_hook = Arc::clone(&fallback_polled);
+        let fallback_parked = Arc::new(Barrier::new(2));
+        let release_fallback = Arc::new(Barrier::new(2));
+        let fallback_parked_for_hook = Arc::clone(&fallback_parked);
+        let release_fallback_for_hook = Arc::clone(&release_fallback);
         *super::lock(&session.fallback_wait_poll_hook) = Some(Arc::new(move || {
-            fallback_polled_for_hook.wait();
+            fallback_parked_for_hook.wait();
+            release_fallback_for_hook.wait();
         }));
 
         let close_reached_child_boundary = Arc::new(Barrier::new(2));
@@ -6220,7 +6308,7 @@ mod tests {
                 .send((observed, result))
                 .expect("report fallback waiter result");
         });
-        fallback_polled.wait();
+        fallback_parked.wait();
 
         let (close_done_tx, close_done_rx) = mpsc::sync_channel(1);
         let state_for_close = Arc::clone(&state);
@@ -6239,6 +6327,10 @@ mod tests {
             !session.leader_reaped.load(Ordering::SeqCst),
             "the long-lived leader must still be anchored at the close boundary"
         );
+        // Keep the fallback waiter parked until explicit close owns `child`.
+        // The previous one-phase rendezvous released both threads together and
+        // accidentally relied on the waiter's 10 ms poll sleep for ordering.
+        release_fallback.wait();
         release_close_boundary.wait();
 
         close_done_rx
