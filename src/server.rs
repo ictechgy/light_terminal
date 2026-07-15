@@ -2231,21 +2231,10 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
                 session_lifecycle::FinalizeTrigger::LeaderExited,
             )
         });
-        let wait_result = {
-            let mut child = lock(&session_for_waiter.child);
-            if leader_exit_observed {
-                terminate_unreaped_process_group(&session_for_waiter, &child);
-            }
-            child.wait()
-        };
+        let wait_result =
+            wait_for_child_and_publish_reaped(&session_for_waiter, leader_exit_observed);
         match wait_result {
             Ok(status) => {
-                // Writer-side half of the stored-PGID invariant: successful
-                // wait means the leader is now reaped and its pid/pgid may be
-                // recycled.
-                session_for_waiter
-                    .leader_reaped
-                    .store(true, Ordering::SeqCst);
                 let (exit_code, signal) = portable_exit_evidence(&status);
                 session_for_waiter
                     .exit_code
@@ -2282,6 +2271,22 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     });
 
     Ok(session)
+}
+
+fn wait_for_child_and_publish_reaped(
+    session: &Session,
+    leader_exit_observed: bool,
+) -> std::io::Result<portable_pty::ExitStatus> {
+    let mut child = lock(&session.child);
+    if leader_exit_observed {
+        terminate_unreaped_process_group(session, &child);
+    }
+    let status = child.wait()?;
+    // Writer-side half of the stored-PGID invariant: publish the successful
+    // reap before releasing `child`, so an explicit-close contender cannot
+    // acquire the mutex and act on a recycled pid/pgid in the fallback window.
+    session.leader_reaped.store(true, Ordering::SeqCst);
+    Ok(status)
 }
 
 struct SpawnedChildGuard {
@@ -4430,7 +4435,9 @@ mod tests {
         MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request, SessionExitTrigger,
         SessionLifecycleState, StatusTheme,
     };
-    use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
+    use portable_pty::{
+        Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system,
+    };
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -5011,6 +5018,51 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    #[derive(Debug)]
+    struct BlockingSuccessfulChild {
+        wait_entered: Arc<Barrier>,
+        release_wait: Arc<Barrier>,
+    }
+
+    #[derive(Debug)]
+    struct NoopChildKiller;
+
+    impl ChildKiller for NoopChildKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl ChildKiller for BlockingSuccessfulChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NoopChildKiller)
+        }
+    }
+
+    impl Child for BlockingSuccessfulChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            self.wait_entered.wait();
+            self.release_wait.wait();
+            Ok(ExitStatus::with_exit_code(37))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
     }
 
     fn install_test_capability(
@@ -6092,6 +6144,80 @@ mod tests {
         assert!(
             session.unreaped_cleanup_started.load(Ordering::SeqCst),
             "unreaped leaders should start residual stored-pgid cleanup"
+        );
+    }
+
+    #[test]
+    fn failed_waitid_fallback_marks_reaped_before_explicit_close_lock_handoff() {
+        let state = Arc::new(State::default());
+        let session = build_test_session("fallback-close-race");
+        assert_eq!(
+            session.process_id, None,
+            "test must use the waitid fallback"
+        );
+        assert!(!session.leader_exit_observed.load(Ordering::SeqCst));
+
+        let wait_entered = Arc::new(Barrier::new(2));
+        let release_wait = Arc::new(Barrier::new(2));
+        *super::lock(&session.child) = Box::new(BlockingSuccessfulChild {
+            wait_entered: Arc::clone(&wait_entered),
+            release_wait: Arc::clone(&release_wait),
+        });
+
+        let session_for_waiter = Arc::clone(&session);
+        let waiter = thread::spawn(move || {
+            super::wait_for_child_and_publish_reaped(&session_for_waiter, false)
+        });
+        wait_entered.wait();
+
+        let close_claim = super::publish_lifecycle_trigger(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested,
+        );
+        assert_eq!(
+            close_claim.authoritative_trigger,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested
+        );
+
+        let close_started = Arc::new(Barrier::new(2));
+        let reaped_at_close_lock = Arc::new(AtomicBool::new(false));
+        let session_for_close = Arc::clone(&session);
+        let close_started_for_thread = Arc::clone(&close_started);
+        let reaped_for_thread = Arc::clone(&reaped_at_close_lock);
+        let close_racer = thread::spawn(move || {
+            close_started_for_thread.wait();
+            // This is the same child-mutex handoff used by explicit-close
+            // process-group termination before it trusts stored pid/pgid data.
+            let _child = super::lock(&session_for_close.child);
+            reaped_for_thread.store(
+                session_for_close.leader_reaped.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        });
+        close_started.wait();
+        release_wait.wait();
+
+        let status = waiter
+            .join()
+            .expect("fallback waiter thread")
+            .expect("successful fallback wait");
+        close_racer.join().expect("explicit-close contender");
+
+        assert_eq!(status.exit_code(), 37);
+        assert!(
+            reaped_at_close_lock.load(Ordering::SeqCst),
+            "explicit close must observe leader_reaped before acquiring the child lock"
+        );
+        let fallback_claim = super::publish_lifecycle_trigger(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::LeaderExited,
+        );
+        assert_eq!(
+            fallback_claim.authoritative_trigger,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested,
+            "the earlier explicit-close trigger remains authoritative"
         );
     }
 
