@@ -100,6 +100,16 @@ pub(crate) struct LifecyclePublication {
     conflicts: AtomicU64,
 }
 
+/// Holds lifecycle state stable while an admitted identity mutation commits.
+///
+/// Identity mutations acquire this only after taking the session-map and
+/// metadata locks. Trigger claimants acquire only lifecycle state, release it,
+/// and then snapshot metadata, so this guard preserves the established lock
+/// order while closing the admissibility-to-commit race.
+pub(crate) struct IdentityCommitGuard<'a> {
+    _state: MutexGuard<'a, PublicationState>,
+}
+
 impl Default for LifecyclePublication {
     fn default() -> Self {
         Self {
@@ -111,6 +121,12 @@ impl Default for LifecyclePublication {
 }
 
 impl LifecyclePublication {
+    pub(crate) fn identity_commit_guard(&self) -> Option<IdentityCommitGuard<'_>> {
+        let state = lock(&self.state);
+        matches!(&*state, PublicationState::Unclaimed(_))
+            .then_some(IdentityCommitGuard { _state: state })
+    }
+
     /// Claims immutable lifecycle authority and clears compatibility alive
     /// while holding the same state lock. The claimant exclusively owns one
     /// event id and one enqueue attempt.
