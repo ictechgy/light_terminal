@@ -1,5 +1,4 @@
 #[path = "session_lifecycle.rs"]
-#[allow(dead_code)]
 mod session_lifecycle;
 
 use crate::paths;
@@ -9,8 +8,8 @@ use crate::protocol::{
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
     MetadataHistoryResult, MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate,
     MetadataPurgeResult, MetadataStepDirection, MetadataStepResult, MetadataValue,
-    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme,
-    WaitContainsResult, WaitExitResult,
+    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionExitTrigger,
+    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -161,6 +160,7 @@ struct State {
     // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
     // 보내 client가 uptime을 omit하게 한다.
     started_at_unix_secs: Option<u64>,
+    lifecycle_journal: Option<Arc<session_lifecycle::LifecycleJournal>>,
 }
 
 #[derive(Default)]
@@ -179,8 +179,17 @@ impl State {
     // 카운터 계열은 Default::default()로 0에서 시작해도 항상 안전하므로 wire에
     // 의존하는 시작 시각만 인자로 받는다. 테스트는 State::default()를 그대로 사용.
     fn new(started_at_unix_secs: Option<u64>) -> Self {
+        let lifecycle_journal = paths::session_lifecycle_dir()
+            .and_then(|path| session_lifecycle::LifecycleJournal::open(&path))
+            .map(Arc::new)
+            .map_err(|err| {
+                eprintln!("lifecycle journal unavailable: {err:#}");
+                err
+            })
+            .ok();
         Self {
             started_at_unix_secs,
+            lifecycle_journal,
             ..Self::default()
         }
     }
@@ -393,6 +402,8 @@ struct Session {
     /// Whether the leader process is still considered live for user-visible
     /// session state and attach input loops.
     alive: AtomicBool,
+    lifecycle: Arc<session_lifecycle::LifecyclePublication>,
+    trigger_claimed_unix_ms: Mutex<Option<u128>>,
     /// One-shot finalizer gate shared by the leader waiter and explicit
     /// kill/shutdown paths. `alive` can become false before teardown finishes,
     /// so cleanup needs its own idempotence and completion state.
@@ -469,9 +480,32 @@ impl Session {
             process_group_id: self.process_group_id,
             status_theme: metadata.status_theme,
             agent_name: self.agent_name.clone(),
-            // Protocol-v8 compatibility placeholder. Task 4 replaces this with
-            // the server's authoritative lifecycle presentation conversion.
-            lifecycle_state: None,
+            lifecycle_state: Some(match self.lifecycle.presentation() {
+                session_lifecycle::SessionPresentation::Healthy => SessionLifecycleState::Healthy,
+                session_lifecycle::SessionPresentation::MonitorFailed => {
+                    SessionLifecycleState::MonitorFailed
+                }
+                session_lifecycle::SessionPresentation::Ending { trigger } => {
+                    SessionLifecycleState::Ending {
+                        trigger: public_trigger(&trigger),
+                    }
+                }
+            }),
+        }
+    }
+
+    fn lifecycle_identity(&self) -> session_lifecycle::LifecycleIdentity {
+        session_lifecycle::LifecycleIdentity {
+            session_id: self.id.clone(),
+            name: self.name(),
+            pane_id: self.pane_id.clone(),
+            parent_session_id: lock(&self.parent_session_id).clone(),
+            parent_pane_id: lock(&self.parent_pane_id).clone(),
+            agent_name: self.agent_name.clone(),
+            created_unix_ms: self.created_unix_ms,
+            process_id: self.process_id,
+            process_group_id: self.process_group_id,
+            attached_clients: lock(&self.subscribers).len(),
         }
     }
 
@@ -1734,14 +1768,24 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 let sessions = lock(&state.sessions);
                 sessions.by_pane.values().cloned().collect()
             };
-            let mut infos: Vec<_> = sessions.iter().map(|s| s.info()).collect();
+            let mut infos: Vec<_> = sessions
+                .iter()
+                .map(|session| session.info())
+                .filter(SessionInfo::is_live_work)
+                .collect();
             infos.sort_by_key(|info| info.created_unix_ms);
             Ok(Response::ok(infos))
         }
-        // Protocol-v8 compile bridge for task 5's client/DTO tests. Task 4
-        // replaces this arm with the private lifecycle journal query.
-        Request::RecentExits { .. } => Ok(Response::err(
-            "recent exit evidence is unavailable until lifecycle storage is integrated",
+        Request::RecentExits {
+            target,
+            limit,
+            scope,
+        } => Ok(Response::ok(
+            state
+                .lifecycle_journal
+                .as_ref()
+                .map(|journal| journal.recent_exits(target.as_deref(), limit, scope))
+                .unwrap_or_default(),
         )),
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Instrument { target } => Ok(Response::ok(
@@ -2124,6 +2168,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
+        lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
+        trigger_claimed_unix_ms: Mutex::new(None),
         cleanup_started: AtomicBool::new(false),
         #[cfg(test)]
         finalization_attempts: AtomicU64::new(0),
@@ -2911,6 +2957,19 @@ fn verified_process_group_id(
 enum SessionFinalizeReason {
     LeaderExited,
     TerminateRequested,
+}
+
+fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTrigger {
+    match trigger {
+        session_lifecycle::FinalizeTrigger::LeaderExited => SessionExitTrigger::LeaderExited,
+        session_lifecycle::FinalizeTrigger::CloseRequested => SessionExitTrigger::CloseRequested,
+        session_lifecycle::FinalizeTrigger::DaemonShutdown => SessionExitTrigger::DaemonShutdown,
+        session_lifecycle::FinalizeTrigger::ParentCascade { parent_session_id } => {
+            SessionExitTrigger::ParentCascade {
+                parent_session_id: parent_session_id.clone(),
+            }
+        }
+    }
 }
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
@@ -4812,6 +4871,8 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
+            lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
+            trigger_claimed_unix_ms: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
             finalization_attempts: AtomicU64::new(0),
             cleanup_completion: (Mutex::new(false), Condvar::new()),
