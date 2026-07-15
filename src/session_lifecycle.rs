@@ -4,13 +4,36 @@
 //! in-memory lifecycle truth published before destructive cleanup and later
 //! acts as the acknowledgement boundary for the private exit journal.
 
+use crate::protocol::{
+    ExitEvidenceState, ExitListScope, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
+};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(crate) const PUBLICATION_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const JOURNAL_SCHEMA_VERSION: &str = "1.0";
+pub(crate) const MAX_EVENT_LINE_BYTES: usize = 16 * 1024;
+const MAX_SEGMENT_BYTES: u64 = 1024 * 1024;
+const WRITER_QUEUE_CAPACITY: usize = 64;
+const CURRENT_SEGMENT: &CStr = c"current.jsonl";
+const PREVIOUS_SEGMENT: &CStr = c"previous.jsonl";
+const LOCK_FILE: &CStr = c"journal.lock";
+const MAX_NAME_BYTES: usize = 128;
+const MAX_PANE_BYTES: usize = 64;
+const MAX_AGENT_BYTES: usize = 64;
+const MAX_SIGNAL_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
