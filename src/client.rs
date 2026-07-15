@@ -1,11 +1,11 @@
 use crate::paths;
 use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
-    CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
-    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_SEND_DATA_BYTES,
-    MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult, PROTOCOL_VERSION, Request,
-    Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme, WaitContainsResult,
-    WaitExitResult,
+    CapabilityToken, DaemonStatus, ExitListScope, InstrumentSnapshot, IssueInputCapabilityResult,
+    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_RECENT_EXITS_LIMIT,
+    MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult,
+    PROTOCOL_VERSION, RecentSessionExit, Request, Response, SensitiveCapabilityRequest,
+    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -103,6 +103,7 @@ const WAIT_PROTOCOL_VERSION: u32 = 3;
 const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
 const METADATA_PROTOCOL_VERSION: u32 = 6;
 const TMUX_PARENT_PANE_PROTOCOL_VERSION: u32 = 7;
+const RECENT_EXITS_PROTOCOL_VERSION: u32 = 8;
 const CAPABILITY_FILE_PREFIX: &[u8] = b"lterm-input-capability-v1\n";
 const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
 const CAPABILITY_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
@@ -523,6 +524,14 @@ fn require_tmux_parent_pane_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_recent_exits_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for recent exits")?;
+    if let Some(message) = recent_exits_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -555,6 +564,15 @@ fn tmux_parent_pane_protocol_error(status: &DaemonStatus) -> Option<String> {
         format!(
             "lterm daemon protocol {} does not support explicit tmux parent panes (requires protocol {}); run `lterm shutdown` and retry after upgrading",
             status.protocol_version, TMUX_PARENT_PANE_PROTOCOL_VERSION
+        )
+    })
+}
+
+fn recent_exits_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < RECENT_EXITS_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support recent exit evidence (requires protocol {}); upgrade/restart is required, and no live session was modified",
+            status.protocol_version, RECENT_EXITS_PROTOCOL_VERSION
         )
     })
 }
@@ -607,7 +625,26 @@ fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     ensure_server()?;
-    rpc(&Request::List)
+    let mut sessions: Vec<SessionInfo> = rpc(&Request::List)?;
+    sessions.retain(SessionInfo::is_live_work);
+    Ok(sessions)
+}
+
+pub fn recent_exits(
+    target: Option<&str>,
+    limit: u16,
+    scope: ExitListScope,
+) -> Result<Vec<RecentSessionExit>> {
+    if limit == 0 || limit > MAX_RECENT_EXITS_LIMIT {
+        bail!("recent exit limit must be between 1 and {MAX_RECENT_EXITS_LIMIT}");
+    }
+    ensure_server()?;
+    require_recent_exits_protocol()?;
+    rpc(&Request::RecentExits {
+        target: target.map(str::to_string),
+        limit,
+        scope,
+    })
 }
 
 pub fn info(target: &str) -> Result<SessionInfo> {
@@ -7232,7 +7269,8 @@ mod tests {
         create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
         dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
-        finish_attach_results, format_status_line, forward_pty_output_frame_or_detached,
+        finish_attach_results, format_attach_failure_diagnosis, format_status_line,
+        forward_pty_output_frame_or_detached,
         handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
         hex_encoded_len, instrument_protocol_error, interruptible_sleep, is_self_provided_tmux,
         join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
@@ -7251,6 +7289,10 @@ mod tests {
         trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
+    };
+    use crate::protocol::{
+        ExitEvidenceState, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
+        SessionLifecycleState,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -12039,6 +12081,74 @@ mod tests {
         );
         assert!(err.contains("attach input thread also failed"), "{err}");
         assert!(err.contains("read stdin"), "{err}");
+    }
+
+    #[test]
+    fn attach_failure_diagnosis_uses_immutable_uuid_and_distinguishes_lifecycle_state() {
+        let original = sample_session_info("reused-name", "sh", None);
+
+        let mut healthy = original.clone();
+        healthy.lifecycle_state = Some(SessionLifecycleState::Healthy);
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&healthy), &[])
+            .expect("healthy diagnosis");
+        assert!(diagnosis.contains("session remains alive"), "{diagnosis}");
+        assert!(diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut degraded = original.clone();
+        degraded.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&degraded), &[])
+            .expect("monitor-failed diagnosis");
+        assert!(diagnosis.contains("leader state is unknown"), "{diagnosis}");
+        assert!(!diagnosis.contains("remains alive"), "{diagnosis}");
+        assert!(!diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut ending = original.clone();
+        ending.alive = false;
+        ending.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::CloseRequested,
+        });
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&ending), &[])
+            .expect("ending diagnosis");
+        assert!(diagnosis.contains("session is ending"), "{diagnosis}");
+        assert!(diagnosis.contains("close_requested"), "{diagnosis}");
+        assert!(!diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut reused = original.clone();
+        reused.id = "different-uuid".to_string();
+        let exit = RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: original.id.clone(),
+            name: original.name.clone(),
+            pane_id: original.pane_id.clone(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: None,
+            created_unix_ms: 1,
+            trigger_claimed_unix_ms: 2,
+            reaped_unix_ms: Some(3),
+            trigger: SessionExitTrigger::LeaderExited,
+            outcome_state: ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: None,
+            evidence_state: ExitEvidenceState::Complete,
+        };
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&reused), &[exit])
+            .expect("recorded exit diagnosis");
+        assert!(diagnosis.contains("session ended during attach"), "{diagnosis}");
+        assert!(diagnosis.contains("exit_code=37"), "{diagnosis}");
+        assert!(!diagnosis.contains("session remains alive"), "{diagnosis}");
+    }
+
+    #[test]
+    fn attach_diagnostic_suffix_keeps_the_original_output_error_first() {
+        let original = sample_session_info("agent", "sh", None);
+        let suffix = format_attach_failure_diagnosis(&original, Some(&original), &[])
+            .expect("healthy diagnosis");
+        let combined = anyhow::anyhow!("read pty output; {suffix}");
+        assert!(
+            format!("{combined:#}").starts_with("read pty output"),
+            "output error must remain primary"
+        );
     }
 
     #[test]
