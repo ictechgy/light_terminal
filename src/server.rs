@@ -407,6 +407,8 @@ struct Session {
     alive: AtomicBool,
     lifecycle: Arc<session_lifecycle::LifecyclePublication>,
     trigger_claimed_unix_ms: Mutex<Option<u128>>,
+    #[cfg(test)]
+    identity_mutation_admitted_hook: Mutex<Option<LifecycleTestHook>>,
     /// One-shot finalizer gate shared by the leader waiter and explicit
     /// kill/shutdown paths. `alive` can become false before teardown finishes,
     /// so cleanup needs its own idempotence and completion state.
@@ -2192,6 +2194,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         alive: AtomicBool::new(true),
         lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
         trigger_claimed_unix_ms: Mutex::new(None),
+        #[cfg(test)]
+        identity_mutation_admitted_hook: Mutex::new(None),
         cleanup_started: AtomicBool::new(false),
         #[cfg(test)]
         finalization_attempts: AtomicU64::new(0),
@@ -2731,6 +2735,9 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 after: after.clone(),
             };
 
+            #[cfg(test)]
+            pause_after_identity_mutation_admission_for_test(&session);
+            let _identity_commit = identity_commit_guard(&session)?;
             sessions.by_name.remove(&old_name);
             sessions
                 .by_name
@@ -2767,6 +2774,20 @@ fn reject_identity_mutation_while_ending(session: &Session) -> Result<()> {
         bail!("session is ending; identity metadata cannot be changed");
     }
     Ok(())
+}
+
+fn identity_commit_guard(session: &Session) -> Result<session_lifecycle::IdentityCommitGuard<'_>> {
+    session
+        .lifecycle
+        .identity_commit_guard()
+        .context("session is ending; identity metadata cannot be changed")
+}
+
+#[cfg(test)]
+fn pause_after_identity_mutation_admission_for_test(session: &Session) {
+    if let Some(hook) = lock(&session.identity_mutation_admitted_hook).take() {
+        hook();
+    }
 }
 
 fn metadata_history(state: &Arc<State>, target: &str) -> Result<MetadataHistoryResult> {
@@ -2850,6 +2871,9 @@ fn metadata_step(
         entry_count: metadata.entries.len(),
     };
 
+    #[cfg(test)]
+    pause_after_identity_mutation_admission_for_test(&session);
+    let _identity_commit = identity_commit_guard(&session)?;
     apply_metadata_name_transition(&mut sessions, &session, &metadata.current.name, &next.name);
     metadata.current = next;
     metadata.cursor = next_cursor;
@@ -5076,6 +5100,7 @@ mod tests {
             alive: AtomicBool::new(true),
             lifecycle: Arc::new(super::session_lifecycle::LifecyclePublication::default()),
             trigger_claimed_unix_ms: Mutex::new(None),
+            identity_mutation_admitted_hook: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
             finalization_attempts: AtomicU64::new(0),
             force_waitid_failure: AtomicBool::new(false),
@@ -5310,6 +5335,169 @@ mod tests {
         assert_eq!(exit.name, "ending-identity-b");
         assert_eq!(exit.exit_code, Some(37));
         assert_eq!(exit.evidence_state, ExitEvidenceState::Complete);
+    }
+
+    #[test]
+    fn ending_claim_between_identity_admission_and_commit_rejects_rename_undo_and_redo() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            Rename,
+            Undo,
+            Redo,
+        }
+
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+
+        for (index, mutation) in [Mutation::Rename, Mutation::Undo, Mutation::Redo]
+            .into_iter()
+            .enumerate()
+        {
+            let session = build_test_session(&format!("identity-race-{index}-a"));
+            register_test_session(&state, &session);
+            rename_session(&state, &session.id, format!("identity-race-{index}-b"))
+                .expect("first preparation rename");
+            rename_session(&state, &session.id, format!("identity-race-{index}-c"))
+                .expect("second preparation rename");
+            if matches!(mutation, Mutation::Redo) {
+                metadata_step(&state, &session.id, MetadataStepDirection::Undo)
+                    .expect("prepare redo cursor");
+            }
+            let claimed_identity = metadata_five_state(&state, &session);
+
+            let (admitted_tx, admitted_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let release_rx_for_hook = Arc::clone(&release_rx);
+            *super::lock(&session.identity_mutation_admitted_hook) = Some(Arc::new(move || {
+                admitted_tx
+                    .send(())
+                    .expect("report identity mutation admission");
+                release_rx_for_hook
+                    .lock()
+                    .expect("lock identity mutation release")
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("identity mutation release must stay bounded");
+            }));
+
+            let (mutation_tx, mutation_rx) = mpsc::sync_channel(1);
+            let state_for_mutation = Arc::clone(&state);
+            let session_for_mutation = Arc::clone(&session);
+            let mutation_thread = thread::spawn(move || {
+                let result = match mutation {
+                    Mutation::Rename => rename_session(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        format!("identity-race-{index}-after-ending"),
+                    )
+                    .map(|_| ()),
+                    Mutation::Undo => metadata_step(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        MetadataStepDirection::Undo,
+                    )
+                    .map(|_| ()),
+                    Mutation::Redo => metadata_step(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        MetadataStepDirection::Redo,
+                    )
+                    .map(|_| ()),
+                }
+                .map_err(|err| err.to_string());
+                mutation_tx
+                    .send(result)
+                    .expect("report identity mutation result");
+            });
+            admitted_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("identity mutation must reach the pre-commit pause");
+
+            let (claim_tx, claim_rx) = mpsc::sync_channel(1);
+            let state_for_claim = Arc::clone(&state);
+            let session_for_claim = Arc::clone(&session);
+            let claim_thread = thread::spawn(move || {
+                let claim = super::publish_lifecycle_trigger(
+                    &state_for_claim,
+                    &session_for_claim,
+                    super::session_lifecycle::FinalizeTrigger::LeaderExited,
+                );
+                claim_tx.send(claim).expect("report lifecycle claim");
+            });
+
+            let claim_deadline = Instant::now() + Duration::from_secs(2);
+            while !matches!(
+                session.lifecycle.presentation(),
+                super::session_lifecycle::SessionPresentation::Ending { .. }
+            ) {
+                assert!(
+                    Instant::now() < claim_deadline,
+                    "concurrent lifecycle claim must publish Ending before mutation resumes"
+                );
+                thread::yield_now();
+            }
+            release_tx
+                .send(())
+                .expect("release paused identity mutation");
+
+            let mutation_error = mutation_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("identity mutation must finish within bounds")
+                .expect_err("identity mutation must not commit after Ending");
+            assert!(
+                mutation_error.contains("session is ending"),
+                "unexpected {mutation:?} rejection: {mutation_error}"
+            );
+            let claim = claim_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("lifecycle claim must finish after metadata unlock");
+            assert!(claim.claimant, "concurrent waiter must own first trigger");
+            assert_eq!(
+                claim.authoritative_trigger,
+                super::session_lifecycle::FinalizeTrigger::LeaderExited
+            );
+            mutation_thread.join().expect("identity mutation thread");
+            claim_thread.join().expect("lifecycle claim thread");
+
+            assert_eq!(
+                metadata_five_state(&state, &session),
+                claimed_identity,
+                "{mutation:?} must leave all identity metadata unchanged after Ending"
+            );
+
+            let exit_code = 70 + i32::try_from(index).expect("small case index");
+            super::publish_leader_reaped(&state, &session, &claim, exit_code, None);
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            let exit = loop {
+                let exits = state
+                    .lifecycle_journal
+                    .as_ref()
+                    .expect("journal")
+                    .recent_exits(Some(&session.id), 10, ExitListScope::All);
+                if let Some(exit) = exits
+                    .into_iter()
+                    .find(|exit| exit.outcome_state == ExitOutcomeState::Complete)
+                {
+                    break exit;
+                }
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "timed out waiting for stable {mutation:?} trigger/reap evidence"
+                );
+                thread::yield_now();
+            };
+            assert_eq!(exit.name, claimed_identity.current.name);
+            assert_eq!(exit.trigger, SessionExitTrigger::LeaderExited);
+            assert_eq!(exit.exit_code, Some(exit_code));
+            assert_eq!(exit.evidence_state, ExitEvidenceState::Complete);
+        }
     }
 
     #[test]
