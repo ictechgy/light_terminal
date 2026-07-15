@@ -98,6 +98,19 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("daemon.log"))
 }
 
+/// Owner-private storage root for the bounded session lifecycle journal.
+///
+/// The journal implementation opens this directory with `O_DIRECTORY`,
+/// `O_NOFOLLOW`, and `O_CLOEXEC`, then performs every leaf operation relative
+/// to that descriptor. Keeping path construction here ensures all daemon
+/// instances use the same already-private data root without exposing journal
+/// paths to protocol or client code.
+pub(crate) fn session_lifecycle_dir() -> Result<PathBuf> {
+    let path = data_dir()?.join("session-lifecycle-v1");
+    ensure_private_dir(&path)?;
+    Ok(path)
+}
+
 pub(crate) fn record_default_socket_path(socket: &Path) -> Result<()> {
     if env::var_os("LTERM_SOCKET").is_some()
         || env::var_os("LTERM_RUNTIME_DIR").is_some()
