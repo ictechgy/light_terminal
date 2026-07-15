@@ -4028,6 +4028,102 @@ fn instrument_rejects_protocol_three_before_sending_instrument_request() -> Test
 
 #[test]
 #[cfg(unix)]
+fn exits_json_uses_protocol_v8_bounded_raw_free_request_and_response() -> TestResult {
+    let env = TestEnv::new()?;
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let listener = UnixListener::bind(run_dir.join("lterm.sock"))?;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let thread_requests = requests.clone();
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept()?;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes)?;
+                let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let request_type = request["type"]
+                    .as_str()
+                    .ok_or("fake daemon request missing type")?;
+                let response = match request_type {
+                    "ping" => serde_json::json!({"ok": true, "result": {"pong": true}}),
+                    "status" => serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "protocol_version": 8,
+                            "session_count": 0,
+                            "active_connections": 1,
+                            "shutting_down": false
+                        }
+                    }),
+                    "recent_exits" => serde_json::json!({
+                        "ok": true,
+                        "result": [{
+                            "schema_version": "1.0",
+                            "session_id": "opaque-id",
+                            "name": "agent",
+                            "pane_id": "%7",
+                            "created_unix_ms": 10,
+                            "trigger_claimed_unix_ms": 20,
+                            "reaped_unix_ms": 30,
+                            "trigger": {"type": "leader_exited"},
+                            "outcome_state": "complete",
+                            "exit_code": 37,
+                            "evidence_state": "complete"
+                        }]
+                    }),
+                    other => return Err(format!("unexpected fake daemon request: {other}").into()),
+                };
+                thread_requests
+                    .lock()
+                    .map_err(|_| "fake daemon requests lock poisoned")?
+                    .push(request);
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+
+    let output = env
+        .cmd()
+        .args(["exits", "opaque-id", "--limit", "1", "--all", "--json"])
+        .output()?;
+    assert!(output.status.success(), "exits failed: {output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(rows[0]["session_id"], "opaque-id");
+    assert_eq!(rows[0]["trigger"]["type"], "leader_exited");
+    assert_eq!(rows[0]["exit_code"], 37);
+    let rendered = String::from_utf8(output.stdout)?;
+    for forbidden in ["command", "cwd", "environment", "scrollback", "process_id"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "leaked {forbidden}: {rendered}"
+        );
+    }
+
+    server.join().map_err(|_| "fake v8 daemon panicked")??;
+    let requests = requests
+        .lock()
+        .map_err(|_| "fake daemon requests lock poisoned")?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter_map(|request| request["type"].as_str())
+            .collect::<Vec<_>>(),
+        ["ping", "status", "status", "recent_exits"]
+    );
+    assert_eq!(requests[3]["target"], "opaque-id");
+    assert_eq!(requests[3]["limit"], 1);
+    assert_eq!(requests[3]["scope"], "all");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn metadata_rejects_protocol_five_before_sending_metadata_request() -> TestResult {
     let env = TestEnv::new()?;
     let run_dir = env.temp.path().join("run");
