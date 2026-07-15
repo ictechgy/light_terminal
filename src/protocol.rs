@@ -233,7 +233,7 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     pub fn lifecycle_state(&self) -> SessionLifecycleState {
-        self.lifecycle_state.clone().unwrap_or_else(|| {
+        self.lifecycle_state.clone().unwrap_or({
             if self.alive {
                 SessionLifecycleState::Healthy
             } else {
