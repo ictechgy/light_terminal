@@ -782,13 +782,15 @@ fn attach_eof_socket_shutdown_and_protocol_skew_are_non_destructive() -> TestRes
             thread::sleep(Duration::from_millis(100));
             let after_read_half_close = env.session_info("attach-fault-matrix")?;
             assert_same_live_session(&before, &after_read_half_close);
-            if let Err(err) = attach.shutdown(Shutdown::Both)
+            if let Err(err) = attach.shutdown(Shutdown::Write)
                 && err.kind() != std::io::ErrorKind::NotConnected
             {
                 return Err(err.into());
             }
         }
-        let after = env.wait_for_attached_clients("attach-fault-matrix", 0)?;
+        let after = env
+            .wait_for_attached_clients("attach-fault-matrix", 0)
+            .map_err(|err| format!("after {shutdown:?}: {err}"))?;
         assert_same_live_session(&before, &after);
         drop(attach);
     }
