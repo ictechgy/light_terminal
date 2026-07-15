@@ -1723,8 +1723,11 @@ fn recv_commit_with_fd(fd: RawFd) -> Result<(GateCommit, File)> {
     }
     let target_fd = unsafe { std::ptr::read(libc::CMSG_DATA(header).cast::<RawFd>()) };
     ensure!(target_fd >= 0);
+    // SAFETY: SCM_RIGHTS transferred a new descriptor owned by this process.
+    // Wrap it before parsing so every subsequent error path closes it.
+    let target = unsafe { File::from_raw_fd(target_fd) };
     let commit = serde_json::from_slice(&bytes[..received as usize]).context("malformed COMMIT")?;
-    Ok((commit, unsafe { File::from_raw_fd(target_fd) }))
+    Ok((commit, target))
 }
 
 #[cfg(target_os = "linux")]
@@ -1942,6 +1945,64 @@ mod tests {
                 should_survive
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_commit_closes_received_target_fd() {
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let target_metadata = target.as_file().metadata().unwrap();
+        let count_target_fds = || {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.dev() == target_metadata.dev()
+                        && metadata.ino() == target_metadata.ino()
+                })
+                .count()
+        };
+        let before = count_target_fds();
+        assert_eq!(before, 1, "test must observe the sender-owned target FD");
+
+        let malformed = b"{";
+        let mut iovec = libc::iovec {
+            iov_base: malformed.as_ptr().cast_mut().cast(),
+            iov_len: malformed.len(),
+        };
+        let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+        let mut control = vec![0u8; control_len];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            assert!(!header.is_null());
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+            std::ptr::write(
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                target.as_file().as_raw_fd(),
+            );
+            message.msg_controllen = (*header).cmsg_len;
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+            malformed.len() as isize
+        );
+
+        let error = recv_commit_with_fd(receiver.as_raw_fd()).unwrap_err();
+        assert!(error.to_string().contains("malformed COMMIT"), "{error:#}");
+        assert_eq!(
+            count_target_fds(),
+            before,
+            "the received SCM_RIGHTS descriptor must close on JSON parse failure"
+        );
     }
 
     #[cfg(target_os = "linux")]
