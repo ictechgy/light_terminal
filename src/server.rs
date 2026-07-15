@@ -393,6 +393,11 @@ struct Session {
     /// kill/shutdown paths. `alive` can become false before teardown finishes,
     /// so cleanup needs its own idempotence and completion state.
     cleanup_started: AtomicBool,
+    /// Test-only observer for the destructive boundary. Attach-only regression
+    /// tests assert this remains zero after subscription teardown, stale resize,
+    /// and backpressure eviction paths.
+    #[cfg(test)]
+    finalization_attempts: AtomicU64,
     cleanup_completion: (Mutex<bool>, Condvar),
     cleanup_complete: AtomicBool,
     /// Set after `waitid(..., WNOWAIT)` observes leader exit but before the
@@ -2116,6 +2121,8 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
         cleanup_started: AtomicBool::new(false),
+        #[cfg(test)]
+        finalization_attempts: AtomicU64::new(0),
         cleanup_completion: (Mutex::new(false), Condvar::new()),
         cleanup_complete: AtomicBool::new(false),
         leader_exit_observed: AtomicBool::new(false),
@@ -2907,6 +2914,8 @@ fn terminate_session(state: &Arc<State>, session: &Session) {
 }
 
 fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
+    #[cfg(test)]
+    session.finalization_attempts.fetch_add(1, Ordering::SeqCst);
     session.alive.store(false, Ordering::SeqCst);
     if session.cleanup_started.swap(true, Ordering::SeqCst) {
         wait_for_cleanup_complete(session);
@@ -4230,7 +4239,7 @@ mod tests {
     };
     use crate::protocol::{
         CapabilityAction, CapabilityToken, MAX_METADATA_JOURNAL_ENTRIES, MetadataStepDirection,
-        StatusTheme,
+        Request, StatusTheme,
     };
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -4800,6 +4809,7 @@ mod tests {
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             cleanup_started: AtomicBool::new(false),
+            finalization_attempts: AtomicU64::new(0),
             cleanup_completion: (Mutex::new(false), Condvar::new()),
             cleanup_complete: AtomicBool::new(false),
             leader_exit_observed: AtomicBool::new(false),
@@ -4837,6 +4847,37 @@ mod tests {
         sessions
             .by_id
             .insert(session.id.clone(), Arc::clone(session));
+    }
+
+    fn assert_attach_fault_kept_session_live_and_indexed(
+        state: &Arc<State>,
+        session: &Arc<Session>,
+    ) {
+        assert!(
+            session.alive.load(Ordering::SeqCst),
+            "attach-only faults must not clear leader liveness"
+        );
+        assert!(
+            !session.cleanup_started.load(Ordering::SeqCst),
+            "attach-only faults must not enter destructive cleanup"
+        );
+        assert_eq!(
+            session.finalization_attempts.load(Ordering::SeqCst),
+            0,
+            "attach-only faults must not cross finalize_session"
+        );
+        let sessions = super::lock(&state.sessions);
+        for indexed in [
+            sessions.by_name.get(&session.name()),
+            sessions.by_pane.get(&session.pane_id),
+            sessions.by_id.get(&session.id),
+        ] {
+            let indexed = indexed.expect("session must remain present in every live index");
+            assert_eq!(
+                indexed.id, session.id,
+                "live index must retain the same UUID"
+            );
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5970,8 +6011,10 @@ mod tests {
     }
 
     #[test]
-    fn attach_subscription_guard_unsubscribes_on_drop() {
+    fn attach_subscription_guard_drop_is_non_destructive() {
+        let state = Arc::new(super::State::default());
         let session = build_test_session("attach-guard");
+        register_test_session(&state, &session);
         let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let (subscriber_id, _rx) = session
             .subscribe_with_snapshot(24, 80, on_evict)
@@ -5986,6 +6029,36 @@ mod tests {
             session.subscribers.lock().expect("subscribers").is_empty(),
             "dropping the guard should remove the subscriber"
         );
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
+    }
+
+    #[test]
+    fn resize_after_unsubscribe_is_non_destructive() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("stale-resize");
+        register_test_session(&state, &session);
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (subscriber_id, _rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe test attach");
+
+        session.unsubscribe(subscriber_id);
+        let err = super::handle_request(
+            &state,
+            Request::Resize {
+                target: session.id.clone(),
+                rows: 40,
+                cols: 120,
+                subscriber_id: Some(subscriber_id),
+            },
+        )
+        .expect_err("stale subscriber resize must be rejected");
+
+        assert!(
+            err.to_string().contains("no longer attached"),
+            "unexpected stale resize error: {err:#}"
+        );
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6868,7 +6941,9 @@ mod tests {
     /// 한다 — PR #13 의 zombie-attach guard 가 timeout fallback 으로도 유지됨을 확인.
     #[test]
     fn append_output_send_timeout_evicts_when_consumer_persistently_stuck() {
+        let state = Arc::new(super::State::default());
         let session = build_test_session("evict");
+        register_test_session(&state, &session);
         let on_evict_calls = Arc::new(AtomicU32::new(0));
         let calls_for_closure = Arc::clone(&on_evict_calls);
         let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -6900,6 +6975,7 @@ mod tests {
         );
         let remaining = super::lock(&session.subscribers).len();
         assert_eq!(remaining, 0, "evicted subscriber must be removed");
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
     }
 
     /// PR #16: 3 sub — sub#0 healthy, sub#1 laggy (queue full), sub#2 healthy.
