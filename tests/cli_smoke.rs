@@ -2749,6 +2749,11 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
     assert!(cold.stderr.is_empty(), "{cold:?}");
     let cold_bundle: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
     assert_eq!(
+        cold_bundle.get("schema_version").and_then(|v| v.as_str()),
+        Some("1.1"),
+        "recent-exit diagnostics must use the explicit v1.1 bundle schema: {cold_bundle:?}"
+    );
+    assert_eq!(
         cold_bundle
             .pointer("/doctor/daemon_reachable")
             .and_then(|v| v.as_bool()),
@@ -2765,6 +2770,19 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
     assert!(
         cold_bundle.get("sessions").is_some_and(|v| v.is_null()),
         "cold bundle should skip sessions without daemon auto-start: {cold_bundle:?}"
+    );
+    assert!(
+        cold_bundle.get("recent_exits").is_some_and(|v| v.is_null()),
+        "cold bundle should skip recent exits without daemon auto-start: {cold_bundle:?}"
+    );
+    assert!(
+        cold_bundle
+            .pointer("/privacy/notes")
+            .and_then(|v| v.as_array())
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("recent exit summaries are raw-free")))),
+        "diagnose privacy notes must describe the recent-exit allowlist: {cold_bundle:?}"
     );
     let cold_compat = cold_bundle
         .get("tmux_compat")
@@ -2816,6 +2834,11 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
     );
     let live_bundle: serde_json::Value = serde_json::from_slice(&live.stdout)?;
     assert_eq!(
+        live_bundle.get("schema_version").and_then(|v| v.as_str()),
+        Some("1.1"),
+        "live recent-exit diagnostics must retain the v1.1 bundle schema: {live_bundle:?}"
+    );
+    assert_eq!(
         live_bundle
             .pointer("/doctor/daemon_reachable")
             .and_then(|v| v.as_bool()),
@@ -2857,6 +2880,16 @@ fn diagnose_bundle_collects_redacted_local_state_without_starting_daemon() -> Te
     assert!(
         live_bundle.get("processes").is_some_and(|v| v.is_array()),
         "live diagnose bundle should include process rows: {live_bundle:?}"
+    );
+    assert!(
+        live_bundle
+            .get("recent_exits")
+            .is_some_and(|v| v.is_array()),
+        "protocol-v8 diagnose bundle should include a bounded recent-exit array: {live_bundle:?}"
+    );
+    assert!(
+        live_bundle.get("recent_exits_error").is_none(),
+        "protocol-v8 recent-exit diagnostics should not report a bridge error: {live_bundle:?}"
     );
     assert!(
         live_bundle
