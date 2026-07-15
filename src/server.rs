@@ -1,3 +1,7 @@
+#[path = "session_lifecycle.rs"]
+#[allow(dead_code)]
+mod session_lifecycle;
+
 use crate::paths;
 use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
