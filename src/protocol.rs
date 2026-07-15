@@ -119,12 +119,34 @@ pub enum ExitListScope {
     All,
 }
 
+impl ExitListScope {
+    pub fn from_flags(all: bool, children: bool) -> Self {
+        if all {
+            Self::All
+        } else if children {
+            Self::Children
+        } else {
+            Self::TopLevel
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitOutcomeState {
     Pending,
     Complete,
     Unknown,
+}
+
+impl ExitOutcomeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +156,17 @@ pub enum ExitEvidenceState {
     DegradedMissingTriggerEvent,
     Conflicted,
     StorageDegraded,
+}
+
+impl ExitEvidenceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::DegradedMissingTriggerEvent => "degraded_missing_trigger_event",
+            Self::Conflicted => "conflicted",
+            Self::StorageDegraded => "storage_degraded",
+        }
+    }
 }
 
 /// Raw-free, bounded lifecycle evidence for a finalized session.
