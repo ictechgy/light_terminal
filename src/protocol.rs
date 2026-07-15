@@ -96,7 +96,10 @@ impl fmt::Display for SessionExitTrigger {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ParentCascade { parent_session_id } => {
-                write!(formatter, "parent_cascade(parent_session_id={parent_session_id})")
+                write!(
+                    formatter,
+                    "parent_cascade(parent_session_id={parent_session_id})"
+                )
             }
             trigger => formatter.write_str(trigger.as_str()),
         }
@@ -925,12 +928,12 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityAction, CapabilityToken, InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES,
-        MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES,
-        ExitEvidenceState, ExitListScope, ExitOutcomeState, MetadataHistoryResult,
-        MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate, MetadataValue,
-        RecentSessionExit, Request, SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo,
-        SessionLifecycleState, StatusTheme,
+        CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
+        InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES, MAX_METADATA_JOURNAL_ENTRIES,
+        MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataJournalEntry,
+        MetadataOperation, MetadataPurgeAggregate, MetadataValue, RecentSessionExit, Request,
+        SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
+        StatusTheme,
     };
 
     #[test]
@@ -1055,7 +1058,10 @@ mod tests {
         info.lifecycle_state = Some(SessionLifecycleState::Ending {
             trigger: SessionExitTrigger::CloseRequested,
         });
-        assert!(!info.is_live_work(), "ending work is never reconnectable/listable");
+        assert!(
+            !info.is_live_work(),
+            "ending work is never reconnectable/listable"
+        );
         assert_eq!(info.lifecycle_state_label(), "ending");
     }
 
