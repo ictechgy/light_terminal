@@ -6,11 +6,10 @@ use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
     CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
-    MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
-    MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
-    MetadataValue, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
-    SessionExitTrigger, SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult,
-    WaitExitResult,
+    MetadataHistoryResult, MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate,
+    MetadataPurgeResult, MetadataStepDirection, MetadataStepResult, MetadataValue,
+    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionExitTrigger,
+    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1781,20 +1780,13 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             target,
             limit,
             scope,
-        } => {
-            if limit == 0 || limit > MAX_RECENT_EXITS_LIMIT {
-                bail!("recent exit limit must be between 1 and {MAX_RECENT_EXITS_LIMIT}");
-            }
-            let journal = state
+        } => Ok(Response::ok(
+            state
                 .lifecycle_journal
                 .as_ref()
-                .context("recent exit evidence is unavailable")?;
-            Ok(Response::ok(journal.recent_exits(
-                target.as_deref(),
-                limit,
-                scope,
-            )))
-        }
+                .map(|journal| journal.recent_exits(target.as_deref(), limit, scope))
+                .unwrap_or_default(),
+        )),
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Instrument { target } => Ok(Response::ok(
             resolve_session(state, &target)?.instrument_snapshot_relaxed(),
@@ -2995,6 +2987,19 @@ fn verified_process_group_id(
         );
     }
     None
+}
+
+fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTrigger {
+    match trigger {
+        session_lifecycle::FinalizeTrigger::LeaderExited => SessionExitTrigger::LeaderExited,
+        session_lifecycle::FinalizeTrigger::CloseRequested => SessionExitTrigger::CloseRequested,
+        session_lifecycle::FinalizeTrigger::DaemonShutdown => SessionExitTrigger::DaemonShutdown,
+        session_lifecycle::FinalizeTrigger::ParentCascade { parent_session_id } => {
+            SessionExitTrigger::ParentCascade {
+                parent_session_id: parent_session_id.clone(),
+            }
+        }
+    }
 }
 
 fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTrigger {
@@ -4998,7 +5003,7 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
-            lifecycle: Arc::new(super::session_lifecycle::LifecyclePublication::default()),
+            lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
             trigger_claimed_unix_ms: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
             finalization_attempts: AtomicU64::new(0),
