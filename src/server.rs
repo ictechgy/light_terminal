@@ -6,10 +6,11 @@ use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
     CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
-    MetadataHistoryResult, MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate,
-    MetadataPurgeResult, MetadataStepDirection, MetadataStepResult, MetadataValue,
-    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionExitTrigger,
-    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
+    MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
+    MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
+    MetadataValue, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
+    SessionExitTrigger, SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult,
+    WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1780,13 +1781,20 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             target,
             limit,
             scope,
-        } => Ok(Response::ok(
-            state
+        } => {
+            if limit == 0 || limit > MAX_RECENT_EXITS_LIMIT {
+                bail!("recent exit limit must be between 1 and {MAX_RECENT_EXITS_LIMIT}");
+            }
+            let journal = state
                 .lifecycle_journal
                 .as_ref()
-                .map(|journal| journal.recent_exits(target.as_deref(), limit, scope))
-                .unwrap_or_default(),
-        )),
+                .context("recent exit evidence is unavailable")?;
+            Ok(Response::ok(journal.recent_exits(
+                target.as_deref(),
+                limit,
+                scope,
+            )))
+        }
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Instrument { target } => Ok(Response::ok(
             resolve_session(state, &target)?.instrument_snapshot_relaxed(),
@@ -1929,7 +1937,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             state.shutting_down.store(true, Ordering::SeqCst);
             let sessions: Vec<_> = lock(&state.sessions).by_pane.values().cloned().collect();
             for session in sessions {
-                terminate_session(state, &session);
+                finalize_session(
+                    state,
+                    &session,
+                    session_lifecycle::FinalizeTrigger::DaemonShutdown,
+                );
             }
             Ok(Response::empty())
         }
@@ -2212,35 +2224,55 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let session_for_waiter = Arc::clone(&session);
     thread::spawn(move || {
         let leader_exit_observed = wait_for_leader_exit_without_reaping(&session_for_waiter);
-        let exit_code = {
+        let observed_claim = leader_exit_observed.then(|| {
+            publish_lifecycle_trigger(
+                &state_for_waiter,
+                &session_for_waiter,
+                session_lifecycle::FinalizeTrigger::LeaderExited,
+            )
+        });
+        let wait_result = {
             let mut child = lock(&session_for_waiter.child);
             if leader_exit_observed {
                 terminate_unreaped_process_group(&session_for_waiter, &child);
             }
-            let exit_code = match child.wait() {
-                Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
-                Err(err) => {
-                    eprintln!("wait error for {}: {err}", session_for_waiter.name());
-                    1
-                }
-            };
-            // Writer-side half of the stored-PGID invariant: callers may use
-            // the unreaped process-group cleanup only while holding this same
-            // child lock, so the flag cannot flip between their guard check
-            // and residual signal ladder.
-            session_for_waiter
-                .leader_reaped
-                .store(true, Ordering::SeqCst);
-            exit_code
+            child.wait()
         };
-        session_for_waiter
-            .exit_code
-            .store(exit_code, Ordering::SeqCst);
-        finalize_session(
-            &state_for_waiter,
-            &session_for_waiter,
-            SessionFinalizeReason::LeaderExited,
-        );
+        match wait_result {
+            Ok(status) => {
+                // Writer-side half of the stored-PGID invariant: successful
+                // wait means the leader is now reaped and its pid/pgid may be
+                // recycled.
+                session_for_waiter
+                    .leader_reaped
+                    .store(true, Ordering::SeqCst);
+                let exit_code = status.exit_code().min(i32::MAX as u32) as i32;
+                session_for_waiter
+                    .exit_code
+                    .store(exit_code, Ordering::SeqCst);
+                let claim = observed_claim.unwrap_or_else(|| {
+                    publish_lifecycle_trigger(
+                        &state_for_waiter,
+                        &session_for_waiter,
+                        session_lifecycle::FinalizeTrigger::LeaderExited,
+                    )
+                });
+                publish_leader_reaped(&state_for_waiter, &session_for_waiter, &claim, exit_code);
+                finalize_session(
+                    &state_for_waiter,
+                    &session_for_waiter,
+                    claim.authoritative_trigger,
+                );
+            }
+            Err(err) => {
+                eprintln!("wait error for {}: {err}", session_for_waiter.name());
+                if let Some(trigger) = session_for_waiter.lifecycle.authoritative_trigger() {
+                    finalize_session(&state_for_waiter, &session_for_waiter, trigger);
+                } else {
+                    session_for_waiter.lifecycle.mark_monitor_failed();
+                }
+            }
+        }
     });
 
     Ok(session)
@@ -2924,7 +2956,13 @@ fn terminate_child_sessions(state: &Arc<State>, parent_session_id: &str) {
             .collect()
     };
     for child in children {
-        terminate_session(state, &child);
+        finalize_session(
+            state,
+            &child,
+            session_lifecycle::FinalizeTrigger::ParentCascade {
+                parent_session_id: parent_session_id.to_string(),
+            },
+        );
     }
 }
 
@@ -2953,12 +2991,6 @@ fn verified_process_group_id(
     None
 }
 
-#[derive(Clone, Copy, Debug)]
-enum SessionFinalizeReason {
-    LeaderExited,
-    TerminateRequested,
-}
-
 fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTrigger {
     match trigger {
         session_lifecycle::FinalizeTrigger::LeaderExited => SessionExitTrigger::LeaderExited,
@@ -2973,20 +3005,31 @@ fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTr
 }
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
-    finalize_session(state, session, SessionFinalizeReason::TerminateRequested);
+    finalize_session(
+        state,
+        session,
+        session_lifecycle::FinalizeTrigger::CloseRequested,
+    );
 }
 
-fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
+fn finalize_session(
+    state: &Arc<State>,
+    session: &Session,
+    trigger: session_lifecycle::FinalizeTrigger,
+) {
     #[cfg(test)]
     session.finalization_attempts.fetch_add(1, Ordering::SeqCst);
-    session.alive.store(false, Ordering::SeqCst);
+    let claim = publish_lifecycle_trigger(state, session, trigger);
     if session.cleanup_started.swap(true, Ordering::SeqCst) {
         wait_for_cleanup_complete(session);
         return;
     }
 
     let mut completion_guard = CleanupCompletionGuard::new(session);
-    if matches!(reason, SessionFinalizeReason::TerminateRequested) {
+    if !matches!(
+        claim.authoritative_trigger,
+        session_lifecycle::FinalizeTrigger::LeaderExited
+    ) {
         terminate_process_group_for_request(session);
     }
     session.close_subscribers();
@@ -2994,6 +3037,75 @@ fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinali
     remove_session(state, session);
     mark_cleanup_complete(session);
     completion_guard.disarm();
+}
+
+fn publish_lifecycle_trigger(
+    state: &Arc<State>,
+    session: &Session,
+    trigger: session_lifecycle::FinalizeTrigger,
+) -> session_lifecycle::ClaimAttempt {
+    let claim = session.lifecycle.claim(trigger, &session.alive);
+    if claim.claimant {
+        let claimed_at = now_unix_ms();
+        *lock(&session.trigger_claimed_unix_ms) = Some(claimed_at);
+        let mut guard =
+            session_lifecycle::ClaimResolutionGuard::new(&session.lifecycle, claim.event_id);
+        let event = session_lifecycle::LifecycleEvent::trigger_claimed(
+            claim.event_id,
+            session.lifecycle_identity(),
+            claimed_at,
+            public_trigger(&claim.authoritative_trigger),
+        );
+        if let Some(journal) = &state.lifecycle_journal {
+            journal.enqueue_claimed(event, Arc::clone(&session.lifecycle), claim.event_id);
+        } else {
+            session.lifecycle.resolve(
+                claim.event_id,
+                session_lifecycle::WriteOutcome::WriterUnavailable,
+            );
+        }
+        guard.disarm();
+    }
+    let resolution = session.lifecycle.wait_for_resolution();
+    if resolution.outcome != session_lifecycle::WriteOutcome::Persisted {
+        eprintln!(
+            "lifecycle trigger publication for {} completed as {:?}",
+            session.name(),
+            resolution.outcome
+        );
+    }
+    claim
+}
+
+fn publish_leader_reaped(
+    state: &Arc<State>,
+    session: &Session,
+    claim: &session_lifecycle::ClaimAttempt,
+    exit_code: i32,
+) {
+    let Some(claimed_at) = *lock(&session.trigger_claimed_unix_ms) else {
+        return;
+    };
+    let Some(journal) = &state.lifecycle_journal else {
+        return;
+    };
+    let event = session_lifecycle::LifecycleEvent::leader_reaped(
+        claim.event_id,
+        session.lifecycle_identity(),
+        claimed_at,
+        now_unix_ms(),
+        public_trigger(&claim.authoritative_trigger),
+        exit_code,
+        None,
+    );
+    let outcome = journal.enqueue_event(event);
+    if outcome != session_lifecycle::WriteOutcome::Persisted {
+        eprintln!(
+            "lifecycle reap publication for {} completed as {:?}",
+            session.name(),
+            outcome
+        );
+    }
 }
 
 struct CleanupCompletionGuard<'a> {
@@ -4871,7 +4983,7 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
-            lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
+            lifecycle: Arc::new(super::session_lifecycle::LifecyclePublication::default()),
             trigger_claimed_unix_ms: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
             finalization_attempts: AtomicU64::new(0),
@@ -5985,7 +6097,11 @@ mod tests {
                 .insert(session.id.clone(), Arc::clone(&session));
         }
 
-        super::finalize_session(&state, &session, super::SessionFinalizeReason::LeaderExited);
+        super::finalize_session(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::LeaderExited,
+        );
 
         assert!(
             !session.alive.load(Ordering::SeqCst),
@@ -6038,7 +6154,7 @@ mod tests {
             super::finalize_session(
                 &state_for_first,
                 &session_for_first,
-                super::SessionFinalizeReason::LeaderExited,
+                super::session_lifecycle::FinalizeTrigger::LeaderExited,
             );
         });
 
