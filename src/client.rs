@@ -4701,7 +4701,29 @@ fn attach_with_presence_and_cue(
     if let Some((_, nested_detection_thread)) = nested_detection {
         let _ = nested_detection_thread.join();
     }
-    finish_attach_results(output_result, input_result)
+    let should_diagnose = output_result
+        .as_ref()
+        .err()
+        .is_some_and(anyhow_error_is_broken_pipe)
+        || input_result
+            .as_ref()
+            .err()
+            .is_some_and(anyhow_error_is_broken_pipe);
+    let attach_result = finish_attach_results(output_result, input_result);
+
+    // Lifecycle RPCs and user-facing error rendering must happen only after all
+    // lterm-owned terminal surfaces have restored raw mode, keyboard state,
+    // status rows, cursor visibility, and any cmux status artifact.
+    drop(status_bar);
+    drop(cmux_status_sink);
+    drop(title_cue_runtime);
+    drop(_attach_active);
+    drop(terminal_guards);
+
+    match attach_result {
+        Err(error) if should_diagnose => Err(diagnose_attach_failure(error, original_info)),
+        result => result,
+    }
 }
 
 fn join_attach_input_thread(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
@@ -4720,6 +4742,111 @@ fn finish_attach_results(output_result: Result<()>, input_result: Result<()>) ->
             "{output_err:#}; attach input thread also failed: {input_err:#}"
         )),
     }
+}
+
+fn diagnose_attach_failure(primary: anyhow::Error, original: &SessionInfo) -> anyhow::Error {
+    let live = rpc::<SessionInfo>(&Request::Info {
+        target: original.id.clone(),
+    })
+    .ok();
+    let matching_live = live.as_ref().filter(|info| info.id == original.id);
+    let needs_exit_lookup = matching_live.is_none()
+        || matching_live.is_some_and(|info| {
+            matches!(
+                info.lifecycle_state(),
+                SessionLifecycleState::Ending { .. }
+            )
+        });
+    let recent = if needs_exit_lookup {
+        rpc::<Vec<RecentSessionExit>>(&Request::RecentExits {
+            target: Some(original.id.clone()),
+            limit: 1,
+            scope: ExitListScope::All,
+        })
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    match format_attach_failure_diagnosis(original, matching_live, &recent) {
+        Some(suffix) => anyhow!("{primary:#}; {suffix}"),
+        None => primary,
+    }
+}
+
+fn format_attach_failure_diagnosis(
+    original: &SessionInfo,
+    live: Option<&SessionInfo>,
+    recent: &[RecentSessionExit],
+) -> Option<String> {
+    let live = live.filter(|info| info.id == original.id);
+    if let Some(info) = live {
+        match info.lifecycle_state() {
+            SessionLifecycleState::Healthy if info.is_live_work() => {
+                let hint = shell_join(&[
+                    "lterm".to_string(),
+                    "resume".to_string(),
+                    "--".to_string(),
+                    original.name.clone(),
+                ])
+                .ok();
+                let mut message = format!(
+                    "attach transport was lost, but session {} remains alive",
+                    sanitize::terminal_text(&original.id)
+                );
+                if let Some(hint) = hint {
+                    message.push_str(&format!("; resume with `{hint}`"));
+                }
+                return Some(message);
+            }
+            SessionLifecycleState::MonitorFailed if info.is_live_work() => {
+                return Some(format!(
+                    "attach transport was lost and session {} leader state is unknown",
+                    sanitize::terminal_text(&original.id)
+                ));
+            }
+            SessionLifecycleState::Ending { trigger } => {
+                let mut message = format!(
+                    "session {} is ending and is not reconnectable (trigger={})",
+                    sanitize::terminal_text(&original.id),
+                    sanitize::terminal_text(&trigger.to_string())
+                );
+                if let Some(exit) = recent.iter().find(|exit| exit.session_id == original.id) {
+                    message.push_str(&format_recent_exit_outcome(exit));
+                }
+                return Some(message);
+            }
+            _ => {
+                return Some(format!(
+                    "attach transport was lost and session {} leader state is unknown",
+                    sanitize::terminal_text(&original.id)
+                ));
+            }
+        }
+    }
+
+    recent
+        .iter()
+        .find(|exit| exit.session_id == original.id)
+        .map(|exit| {
+            format!(
+                "session ended during attach (session_id={}, trigger={}){}",
+                sanitize::terminal_text(&exit.session_id),
+                sanitize::terminal_text(&exit.trigger.to_string()),
+                format_recent_exit_outcome(exit)
+            )
+        })
+}
+
+fn format_recent_exit_outcome(exit: &RecentSessionExit) -> String {
+    let mut details = format!("; outcome={}", exit.outcome_state.as_str());
+    if let Some(exit_code) = exit.exit_code {
+        details.push_str(&format!("; exit_code={exit_code}"));
+    }
+    if let Some(signal) = exit.signal.as_deref() {
+        details.push_str(&format!("; signal={}", sanitize::terminal_text(signal)));
+    }
+    details
 }
 
 fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {

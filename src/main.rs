@@ -194,6 +194,23 @@ enum Commands {
         #[arg(long, conflicts_with = "all")]
         children: bool,
     },
+    /// Show bounded raw-free evidence for recently exited sessions.
+    Exits {
+        /// Optional exact session UUID, pane, or prior session name.
+        target: Option<String>,
+        /// Maximum records to return (daemon-enforced hard cap: 100).
+        #[arg(long, default_value_t = protocol::DEFAULT_RECENT_EXITS_LIMIT, value_parser = parse_recent_exits_limit_arg)]
+        limit: u16,
+        /// Print recent exits as a JSON array for automation.
+        #[arg(long)]
+        json: bool,
+        /// Include both top-level and child session exits.
+        #[arg(long, conflicts_with = "children")]
+        all: bool,
+        /// Show only child session exits.
+        #[arg(long, conflicts_with = "all")]
+        children: bool,
+    },
     /// Print a raw-free live measurement snapshot for a session or pane.
     Instrument {
         /// Session or pane target to measure.
@@ -926,6 +943,27 @@ fn run() -> Result<()> {
                         format_attach_state(s.attached_clients),
                         sanitize::terminal_text(parent_pane_display(&s))
                     );
+                }
+            }
+            Ok(())
+        }
+        Commands::Exits {
+            target,
+            limit,
+            json,
+            all,
+            children,
+        } => {
+            let exits = client::recent_exits(
+                target.as_deref(),
+                limit,
+                protocol::ExitListScope::from_flags(all, children),
+            )?;
+            if json {
+                println!("{}", client::json_pretty(&exits));
+            } else {
+                for exit in exits {
+                    println!("{}", recent_exit_output_line(&exit));
                 }
             }
             Ok(())
@@ -2808,6 +2846,20 @@ fn parse_compose_tail_arg(value: &str) -> std::result::Result<usize, String> {
         .map_err(|_| "--tail exceeds supported scrollback range".to_string())
 }
 
+fn parse_recent_exits_limit_arg(value: &str) -> std::result::Result<u16, String> {
+    let limit = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("invalid recent exit limit {value:?}; expected 1..=100"))?;
+    if limit == 0 || limit > protocol::MAX_RECENT_EXITS_LIMIT {
+        return Err(format!(
+            "recent exit limit must be between 1 and {}",
+            protocol::MAX_RECENT_EXITS_LIMIT
+        ));
+    }
+    Ok(limit)
+}
+
 fn input_commit_bytes(text: String, enter: bool) -> Vec<u8> {
     let mut bytes = text.into_bytes();
     if enter {
@@ -2872,6 +2924,24 @@ fn filter_list_sessions(
             ListScope::All => true,
         })
         .collect()
+}
+
+fn recent_exit_output_line(exit: &protocol::RecentSessionExit) -> String {
+    let exit_code = exit
+        .exit_code
+        .map_or_else(|| "-".to_string(), |code| code.to_string());
+    let signal = exit.signal.as_deref().unwrap_or("-");
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        sanitize::terminal_text(&exit.name),
+        sanitize::terminal_text(&exit.pane_id),
+        sanitize::terminal_text(&exit.session_id),
+        sanitize::terminal_text(&exit.trigger.to_string()),
+        exit.outcome_state.as_str(),
+        exit_code,
+        sanitize::terminal_text(signal),
+        exit.evidence_state.as_str()
+    )
 }
 
 fn format_attach_state(attached_clients: usize) -> String {
