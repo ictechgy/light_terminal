@@ -30,6 +30,7 @@ const WRITER_QUEUE_CAPACITY: usize = 64;
 const CURRENT_SEGMENT: &[u8] = b"current.jsonl\0";
 const PREVIOUS_SEGMENT: &[u8] = b"previous.jsonl\0";
 const LOCK_FILE: &[u8] = b"journal.lock\0";
+const OVERSIZED_SEGMENT_SENTINEL: &[u8] = b"oversized segment discarded\n";
 const MAX_NAME_BYTES: usize = 128;
 const MAX_PANE_BYTES: usize = 64;
 const MAX_AGENT_BYTES: usize = 64;
@@ -469,7 +470,7 @@ impl LifecycleEvent {
             reaped_unix_ms: u64::try_from(reaped_unix_ms).unwrap_or(u64::MAX),
             trigger,
             exit_code,
-            signal: signal.map(|value| sanitized_field(&value, MAX_SIGNAL_BYTES)),
+            signal: signal.map(|value| sanitize_exit_signal(&value)),
         }
     }
 
@@ -625,8 +626,8 @@ pub(crate) fn fold_events(
     }
 
     let mut exits: Vec<_> = buckets
-        .into_values()
-        .filter_map(|bucket| fold_bucket(bucket, storage_degraded))
+        .into_iter()
+        .filter_map(|(session_id, bucket)| fold_bucket(&session_id, bucket, storage_degraded))
         .filter(|exit| match scope {
             ExitListScope::TopLevel => exit.parent_session_id.is_none(),
             ExitListScope::Children => exit.parent_session_id.is_some(),
@@ -652,7 +653,11 @@ fn event_sort_key(event: &LifecycleEvent) -> Vec<u8> {
     serde_json::to_vec(event).unwrap_or_default()
 }
 
-fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessionExit> {
+fn fold_bucket(
+    session_id: &str,
+    bucket: FoldBucket,
+    storage_degraded: bool,
+) -> Option<RecentSessionExit> {
     let trigger = bucket.triggers.first();
     let reap = bucket.reaps.first();
     let trigger_conflict = bucket.triggers.len() > 1;
@@ -668,11 +673,28 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
     };
     let conflicted = trigger_conflict || reap_conflict || cross_conflict;
     let source = trigger.or(reap)?;
+    if conflicted {
+        return Some(RecentSessionExit {
+            schema_version: JOURNAL_SCHEMA_VERSION.to_string(),
+            session_id: session_id.to_string(),
+            name: String::new(),
+            pane_id: String::new(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: None,
+            created_unix_ms: 0,
+            trigger_claimed_unix_ms: 0,
+            reaped_unix_ms: None,
+            trigger: SessionExitTrigger::Unknown,
+            outcome_state: ExitOutcomeState::Unknown,
+            exit_code: None,
+            signal: None,
+            evidence_state: ExitEvidenceState::Conflicted,
+        });
+    }
     let identity = source.identity();
 
-    let (public_trigger, evidence_state) = if conflicted {
-        (SessionExitTrigger::Unknown, ExitEvidenceState::Conflicted)
-    } else if let Some(trigger) = trigger {
+    let (public_trigger, evidence_state) = if let Some(trigger) = trigger {
         (
             trigger.trigger().clone(),
             if storage_degraded {
@@ -692,24 +714,23 @@ fn fold_bucket(bucket: FoldBucket, storage_degraded: bool) -> Option<RecentSessi
         )
     };
 
-    let (outcome_state, reaped_unix_ms, exit_code, signal) = if reap_conflict || cross_conflict {
-        (ExitOutcomeState::Unknown, None, None, None)
-    } else if let Some(LifecycleEvent::LeaderReaped {
-        reaped_unix_ms,
-        exit_code,
-        signal,
-        ..
-    }) = reap
-    {
-        (
-            ExitOutcomeState::Complete,
-            Some(u128::from(*reaped_unix_ms)),
-            Some(*exit_code),
-            signal.clone(),
-        )
-    } else {
-        (ExitOutcomeState::Pending, None, None, None)
-    };
+    let (outcome_state, reaped_unix_ms, exit_code, signal) =
+        if let Some(LifecycleEvent::LeaderReaped {
+            reaped_unix_ms,
+            exit_code,
+            signal,
+            ..
+        }) = reap
+        {
+            (
+                ExitOutcomeState::Complete,
+                Some(u128::from(*reaped_unix_ms)),
+                Some(*exit_code),
+                signal.clone(),
+            )
+        } else {
+            (ExitOutcomeState::Pending, None, None, None)
+        };
 
     Some(RecentSessionExit {
         schema_version: JOURNAL_SCHEMA_VERSION.to_string(),
@@ -920,8 +941,13 @@ impl SecureStorage {
             return Err(std::io::Error::last_os_error()).context("lock lifecycle journal");
         }
 
-        let current = open_regular_at(dir.as_raw_fd(), leaf(CURRENT_SEGMENT), true, true)?
+        let mut current = open_regular_at(dir.as_raw_fd(), leaf(CURRENT_SEGMENT), true, true)?
             .context("open current lifecycle journal segment")?;
+        let mut previous = open_regular_at(dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT), false, true)?;
+        repair_oversized_segment(&mut current)?;
+        if let Some(previous) = previous.as_mut() {
+            repair_oversized_segment(previous)?;
+        }
         let current_bytes = current
             .metadata()
             .context("stat current lifecycle journal segment")?
@@ -935,6 +961,7 @@ impl SecureStorage {
     }
 
     fn append(&mut self, event: &LifecycleEvent) -> Result<bool> {
+        let repaired = self.repair_oversized_segments()?;
         let line = event.to_json_line()?;
         let line_len = u64::try_from(line.len()).context("lifecycle line length overflow")?;
         let rotated = self.current_bytes > 0
@@ -946,13 +973,14 @@ impl SecureStorage {
             .write_all(&line)
             .context("append lifecycle journal event")?;
         self.current_bytes = self.current_bytes.saturating_add(line_len);
-        Ok(rotated)
+        Ok(repaired || rotated)
     }
 
     fn rotate(&mut self) -> Result<()> {
-        if let Some(previous) =
-            open_regular_at(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT), false, false)?
+        if let Some(mut previous) =
+            open_regular_at(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT), false, true)?
         {
+            repair_oversized_segment(&mut previous)?;
             drop(previous);
             let result =
                 unsafe { libc::unlinkat(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT).as_ptr(), 0) };
@@ -961,6 +989,12 @@ impl SecureStorage {
                     .context("remove previous lifecycle journal segment");
             }
         }
+        repair_oversized_segment(&mut self.current)?;
+        self.current_bytes = self
+            .current
+            .metadata()
+            .context("stat current lifecycle journal segment before rotation")?
+            .len();
         let result = unsafe {
             libc::renameat(
                 self.dir.as_raw_fd(),
@@ -979,6 +1013,21 @@ impl SecureStorage {
         Ok(())
     }
 
+    fn repair_oversized_segments(&mut self) -> Result<bool> {
+        let mut repaired = repair_oversized_segment(&mut self.current)?;
+        self.current_bytes = self
+            .current
+            .metadata()
+            .context("stat current lifecycle journal segment")?
+            .len();
+        if let Some(mut previous) =
+            open_regular_at(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT), false, true)?
+        {
+            repaired |= repair_oversized_segment(&mut previous)?;
+        }
+        Ok(repaired)
+    }
+
     fn load_all(&self) -> Result<LoadedEvents> {
         let mut loaded = LoadedEvents {
             events: Vec::new(),
@@ -992,6 +1041,22 @@ impl SecureStorage {
         }
         Ok(loaded)
     }
+}
+
+fn repair_oversized_segment(file: &mut File) -> Result<bool> {
+    if file
+        .metadata()
+        .context("stat lifecycle journal segment for bound repair")?
+        .len()
+        <= MAX_SEGMENT_BYTES
+    {
+        return Ok(false);
+    }
+    file.set_len(0)
+        .context("truncate oversized lifecycle journal segment")?;
+    file.write_all(OVERSIZED_SEGMENT_SENTINEL)
+        .context("mark oversized lifecycle journal segment degraded")?;
+    Ok(true)
 }
 
 fn load_segment(file: File, loaded: &mut LoadedEvents) -> Result<()> {
@@ -1160,12 +1225,16 @@ fn sanitized_field(value: &str, max_bytes: usize) -> String {
     sanitized[..end].to_string()
 }
 
+pub(crate) fn sanitize_exit_signal(value: &str) -> String {
+    sanitized_field(value, MAX_SIGNAL_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
     use std::sync::Arc;
     use std::thread;
 
@@ -1194,6 +1263,83 @@ mod tests {
         };
         load_segment(file, &mut loaded).expect("load journal segment");
         loaded
+    }
+
+    fn write_private_sized(path: &Path, size: u64) {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create private journal segment");
+        file.set_len(size).expect("size private journal segment");
+    }
+
+    fn assert_retained_segments_bounded(path: &Path) {
+        for leaf in ["current.jsonl", "previous.jsonl"] {
+            let segment = path.join(leaf);
+            if let Ok(metadata) = fs::metadata(&segment) {
+                assert!(
+                    metadata.len() <= MAX_SEGMENT_BYTES,
+                    "{leaf} retained {} bytes above {MAX_SEGMENT_BYTES}",
+                    metadata.len()
+                );
+            }
+        }
+    }
+
+    fn assert_boundary_repair_survives_restart(leaf: &str, size: u64) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        write_private_sized(&temp.path().join(leaf), size);
+
+        let session_id = Uuid::new_v4().to_string();
+        let event = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity(&session_id),
+            20,
+            SessionExitTrigger::LeaderExited,
+        );
+        {
+            let mut storage = SecureStorage::open(temp.path()).expect("open bounded storage");
+            storage
+                .append(&event)
+                .expect("append after boundary repair");
+            assert_retained_segments_bounded(temp.path());
+            let loaded = storage.load_all().expect("load repaired storage");
+            let exits = fold_events(
+                &loaded.events,
+                loaded.degraded,
+                Some(&session_id),
+                10,
+                ExitListScope::All,
+            );
+            assert_eq!(exits.len(), 1, "{leaf} size {size}");
+            assert_eq!(
+                exits[0].evidence_state,
+                ExitEvidenceState::StorageDegraded,
+                "{leaf} size {size} must fail closed"
+            );
+        }
+
+        let storage = SecureStorage::open(temp.path()).expect("restart bounded storage");
+        assert_retained_segments_bounded(temp.path());
+        let loaded = storage.load_all().expect("reload repaired storage");
+        let exits = fold_events(
+            &loaded.events,
+            loaded.degraded,
+            Some(&session_id),
+            10,
+            ExitListScope::All,
+        );
+        assert_eq!(exits.len(), 1, "restart {leaf} size {size}");
+        assert_eq!(
+            exits[0].evidence_state,
+            ExitEvidenceState::StorageDegraded,
+            "restart {leaf} size {size} must retain degraded evidence"
+        );
     }
 
     #[test]
@@ -1334,16 +1480,25 @@ mod tests {
 
     #[test]
     fn conflicting_same_sequence_rows_fail_closed() {
+        let session_id = Uuid::new_v4().to_string();
+        let mut first_identity = identity(&session_id);
+        first_identity.name = "candidate-a".to_string();
+        first_identity.pane_id = "%1".to_string();
+        first_identity.created_unix_ms = 10;
+        let mut second_identity = identity(&session_id);
+        second_identity.name = "candidate-b".to_string();
+        second_identity.pane_id = "%9".to_string();
+        second_identity.created_unix_ms = 99;
         let first = LifecycleEvent::trigger_claimed(
             Uuid::new_v4(),
-            identity("session-1"),
+            first_identity,
             20,
             SessionExitTrigger::LeaderExited,
         );
         let second = LifecycleEvent::trigger_claimed(
             Uuid::new_v4(),
-            identity("session-1"),
-            20,
+            second_identity,
+            200,
             SessionExitTrigger::CloseRequested,
         );
         let folded = fold_events(
@@ -1357,6 +1512,34 @@ mod tests {
         assert_eq!(folded, reversed);
         assert_eq!(folded[0].evidence_state, ExitEvidenceState::Conflicted);
         assert_eq!(folded[0].trigger, SessionExitTrigger::Unknown);
+        assert_eq!(folded[0].session_id, session_id);
+        assert_eq!(folded[0].name, "");
+        assert_eq!(folded[0].pane_id, "");
+        assert_eq!(folded[0].created_unix_ms, 0);
+        assert_eq!(folded[0].trigger_claimed_unix_ms, 0);
+        assert_eq!(folded[0].outcome_state, ExitOutcomeState::Unknown);
+    }
+
+    #[test]
+    fn existing_current_segment_respects_cap_boundaries_and_restart() {
+        for size in [
+            MAX_SEGMENT_BYTES - 1,
+            MAX_SEGMENT_BYTES,
+            MAX_SEGMENT_BYTES + 1,
+        ] {
+            assert_boundary_repair_survives_restart("current.jsonl", size);
+        }
+    }
+
+    #[test]
+    fn existing_previous_segment_respects_cap_boundaries_and_restart() {
+        for size in [
+            MAX_SEGMENT_BYTES - 1,
+            MAX_SEGMENT_BYTES,
+            MAX_SEGMENT_BYTES + 1,
+        ] {
+            assert_boundary_repair_survives_restart("previous.jsonl", size);
+        }
     }
 
     #[test]
@@ -1465,5 +1648,89 @@ mod tests {
         )
         .expect("broaden journal leaf");
         assert!(LifecycleJournal::open(temp.path()).is_err());
+    }
+
+    #[test]
+    fn previous_and_lock_leaves_enforce_private_regular_single_link_safety() {
+        for leaf in ["previous.jsonl", "journal.lock"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+                .expect("private tempdir");
+            let target = temp.path().join("target");
+            write_private_sized(&target, 0);
+            symlink(&target, temp.path().join(leaf)).expect("unsafe journal symlink");
+            assert!(
+                LifecycleJournal::open(temp.path()).is_err(),
+                "{leaf} symlink"
+            );
+
+            fs::remove_file(temp.path().join(leaf)).expect("remove symlink");
+            fs::hard_link(&target, temp.path().join(leaf)).expect("unsafe journal hardlink");
+            assert!(
+                LifecycleJournal::open(temp.path()).is_err(),
+                "{leaf} hardlink"
+            );
+
+            fs::remove_file(temp.path().join(leaf)).expect("remove hardlink");
+            write_private_sized(&temp.path().join(leaf), 0);
+            fs::set_permissions(temp.path().join(leaf), fs::Permissions::from_mode(0o644))
+                .expect("broaden unsafe journal leaf");
+            assert!(LifecycleJournal::open(temp.path()).is_err(), "{leaf} mode");
+
+            fs::remove_file(temp.path().join(leaf)).expect("remove broad leaf");
+            fs::create_dir(temp.path().join(leaf)).expect("unsafe journal directory leaf");
+            assert!(
+                LifecycleJournal::open(temp.path()).is_err(),
+                "{leaf} non-regular"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_refuses_unsafe_previous_target_without_losing_current() {
+        for hardlink in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+                .expect("private tempdir");
+            let mut storage = SecureStorage::open(temp.path()).expect("open storage");
+            let current = temp.path().join("current.jsonl");
+            let before = LifecycleEvent::trigger_claimed(
+                Uuid::new_v4(),
+                identity(&Uuid::new_v4().to_string()),
+                20,
+                SessionExitTrigger::LeaderExited,
+            );
+            storage.append(&before).expect("seed current segment");
+            let current_len = fs::metadata(&current).expect("stat current").len();
+
+            let target = temp.path().join("rotation-target");
+            write_private_sized(&target, 0);
+            if hardlink {
+                fs::hard_link(&target, temp.path().join("previous.jsonl"))
+                    .expect("unsafe hardlink rotation target");
+            } else {
+                symlink(&target, temp.path().join("previous.jsonl"))
+                    .expect("unsafe symlink rotation target");
+            }
+            assert!(storage.rotate().is_err());
+            assert_eq!(
+                fs::metadata(&current).expect("current remains").len(),
+                current_len
+            );
+        }
+    }
+
+    #[test]
+    fn advisory_lock_serializes_storage_instances() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        let first = SecureStorage::open(temp.path()).expect("first storage lock");
+        assert!(
+            SecureStorage::open(temp.path()).is_err(),
+            "second storage must not bypass the advisory lock"
+        );
+        drop(first);
+        SecureStorage::open(temp.path()).expect("lock released after first storage drops");
     }
 }
