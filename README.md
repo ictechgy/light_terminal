@@ -17,13 +17,15 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.30
+## Current release: 1.0.31
 
-The 1.0.30 release focuses on explicit OMC status-row visibility for madmax launches:
+The 1.0.31 release adds bounded control and measurement surfaces plus a crash-safe Linux launch foundation while keeping raw PTY behavior unchanged:
 
-- **OMC madmax status recovery** — `lterm omc --status --madmax` now restores the requested lterm status row after OMC startup enters alt-screen and clears the display.
-- **Conservative defaults preserved** — built-in agent launchers still default to full-height raw attaches unless `--status` explicitly asks for the host row.
-- **Regression coverage** — a PTY smoke test now verifies `--madmax` argument forwarding and post-alt-screen status repaint for the explicit status path.
+- **Raw-free instrument snapshots (#159)** — `lterm instrument <target> --json` reports opaque liveness, output-progress, client-count, and geometry measurements without attaching or reading PTY bytes.
+- **Cooperative input capabilities (#160)** — finite byte-budget bearer files delegate exact binary input without changing legacy ambient input, Send, or raw Attach behavior.
+- **Reversible live metadata (#161)** — bounded name/theme history supports guarded undo and redo, with an explicit irreversible purge gate when evidence must be discarded.
+- **Durable managed Linux launch (#162)** — pre-spawn intent, exact process-birth identity, inherited OFD guards, pidfd cleanup, and durable tombstones close daemon-crash windows for future managed root processes.
+- **Cleaner default session lists (#162)** — explicitly targeted detached tmux review/helper children are hidden from default `lterm ls` output while remaining available through `--children` and `--all`.
 
 ## Why lterm instead of plain tmux?
 
@@ -89,7 +91,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.30
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.31
 ```
 
 Building from this checkout requires Rust 1.85 or newer:
