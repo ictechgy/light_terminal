@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lterm exits --json output",
+  "type": "array",
+  "$defs": {
+    "exitTrigger": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["leader_exited", "close_requested", "daemon_shutdown", "unknown"] }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "parent_session_id"],
+          "properties": {
+            "type": { "const": "parent_cascade" },
+            "parent_session_id": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "items": {
+    "type": "object",
+    "required": [
+      "schema_version",
+      "session_id",
+      "name",
+      "pane_id",
+      "created_unix_ms",
+      "trigger_claimed_unix_ms",
+      "trigger",
+      "outcome_state",
+      "evidence_state"
+    ],
+    "properties": {
+      "schema_version": { "const": "1.0" },
+      "session_id": { "type": "string", "minLength": 1 },
+      "name": { "type": "string", "minLength": 1 },
+      "pane_id": { "type": "string", "pattern": "^%[0-9]+$" },
+      "parent_session_id": { "type": "string", "minLength": 1 },
+      "parent_pane_id": { "type": "string", "pattern": "^%[0-9]+$" },
+      "agent_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+      "created_unix_ms": { "type": "integer", "minimum": 0 },
+      "trigger_claimed_unix_ms": { "type": "integer", "minimum": 0 },
+      "reaped_unix_ms": { "type": "integer", "minimum": 0 },
+      "trigger": { "$ref": "#/$defs/exitTrigger" },
+      "outcome_state": { "enum": ["pending", "complete", "unknown"] },
+      "exit_code": { "type": "integer" },
+      "signal": { "type": "string", "minLength": 1 },
+      "evidence_state": { "enum": ["complete", "degraded_missing_trigger_event", "conflicted", "storage_degraded"] }
+    },
+    "additionalProperties": false
+  }
+}
