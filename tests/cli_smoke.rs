@@ -9959,7 +9959,8 @@ fn tmux_compat_reports_focus_events_enabled() -> TestResult {
         .args(["tmux-compat", "show-option", "-gqv", "focus-events"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "on");
+    assert_eq!(output.stdout, b"on\n", "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     let refresh = env
         .cmd()
@@ -10010,61 +10011,138 @@ fn tmux_compat_user_option_contract_preserves_legacy_no_name_and_builtin_behavio
 }
 
 #[test]
-fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestResult {
+fn tmux_compat_user_option_contract_accepts_closed_grammar_and_separates_pane_and_root_session_scopes()
+-> TestResult {
     let env = TestEnv::new()?;
-    let cases: &[&[&str]] = &[
-        &["tmux-compat", "set-option", "-p", "-t", "%1", "@"],
-        &["tmux-compat", "set-option", "-p", "-t", "%1", "@owner"],
-        &[
+    let pane = create_sleep_session(&env, "user-option-grammar")?;
+    let attached_target = format!("-t{pane}");
+    let mut failures = Vec::new();
+
+    for (name, args) in [
+        (
+            "session set with separate target",
+            vec![
+                "tmux-compat",
+                "set-option",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "session-value",
+            ],
+        ),
+        (
+            "pane set alias with attached target",
+            vec![
+                "tmux-compat",
+                "set",
+                "-qp",
+                attached_target.as_str(),
+                "@owner",
+                "pane-value",
+            ],
+        ),
+        (
+            "separator set",
+            vec![
+                "tmux-compat",
+                "set-option",
+                "-t",
+                pane.as_str(),
+                "--",
+                "@separator",
+                "separator-value",
+            ],
+        ),
+        (
+            "full allowed name alphabet",
+            vec![
+                "tmux-compat",
+                "set-option",
+                "-t",
+                pane.as_str(),
+                "@A.z_9:-",
+                "alphabet-value",
+            ],
+        ),
+    ] {
+        let output = env.cmd().args(args).output()?;
+        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            failures.push(format!("{name}: {output:?}"));
+        }
+    }
+
+    for (name, args, expected) in [
+        (
+            "session show with common flag order",
+            vec![
+                "tmux-compat",
+                "show-option",
+                "-qv",
+                "-t",
+                pane.as_str(),
+                "@owner",
+            ],
+            b"session-value\n".as_slice(),
+        ),
+        (
+            "pane show alias with boolean cluster",
+            vec![
+                "tmux-compat",
+                "show",
+                "-pqv",
+                attached_target.as_str(),
+                "@owner",
+            ],
+            b"pane-value\n".as_slice(),
+        ),
+        (
+            "separator show",
+            vec![
+                "tmux-compat",
+                "show-option",
+                "-qv",
+                "-t",
+                pane.as_str(),
+                "--",
+                "@separator",
+            ],
+            b"separator-value\n".as_slice(),
+        ),
+        (
+            "flags reordered after target value",
+            vec![
+                "tmux-compat",
+                "show-option",
+                "-t",
+                pane.as_str(),
+                "-qv",
+                "@A.z_9:-",
+            ],
+            b"alphabet-value\n".as_slice(),
+        ),
+    ] {
+        let output = env.cmd().args(args).output()?;
+        if !output.status.success() || output.stdout != expected || !output.stderr.is_empty() {
+            failures.push(format!("{name}: {output:?}"));
+        }
+    }
+
+    let unset = env
+        .cmd()
+        .args([
             "tmux-compat",
             "set-option",
             "-p",
             "-t",
-            "%1",
+            pane.as_str(),
             "-u",
             "@owner",
-            "extra",
-        ],
-        &[
-            "tmux-compat",
-            "set-option",
-            "-p",
-            "-t",
-            "%1",
-            "@owner",
-            "value",
-            "extra",
-        ],
-        &[
-            "tmux-compat",
-            "set-option",
-            "-g",
-            "-p",
-            "-t",
-            "%1",
-            "@owner",
-            "value",
-        ],
-        &["tmux-compat", "show-option", "-pt", "%1", "@owner"],
-    ];
-
-    for args in cases {
-        let output = env.cmd().args(*args).output()?;
-        assert!(
-            !output.status.success(),
-            "closed user-option grammar must reject {args:?}: {output:?}"
-        );
-        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        ])
+        .output()?;
+    if !unset.status.success() || !unset.stdout.is_empty() || !unset.stderr.is_empty() {
+        failures.push(format!("valid unset: {unset:?}"));
     }
-    Ok(())
-}
-
-#[test]
-fn tmux_compat_user_option_contract_distinguishes_absent_and_present_empty() -> TestResult {
-    let env = TestEnv::new()?;
-    let pane = create_sleep_session(&env, "user-option-empty")?;
-
-    let absent = env
+    let absent_after_unset = env
         .cmd()
         .args([
             "tmux-compat",
@@ -10073,12 +10151,230 @@ fn tmux_compat_user_option_contract_distinguishes_absent_and_present_empty() -> 
             "-p",
             "-t",
             pane.as_str(),
-            "@omx_instance_id",
+            "@owner",
         ])
         .output()?;
-    assert!(absent.status.success(), "{absent:?}");
-    assert_eq!(absent.stdout, b"", "quiet absence must be zero bytes");
-    assert!(absent.stderr.is_empty(), "{absent:?}");
+    if !absent_after_unset.status.success()
+        || !absent_after_unset.stdout.is_empty()
+        || !absent_after_unset.stderr.is_empty()
+    {
+        failures.push(format!("quiet absence after unset: {absent_after_unset:?}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "valid user-option grammar/scope failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "user-option-invalid-grammar")?;
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "empty user-option name",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@",
+                "value",
+            ],
+        ),
+        (
+            "missing set value",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+            ],
+        ),
+        (
+            "missing set name",
+            &["tmux-compat", "set-option", "-p", "-t", pane.as_str()],
+        ),
+        (
+            "unset with value",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "-u",
+                "@owner",
+                "extra",
+            ],
+        ),
+        (
+            "set positional over-arity",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "value",
+                "extra",
+            ],
+        ),
+        (
+            "show positional over-arity",
+            &[
+                "tmux-compat",
+                "show-option",
+                "-qv",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "extra",
+            ],
+        ),
+        (
+            "unsupported global scope",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-g",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "value",
+            ],
+        ),
+        (
+            "unsupported server scope",
+            &["tmux-compat", "set-option", "-s", "@owner", "value"],
+        ),
+        (
+            "unsupported window scope",
+            &[
+                "tmux-compat",
+                "set-option",
+                "-w",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "value",
+            ],
+        ),
+        (
+            "target flag in cluster",
+            &["tmux-compat", "show-option", "-pt", pane.as_str(), "@owner"],
+        ),
+        (
+            "unknown flag",
+            &[
+                "tmux-compat",
+                "show-option",
+                "-x",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+            ],
+        ),
+        (
+            "flag after first positional",
+            &[
+                "tmux-compat",
+                "show-option",
+                "@owner",
+                "-qv",
+                "-p",
+                "-t",
+                pane.as_str(),
+            ],
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, args) in cases {
+        let output = env.cmd().args(*args).output()?;
+        if output.status.success() || !output.stdout.is_empty() || output.stderr.is_empty() {
+            failures.push(format!("{name}: {output:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "invalid user-option grammar was accepted or misreported:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_distinguishes_absence_and_present_empty() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "user-option-empty")?;
+    let mut failures = Vec::new();
+
+    let quiet_absent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@missing",
+        ])
+        .output()?;
+    if !quiet_absent.status.success()
+        || !quiet_absent.stdout.is_empty()
+        || !quiet_absent.stderr.is_empty()
+    {
+        failures.push(format!("quiet absence: {quiet_absent:?}"));
+    }
+
+    let loud_absent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-v",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@missing",
+        ])
+        .output()?;
+    let loud_absent_reordered = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "-v",
+            "@missing",
+        ])
+        .output()?;
+    if loud_absent.status.success()
+        || !loud_absent.stdout.is_empty()
+        || loud_absent.stderr.is_empty()
+        || loud_absent_reordered.status.success()
+        || !loud_absent_reordered.stdout.is_empty()
+        || loud_absent_reordered.stderr.is_empty()
+        || loud_absent.stderr != loud_absent_reordered.stderr
+    {
+        failures.push(format!(
+            "loud absence was not a stable diagnostic: first={loud_absent:?}, reordered={loud_absent_reordered:?}"
+        ));
+    }
 
     let set_empty = env
         .cmd()
@@ -10106,12 +10402,17 @@ fn tmux_compat_user_option_contract_distinguishes_absent_and_present_empty() -> 
             "@omx_instance_id",
         ])
         .output()?;
-    assert!(present_empty.status.success(), "{present_empty:?}");
-    assert_eq!(
-        present_empty.stdout, b"\n",
-        "a present empty value must print exactly one newline"
+    if !present_empty.status.success()
+        || present_empty.stdout != b"\n"
+        || !present_empty.stderr.is_empty()
+    {
+        failures.push(format!("present empty: {present_empty:?}"));
+    }
+    assert!(
+        failures.is_empty(),
+        "absence/present-empty contract failures:\n{}",
+        failures.join("\n")
     );
-    assert!(present_empty.stderr.is_empty(), "{present_empty:?}");
     Ok(())
 }
 
@@ -10123,14 +10424,50 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
     let oversized_name = format!("@{}", "n".repeat(128));
     let valid_value = "v".repeat(4096);
     let oversized_value = "v".repeat(4097);
+    let mut failures = Vec::new();
 
-    for (name, value, should_succeed) in [
-        (valid_name.as_str(), valid_value.as_str(), true),
-        (oversized_name.as_str(), "value", false),
-        ("@owner", oversized_value.as_str(), false),
-        ("@owner", "line\nbreak", false),
-        ("@owner", "bidi\u{202e}override", false),
-        ("@owner", "zero\u{200b}width", false),
+    let valid = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            pane.as_str(),
+            valid_name.as_str(),
+            valid_value.as_str(),
+        ])
+        .output()?;
+    if !valid.status.success() || !valid.stdout.is_empty() || !valid.stderr.is_empty() {
+        failures.push(format!("exact name/value maxima rejected: {valid:?}"));
+    }
+    let shown = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            valid_name.as_str(),
+        ])
+        .output()?;
+    let mut expected = valid_value.as_bytes().to_vec();
+    expected.push(b'\n');
+    if !shown.status.success() || shown.stdout != expected || !shown.stderr.is_empty() {
+        failures.push(format!("exact maxima did not round-trip: {shown:?}"));
+    }
+
+    for (label, name, value) in [
+        ("oversized name", oversized_name.as_str(), "value"),
+        ("invalid name alphabet", "@bad/name", "value"),
+        ("oversized value", "@owner", oversized_value.as_str()),
+        ("C0 control", "@owner", "line\nbreak"),
+        ("DEL control", "@owner", "delete\u{7f}control"),
+        ("format control", "@owner", "word\u{2060}joiner"),
+        ("bidi control", "@owner", "bidi\u{202e}override"),
+        ("zero-width", "@owner", "zero\u{200b}width"),
     ] {
         let output = env
             .cmd()
@@ -10144,15 +10481,19 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
                 value,
             ])
             .output()?;
-        assert_eq!(
-            output.status.success(),
-            should_succeed,
-            "unexpected bound/control result for name_bytes={} value_bytes={}: {output:?}",
-            name.len(),
-            value.len()
-        );
-        assert!(output.stdout.is_empty(), "{output:?}");
+        if output.status.success() || !output.stdout.is_empty() || output.stderr.is_empty() {
+            failures.push(format!(
+                "{label} accepted for name_bytes={} value_bytes={}: {output:?}",
+                name.len(),
+                value.len()
+            ));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "user-option bounds/control failures:\n{}",
+        failures.join("\n")
+    );
     Ok(())
 }
 
@@ -10162,25 +10503,35 @@ fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_
     let env = TestEnv::new()?;
     let data_dir = env.temp.path().join("data");
     std::fs::create_dir_all(&data_dir)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::write(
         data_dir.join("tmux-compat-store.json"),
         br#"{"panes":{},"wait_generations":{},"wait_generation_touched_secs":{}}"#,
     )?;
     let pane = create_sleep_session(&env, "user-option-old-store")?;
+    let mut failures = Vec::new();
 
-    let window_alias = env
-        .cmd()
-        .args([
-            "tmux-compat",
-            "setw",
-            "-p",
-            "-t",
-            pane.as_str(),
-            "@owner",
-            "window-value",
-        ])
-        .output()?;
-    assert!(window_alias.status.success(), "{window_alias:?}");
+    for alias in ["setw", "set-window-option"] {
+        let window_alias = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                alias,
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "window-value",
+            ])
+            .output()?;
+        if !window_alias.status.success()
+            || !window_alias.stdout.is_empty()
+            || !window_alias.stderr.is_empty()
+        {
+            failures.push(format!("{alias} legacy no-op: {window_alias:?}"));
+        }
+    }
 
     let absent = env
         .cmd()
@@ -10194,11 +10545,30 @@ fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_
             "@owner",
         ])
         .output()?;
-    assert!(absent.status.success(), "{absent:?}");
-    assert!(
-        absent.stdout.is_empty(),
-        "setw must not mutate pane storage"
-    );
+    if !absent.status.success() || !absent.stdout.is_empty() || !absent.stderr.is_empty() {
+        failures.push(format!("window aliases mutated pane storage: {absent:?}"));
+    }
+
+    for alias in ["showw", "show-window-option", "show-window-options"] {
+        let window_show = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                alias,
+                "-v",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+            ])
+            .output()?;
+        if !window_show.status.success()
+            || window_show.stdout != b"off\n"
+            || !window_show.stderr.is_empty()
+        {
+            failures.push(format!("{alias} reached pane storage: {window_show:?}"));
+        }
+    }
 
     let set = env
         .cmd()
@@ -10209,10 +10579,12 @@ fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_
             "-t",
             pane.as_str(),
             "@owner",
-            "session-value",
+            "pane-value",
         ])
         .output()?;
-    assert!(set.status.success(), "{set:?}");
+    if !set.status.success() || !set.stdout.is_empty() || !set.stderr.is_empty() {
+        failures.push(format!("set alias: {set:?}"));
+    }
     let shown = env
         .cmd()
         .args([
@@ -10225,12 +10597,26 @@ fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_
             "@owner",
         ])
         .output()?;
-    assert!(shown.status.success(), "{shown:?}");
-    assert_eq!(shown.stdout, b"session-value\n", "{shown:?}");
+    if !shown.status.success() || shown.stdout != b"pane-value\n" || !shown.stderr.is_empty() {
+        failures.push(format!("show alias: {shown:?}"));
+    }
 
     let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
-    assert!(store.get("pane_user_options").is_some(), "{store:?}");
-    assert!(store.get("session_user_options").is_some(), "{store:?}");
+    if store.get("pane_user_options").is_none() {
+        failures.push(format!(
+            "old store lacks pane_user_options after mutation: {store:?}"
+        ));
+    }
+    if store.get("session_user_options").is_none() {
+        failures.push(format!(
+            "old store lacks session_user_options after mutation: {store:?}"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "migration/window-alias failures:\n{}",
+        failures.join("\n")
+    );
     Ok(())
 }
 
