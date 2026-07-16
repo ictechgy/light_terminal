@@ -1021,12 +1021,6 @@ impl SecureStorage {
         {
             repair_oversized_segment(&mut previous)?;
             drop(previous);
-            let result =
-                unsafe { libc::unlinkat(self.dir.as_raw_fd(), leaf(PREVIOUS_SEGMENT).as_ptr(), 0) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("remove previous lifecycle journal segment");
-            }
         }
         repair_oversized_segment(&mut self.current)?;
         self.current_bytes = self
@@ -1919,6 +1913,39 @@ mod tests {
                 current_len
             );
         }
+    }
+
+    #[test]
+    fn failed_rotation_preserves_previous_segment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        let mut storage = SecureStorage::open(temp.path()).expect("open storage");
+        let current = LifecycleEvent::trigger_claimed(
+            Uuid::new_v4(),
+            identity(&Uuid::new_v4().to_string()),
+            20,
+            SessionExitTrigger::LeaderExited,
+        );
+        storage.append(&current).expect("seed current segment");
+
+        let previous_path = temp.path().join("previous.jsonl");
+        let previous_bytes = b"retained previous segment\n";
+        fs::write(&previous_path, previous_bytes).expect("seed previous segment");
+        fs::set_permissions(&previous_path, fs::Permissions::from_mode(0o600))
+            .expect("private previous segment");
+
+        fs::remove_file(temp.path().join("current.jsonl"))
+            .expect("remove current path while storage keeps its open descriptor");
+        assert!(
+            storage.rotate().is_err(),
+            "missing source path must fail rotation"
+        );
+        assert_eq!(
+            fs::read(&previous_path).expect("previous segment must remain readable"),
+            previous_bytes,
+            "failed replacement must preserve the retained previous segment"
+        );
     }
 
     #[test]
