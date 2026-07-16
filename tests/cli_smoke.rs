@@ -9970,6 +9970,320 @@ fn tmux_compat_reports_focus_events_enabled() -> TestResult {
 }
 
 #[test]
+fn tmux_compat_user_option_contract_preserves_legacy_no_name_and_builtin_behavior() -> TestResult {
+    let env = TestEnv::new()?;
+
+    for (args, expected) in [
+        (vec!["tmux-compat", "show-option"], b"".as_slice()),
+        (vec!["tmux-compat", "show-option", "-q"], b"".as_slice()),
+        (
+            vec!["tmux-compat", "show-option", "-v"],
+            b"off\n".as_slice(),
+        ),
+        (
+            vec!["tmux-compat", "show-option", "-g"],
+            b"off\n".as_slice(),
+        ),
+    ] {
+        let output = env.cmd().args(args).output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected, "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    let mutation = env
+        .cmd()
+        .args(["tmux-compat", "set-option", "-g", "status", "on"])
+        .output()?;
+    assert!(mutation.status.success(), "{mutation:?}");
+    assert!(mutation.stdout.is_empty(), "{mutation:?}");
+    assert!(mutation.stderr.is_empty(), "{mutation:?}");
+
+    let query = env
+        .cmd()
+        .args(["tmux-compat", "show-option", "-gqv", "status"])
+        .output()?;
+    assert!(query.status.success(), "{query:?}");
+    assert_eq!(query.stdout, b"off\n", "{query:?}");
+    assert!(query.stderr.is_empty(), "{query:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestResult {
+    let env = TestEnv::new()?;
+    let cases: &[&[&str]] = &[
+        &["tmux-compat", "set-option", "-p", "-t", "%1", "@"],
+        &["tmux-compat", "set-option", "-p", "-t", "%1", "@owner"],
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            "-u",
+            "@owner",
+            "extra",
+        ],
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            "@owner",
+            "value",
+            "extra",
+        ],
+        &[
+            "tmux-compat",
+            "set-option",
+            "-g",
+            "-p",
+            "-t",
+            "%1",
+            "@owner",
+            "value",
+        ],
+        &["tmux-compat", "show-option", "-pt", "%1", "@owner"],
+    ];
+
+    for args in cases {
+        let output = env.cmd().args(*args).output()?;
+        assert!(
+            !output.status.success(),
+            "closed user-option grammar must reject {args:?}: {output:?}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_distinguishes_absent_and_present_empty() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "user-option-empty")?;
+
+    let absent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@omx_instance_id",
+        ])
+        .output()?;
+    assert!(absent.status.success(), "{absent:?}");
+    assert_eq!(absent.stdout, b"", "quiet absence must be zero bytes");
+    assert!(absent.stderr.is_empty(), "{absent:?}");
+
+    let set_empty = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@omx_instance_id",
+            "",
+        ])
+        .output()?;
+    assert!(set_empty.status.success(), "{set_empty:?}");
+
+    let present_empty = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@omx_instance_id",
+        ])
+        .output()?;
+    assert!(present_empty.status.success(), "{present_empty:?}");
+    assert_eq!(
+        present_empty.stdout, b"\n",
+        "a present empty value must print exactly one newline"
+    );
+    assert!(present_empty.stderr.is_empty(), "{present_empty:?}");
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds() -> TestResult {
+    let env = TestEnv::new()?;
+    let pane = create_sleep_session(&env, "user-option-bounds")?;
+    let valid_name = format!("@{}", "n".repeat(127));
+    let oversized_name = format!("@{}", "n".repeat(128));
+    let valid_value = "v".repeat(4096);
+    let oversized_value = "v".repeat(4097);
+
+    for (name, value, should_succeed) in [
+        (valid_name.as_str(), valid_value.as_str(), true),
+        (oversized_name.as_str(), "value", false),
+        ("@owner", oversized_value.as_str(), false),
+        ("@owner", "line\nbreak", false),
+        ("@owner", "bidi\u{202e}override", false),
+        ("@owner", "zero\u{200b}width", false),
+    ] {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                name,
+                value,
+            ])
+            .output()?;
+        assert_eq!(
+            output.status.success(),
+            should_succeed,
+            "unexpected bound/control result for name_bytes={} value_bytes={}: {output:?}",
+            name.len(),
+            value.len()
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_separate()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let data_dir = env.temp.path().join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::write(
+        data_dir.join("tmux-compat-store.json"),
+        br#"{"panes":{},"wait_generations":{},"wait_generation_touched_secs":{}}"#,
+    )?;
+    let pane = create_sleep_session(&env, "user-option-old-store")?;
+
+    let window_alias = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "setw",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@owner",
+            "window-value",
+        ])
+        .output()?;
+    assert!(window_alias.status.success(), "{window_alias:?}");
+
+    let absent = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@owner",
+        ])
+        .output()?;
+    assert!(absent.status.success(), "{absent:?}");
+    assert!(
+        absent.stdout.is_empty(),
+        "setw must not mutate pane storage"
+    );
+
+    let set = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "set",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@owner",
+            "session-value",
+        ])
+        .output()?;
+    assert!(set.status.success(), "{set:?}");
+    let shown = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show",
+            "-qv",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@owner",
+        ])
+        .output()?;
+    assert!(shown.status.success(), "{shown:?}");
+    assert_eq!(shown.stdout, b"session-value\n", "{shown:?}");
+
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    assert!(store.get("pane_user_options").is_some(), "{store:?}");
+    assert!(store.get("session_user_options").is_some(), "{store:?}");
+    Ok(())
+}
+
+// Pinned contract mirror, not authentication proof. Provenance:
+// oh-my-codex 0.20.2, src/team/managed-tmux.ts pane-first ownership evaluator.
+fn omx_pane_first_binds(
+    candidate: &str,
+    pane_read: Result<&str, ()>,
+    session_read: Result<Option<&str>, ()>,
+) -> bool {
+    match pane_read {
+        Ok("") => matches!(session_read, Ok(Some(value)) if value == candidate),
+        Ok(value) => value == candidate,
+        Err(()) => false,
+    }
+}
+
+#[test]
+fn tmux_compat_user_option_contract_pins_omx_pane_first_classification_matrix() {
+    let candidate = "omx-instance-a";
+    let cases = [
+        ("exact pane", Ok(candidate), Ok(None), true),
+        (
+            "pane mismatch rejects exact session fallback",
+            Ok("omx-instance-b"),
+            Ok(Some(candidate)),
+            false,
+        ),
+        (
+            "pane read error rejects exact session fallback",
+            Err(()),
+            Ok(Some(candidate)),
+            false,
+        ),
+        (
+            "empty pane permits exact session fallback",
+            Ok(""),
+            Ok(Some(candidate)),
+            true,
+        ),
+        ("total absence rejects", Ok(""), Ok(None), false),
+    ];
+
+    for (name, pane, session, expected) in cases {
+        assert_eq!(
+            omx_pane_first_binds(candidate, pane, session),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn tmux_compat_missing_target_value_does_not_fall_back_to_default() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
