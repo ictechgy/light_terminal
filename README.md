@@ -17,15 +17,15 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.31
+## Current release: 1.0.32
 
-The 1.0.31 release adds bounded control and measurement surfaces plus a crash-safe Linux launch foundation while keeping raw PTY behavior unchanged:
+The 1.0.32 release hardens session exit and cleanup lifecycle behavior while preserving the public PTY and metadata contracts:
 
-- **Raw-free instrument snapshots (#159)** — `lterm instrument <target> --json` reports opaque liveness, output-progress, client-count, and geometry measurements without attaching or reading PTY bytes.
-- **Cooperative input capabilities (#160)** — finite byte-budget bearer files delegate exact binary input without changing legacy ambient input, Send, or raw Attach behavior.
-- **Reversible live metadata (#161)** — bounded name/theme history supports guarded undo and redo, with an explicit irreversible purge gate when evidence must be discarded.
-- **Durable managed Linux launch (#162)** — pre-spawn intent, exact process-birth identity, inherited OFD guards, pidfd cleanup, and durable tombstones close daemon-crash windows for future managed root processes.
-- **Cleaner default session lists (#162)** — explicitly targeted detached tmux review/helper children are hidden from default `lterm ls` output while remaining available through `--children` and `--all`.
+- **Authoritative exit evidence** — lifecycle triggers are published before teardown and persisted in a bounded private journal, so exit facts survive blocked writers and daemon recovery.
+- **Non-blocking cleanup** — close and shutdown paths keep making progress without joining stalled lifecycle writers, while process-group and session cleanup remain observable.
+- **Race-safe final identity** — rename, undo, and redo commits serialize against the `Ending` claim so reaping cannot publish a stale or conflicting session identity.
+- **Bounded recovery and diagnostics** — corrupted or partial journal state is recovered conservatively, and recent-exit diagnostics preserve the evidence needed to explain cleanup outcomes.
+- **Regression coverage** — unit, daemon lifecycle, and CLI smoke tests lock the TOCTOU barrier, waitid fallback, recovery, and managed-attach cleanup contracts.
 
 ## Why lterm instead of plain tmux?
 
@@ -91,7 +91,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.31
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.32
 ```
 
 Building from this checkout requires Rust 1.85 or newer:

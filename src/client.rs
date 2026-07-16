@@ -1,11 +1,11 @@
 use crate::paths;
 use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
-    CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
-    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_SEND_DATA_BYTES,
-    MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult, PROTOCOL_VERSION, Request,
-    Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme, WaitContainsResult,
-    WaitExitResult,
+    CapabilityToken, DaemonStatus, ExitListScope, InstrumentSnapshot, IssueInputCapabilityResult,
+    MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_RECENT_EXITS_LIMIT,
+    MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult,
+    PROTOCOL_VERSION, RecentSessionExit, Request, Response, SensitiveCapabilityRequest,
+    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -103,6 +103,7 @@ const WAIT_PROTOCOL_VERSION: u32 = 3;
 const INSTRUMENT_PROTOCOL_VERSION: u32 = 4;
 const METADATA_PROTOCOL_VERSION: u32 = 6;
 const TMUX_PARENT_PANE_PROTOCOL_VERSION: u32 = 7;
+const RECENT_EXITS_PROTOCOL_VERSION: u32 = 8;
 const CAPABILITY_FILE_PREFIX: &[u8] = b"lterm-input-capability-v1\n";
 const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
 const CAPABILITY_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
@@ -523,6 +524,14 @@ fn require_tmux_parent_pane_protocol() -> Result<()> {
     Ok(())
 }
 
+fn require_recent_exits_protocol() -> Result<()> {
+    let status = daemon_status().context("check lterm daemon protocol for recent exits")?;
+    if let Some(message) = recent_exits_protocol_error(&status) {
+        bail!(message);
+    }
+    Ok(())
+}
+
 fn status_theme_protocol_error(status: &DaemonStatus) -> Option<String> {
     (status.protocol_version < STATUS_THEME_PROTOCOL_VERSION).then(|| {
         format!(
@@ -555,6 +564,15 @@ fn tmux_parent_pane_protocol_error(status: &DaemonStatus) -> Option<String> {
         format!(
             "lterm daemon protocol {} does not support explicit tmux parent panes (requires protocol {}); run `lterm shutdown` and retry after upgrading",
             status.protocol_version, TMUX_PARENT_PANE_PROTOCOL_VERSION
+        )
+    })
+}
+
+fn recent_exits_protocol_error(status: &DaemonStatus) -> Option<String> {
+    (status.protocol_version < RECENT_EXITS_PROTOCOL_VERSION).then(|| {
+        format!(
+            "lterm daemon protocol {} does not support recent exit evidence (requires protocol {}); upgrade/restart is required, and no live session was modified",
+            status.protocol_version, RECENT_EXITS_PROTOCOL_VERSION
         )
     })
 }
@@ -607,7 +625,26 @@ fn resolve_client_cwd(cwd: Option<String>) -> Result<String> {
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
     ensure_server()?;
-    rpc(&Request::List)
+    let mut sessions: Vec<SessionInfo> = rpc(&Request::List)?;
+    sessions.retain(SessionInfo::is_live_work);
+    Ok(sessions)
+}
+
+pub fn recent_exits(
+    target: Option<&str>,
+    limit: u16,
+    scope: ExitListScope,
+) -> Result<Vec<RecentSessionExit>> {
+    if limit == 0 || limit > MAX_RECENT_EXITS_LIMIT {
+        bail!("recent exit limit must be between 1 and {MAX_RECENT_EXITS_LIMIT}");
+    }
+    ensure_server()?;
+    require_recent_exits_protocol()?;
+    rpc(&Request::RecentExits {
+        target: target.map(str::to_string),
+        limit,
+        scope,
+    })
 }
 
 pub fn info(target: &str) -> Result<SessionInfo> {
@@ -1026,11 +1063,13 @@ fn reconnect_target(fallback_target: &str, create_fallback: bool) -> Result<Sess
             return Ok(info);
         }
     }
-    if create_fallback {
+    let fallback = if create_fallback {
         attach_or_new(fallback_target)
     } else {
         info(fallback_target)
-    }
+    }?;
+    ensure_automatic_reconnect_candidate(&fallback)?;
+    Ok(fallback)
 }
 
 fn resolve_reconnect_state(state: &ReconnectState) -> Option<SessionInfo> {
@@ -1038,11 +1077,34 @@ fn resolve_reconnect_state(state: &ReconnectState) -> Option<SessionInfo> {
         let Ok(info) = info(target) else {
             continue;
         };
-        if info.id == state.session_id {
+        if info.id == state.session_id && automatic_reconnect_candidate(&info) {
             return Some(info);
         }
     }
     None
+}
+
+fn automatic_reconnect_candidate(info: &SessionInfo) -> bool {
+    matches!(info.lifecycle_state(), SessionLifecycleState::Healthy) && info.is_live_work()
+}
+
+fn ensure_automatic_reconnect_candidate(info: &SessionInfo) -> Result<()> {
+    match info.lifecycle_state() {
+        SessionLifecycleState::Healthy if info.is_live_work() => Ok(()),
+        SessionLifecycleState::MonitorFailed => bail!(
+            "automatic reconnect skipped session {} because leader state is unknown; use `lterm resume -- {}` for an explicit best-effort attach",
+            sanitize::terminal_text(&info.id),
+            sanitize::terminal_text(&info.name)
+        ),
+        SessionLifecycleState::Ending { trigger } => bail!(
+            "automatic reconnect skipped ending session {} ({trigger}); select another live target",
+            sanitize::terminal_text(&info.id)
+        ),
+        SessionLifecycleState::Healthy => bail!(
+            "automatic reconnect skipped session {} because its lifecycle fields are inconsistent",
+            sanitize::terminal_text(&info.id)
+        ),
+    }
 }
 
 fn remember_reconnect_target_best_effort(info: &SessionInfo) {
@@ -2742,6 +2804,22 @@ pub fn attach_info_with_policy(
     options: AttachPolicyOptions,
     explicit_no_status: bool,
 ) -> Result<()> {
+    match info.lifecycle_state() {
+        SessionLifecycleState::Healthy if info.is_live_work() => {}
+        SessionLifecycleState::MonitorFailed if info.is_live_work() => eprintln!(
+            "warning: session {} leader state is unknown; attempting an explicit best-effort attach",
+            sanitize::terminal_text(&info.id)
+        ),
+        SessionLifecycleState::Ending { trigger } => bail!(
+            "session {} is ending ({trigger}) and is not reconnectable; inspect `lterm exits -- {}`",
+            sanitize::terminal_text(&info.id),
+            sanitize::terminal_text(&info.id)
+        ),
+        _ => bail!(
+            "session {} has inconsistent lifecycle fields and is not safe to attach",
+            sanitize::terminal_text(&info.id)
+        ),
+    }
     remember_reconnect_target_best_effort(info);
     let use_mobile = match options.mode {
         AttachMode::Raw => false,
@@ -2761,6 +2839,7 @@ pub fn attach_info_with_policy(
             &info.pane_id,
             presence_policy,
             stdin_eof,
+            info,
             agent_presence_cue,
             explicit_no_status,
         )
@@ -4018,13 +4097,22 @@ pub fn attach_with_presence(
     stdin_eof: AttachStdinEof,
     explicit_no_status: bool,
 ) -> Result<()> {
-    attach_with_presence_and_cue(target, presence_policy, stdin_eof, None, explicit_no_status)
+    let original_info = info(target)?;
+    attach_with_presence_and_cue(
+        &original_info.pane_id,
+        presence_policy,
+        stdin_eof,
+        &original_info,
+        None,
+        explicit_no_status,
+    )
 }
 
 fn attach_with_presence_and_cue(
     target: &str,
     presence_policy: StatusPresencePolicy,
     stdin_eof: AttachStdinEof,
+    original_info: &SessionInfo,
     agent_presence_cue: Option<AgentPresenceCue>,
     // 사용자가 `--no-status`를 명시했는지. 정책 `RowOff`는 "agent 기본"과 "--no-status"를
     // 구분 못 하므로, cmux pill sink 게이트(`sink_enabled`)는 이 신호로 명시적 비활성을 존중한다.
@@ -4073,7 +4161,7 @@ fn attach_with_presence_and_cue(
     // attached_clients 를 미리 읽을 이유는 더 이상 없다 — server 가 자체 clamp-to-
     // smallest 로 사이즈 정책을 결정한다 (PR #15).
     let status_info = if content_active {
-        Some(info(target)?)
+        Some(original_info.clone())
     } else {
         None
     };
@@ -4613,7 +4701,29 @@ fn attach_with_presence_and_cue(
     if let Some((_, nested_detection_thread)) = nested_detection {
         let _ = nested_detection_thread.join();
     }
-    finish_attach_results(output_result, input_result)
+    let should_diagnose = output_result
+        .as_ref()
+        .err()
+        .is_some_and(anyhow_error_is_broken_pipe)
+        || input_result
+            .as_ref()
+            .err()
+            .is_some_and(anyhow_error_is_broken_pipe);
+    let attach_result = finish_attach_results(output_result, input_result);
+
+    // Lifecycle RPCs and user-facing error rendering must happen only after all
+    // lterm-owned terminal surfaces have restored raw mode, keyboard state,
+    // status rows, cursor visibility, and any cmux status artifact.
+    drop(status_bar);
+    drop(cmux_status_sink);
+    drop(title_cue_runtime);
+    drop(_attach_active);
+    drop(terminal_guards);
+
+    match attach_result {
+        Err(error) if should_diagnose => Err(diagnose_attach_failure(error, original_info)),
+        result => result,
+    }
 }
 
 fn join_attach_input_thread(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
@@ -4632,6 +4742,108 @@ fn finish_attach_results(output_result: Result<()>, input_result: Result<()>) ->
             "{output_err:#}; attach input thread also failed: {input_err:#}"
         )),
     }
+}
+
+fn diagnose_attach_failure(primary: anyhow::Error, original: &SessionInfo) -> anyhow::Error {
+    let live = rpc::<SessionInfo>(&Request::Info {
+        target: original.id.clone(),
+    })
+    .ok();
+    let matching_live = live.as_ref().filter(|info| info.id == original.id);
+    let needs_exit_lookup = matching_live.is_none()
+        || matching_live.is_some_and(|info| {
+            matches!(info.lifecycle_state(), SessionLifecycleState::Ending { .. })
+        });
+    let recent = if needs_exit_lookup {
+        rpc::<Vec<RecentSessionExit>>(&Request::RecentExits {
+            target: Some(original.id.clone()),
+            limit: 1,
+            scope: ExitListScope::All,
+        })
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    match format_attach_failure_diagnosis(original, matching_live, &recent) {
+        Some(suffix) => anyhow!("{primary:#}; {suffix}"),
+        None => primary,
+    }
+}
+
+fn format_attach_failure_diagnosis(
+    original: &SessionInfo,
+    live: Option<&SessionInfo>,
+    recent: &[RecentSessionExit],
+) -> Option<String> {
+    let live = live.filter(|info| info.id == original.id);
+    if let Some(info) = live {
+        match info.lifecycle_state() {
+            SessionLifecycleState::Healthy if info.is_live_work() => {
+                let hint = shell_join(&[
+                    "lterm".to_string(),
+                    "resume".to_string(),
+                    "--".to_string(),
+                    original.name.clone(),
+                ])
+                .ok();
+                let mut message = format!(
+                    "attach transport lost; session remains alive (session_id={})",
+                    sanitize::terminal_text(&original.id)
+                );
+                if let Some(hint) = hint {
+                    message.push_str(&format!("; resume with `{hint}`"));
+                }
+                return Some(message);
+            }
+            SessionLifecycleState::MonitorFailed if info.is_live_work() => {
+                return Some(format!(
+                    "attach transport lost; leader state is unknown (session_id={})",
+                    sanitize::terminal_text(&original.id)
+                ));
+            }
+            SessionLifecycleState::Ending { trigger } => {
+                let mut message = format!(
+                    "session is ending and is not reconnectable (session_id={}, trigger={})",
+                    sanitize::terminal_text(&original.id),
+                    sanitize::terminal_text(&trigger.to_string())
+                );
+                if let Some(exit) = recent.iter().find(|exit| exit.session_id == original.id) {
+                    message.push_str(&format_recent_exit_outcome(exit));
+                }
+                return Some(message);
+            }
+            _ => {
+                return Some(format!(
+                    "attach transport lost; leader state is unknown (session_id={})",
+                    sanitize::terminal_text(&original.id)
+                ));
+            }
+        }
+    }
+
+    recent
+        .iter()
+        .find(|exit| exit.session_id == original.id)
+        .map(|exit| {
+            format!(
+                "session ended during attach (session_id={}, trigger={}){}",
+                sanitize::terminal_text(&exit.session_id),
+                sanitize::terminal_text(&exit.trigger.to_string()),
+                format_recent_exit_outcome(exit)
+            )
+        })
+}
+
+fn format_recent_exit_outcome(exit: &RecentSessionExit) -> String {
+    let mut details = format!("; outcome={}", exit.outcome_state.as_str());
+    if let Some(exit_code) = exit.exit_code {
+        details.push_str(&format!("; exit_code={exit_code}"));
+    }
+    if let Some(signal) = exit.signal.as_deref() {
+        details.push_str(&format!("; signal={}", sanitize::terminal_text(signal)));
+    }
+    details
 }
 
 fn attach_pty_rows(rows: u16, show_status: bool) -> u16 {
@@ -7223,26 +7435,28 @@ mod tests {
         StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
         TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
-        apply_pending_status_command, attach_pty_rows, build_process_tree_from_rows,
-        build_status_payload, compose_commit_bytes, compose_display_line,
-        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
-        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
-        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
-        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled,
-        create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
-        dectcem_param_matches, ensure_panic_terminal_cleanup_hook,
+        apply_pending_status_command, attach_pty_rows, automatic_reconnect_candidate,
+        build_process_tree_from_rows, build_status_payload, compose_commit_bytes,
+        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
+        compose_push_paste, compose_refresh_interval, compose_render_action,
+        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
+        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
+        compute_sink_enabled, create_private_capability_file, current_unix_ms,
+        cursor_clamp_into_scroll_region, dectcem_param_matches,
+        ensure_automatic_reconnect_candidate, ensure_panic_terminal_cleanup_hook,
         ensure_trace_force_target_private, extract_search_matches, extract_urls,
-        finish_attach_results, format_status_line, forward_pty_output_frame_or_detached,
-        handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
-        hex_encoded_len, instrument_protocol_error, interruptible_sleep, is_self_provided_tmux,
-        join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
-        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
-        mobile_transcript_grep_query, nested_known_agent_present_in_processes,
-        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
-        parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_private_capability_file, read_reconnect_state_best_effort_from_path,
-        read_reconnect_state_from_path, read_trace_jsonl_line,
+        finish_attach_results, format_attach_failure_diagnosis, format_status_line,
+        forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
+        heartbeat_due, hex_decode, hex_encode, hex_encoded_len, instrument_protocol_error,
+        interruptible_sleep, is_self_provided_tmux, join_attach_input_thread,
+        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
+        mobile_client_detected, mobile_transcript_capture_changed, mobile_transcript_grep_query,
+        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_private_capability_file,
+        read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
+        read_trace_jsonl_line, recent_exits_protocol_error,
         remember_reconnect_target_best_effort_at_path, reset_raw_attach_initial_sgr_if_needed,
         resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
         run_nested_agent_detection_loop, run_status_command, select_status_backend,
@@ -7251,6 +7465,10 @@ mod tests {
         trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
+    };
+    use crate::protocol::{
+        ExitEvidenceState, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
+        SessionLifecycleState,
     };
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -7896,7 +8114,60 @@ mod tests {
             process_group_id: None,
             status_theme: None,
             agent_name: agent_name.map(str::to_string),
+            lifecycle_state: None,
         }
+    }
+
+    #[test]
+    fn automatic_reconnect_accepts_only_healthy_live_sessions() {
+        let mut info = sample_session_info("agent", "sh", None);
+        assert!(automatic_reconnect_candidate(&info));
+        assert!(ensure_automatic_reconnect_candidate(&info).is_ok());
+
+        info.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        assert!(!automatic_reconnect_candidate(&info));
+        let error = ensure_automatic_reconnect_candidate(&info)
+            .expect_err("monitor-failed reconnect must require explicit selection")
+            .to_string();
+        assert!(error.contains("leader state is unknown"), "{error}");
+        assert!(error.contains("lterm resume"), "{error}");
+
+        info.alive = false;
+        info.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::DaemonShutdown,
+        });
+        assert!(!automatic_reconnect_candidate(&info));
+        let error = ensure_automatic_reconnect_candidate(&info)
+            .expect_err("ending reconnect must be rejected")
+            .to_string();
+        assert!(error.contains("ending session"), "{error}");
+        assert!(!error.contains("lterm resume"), "{error}");
+    }
+
+    #[test]
+    fn recent_exits_protocol_guard_is_non_destructive_and_explicit() {
+        let old = DaemonStatus {
+            version: "1.0.31".to_string(),
+            protocol_version: 7,
+            session_count: 1,
+            active_connections: 0,
+            shutting_down: false,
+            daemon_uid: None,
+            started_at_unix_secs: None,
+        };
+        let message = recent_exits_protocol_error(&old).expect("protocol 7 must be rejected");
+        assert!(message.contains("upgrade/restart is required"), "{message}");
+        assert!(
+            message.contains("no live session was modified"),
+            "{message}"
+        );
+        assert!(!message.contains("lterm shutdown"), "{message}");
+
+        let current = DaemonStatus {
+            protocol_version: super::RECENT_EXITS_PROTOCOL_VERSION,
+            ..old
+        };
+        assert_eq!(recent_exits_protocol_error(&current), None);
     }
 
     #[test]
@@ -12038,6 +12309,77 @@ mod tests {
         );
         assert!(err.contains("attach input thread also failed"), "{err}");
         assert!(err.contains("read stdin"), "{err}");
+    }
+
+    #[test]
+    fn attach_failure_diagnosis_uses_immutable_uuid_and_distinguishes_lifecycle_state() {
+        let original = sample_session_info("reused-name", "sh", None);
+
+        let mut healthy = original.clone();
+        healthy.lifecycle_state = Some(SessionLifecycleState::Healthy);
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&healthy), &[])
+            .expect("healthy diagnosis");
+        assert!(diagnosis.contains("session remains alive"), "{diagnosis}");
+        assert!(diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut degraded = original.clone();
+        degraded.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&degraded), &[])
+            .expect("monitor-failed diagnosis");
+        assert!(diagnosis.contains("leader state is unknown"), "{diagnosis}");
+        assert!(!diagnosis.contains("remains alive"), "{diagnosis}");
+        assert!(!diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut ending = original.clone();
+        ending.alive = false;
+        ending.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::CloseRequested,
+        });
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&ending), &[])
+            .expect("ending diagnosis");
+        assert!(diagnosis.contains("session is ending"), "{diagnosis}");
+        assert!(diagnosis.contains("close_requested"), "{diagnosis}");
+        assert!(!diagnosis.contains("lterm resume"), "{diagnosis}");
+
+        let mut reused = original.clone();
+        reused.id = "different-uuid".to_string();
+        let exit = RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: original.id.clone(),
+            name: original.name.clone(),
+            pane_id: original.pane_id.clone(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: None,
+            created_unix_ms: 1,
+            trigger_claimed_unix_ms: 2,
+            reaped_unix_ms: Some(3),
+            trigger: SessionExitTrigger::LeaderExited,
+            outcome_state: ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: None,
+            evidence_state: ExitEvidenceState::Complete,
+        };
+        let diagnosis = format_attach_failure_diagnosis(&original, Some(&reused), &[exit])
+            .expect("recorded exit diagnosis");
+        assert!(
+            diagnosis.contains("session ended during attach"),
+            "{diagnosis}"
+        );
+        assert!(diagnosis.contains("exit_code=37"), "{diagnosis}");
+        assert!(!diagnosis.contains("session remains alive"), "{diagnosis}");
+    }
+
+    #[test]
+    fn attach_diagnostic_suffix_keeps_the_original_output_error_first() {
+        let original = sample_session_info("agent", "sh", None);
+        let suffix = format_attach_failure_diagnosis(&original, Some(&original), &[])
+            .expect("healthy diagnosis");
+        let combined = anyhow::anyhow!("read pty output; {suffix}");
+        assert!(
+            format!("{combined:#}").starts_with("read pty output"),
+            "output error must remain primary"
+        );
     }
 
     #[test]

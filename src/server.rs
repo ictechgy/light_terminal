@@ -1,12 +1,16 @@
+#[path = "session_lifecycle.rs"]
+mod session_lifecycle;
+
 use crate::paths;
 use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
     CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
-    MetadataHistoryResult, MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate,
-    MetadataPurgeResult, MetadataStepDirection, MetadataStepResult, MetadataValue,
-    PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest, SessionInfo, StatusTheme,
-    WaitContainsResult, WaitExitResult,
+    MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
+    MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
+    MetadataValue, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
+    SessionExitTrigger, SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult,
+    WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -67,6 +71,8 @@ const MAX_INPUT_CAPABILITIES_PER_SESSION: usize = 64;
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type LifecycleTestHook = Arc<dyn Fn() + Send + Sync>;
 
 /// attach 클라이언트 한 명의 lifecycle 단위.
 ///
@@ -157,6 +163,7 @@ struct State {
     // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
     // 보내 client가 uptime을 omit하게 한다.
     started_at_unix_secs: Option<u64>,
+    lifecycle_journal: Option<Arc<session_lifecycle::LifecycleJournal>>,
 }
 
 #[derive(Default)]
@@ -175,8 +182,17 @@ impl State {
     // 카운터 계열은 Default::default()로 0에서 시작해도 항상 안전하므로 wire에
     // 의존하는 시작 시각만 인자로 받는다. 테스트는 State::default()를 그대로 사용.
     fn new(started_at_unix_secs: Option<u64>) -> Self {
+        let lifecycle_journal = paths::session_lifecycle_dir()
+            .and_then(|path| session_lifecycle::LifecycleJournal::open(&path))
+            .map(Arc::new)
+            .map_err(|err| {
+                eprintln!("lifecycle journal unavailable: {err:#}");
+                err
+            })
+            .ok();
         Self {
             started_at_unix_secs,
+            lifecycle_journal,
             ..Self::default()
         }
     }
@@ -389,10 +405,27 @@ struct Session {
     /// Whether the leader process is still considered live for user-visible
     /// session state and attach input loops.
     alive: AtomicBool,
+    lifecycle: Arc<session_lifecycle::LifecyclePublication>,
+    trigger_claimed_unix_ms: Mutex<Option<u128>>,
+    #[cfg(test)]
+    identity_mutation_admitted_hook: Mutex<Option<LifecycleTestHook>>,
     /// One-shot finalizer gate shared by the leader waiter and explicit
     /// kill/shutdown paths. `alive` can become false before teardown finishes,
     /// so cleanup needs its own idempotence and completion state.
     cleanup_started: AtomicBool,
+    /// Test-only observer for the destructive boundary. Attach-only regression
+    /// tests assert this remains zero after subscription teardown, stale resize,
+    /// and backpressure eviction paths.
+    #[cfg(test)]
+    finalization_attempts: AtomicU64,
+    #[cfg(test)]
+    force_waitid_failure: AtomicBool,
+    #[cfg(test)]
+    fallback_wait_poll_hook: Mutex<Option<LifecycleTestHook>>,
+    #[cfg(test)]
+    terminate_child_boundary_hook: Mutex<Option<LifecycleTestHook>>,
+    #[cfg(test)]
+    process_identity_signal_attempts: AtomicU64,
     cleanup_completion: (Mutex<bool>, Condvar),
     cleanup_complete: AtomicBool,
     /// Set after `waitid(..., WNOWAIT)` observes leader exit but before the
@@ -460,6 +493,32 @@ impl Session {
             process_group_id: self.process_group_id,
             status_theme: metadata.status_theme,
             agent_name: self.agent_name.clone(),
+            lifecycle_state: Some(match self.lifecycle.presentation() {
+                session_lifecycle::SessionPresentation::Healthy => SessionLifecycleState::Healthy,
+                session_lifecycle::SessionPresentation::MonitorFailed => {
+                    SessionLifecycleState::MonitorFailed
+                }
+                session_lifecycle::SessionPresentation::Ending { trigger } => {
+                    SessionLifecycleState::Ending {
+                        trigger: public_trigger(&trigger),
+                    }
+                }
+            }),
+        }
+    }
+
+    fn lifecycle_identity(&self) -> session_lifecycle::LifecycleIdentity {
+        session_lifecycle::LifecycleIdentity {
+            session_id: self.id.clone(),
+            name: self.name(),
+            pane_id: self.pane_id.clone(),
+            parent_session_id: lock(&self.parent_session_id).clone(),
+            parent_pane_id: lock(&self.parent_pane_id).clone(),
+            agent_name: self.agent_name.clone(),
+            created_unix_ms: self.created_unix_ms,
+            process_id: self.process_id,
+            process_group_id: self.process_group_id,
+            attached_clients: lock(&self.subscribers).len(),
         }
     }
 
@@ -1722,9 +1781,31 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 let sessions = lock(&state.sessions);
                 sessions.by_pane.values().cloned().collect()
             };
-            let mut infos: Vec<_> = sessions.iter().map(|s| s.info()).collect();
+            let mut infos: Vec<_> = sessions
+                .iter()
+                .map(|session| session.info())
+                .filter(SessionInfo::is_live_work)
+                .collect();
             infos.sort_by_key(|info| info.created_unix_ms);
             Ok(Response::ok(infos))
+        }
+        Request::RecentExits {
+            target,
+            limit,
+            scope,
+        } => {
+            if limit == 0 || limit > MAX_RECENT_EXITS_LIMIT {
+                bail!("recent exit limit must be between 1 and {MAX_RECENT_EXITS_LIMIT}");
+            }
+            let journal = state
+                .lifecycle_journal
+                .as_ref()
+                .context("recent exit evidence is unavailable")?;
+            Ok(Response::ok(journal.recent_exits(
+                target.as_deref(),
+                limit,
+                scope,
+            )))
         }
         Request::Info { target } => Ok(Response::ok(resolve_session(state, &target)?.info())),
         Request::Instrument { target } => Ok(Response::ok(
@@ -1868,7 +1949,11 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             state.shutting_down.store(true, Ordering::SeqCst);
             let sessions: Vec<_> = lock(&state.sessions).by_pane.values().cloned().collect();
             for session in sessions {
-                terminate_session(state, &session);
+                finalize_session(
+                    state,
+                    &session,
+                    session_lifecycle::FinalizeTrigger::DaemonShutdown,
+                );
             }
             Ok(Response::empty())
         }
@@ -2107,7 +2192,21 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         geometry_apply: Mutex::new(()),
         next_subscriber_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
+        lifecycle: Arc::new(session_lifecycle::LifecyclePublication::default()),
+        trigger_claimed_unix_ms: Mutex::new(None),
+        #[cfg(test)]
+        identity_mutation_admitted_hook: Mutex::new(None),
         cleanup_started: AtomicBool::new(false),
+        #[cfg(test)]
+        finalization_attempts: AtomicU64::new(0),
+        #[cfg(test)]
+        force_waitid_failure: AtomicBool::new(false),
+        #[cfg(test)]
+        fallback_wait_poll_hook: Mutex::new(None),
+        #[cfg(test)]
+        terminate_child_boundary_hook: Mutex::new(None),
+        #[cfg(test)]
+        process_identity_signal_attempts: AtomicU64::new(0),
         cleanup_completion: (Mutex::new(false), Condvar::new()),
         cleanup_complete: AtomicBool::new(false),
         leader_exit_observed: AtomicBool::new(false),
@@ -2147,38 +2246,87 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
     let session_for_waiter = Arc::clone(&session);
     thread::spawn(move || {
         let leader_exit_observed = wait_for_leader_exit_without_reaping(&session_for_waiter);
-        let exit_code = {
-            let mut child = lock(&session_for_waiter.child);
-            if leader_exit_observed {
-                terminate_unreaped_process_group(&session_for_waiter, &child);
+        let observed_claim = leader_exit_observed.then(|| {
+            publish_lifecycle_trigger(
+                &state_for_waiter,
+                &session_for_waiter,
+                session_lifecycle::FinalizeTrigger::LeaderExited,
+            )
+        });
+        let wait_result =
+            wait_for_child_and_publish_reaped(&session_for_waiter, leader_exit_observed);
+        match wait_result {
+            Ok(status) => {
+                let (exit_code, signal) = portable_exit_evidence(&status);
+                session_for_waiter
+                    .exit_code
+                    .store(exit_code, Ordering::SeqCst);
+                let claim = observed_claim.unwrap_or_else(|| {
+                    publish_lifecycle_trigger(
+                        &state_for_waiter,
+                        &session_for_waiter,
+                        session_lifecycle::FinalizeTrigger::LeaderExited,
+                    )
+                });
+                publish_leader_reaped(
+                    &state_for_waiter,
+                    &session_for_waiter,
+                    &claim,
+                    exit_code,
+                    signal,
+                );
+                finalize_session(
+                    &state_for_waiter,
+                    &session_for_waiter,
+                    claim.authoritative_trigger,
+                );
             }
-            let exit_code = match child.wait() {
-                Ok(status) => status.exit_code().min(i32::MAX as u32) as i32,
-                Err(err) => {
-                    eprintln!("wait error for {}: {err}", session_for_waiter.name());
-                    1
+            Err(err) => {
+                eprintln!("wait error for {}: {err}", session_for_waiter.name());
+                if let Some(trigger) = session_for_waiter.lifecycle.authoritative_trigger() {
+                    finalize_session(&state_for_waiter, &session_for_waiter, trigger);
+                } else {
+                    session_for_waiter.lifecycle.mark_monitor_failed();
                 }
-            };
-            // Writer-side half of the stored-PGID invariant: callers may use
-            // the unreaped process-group cleanup only while holding this same
-            // child lock, so the flag cannot flip between their guard check
-            // and residual signal ladder.
-            session_for_waiter
-                .leader_reaped
-                .store(true, Ordering::SeqCst);
-            exit_code
-        };
-        session_for_waiter
-            .exit_code
-            .store(exit_code, Ordering::SeqCst);
-        finalize_session(
-            &state_for_waiter,
-            &session_for_waiter,
-            SessionFinalizeReason::LeaderExited,
-        );
+            }
+        }
     });
 
     Ok(session)
+}
+
+fn wait_for_child_and_publish_reaped(
+    session: &Session,
+    leader_exit_observed: bool,
+) -> std::io::Result<portable_pty::ExitStatus> {
+    let mut cleanup_unreaped_group = leader_exit_observed;
+    loop {
+        {
+            let mut child = lock(&session.child);
+            if cleanup_unreaped_group {
+                terminate_unreaped_process_group(session, &child);
+                cleanup_unreaped_group = false;
+            }
+            if let Some(status) = child.try_wait()? {
+                // `try_wait` reaps on success. Publish that fact before releasing
+                // `child`, so a close/shutdown contender either signals while the
+                // leader still anchors its pid/pgid or observes `leader_reaped`
+                // and skips every stored-identity signal.
+                session.leader_reaped.store(true, Ordering::SeqCst);
+                return Ok(status);
+            }
+        }
+
+        // A failed waitid probe must not turn the portable blocking `Child::wait`
+        // fallback into ownership of the signaling mutex. Polling `try_wait`
+        // keeps each ownership interval bounded while preserving the atomic
+        // reap-publication handoff above.
+        #[cfg(test)]
+        if let Some(hook) = lock(&session.fallback_wait_poll_hook).take() {
+            hook();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct SpawnedChildGuard {
@@ -2538,6 +2686,7 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
         })?;
 
         let mut metadata = lock(&session.metadata);
+        reject_identity_mutation_while_ending(&session)?;
         if metadata.current.name == new_name {
             if sessions
                 .by_name
@@ -2586,6 +2735,9 @@ fn rename_session(state: &Arc<State>, target: &str, new_name: String) -> Result<
                 after: after.clone(),
             };
 
+            #[cfg(test)]
+            pause_after_identity_mutation_admission_for_test(&session);
+            let _identity_commit = identity_commit_guard(&session)?;
             sessions.by_name.remove(&old_name);
             sessions
                 .by_name
@@ -2612,6 +2764,30 @@ fn validate_metadata_append(metadata: &SessionMetadata) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn reject_identity_mutation_while_ending(session: &Session) -> Result<()> {
+    if matches!(
+        session.lifecycle.presentation(),
+        session_lifecycle::SessionPresentation::Ending { .. }
+    ) {
+        bail!("session is ending; identity metadata cannot be changed");
+    }
+    Ok(())
+}
+
+fn identity_commit_guard(session: &Session) -> Result<session_lifecycle::IdentityCommitGuard<'_>> {
+    session
+        .lifecycle
+        .identity_commit_guard()
+        .context("session is ending; identity metadata cannot be changed")
+}
+
+#[cfg(test)]
+fn pause_after_identity_mutation_admission_for_test(session: &Session) {
+    if let Some(hook) = lock(&session.identity_mutation_admitted_hook).take() {
+        hook();
+    }
 }
 
 fn metadata_history(state: &Arc<State>, target: &str) -> Result<MetadataHistoryResult> {
@@ -2650,6 +2826,7 @@ fn metadata_step(
         )
     })?;
     let mut metadata = lock(&session.metadata);
+    reject_identity_mutation_while_ending(&session)?;
     let (entry, expected, next, next_cursor) = match direction {
         MetadataStepDirection::Undo => {
             let index = metadata
@@ -2694,6 +2871,9 @@ fn metadata_step(
         entry_count: metadata.entries.len(),
     };
 
+    #[cfg(test)]
+    pause_after_identity_mutation_admission_for_test(&session);
+    let _identity_commit = identity_commit_guard(&session)?;
     apply_metadata_name_transition(&mut sessions, &session, &metadata.current.name, &next.name);
     metadata.current = next;
     metadata.cursor = next_cursor;
@@ -2859,7 +3039,13 @@ fn terminate_child_sessions(state: &Arc<State>, parent_session_id: &str) {
             .collect()
     };
     for child in children {
-        terminate_session(state, &child);
+        finalize_session(
+            state,
+            &child,
+            session_lifecycle::FinalizeTrigger::ParentCascade {
+                parent_session_id: parent_session_id.to_string(),
+            },
+        );
     }
 }
 
@@ -2888,25 +3074,45 @@ fn verified_process_group_id(
     None
 }
 
-#[derive(Clone, Copy, Debug)]
-enum SessionFinalizeReason {
-    LeaderExited,
-    TerminateRequested,
+fn public_trigger(trigger: &session_lifecycle::FinalizeTrigger) -> SessionExitTrigger {
+    match trigger {
+        session_lifecycle::FinalizeTrigger::LeaderExited => SessionExitTrigger::LeaderExited,
+        session_lifecycle::FinalizeTrigger::CloseRequested => SessionExitTrigger::CloseRequested,
+        session_lifecycle::FinalizeTrigger::DaemonShutdown => SessionExitTrigger::DaemonShutdown,
+        session_lifecycle::FinalizeTrigger::ParentCascade { parent_session_id } => {
+            SessionExitTrigger::ParentCascade {
+                parent_session_id: parent_session_id.clone(),
+            }
+        }
+    }
 }
 
 fn terminate_session(state: &Arc<State>, session: &Session) {
-    finalize_session(state, session, SessionFinalizeReason::TerminateRequested);
+    finalize_session(
+        state,
+        session,
+        session_lifecycle::FinalizeTrigger::CloseRequested,
+    );
 }
 
-fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinalizeReason) {
-    session.alive.store(false, Ordering::SeqCst);
+fn finalize_session(
+    state: &Arc<State>,
+    session: &Session,
+    trigger: session_lifecycle::FinalizeTrigger,
+) {
+    #[cfg(test)]
+    session.finalization_attempts.fetch_add(1, Ordering::SeqCst);
+    let claim = publish_lifecycle_trigger(state, session, trigger);
     if session.cleanup_started.swap(true, Ordering::SeqCst) {
         wait_for_cleanup_complete(session);
         return;
     }
 
     let mut completion_guard = CleanupCompletionGuard::new(session);
-    if matches!(reason, SessionFinalizeReason::TerminateRequested) {
+    if !matches!(
+        claim.authoritative_trigger,
+        session_lifecycle::FinalizeTrigger::LeaderExited
+    ) {
         terminate_process_group_for_request(session);
     }
     session.close_subscribers();
@@ -2914,6 +3120,82 @@ fn finalize_session(state: &Arc<State>, session: &Session, reason: SessionFinali
     remove_session(state, session);
     mark_cleanup_complete(session);
     completion_guard.disarm();
+}
+
+fn publish_lifecycle_trigger(
+    state: &Arc<State>,
+    session: &Session,
+    trigger: session_lifecycle::FinalizeTrigger,
+) -> session_lifecycle::ClaimAttempt {
+    let claim = session.lifecycle.claim(trigger, &session.alive);
+    if claim.claimant {
+        let claimed_at = now_unix_ms();
+        *lock(&session.trigger_claimed_unix_ms) = Some(claimed_at);
+        let mut guard =
+            session_lifecycle::ClaimResolutionGuard::new(&session.lifecycle, claim.event_id);
+        let event = session_lifecycle::LifecycleEvent::trigger_claimed(
+            claim.event_id,
+            session.lifecycle_identity(),
+            claimed_at,
+            public_trigger(&claim.authoritative_trigger),
+        );
+        if let Some(journal) = &state.lifecycle_journal {
+            journal.enqueue_claimed(event, Arc::clone(&session.lifecycle), claim.event_id);
+        } else {
+            session.lifecycle.resolve(
+                claim.event_id,
+                session_lifecycle::WriteOutcome::WriterUnavailable,
+            );
+        }
+        guard.disarm();
+    }
+    let resolution = session.lifecycle.wait_for_resolution();
+    if resolution.outcome != session_lifecycle::WriteOutcome::Persisted {
+        eprintln!(
+            "lifecycle trigger publication for {} completed as {:?}",
+            session.name(),
+            resolution.outcome
+        );
+    }
+    claim
+}
+
+fn publish_leader_reaped(
+    state: &Arc<State>,
+    session: &Session,
+    claim: &session_lifecycle::ClaimAttempt,
+    exit_code: i32,
+    signal: Option<String>,
+) {
+    let Some(claimed_at) = *lock(&session.trigger_claimed_unix_ms) else {
+        return;
+    };
+    let Some(journal) = &state.lifecycle_journal else {
+        return;
+    };
+    let event = session_lifecycle::LifecycleEvent::leader_reaped(
+        claim.event_id,
+        session.lifecycle_identity(),
+        claimed_at,
+        now_unix_ms(),
+        public_trigger(&claim.authoritative_trigger),
+        exit_code,
+        signal,
+    );
+    let outcome = journal.enqueue_event(event);
+    if outcome != session_lifecycle::WriteOutcome::Persisted {
+        eprintln!(
+            "lifecycle reap publication for {} completed as {:?}",
+            session.name(),
+            outcome
+        );
+    }
+}
+
+fn portable_exit_evidence(status: &portable_pty::ExitStatus) -> (i32, Option<String>) {
+    let exit_code = status.exit_code().min(i32::MAX as u32) as i32;
+    let signal = status.signal().map(session_lifecycle::sanitize_exit_signal);
+    (exit_code, signal)
 }
 
 struct CleanupCompletionGuard<'a> {
@@ -3237,6 +3519,10 @@ fn terminate_process_group_for_request(session: &Session) {
     // Hold the child lock while signaling so the waiter cannot reap the leader
     // and release the pgid anchor between an unreaped-pgid check and `kill`.
     let reap_guard = lock(&session.child);
+    #[cfg(test)]
+    if let Some(hook) = lock(&session.terminate_child_boundary_hook).take() {
+        hook();
+    }
     if session.leader_reaped.load(Ordering::SeqCst) {
         return;
     }
@@ -3281,6 +3567,10 @@ fn wait_for_leader_exit_observed(session: &Session, timeout: Duration) -> bool {
 }
 
 fn wait_for_leader_exit_without_reaping(session: &Session) -> bool {
+    #[cfg(test)]
+    if session.force_waitid_failure.load(Ordering::SeqCst) {
+        return false;
+    }
     let Some(pid) = session
         .process_id
         .and_then(|pid| libc::pid_t::try_from(pid).ok())
@@ -3380,6 +3670,10 @@ fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
     let Some(pgid) = session.process_group_id.filter(|pgid| *pgid > 1) else {
         return;
     };
+    #[cfg(test)]
+    session
+        .process_identity_signal_attempts
+        .fetch_add(1, Ordering::SeqCst);
     let rc = unsafe { libc::kill(-pgid, signal) };
     if rc == 0 {
         return;
@@ -3397,6 +3691,10 @@ fn signal_unreaped_process_group(session: &Session, signal: libc::c_int) {
 
 fn signal_process_group(session: &Session, signal: libc::c_int) {
     if let Some(pgid) = verified_session_process_group_id(session) {
+        #[cfg(test)]
+        session
+            .process_identity_signal_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let rc = unsafe { libc::kill(-pgid, signal) };
         if rc == 0 {
             return;
@@ -3417,6 +3715,10 @@ fn signal_process_group(session: &Session, signal: libc::c_int) {
         .process_id
         .and_then(|pid| libc::pid_t::try_from(pid).ok())
     {
+        #[cfg(test)]
+        session
+            .process_identity_signal_attempts
+            .fetch_add(1, Ordering::SeqCst);
         let rc = unsafe { libc::kill(pid, signal) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
@@ -4214,19 +4516,21 @@ mod tests {
         apply_capability_input, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
         forward_attach_output, handle_capability_channel, initial_pty_size, issue_input_capability,
         metadata_history, metadata_purge_history, metadata_step, os_key_is_private_multiplexer_env,
-        os_key_starts_with_cmux_prefix, process_group_still_owns_child,
+        os_key_starts_with_cmux_prefix, portable_exit_evidence, process_group_still_owns_child,
         read_request_frame_with_limit, read_request_frame_with_timeout, remove_session,
         rename_session, request_frame_from_chunk, revoke_input_capability, sanitize_child_env,
         sanitized_tail_for_needle, set_status_theme, validate_terminal_geometry,
         verify_linux_peercred_len, verify_peer_uid, wait_for_session_contains,
     };
     use crate::protocol::{
-        CapabilityAction, CapabilityToken, MAX_METADATA_JOURNAL_ENTRIES, MetadataStepDirection,
-        StatusTheme,
+        CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
+        MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request,
+        SessionExitTrigger, SessionLifecycleState, StatusTheme,
     };
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
     use std::io::{BufRead, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -4732,7 +5036,11 @@ mod tests {
     /// 검증하려는 것은 `subscribe_with_snapshot`/`append_output` 의 채널 기반 의미
     /// 이지 PTY 실제 동작이 아니다. 호출자는 명시적으로 `terminate` 같은 정리를 할
     /// 필요가 없도록 child 가 자동 종료되는 짧은 명령 (`true`) 을 띄운다.
-    fn build_test_session(name: &str) -> Arc<Session> {
+    fn build_test_session_with_command(
+        name: &str,
+        mut command: CommandBuilder,
+        retain_process_identity: bool,
+    ) -> Arc<Session> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -4742,19 +5050,18 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("openpty for test session");
-        // `true` 는 즉시 종료되지만 PTY 마스터/슬레이브 fd 는 살아 있어 Session 구조에
-        // 필요한 trait object 들을 채울 수 있다. process_id 는 보장되지 않으므로 None
-        // 으로 두어도 본 단위테스트가 사용하는 어떤 경로도 process_id 에 의존하지 않는다.
-        let true_path = ["/bin/true", "/usr/bin/true"]
-            .into_iter()
-            .find(|path| std::path::Path::new(path).is_file())
-            .expect("absolute true for test session");
-        let mut cmd = CommandBuilder::new(true_path);
-        cmd.cwd(std::env::current_dir().expect("test session cwd"));
+        command.cwd(std::env::current_dir().expect("test session cwd"));
         let child = pair
             .slave
-            .spawn_command(cmd)
-            .expect("spawn `true` for test session");
+            .spawn_command(command)
+            .expect("spawn test session command");
+        let process_id =
+            retain_process_identity.then(|| child.process_id().expect("test child process id"));
+        let process_group_id = retain_process_identity.then(|| {
+            pair.master
+                .process_group_leader()
+                .expect("test child process group")
+        });
         let killer = child.clone_killer();
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("take pty writer");
@@ -4769,8 +5076,8 @@ mod tests {
             cwd: ".".to_string(),
             agent_name: None,
             created_unix_ms: 0,
-            process_id: None,
-            process_group_id: None,
+            process_id,
+            process_group_id,
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             master: Mutex::new(pair.master),
@@ -4791,7 +5098,15 @@ mod tests {
             geometry_apply: Mutex::new(()),
             next_subscriber_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
+            lifecycle: Arc::new(super::session_lifecycle::LifecyclePublication::default()),
+            trigger_claimed_unix_ms: Mutex::new(None),
+            identity_mutation_admitted_hook: Mutex::new(None),
             cleanup_started: AtomicBool::new(false),
+            finalization_attempts: AtomicU64::new(0),
+            force_waitid_failure: AtomicBool::new(false),
+            fallback_wait_poll_hook: Mutex::new(None),
+            terminate_child_boundary_hook: Mutex::new(None),
+            process_identity_signal_attempts: AtomicU64::new(0),
             cleanup_completion: (Mutex::new(false), Condvar::new()),
             cleanup_complete: AtomicBool::new(false),
             leader_exit_observed: AtomicBool::new(false),
@@ -4801,6 +5116,27 @@ mod tests {
             rows: Mutex::new(24),
             cols: Mutex::new(80),
         })
+    }
+
+    fn build_test_session(name: &str) -> Arc<Session> {
+        // `true` exits immediately while the PTY descriptors remain valid for
+        // unit tests that need a fully populated Session.
+        let true_path = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("absolute true for test session");
+        build_test_session_with_command(name, CommandBuilder::new(true_path), false)
+    }
+
+    fn build_long_lived_test_session(name: &str) -> Arc<Session> {
+        let shell_path = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("absolute shell for test session");
+        let mut command = CommandBuilder::new(shell_path);
+        command.arg("-c");
+        command.arg("trap 'exit 0' HUP TERM; while :; do sleep 1; done");
+        build_test_session_with_command(name, command, true)
     }
 
     fn install_test_capability(
@@ -4829,6 +5165,37 @@ mod tests {
         sessions
             .by_id
             .insert(session.id.clone(), Arc::clone(session));
+    }
+
+    fn assert_attach_fault_kept_session_live_and_indexed(
+        state: &Arc<State>,
+        session: &Arc<Session>,
+    ) {
+        assert!(
+            session.alive.load(Ordering::SeqCst),
+            "attach-only faults must not clear leader liveness"
+        );
+        assert!(
+            !session.cleanup_started.load(Ordering::SeqCst),
+            "attach-only faults must not enter destructive cleanup"
+        );
+        assert_eq!(
+            session.finalization_attempts.load(Ordering::SeqCst),
+            0,
+            "attach-only faults must not cross finalize_session"
+        );
+        let sessions = super::lock(&state.sessions);
+        for indexed in [
+            sessions.by_name.get(&session.name()),
+            sessions.by_pane.get(&session.pane_id),
+            sessions.by_id.get(&session.id),
+        ] {
+            let indexed = indexed.expect("session must remain present in every live index");
+            assert_eq!(
+                indexed.id, session.id,
+                "live index must retain the same UUID"
+            );
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4895,6 +5262,242 @@ mod tests {
         assert_eq!(redone.current, final_state.current);
         assert_eq!(redone.cursor, 1000);
         assert_eq!(redone.entries, final_state.entries);
+    }
+
+    #[test]
+    fn ending_rejects_uuid_rename_undo_and_redo_without_conflicting_reap_identity() {
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+        let session = build_test_session("ending-identity-a");
+        register_test_session(&state, &session);
+
+        rename_session(&state, &session.id, "ending-identity-b".to_string())
+            .expect("first pre-claim rename");
+        rename_session(&state, &session.id, "ending-identity-c".to_string())
+            .expect("second pre-claim rename");
+        metadata_step(&state, &session.id, MetadataStepDirection::Undo)
+            .expect("prepare both undo and redo history");
+        let claimed_identity = metadata_five_state(&state, &session);
+        assert_eq!(claimed_identity.current.name, "ending-identity-b");
+
+        let claim = super::publish_lifecycle_trigger(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested,
+        );
+        assert!(claim.claimant, "test must own the lifecycle claim");
+
+        let rename_err = rename_session(
+            &state,
+            &session.id,
+            "ending-identity-after-claim".to_string(),
+        )
+        .expect_err("UUID-targeted rename must reject Ending sessions");
+        assert!(rename_err.to_string().contains("session is ending"));
+        for direction in [MetadataStepDirection::Undo, MetadataStepDirection::Redo] {
+            let err = metadata_step(&state, &session.id, direction)
+                .expect_err("undo/redo must reject Ending sessions");
+            assert!(err.to_string().contains("session is ending"));
+        }
+        assert_eq!(
+            metadata_five_state(&state, &session),
+            claimed_identity,
+            "rejected Ending mutations must leave every metadata field unchanged"
+        );
+
+        super::publish_leader_reaped(&state, &session, &claim, 37, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let exit = loop {
+            let exits = state
+                .lifecycle_journal
+                .as_ref()
+                .expect("journal")
+                .recent_exits(Some(&session.id), 10, ExitListScope::All);
+            if let Some(exit) = exits
+                .into_iter()
+                .find(|exit| exit.outcome_state == ExitOutcomeState::Complete)
+            {
+                break exit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for complete reap evidence"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(exit.name, "ending-identity-b");
+        assert_eq!(exit.exit_code, Some(37));
+        assert_eq!(exit.evidence_state, ExitEvidenceState::Complete);
+    }
+
+    #[test]
+    fn ending_claim_between_identity_admission_and_commit_rejects_rename_undo_and_redo() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            Rename,
+            Undo,
+            Redo,
+        }
+
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+
+        for (index, mutation) in [Mutation::Rename, Mutation::Undo, Mutation::Redo]
+            .into_iter()
+            .enumerate()
+        {
+            let session = build_test_session(&format!("identity-race-{index}-a"));
+            register_test_session(&state, &session);
+            rename_session(&state, &session.id, format!("identity-race-{index}-b"))
+                .expect("first preparation rename");
+            rename_session(&state, &session.id, format!("identity-race-{index}-c"))
+                .expect("second preparation rename");
+            if matches!(mutation, Mutation::Redo) {
+                metadata_step(&state, &session.id, MetadataStepDirection::Undo)
+                    .expect("prepare redo cursor");
+            }
+            let claimed_identity = metadata_five_state(&state, &session);
+
+            let (admitted_tx, admitted_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let release_rx_for_hook = Arc::clone(&release_rx);
+            *super::lock(&session.identity_mutation_admitted_hook) = Some(Arc::new(move || {
+                admitted_tx
+                    .send(())
+                    .expect("report identity mutation admission");
+                release_rx_for_hook
+                    .lock()
+                    .expect("lock identity mutation release")
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("identity mutation release must stay bounded");
+            }));
+
+            let (mutation_tx, mutation_rx) = mpsc::sync_channel(1);
+            let state_for_mutation = Arc::clone(&state);
+            let session_for_mutation = Arc::clone(&session);
+            let mutation_thread = thread::spawn(move || {
+                let result = match mutation {
+                    Mutation::Rename => rename_session(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        format!("identity-race-{index}-after-ending"),
+                    )
+                    .map(|_| ()),
+                    Mutation::Undo => metadata_step(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        MetadataStepDirection::Undo,
+                    )
+                    .map(|_| ()),
+                    Mutation::Redo => metadata_step(
+                        &state_for_mutation,
+                        &session_for_mutation.id,
+                        MetadataStepDirection::Redo,
+                    )
+                    .map(|_| ()),
+                }
+                .map_err(|err| err.to_string());
+                mutation_tx
+                    .send(result)
+                    .expect("report identity mutation result");
+            });
+            admitted_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("identity mutation must reach the pre-commit pause");
+
+            let (claim_tx, claim_rx) = mpsc::sync_channel(1);
+            let state_for_claim = Arc::clone(&state);
+            let session_for_claim = Arc::clone(&session);
+            let claim_thread = thread::spawn(move || {
+                let claim = super::publish_lifecycle_trigger(
+                    &state_for_claim,
+                    &session_for_claim,
+                    super::session_lifecycle::FinalizeTrigger::LeaderExited,
+                );
+                claim_tx.send(claim).expect("report lifecycle claim");
+            });
+
+            let claim_deadline = Instant::now() + Duration::from_secs(2);
+            while !matches!(
+                session.lifecycle.presentation(),
+                super::session_lifecycle::SessionPresentation::Ending { .. }
+            ) {
+                assert!(
+                    Instant::now() < claim_deadline,
+                    "concurrent lifecycle claim must publish Ending before mutation resumes"
+                );
+                thread::yield_now();
+            }
+            release_tx
+                .send(())
+                .expect("release paused identity mutation");
+
+            let mutation_error = mutation_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("identity mutation must finish within bounds")
+                .expect_err("identity mutation must not commit after Ending");
+            assert!(
+                mutation_error.contains("session is ending"),
+                "unexpected {mutation:?} rejection: {mutation_error}"
+            );
+            let claim = claim_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("lifecycle claim must finish after metadata unlock");
+            assert!(claim.claimant, "concurrent waiter must own first trigger");
+            assert_eq!(
+                claim.authoritative_trigger,
+                super::session_lifecycle::FinalizeTrigger::LeaderExited
+            );
+            mutation_thread.join().expect("identity mutation thread");
+            claim_thread.join().expect("lifecycle claim thread");
+
+            assert_eq!(
+                metadata_five_state(&state, &session),
+                claimed_identity,
+                "{mutation:?} must leave all identity metadata unchanged after Ending"
+            );
+
+            let exit_code = 70 + i32::try_from(index).expect("small case index");
+            super::publish_leader_reaped(&state, &session, &claim, exit_code, None);
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            let exit = loop {
+                let exits = state
+                    .lifecycle_journal
+                    .as_ref()
+                    .expect("journal")
+                    .recent_exits(Some(&session.id), 10, ExitListScope::All);
+                if let Some(exit) = exits
+                    .into_iter()
+                    .find(|exit| exit.outcome_state == ExitOutcomeState::Complete)
+                {
+                    break exit;
+                }
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "timed out waiting for stable {mutation:?} trigger/reap evidence"
+                );
+                thread::yield_now();
+            };
+            assert_eq!(exit.name, claimed_identity.current.name);
+            assert_eq!(exit.trigger, SessionExitTrigger::LeaderExited);
+            assert_eq!(exit.exit_code, Some(exit_code));
+            assert_eq!(exit.evidence_state, ExitEvidenceState::Complete);
+        }
     }
 
     #[test]
@@ -5855,6 +6458,117 @@ mod tests {
     }
 
     #[test]
+    fn failed_waitid_fallback_allows_actual_close_without_post_reap_signaling() {
+        let state = Arc::new(State::default());
+        let session = build_long_lived_test_session("fallback-actual-close");
+        register_test_session(&state, &session);
+        session.force_waitid_failure.store(true, Ordering::SeqCst);
+        let pid = session.process_id.expect("long-lived leader pid") as libc::pid_t;
+        let pgid = session
+            .process_group_id
+            .expect("long-lived leader process group");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "leader must start live");
+
+        let fallback_parked = Arc::new(Barrier::new(2));
+        let release_fallback = Arc::new(Barrier::new(2));
+        let fallback_parked_for_hook = Arc::clone(&fallback_parked);
+        let release_fallback_for_hook = Arc::clone(&release_fallback);
+        *super::lock(&session.fallback_wait_poll_hook) = Some(Arc::new(move || {
+            fallback_parked_for_hook.wait();
+            release_fallback_for_hook.wait();
+        }));
+
+        let close_reached_child_boundary = Arc::new(Barrier::new(2));
+        let release_close_boundary = Arc::new(Barrier::new(2));
+        let close_reached_for_hook = Arc::clone(&close_reached_child_boundary);
+        let release_close_for_hook = Arc::clone(&release_close_boundary);
+        *super::lock(&session.terminate_child_boundary_hook) = Some(Arc::new(move || {
+            close_reached_for_hook.wait();
+            release_close_for_hook.wait();
+        }));
+
+        let (waiter_done_tx, waiter_done_rx) = mpsc::sync_channel(1);
+        let session_for_waiter = Arc::clone(&session);
+        let waiter = thread::spawn(move || {
+            let observed = super::wait_for_leader_exit_without_reaping(&session_for_waiter);
+            let result = super::wait_for_child_and_publish_reaped(&session_for_waiter, observed);
+            waiter_done_tx
+                .send((observed, result))
+                .expect("report fallback waiter result");
+        });
+        fallback_parked.wait();
+
+        let (close_done_tx, close_done_rx) = mpsc::sync_channel(1);
+        let state_for_close = Arc::clone(&state);
+        let session_for_close = Arc::clone(&session);
+        let close = thread::spawn(move || {
+            super::terminate_session(&state_for_close, &session_for_close);
+            close_done_tx.send(()).expect("report close completion");
+        });
+        close_reached_child_boundary.wait();
+        assert_eq!(
+            session.lifecycle.authoritative_trigger(),
+            Some(super::session_lifecycle::FinalizeTrigger::CloseRequested),
+            "actual close must claim authority before crossing the signaling boundary"
+        );
+        assert!(
+            !session.leader_reaped.load(Ordering::SeqCst),
+            "the long-lived leader must still be anchored at the close boundary"
+        );
+        // Keep the fallback waiter parked until explicit close owns `child`.
+        // The previous one-phase rendezvous released both threads together and
+        // accidentally relied on the waiter's 10 ms poll sleep for ordering.
+        release_fallback.wait();
+        release_close_boundary.wait();
+
+        close_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actual close must finish within bounds");
+        let (observed, status) = waiter_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("fallback waiter must reap the signaled leader within bounds");
+        let _status = status.expect("fallback try_wait must reap successfully");
+        assert!(
+            !observed,
+            "test must exercise the forced waitid failure path"
+        );
+        close.join().expect("actual close thread");
+        waiter.join().expect("fallback waiter thread");
+
+        let fallback_claim = super::publish_lifecycle_trigger(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::LeaderExited,
+        );
+        assert_eq!(
+            fallback_claim.authoritative_trigger,
+            super::session_lifecycle::FinalizeTrigger::CloseRequested,
+            "the earlier explicit-close trigger remains authoritative"
+        );
+        assert!(session.leader_reaped.load(Ordering::SeqCst));
+        assert!(
+            !super::process_group_still_owns_child(Some(pid as u32), pgid),
+            "the reaped leader pid must no longer verify the stored process group"
+        );
+
+        let signals_before_reaped_retry = session
+            .process_identity_signal_attempts
+            .load(Ordering::SeqCst);
+        assert!(
+            signals_before_reaped_retry > 0,
+            "actual close must signal the long-lived leader or its process group"
+        );
+        super::terminate_process_group_for_request(&session);
+        assert_eq!(
+            session
+                .process_identity_signal_attempts
+                .load(Ordering::SeqCst),
+            signals_before_reaped_retry,
+            "after atomic reaped publication no recycled pid or pgid may be signaled"
+        );
+    }
+
+    #[test]
     fn leader_exit_finalize_marks_not_alive_and_removes_indexes() {
         let state = Arc::new(super::State::default());
         let session = build_test_session("leader-exit-finalize");
@@ -5871,7 +6585,11 @@ mod tests {
                 .insert(session.id.clone(), Arc::clone(&session));
         }
 
-        super::finalize_session(&state, &session, super::SessionFinalizeReason::LeaderExited);
+        super::finalize_session(
+            &state,
+            &session,
+            super::session_lifecycle::FinalizeTrigger::LeaderExited,
+        );
 
         assert!(
             !session.alive.load(Ordering::SeqCst),
@@ -5889,6 +6607,79 @@ mod tests {
         assert!(!sessions.by_name.contains_key(&session.name()));
         assert!(!sessions.by_pane.contains_key(&session.pane_id));
         assert!(!sessions.by_id.contains_key(&session.id));
+    }
+
+    #[test]
+    fn close_trigger_is_presented_and_queryable_from_private_journal() {
+        let temp = tempfile::tempdir().expect("journal tempdir");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private journal tempdir");
+        let journal = super::session_lifecycle::LifecycleJournal::open(temp.path())
+            .expect("open lifecycle journal");
+        let state = Arc::new(State {
+            lifecycle_journal: Some(Arc::new(journal)),
+            ..State::default()
+        });
+        let session = build_test_session("close-journal");
+        register_test_session(&state, &session);
+
+        super::terminate_session(&state, &session);
+
+        assert_eq!(
+            session.info().lifecycle_state,
+            Some(SessionLifecycleState::Ending {
+                trigger: SessionExitTrigger::CloseRequested,
+            })
+        );
+        let exits = state
+            .lifecycle_journal
+            .as_ref()
+            .expect("journal")
+            .recent_exits(None, 10, ExitListScope::All);
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].session_id, session.id);
+        assert_eq!(exits[0].trigger, SessionExitTrigger::CloseRequested);
+    }
+
+    #[test]
+    fn portable_pty_signal_evidence_is_optional_bounded_and_sanitized() {
+        let clean = ExitStatus::with_exit_code(37);
+        assert_eq!(portable_exit_evidence(&clean), (37, None));
+
+        let unsafe_signal = format!("TERM\u{1b}]52;c;secret\u{7}{}", "x".repeat(256));
+        let signaled = ExitStatus::with_signal(&unsafe_signal);
+        let (exit_code, signal) = portable_exit_evidence(&signaled);
+        let signal = signal.expect("portable-pty signal must be retained when available");
+        assert_eq!(exit_code, 1);
+        assert!(
+            signal.len() <= 64,
+            "signal must be byte bounded: {signal:?}"
+        );
+        assert!(
+            !signal.contains("secret"),
+            "signal must be sanitized: {signal:?}"
+        );
+        assert!(
+            !signal.contains('\u{1b}'),
+            "signal must be terminal safe: {signal:?}"
+        );
+    }
+
+    #[test]
+    fn recent_exits_rejects_raw_limits_outside_protocol_bound() {
+        let state = Arc::new(State::default());
+        for limit in [0, MAX_RECENT_EXITS_LIMIT + 1] {
+            let err = super::handle_request(
+                &state,
+                Request::RecentExits {
+                    target: None,
+                    limit,
+                    scope: ExitListScope::All,
+                },
+            )
+            .expect_err("invalid raw limit must fail");
+            assert!(err.to_string().contains("recent exit limit"));
+        }
     }
 
     #[test]
@@ -5924,7 +6715,7 @@ mod tests {
             super::finalize_session(
                 &state_for_first,
                 &session_for_first,
-                super::SessionFinalizeReason::LeaderExited,
+                super::session_lifecycle::FinalizeTrigger::LeaderExited,
             );
         });
 
@@ -5962,8 +6753,10 @@ mod tests {
     }
 
     #[test]
-    fn attach_subscription_guard_unsubscribes_on_drop() {
+    fn attach_subscription_guard_drop_is_non_destructive() {
+        let state = Arc::new(super::State::default());
         let session = build_test_session("attach-guard");
+        register_test_session(&state, &session);
         let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let (subscriber_id, _rx) = session
             .subscribe_with_snapshot(24, 80, on_evict)
@@ -5978,6 +6771,36 @@ mod tests {
             session.subscribers.lock().expect("subscribers").is_empty(),
             "dropping the guard should remove the subscriber"
         );
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
+    }
+
+    #[test]
+    fn resize_after_unsubscribe_is_non_destructive() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("stale-resize");
+        register_test_session(&state, &session);
+        let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let (subscriber_id, _rx) = session
+            .subscribe_with_snapshot(24, 80, on_evict)
+            .expect("subscribe test attach");
+
+        session.unsubscribe(subscriber_id);
+        let err = super::handle_request(
+            &state,
+            Request::Resize {
+                target: session.id.clone(),
+                rows: 40,
+                cols: 120,
+                subscriber_id: Some(subscriber_id),
+            },
+        )
+        .expect_err("stale subscriber resize must be rejected");
+
+        assert!(
+            err.to_string().contains("no longer attached"),
+            "unexpected stale resize error: {err:#}"
+        );
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6860,7 +7683,9 @@ mod tests {
     /// 한다 — PR #13 의 zombie-attach guard 가 timeout fallback 으로도 유지됨을 확인.
     #[test]
     fn append_output_send_timeout_evicts_when_consumer_persistently_stuck() {
+        let state = Arc::new(super::State::default());
         let session = build_test_session("evict");
+        register_test_session(&state, &session);
         let on_evict_calls = Arc::new(AtomicU32::new(0));
         let calls_for_closure = Arc::clone(&on_evict_calls);
         let on_evict: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -6892,6 +7717,7 @@ mod tests {
         );
         let remaining = super::lock(&session.subscribers).len();
         assert_eq!(remaining, 0, "evicted subscriber must be removed");
+        assert_attach_fault_kept_session_live_and_indexed(&state, &session);
     }
 
     /// PR #16: 3 sub — sub#0 healthy, sub#1 laggy (queue full), sub#2 healthy.

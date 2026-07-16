@@ -194,6 +194,23 @@ enum Commands {
         #[arg(long, conflicts_with = "all")]
         children: bool,
     },
+    /// Show bounded raw-free evidence for recently exited sessions.
+    Exits {
+        /// Optional exact session UUID, pane, or prior session name.
+        target: Option<String>,
+        /// Maximum records to return (daemon-enforced hard cap: 100).
+        #[arg(long, default_value_t = protocol::DEFAULT_RECENT_EXITS_LIMIT, value_parser = parse_recent_exits_limit_arg)]
+        limit: u16,
+        /// Print recent exits as a JSON array for automation.
+        #[arg(long)]
+        json: bool,
+        /// Include both top-level and child session exits.
+        #[arg(long, conflicts_with = "children")]
+        all: bool,
+        /// Show only child session exits.
+        #[arg(long, conflicts_with = "all")]
+        children: bool,
+    },
     /// Print a raw-free live measurement snapshot for a session or pane.
     Instrument {
         /// Session or pane target to measure.
@@ -920,12 +937,33 @@ fn run() -> Result<()> {
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         sanitize::terminal_text(&s.name),
                         sanitize::terminal_text(&s.pane_id),
-                        if s.alive { "alive" } else { "dead" },
+                        s.lifecycle_state_label(),
                         sanitize::terminal_text(&s.cwd),
                         sanitize::terminal_text(&s.command),
                         format_attach_state(s.attached_clients),
                         sanitize::terminal_text(parent_pane_display(&s))
                     );
+                }
+            }
+            Ok(())
+        }
+        Commands::Exits {
+            target,
+            limit,
+            json,
+            all,
+            children,
+        } => {
+            let exits = client::recent_exits(
+                target.as_deref(),
+                limit,
+                protocol::ExitListScope::from_flags(all, children),
+            )?;
+            if json {
+                println!("{}", client::json_pretty(&exits));
+            } else {
+                for exit in exits {
+                    println!("{}", recent_exit_output_line(&exit));
                 }
             }
             Ok(())
@@ -2058,6 +2096,8 @@ struct DiagnosticSession {
     process_group_id: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_theme: Option<protocol::StatusTheme>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_state: Option<protocol::SessionLifecycleState>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2088,6 +2128,9 @@ struct DiagnosticBundle {
     sessions: Option<Vec<DiagnosticSession>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
+    recent_exits: Option<Vec<protocol::RecentSessionExit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recent_exits_error: Option<String>,
     processes: Option<Vec<DiagnosticProcess>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     processes_error: Option<String>,
@@ -2337,9 +2380,22 @@ fn print_diagnose_bundle() -> Result<()> {
         (None, None)
     };
 
+    let (recent_exits, recent_exits_error) = if doctor.daemon_reachable {
+        match client::recent_exits(
+            None,
+            protocol::MAX_RECENT_EXITS_LIMIT,
+            protocol::ExitListScope::All,
+        ) {
+            Ok(exits) => (Some(exits), None),
+            Err(err) => (None, Some(sanitize::terminal_text(&err.to_string()))),
+        }
+    } else {
+        (None, None)
+    };
+
     let environment = diagnostic_environment(&doctor);
     let bundle = DiagnosticBundle {
-        schema_version: "1.0",
+        schema_version: "1.1",
         generated_at_unix_secs: current_unix_secs(),
         privacy: DiagnosticPrivacy {
             raw_pty_streams_included: false,
@@ -2354,6 +2410,7 @@ fn print_diagnose_bundle() -> Result<()> {
                 "session/process command fields keep only the executable basename plus an argument-redaction marker",
                 "tmux compatibility diagnostics are derived from local lterm metadata and PATH-order boolean/null indicators; no real tmux commands are executed",
                 "no raw terminal scrollback or PTY bytes are included",
+                "recent exit summaries are raw-free lifecycle metadata without commands, paths, process identifiers, or terminal content",
             ],
         },
         doctor: redact_doctor_report(&doctor),
@@ -2361,6 +2418,8 @@ fn print_diagnose_bundle() -> Result<()> {
         tmux_compat: build_diagnostic_tmux_compat(&doctor.tmux_compat),
         sessions,
         sessions_error,
+        recent_exits,
+        recent_exits_error,
         processes,
         processes_error,
         notes,
@@ -2562,6 +2621,7 @@ fn redact_session_info(session: protocol::SessionInfo) -> DiagnosticSession {
         process_id: session.process_id,
         process_group_id: session.process_group_id,
         status_theme: session.status_theme,
+        lifecycle_state: session.lifecycle_state,
     }
 }
 
@@ -2808,6 +2868,20 @@ fn parse_compose_tail_arg(value: &str) -> std::result::Result<usize, String> {
         .map_err(|_| "--tail exceeds supported scrollback range".to_string())
 }
 
+fn parse_recent_exits_limit_arg(value: &str) -> std::result::Result<u16, String> {
+    let limit = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("invalid recent exit limit {value:?}; expected 1..=100"))?;
+    if limit == 0 || limit > protocol::MAX_RECENT_EXITS_LIMIT {
+        return Err(format!(
+            "recent exit limit must be between 1 and {}",
+            protocol::MAX_RECENT_EXITS_LIMIT
+        ));
+    }
+    Ok(limit)
+}
+
 fn input_commit_bytes(text: String, enter: bool) -> Vec<u8> {
     let mut bytes = text.into_bytes();
     if enter {
@@ -2866,12 +2940,31 @@ fn filter_list_sessions(
 ) -> Vec<protocol::SessionInfo> {
     sessions
         .into_iter()
+        .filter(|session| session.is_live_work())
         .filter(|session| match scope {
             ListScope::Roots => session.parent_pane_id.is_none(),
             ListScope::Children => session.parent_pane_id.is_some(),
             ListScope::All => true,
         })
         .collect()
+}
+
+fn recent_exit_output_line(exit: &protocol::RecentSessionExit) -> String {
+    let exit_code = exit
+        .exit_code
+        .map_or_else(|| "-".to_string(), |code| code.to_string());
+    let signal = exit.signal.as_deref().unwrap_or("-");
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        sanitize::terminal_text(&exit.name),
+        sanitize::terminal_text(&exit.pane_id),
+        sanitize::terminal_text(&exit.session_id),
+        sanitize::terminal_text(&exit.trigger.to_string()),
+        exit.outcome_state.as_str(),
+        exit_code,
+        sanitize::terminal_text(signal),
+        exit.evidence_state.as_str()
+    )
 }
 
 fn format_attach_state(attached_clients: usize) -> String {
@@ -3863,6 +3956,7 @@ mod tests {
             process_group_id: None,
             status_theme: None,
             agent_name: agent_name.map(str::to_string),
+            lifecycle_state: None,
         }
     }
 
@@ -4016,6 +4110,87 @@ mod tests {
         };
         assert_eq!(target, "%7");
         assert!(json);
+    }
+
+    #[test]
+    fn exits_parses_bounded_scope_and_json_flags() {
+        let cli = Cli::try_parse_from([
+            "lterm",
+            "exits",
+            "opaque-id",
+            "--limit",
+            "100",
+            "--all",
+            "--json",
+        ])
+        .expect("exits flags should parse");
+        let Commands::Exits {
+            target,
+            limit,
+            json,
+            all,
+            children,
+        } = cli.command
+        else {
+            panic!("expected exits command");
+        };
+        assert_eq!(target.as_deref(), Some("opaque-id"));
+        assert_eq!(limit, 100);
+        assert!(json);
+        assert!(all);
+        assert!(!children);
+        assert!(Cli::try_parse_from(["lterm", "exits", "--limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "exits", "--limit", "101"]).is_err());
+        assert!(Cli::try_parse_from(["lterm", "exits", "--all", "--children"]).is_err());
+    }
+
+    #[test]
+    fn live_list_filters_ending_but_keeps_monitor_failed_degraded() {
+        let mut healthy = sample_status_session_info("healthy", "sh", None);
+        healthy.pane_id = "%1".to_string();
+        let mut degraded = sample_status_session_info("degraded", "sh", None);
+        degraded.pane_id = "%2".to_string();
+        degraded.lifecycle_state = Some(protocol::SessionLifecycleState::MonitorFailed);
+        let mut ending = sample_status_session_info("ending", "sh", None);
+        ending.pane_id = "%3".to_string();
+        ending.alive = false;
+        ending.lifecycle_state = Some(protocol::SessionLifecycleState::Ending {
+            trigger: protocol::SessionExitTrigger::CloseRequested,
+        });
+
+        let listed = filter_list_sessions(vec![healthy, degraded.clone(), ending], ListScope::All);
+        assert_eq!(listed.len(), 2, "ending sessions must be absent");
+        assert!(listed.iter().any(|session| session.name == "healthy"));
+        assert_eq!(degraded.lifecycle_state_label(), "degraded");
+    }
+
+    #[test]
+    fn recent_exit_text_is_single_line_raw_free_and_uuid_disambiguated() {
+        let exit = protocol::RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: "opaque-id".to_string(),
+            name: "agent\nname".to_string(),
+            pane_id: "%7".to_string(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 1,
+            trigger_claimed_unix_ms: 2,
+            reaped_unix_ms: Some(3),
+            trigger: protocol::SessionExitTrigger::LeaderExited,
+            outcome_state: protocol::ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: Some("signal\ntext".to_string()),
+            evidence_state: protocol::ExitEvidenceState::Complete,
+        };
+        let line = recent_exit_output_line(&exit);
+        assert_eq!(line.matches('\t').count(), 7, "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("opaque-id"), "{line:?}");
+        assert!(line.contains("leader_exited"), "{line:?}");
+        assert!(line.contains("37"), "{line:?}");
+        assert!(!line.contains("command"), "{line:?}");
+        assert!(!line.contains("cwd"), "{line:?}");
     }
 
     #[test]
@@ -5146,6 +5321,7 @@ mod tests {
             process_id: None,
             process_group_id: None,
             status_theme: None,
+            lifecycle_state: None,
         });
         assert_eq!(line.matches('\t').count(), 2, "{line:?}");
         assert!(line.ends_with('\n'), "{line:?}");

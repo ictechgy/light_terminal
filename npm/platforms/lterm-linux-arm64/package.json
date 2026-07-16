@@ -1,6 +1,6 @@
 {
   "name": "lterm-linux-arm64",
-  "version": "1.0.31",
+  "version": "1.0.32",
   "description": "Native lterm binary for Linux ARM64.",
   "license": "MIT OR Apache-2.0",
   "repository": {

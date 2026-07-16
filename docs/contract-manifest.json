@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "release": "lterm-1.0.31",
+  "release": "lterm-1.0.32",
   "source_of_truth": "docs/contract-manifest.json",
   "policy": {
     "stable_json_requires_schema": true,
@@ -264,6 +264,51 @@
       "raw_stream_policy": "sanitized-output-only",
       "examples": [
         "lterm sessions --json"
+      ]
+    },
+    {
+      "command": "lterm exits",
+      "aliases": [],
+      "text_output_stability": "stable",
+      "json_output_stability": "stable",
+      "schema_path": "docs/schemas/recent-exits.schema.json",
+      "tests": [
+        "cargo test --bin lterm exits_parses_bounded_scope_and_json_flags",
+        "cargo test --bin lterm lifecycle_request_and_raw_free_exit_summary_round_trip",
+        "cargo test --bin lterm recent_exits_protocol_guard_is_non_destructive_and_explicit",
+        "cargo test --test cli_smoke exits_json_uses_protocol_v8_bounded_raw_free_request_and_response"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "stable",
+      "raw_stream_policy": "sanitized-output-only",
+      "stability_scope": "Exits is a bounded raw-free recent-session lifecycle evidence report. It exposes only opaque session identity, sanitized hierarchy/profile fields, lifecycle timestamps, trigger/outcome/evidence enums, and optional exit code or sanitized signal. It excludes command, cwd, environment, PTY bytes, scrollback, tokens, and process identifiers. The daemon caps --limit at 100 and applies top-level/children/all scope before returning newest-first rows.",
+      "json_samples": [
+        {
+          "setup": [
+            [
+              "start",
+              "-d",
+              "-n",
+              "schema-exits",
+              "--",
+              "sh",
+              "-lc",
+              "sleep 5"
+            ],
+            [
+              "close",
+              "schema-exits"
+            ]
+          ],
+          "argv": [
+            "exits",
+            "schema-exits",
+            "--json"
+          ]
+        }
+      ],
+      "examples": [
+        "lterm exits --json"
       ]
     },
     {

@@ -2,6 +2,50 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "lterm wait/watch --json output",
   "type": "object",
+  "$defs": {
+    "exitTrigger": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["leader_exited", "close_requested", "daemon_shutdown", "unknown"] }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "parent_session_id"],
+          "properties": {
+            "type": { "const": "parent_cascade" },
+            "parent_session_id": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "lifecycleState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state"],
+          "properties": {
+            "state": { "enum": ["healthy", "monitor_failed"] }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["state", "trigger"],
+          "properties": {
+            "state": { "const": "ending" },
+            "trigger": { "$ref": "#/$defs/exitTrigger" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
   "required": ["target", "event", "matched", "timed_out", "elapsed_ms"],
   "oneOf": [
     {
@@ -46,7 +90,8 @@
         "process_id": { "type": ["integer", "null"], "minimum": 1 },
         "process_group_id": { "type": ["integer", "null"] },
         "status_theme": { "type": "string", "enum": ["blue", "green", "magenta", "cyan", "amber", "red", "gray", "plain"] },
-        "agent_name": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Optional sanitized agent profile name persisted from LTERM_AGENT; omitted for non-agent sessions." }
+        "agent_name": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Optional sanitized agent profile name persisted from LTERM_AGENT; omitted for non-agent sessions." },
+        "lifecycle_state": { "$ref": "#/$defs/lifecycleState", "description": "Optional raw-free lifecycle presentation. Omitted by older daemons." }
       },
       "additionalProperties": false
     }

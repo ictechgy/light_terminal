@@ -44,7 +44,7 @@ behavior, but it also means untrusted programs can emit terminal escape
 sequences to the attaching terminal. Do not use raw attached `lterm` streams as
 a sanitizer or sandbox.
 
-Report-style surfaces are different: `sessions`, `instrument`, `processes`, `doctor`, `logs`,
+Report-style surfaces are different: `sessions`, `exits`, `instrument`, `processes`, `doctor`, `logs`,
 `wait`, `watch`, `agents`, `notify` fallback output, and tmux-compat listing
 surfaces sanitize terminal controls before printing human-readable or
 machine-readable reports.
@@ -145,6 +145,7 @@ or raw output stream.
 | `lterm open` | `lterm attach-or-new` | `explicit-raw-unsafe` | none at command level; raw stream is transparent; local status/presence decorations are best-effort sub-surfaces | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm reconnect` | none | `explicit-raw-unsafe` | none at command level; raw stream is transparent; private last-session pointer is best-effort; mobile transcript output is sanitized | none | `raw-transparent` for raw attach; `sanitized-output-only` for mobile transcript |
 | `lterm sessions` | `lterm list`, `lterm ls` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
+| `lterm exits` | none | `stable` | `stable` bounded raw-free recent-exit rows | `stable` | `sanitized-output-only` |
 | `lterm instrument` | none | `stable` | none | `stable` raw-free measurement snapshot; `--json` is required | `sanitized-output-only` |
 | `lterm capability` | none | `stable` | none | none | `not-applicable` |
 | `lterm metadata` | none | `stable` | none except JSON objects from undo/redo/purge | `stable` for `history --json` | `sanitized-output-only` |
@@ -332,6 +333,22 @@ process, not as commands or safe markup.
 The value is sanitized profile metadata persisted from `LTERM_AGENT`; non-agent
 sessions omit the field rather than emitting `null`.
 
+Those session objects may also include the raw-free `lifecycle_state` object.
+Healthy and degraded-monitor states serialize as `{"state":"healthy"}` and
+`{"state":"monitor_failed"}`. An ending session serializes as
+`{"state":"ending","trigger":...}` with a bounded trigger object whose `type`
+is `leader_exited`, `close_requested`, `daemon_shutdown`, `parent_cascade`, or
+`unknown`; only `parent_cascade` also includes `parent_session_id`. Older daemons
+may omit `lifecycle_state`, so clients must retain the legacy `alive` fallback.
+
+`lterm exits [TARGET] --json` returns a bounded newest-first array of raw-free
+recent-exit evidence. Each row contains opaque session identity, lifecycle
+timestamps, one of the trigger objects above, `pending` / `complete` / `unknown`
+outcome state, optional exit code or sanitized signal, and an evidence state.
+Command lines, cwd, environment, PTY bytes, scrollback, capability or parent
+tokens, and process identifiers are never part of this report. `--limit` is
+daemon-capped at 100, while `--all` and `--children` select hierarchy scope.
+
 ## tmux compatibility boundary
 
 `lterm tmux-compat ...` is a compatibility shim namespace for scripts that already
@@ -358,6 +375,7 @@ kept side-effect-light so CI can run them with isolated `LTERM_RUNTIME_DIR` and
 ```bash
 lterm install-shim
 lterm sessions --json
+lterm exits --json
 lterm doctor --json
 lterm inspect --json
 lterm shutdown

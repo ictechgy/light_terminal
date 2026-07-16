@@ -11,8 +11,10 @@ pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_METADATA_JOURNAL_ENTRIES: usize = 1024;
+pub const DEFAULT_RECENT_EXITS_LIMIT: u16 = 20;
+pub const MAX_RECENT_EXITS_LIMIT: u16 = 100;
 pub const CMUX_CONTEXT_ENV: &[&str] = &[
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",
@@ -68,6 +70,137 @@ impl StatusTheme {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionExitTrigger {
+    LeaderExited,
+    CloseRequested,
+    DaemonShutdown,
+    ParentCascade { parent_session_id: String },
+    Unknown,
+}
+
+impl SessionExitTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LeaderExited => "leader_exited",
+            Self::CloseRequested => "close_requested",
+            Self::DaemonShutdown => "daemon_shutdown",
+            Self::ParentCascade { .. } => "parent_cascade",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for SessionExitTrigger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ParentCascade { parent_session_id } => {
+                write!(
+                    formatter,
+                    "parent_cascade(parent_session_id={parent_session_id})"
+                )
+            }
+            trigger => formatter.write_str(trigger.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionLifecycleState {
+    Healthy,
+    MonitorFailed,
+    Ending { trigger: SessionExitTrigger },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitListScope {
+    TopLevel,
+    Children,
+    All,
+}
+
+impl ExitListScope {
+    pub fn from_flags(all: bool, children: bool) -> Self {
+        if all {
+            Self::All
+        } else if children {
+            Self::Children
+        } else {
+            Self::TopLevel
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitOutcomeState {
+    Pending,
+    Complete,
+    Unknown,
+}
+
+impl ExitOutcomeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitEvidenceState {
+    Complete,
+    DegradedMissingTriggerEvent,
+    Conflicted,
+    StorageDegraded,
+}
+
+impl ExitEvidenceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::DegradedMissingTriggerEvent => "degraded_missing_trigger_event",
+            Self::Conflicted => "conflicted",
+            Self::StorageDegraded => "storage_degraded",
+        }
+    }
+}
+
+/// Raw-free, bounded lifecycle evidence for a finalized session.
+///
+/// This allowlist intentionally excludes commands, paths, environment values,
+/// PTY bytes, scrollback, capability/parent tokens, and process identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentSessionExit {
+    pub schema_version: String,
+    pub session_id: String,
+    pub name: String,
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    pub created_unix_ms: u128,
+    pub trigger_claimed_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaped_unix_ms: Option<u128>,
+    pub trigger: SessionExitTrigger,
+    pub outcome_state: ExitOutcomeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    pub evidence_state: ExitEvidenceState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -94,6 +227,41 @@ pub struct SessionInfo {
     pub status_theme: Option<StatusTheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<SessionLifecycleState>,
+}
+
+impl SessionInfo {
+    pub fn lifecycle_state(&self) -> SessionLifecycleState {
+        self.lifecycle_state.clone().unwrap_or({
+            if self.alive {
+                SessionLifecycleState::Healthy
+            } else {
+                SessionLifecycleState::Ending {
+                    trigger: SessionExitTrigger::Unknown,
+                }
+            }
+        })
+    }
+
+    pub fn is_live_work(&self) -> bool {
+        match (&self.lifecycle_state, self.alive) {
+            (None, alive) => alive,
+            (Some(SessionLifecycleState::Healthy | SessionLifecycleState::MonitorFailed), true) => {
+                true
+            }
+            (Some(SessionLifecycleState::Ending { .. }), false) => false,
+            _ => false,
+        }
+    }
+
+    pub fn lifecycle_state_label(&self) -> &'static str {
+        match self.lifecycle_state() {
+            SessionLifecycleState::Healthy => "alive",
+            SessionLifecycleState::MonitorFailed => "degraded",
+            SessionLifecycleState::Ending { .. } => "ending",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +502,12 @@ pub enum Request {
         tmux: bool,
     },
     List,
+    RecentExits {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        limit: u16,
+        scope: ExitListScope,
+    },
     Info {
         target: String,
     },
@@ -754,10 +928,12 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityAction, CapabilityToken, InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES,
-        MAX_METADATA_JOURNAL_ENTRIES, MAX_SEND_DATA_BYTES, MetadataHistoryResult,
-        MetadataJournalEntry, MetadataOperation, MetadataPurgeAggregate, MetadataValue, Request,
-        SensitiveCapabilityRequest, SessionInfo, StatusTheme,
+        CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
+        InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES, MAX_METADATA_JOURNAL_ENTRIES,
+        MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataJournalEntry,
+        MetadataOperation, MetadataPurgeAggregate, MetadataValue, RecentSessionExit, Request,
+        SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
+        StatusTheme,
     };
 
     #[test]
@@ -804,6 +980,89 @@ mod tests {
         assert_eq!(info.parent_session_id, None);
         assert_eq!(info.attached_clients, 0);
         assert_eq!(info.status_theme, None);
+        assert_eq!(info.lifecycle_state, None);
+    }
+
+    #[test]
+    fn lifecycle_request_and_raw_free_exit_summary_round_trip() {
+        let request = Request::RecentExits {
+            target: Some("opaque-session-id".to_string()),
+            limit: MAX_RECENT_EXITS_LIMIT,
+            scope: ExitListScope::All,
+        };
+        let request_value = serde_json::to_value(&request).expect("serialize recent exits request");
+        assert_eq!(
+            request_value,
+            serde_json::json!({
+                "type": "recent_exits",
+                "target": "opaque-session-id",
+                "limit": 100,
+                "scope": "all"
+            })
+        );
+
+        let exit = RecentSessionExit {
+            schema_version: "1.0".to_string(),
+            session_id: "opaque-session-id".to_string(),
+            name: "agent".to_string(),
+            pane_id: "%7".to_string(),
+            parent_session_id: None,
+            parent_pane_id: None,
+            agent_name: Some("codex".to_string()),
+            created_unix_ms: 10,
+            trigger_claimed_unix_ms: 20,
+            reaped_unix_ms: Some(30),
+            trigger: SessionExitTrigger::LeaderExited,
+            outcome_state: ExitOutcomeState::Complete,
+            exit_code: Some(37),
+            signal: None,
+            evidence_state: ExitEvidenceState::Complete,
+        };
+        let value = serde_json::to_value(&exit).expect("serialize recent exit");
+        let object = value.as_object().expect("recent exit object");
+        for forbidden in [
+            "command",
+            "cwd",
+            "environment",
+            "output",
+            "scrollback",
+            "capability_token",
+            "parent_token",
+            "process_id",
+            "process_group_id",
+        ] {
+            assert!(!object.contains_key(forbidden), "forbidden key {forbidden}");
+        }
+        let decoded: RecentSessionExit =
+            serde_json::from_value(value).expect("round trip recent exit");
+        assert_eq!(decoded, exit);
+    }
+
+    #[test]
+    fn session_lifecycle_state_is_optional_and_controls_live_work_presentation() {
+        let mut info: SessionInfo = serde_json::from_str(
+            r#"{
+                "id":"id","name":"name","pane_id":"%1","command":"sh","cwd":"/tmp",
+                "created_unix_ms":1,"alive":true,"exit_code":null,"rows":24,"cols":80
+            }"#,
+        )
+        .expect("legacy session info");
+        assert!(info.is_live_work());
+        assert_eq!(info.lifecycle_state(), SessionLifecycleState::Healthy);
+
+        info.lifecycle_state = Some(SessionLifecycleState::MonitorFailed);
+        assert!(info.is_live_work(), "monitor-failed work remains listable");
+        assert_eq!(info.lifecycle_state_label(), "degraded");
+
+        info.alive = false;
+        info.lifecycle_state = Some(SessionLifecycleState::Ending {
+            trigger: SessionExitTrigger::CloseRequested,
+        });
+        assert!(
+            !info.is_live_work(),
+            "ending work is never reconnectable/listable"
+        );
+        assert_eq!(info.lifecycle_state_label(), "ending");
     }
 
     #[test]
