@@ -1640,19 +1640,17 @@ fn validate_user_option_value(value: &str) -> Result<()> {
 }
 
 fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
-    let _lock = StoreLock::acquire()?;
-    let sessions = client::list_sessions()?;
-    let identity = user_option_identity_from_snapshot(args, &sessions)?;
-    let live_identities: HashSet<&str> = sessions.iter().map(|info| info.id.as_str()).collect();
-    let mut store = load_store()?;
-    prune_user_options(&mut store, &live_identities);
-    let result = (|| {
+    let identity = user_option_identity(args)?;
+    let live_identities = live_user_option_identities()?;
+    update_store(|store| {
+        prune_user_options(store, &live_identities);
+        let options = if args.pane {
+            &mut store.pane_user_options
+        } else {
+            &mut store.session_user_options
+        };
+
         if args.unset {
-            let options = if args.pane {
-                &mut store.pane_user_options
-            } else {
-                &mut store.session_user_options
-            };
             if let Some(identity_options) = options.get_mut(&identity) {
                 identity_options.remove(&args.name);
                 if identity_options.is_empty() {
@@ -1666,23 +1664,10 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
             .value
             .as_deref()
             .context("tmux user option value missing")?;
-        let option_exists = if args.pane {
-            store
-                .pane_user_options
-                .get(&identity)
-                .is_some_and(|options| options.contains_key(&args.name))
-        } else {
-            store
-                .session_user_options
-                .get(&identity)
-                .is_some_and(|options| options.contains_key(&args.name))
-        };
-        let options = if args.pane {
-            &mut store.pane_user_options
-        } else {
-            &mut store.session_user_options
-        };
-        if option_exists {
+        if options
+            .get(&identity)
+            .is_some_and(|identity_options| identity_options.contains_key(&args.name))
+        {
             options
                 .get_mut(&identity)
                 .expect("checked user-option identity exists")
@@ -1692,75 +1677,51 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
 
         let identity_exists = store.pane_user_options.contains_key(&identity)
             || store.session_user_options.contains_key(&identity);
-        let identity_count = user_option_identity_count(&store);
-        let entry_count = user_option_entry_count(&store);
+        let identity_count = user_option_identity_count(store);
+        let entry_count = user_option_entry_count(store);
         if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
             bail!("tmux user-option identity limit reached");
         }
         if entry_count >= USER_OPTION_ENTRIES_MAX {
             bail!("tmux user-option entry limit reached");
         }
-        if user_option_count_for_identity(&store, &identity) >= USER_OPTIONS_PER_IDENTITY_MAX {
+        let identity_options = options.entry(identity).or_default();
+        if identity_options.len() >= USER_OPTIONS_PER_IDENTITY_MAX {
             bail!("tmux user-option per-identity limit reached");
         }
-        let options = if args.pane {
-            &mut store.pane_user_options
-        } else {
-            &mut store.session_user_options
-        };
-        let identity_options = options.entry(identity).or_default();
         identity_options.insert(args.name.clone(), value.to_string());
         Ok(())
-    })();
-    result?;
-    save_store(&store)
+    })
 }
 
 fn read_user_option(args: &UserOptionArgs) -> Result<Option<String>> {
-    let _lock = StoreLock::acquire()?;
-    let sessions = client::list_sessions()?;
-    let identity = user_option_identity_from_snapshot(args, &sessions)?;
-    let store = load_store()?;
-    let options = if args.pane {
-        &store.pane_user_options
-    } else {
-        &store.session_user_options
-    };
-    Ok(options
-        .get(&identity)
-        .and_then(|identity_options| identity_options.get(&args.name))
-        .cloned())
+    let identity = user_option_identity(args)?;
+    read_store(|store| {
+        let options = if args.pane {
+            &store.pane_user_options
+        } else {
+            &store.session_user_options
+        };
+        Ok(options
+            .get(&identity)
+            .and_then(|identity_options| identity_options.get(&args.name))
+            .cloned())
+    })
 }
 
-fn user_option_identity_from_snapshot(
-    args: &UserOptionArgs,
-    sessions: &[SessionInfo],
-) -> Result<String> {
+fn user_option_identity(args: &UserOptionArgs) -> Result<String> {
     let target = args.target.clone().unwrap_or_else(default_target);
-    let target = normalize_tmux_target(&target)?;
-    let info = sessions
-        .iter()
-        .find(|info| target_matches_info(target.as_ref(), info))
-        .cloned()
-        .with_context(|| {
-            format!(
-                "tmux user-option target {} is unavailable",
-                sanitize::terminal_text(target.as_ref())
-            )
-        })?;
+    let info = info_for_tmux_target(&target)?;
     if args.pane {
         return Ok(info.id);
     }
-    root_session_identity_from_snapshot(info, sessions)
+    root_session_identity(info)
 }
 
-fn root_session_identity_from_snapshot(
-    mut info: SessionInfo,
-    sessions: &[SessionInfo],
-) -> Result<String> {
+fn root_session_identity(mut info: SessionInfo) -> Result<String> {
+    let sessions = client::list_sessions()?;
     let by_id: HashMap<String, SessionInfo> = sessions
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|session| (session.id.clone(), session))
         .collect();
     let mut seen = HashSet::new();
@@ -1778,13 +1739,20 @@ fn root_session_identity_from_snapshot(
     Ok(info.id)
 }
 
-fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<&str>) {
-    store.pane_user_options.retain(|identity, options| {
-        live_identities.contains(identity.as_str()) && !options.is_empty()
-    });
-    store.session_user_options.retain(|identity, options| {
-        live_identities.contains(identity.as_str()) && !options.is_empty()
-    });
+fn live_user_option_identities() -> Result<HashSet<String>> {
+    Ok(client::list_sessions()?
+        .into_iter()
+        .map(|info| info.id)
+        .collect())
+}
+
+fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<String>) {
+    store
+        .pane_user_options
+        .retain(|identity, options| live_identities.contains(identity) && !options.is_empty());
+    store
+        .session_user_options
+        .retain(|identity, options| live_identities.contains(identity) && !options.is_empty());
 }
 
 fn user_option_identity_count(store: &CompatStore) -> usize {
@@ -1794,17 +1762,6 @@ fn user_option_identity_count(store: &CompatStore) -> usize {
         .chain(store.session_user_options.keys())
         .collect::<HashSet<_>>()
         .len()
-}
-
-fn user_option_count_for_identity(store: &CompatStore, identity: &str) -> usize {
-    store
-        .pane_user_options
-        .get(identity)
-        .map_or(0, HashMap::len)
-        + store
-            .session_user_options
-            .get(identity)
-            .map_or(0, HashMap::len)
 }
 
 fn user_option_entry_count(store: &CompatStore) -> usize {
