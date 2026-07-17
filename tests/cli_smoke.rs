@@ -10151,6 +10151,21 @@ fn tmux_compat_user_option_contract_preserves_legacy_no_name_and_builtin_behavio
     assert_eq!(query.stdout, b"off\n", "{query:?}");
     assert!(query.stderr.is_empty(), "{query:?}");
 
+    let at_prefixed_target = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-t",
+            "@42",
+            "status",
+        ])
+        .output()?;
+    assert!(at_prefixed_target.status.success(), "{at_prefixed_target:?}");
+    assert_eq!(at_prefixed_target.stdout, b"off\n", "{at_prefixed_target:?}");
+    assert!(at_prefixed_target.stderr.is_empty(), "{at_prefixed_target:?}");
+
     for (label, args) in [
         (
             "pane-scoped legacy option",
@@ -10264,6 +10279,18 @@ fn tmux_compat_user_option_contract_accepts_closed_grammar_and_separates_pane_an
                 "@owner",
             ],
             b"session-value\n".as_slice(),
+        ),
+        (
+            "session show with option name and value",
+            vec![
+                "tmux-compat",
+                "show-option",
+                "-q",
+                "-t",
+                pane.as_str(),
+                "@owner",
+            ],
+            b"@owner session-value\n".as_slice(),
         ),
         (
             "pane show alias with boolean cluster",
@@ -10588,6 +10615,27 @@ fn tmux_compat_user_option_contract_distinguishes_absence_and_present_empty() ->
         || !present_empty.stderr.is_empty()
     {
         failures.push(format!("present empty: {present_empty:?}"));
+    }
+
+    let present_empty_with_name = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "show-option",
+            "-q",
+            "-p",
+            "-t",
+            pane.as_str(),
+            "@omx_instance_id",
+        ])
+        .output()?;
+    if !present_empty_with_name.status.success()
+        || present_empty_with_name.stdout != b"@omx_instance_id \n"
+        || !present_empty_with_name.stderr.is_empty()
+    {
+        failures.push(format!(
+            "present empty with name: {present_empty_with_name:?}"
+        ));
     }
     assert!(
         failures.is_empty(),

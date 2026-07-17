@@ -1571,7 +1571,7 @@ fn user_option_name_candidate(args: &[String]) -> Option<&str> {
 }
 
 fn looks_like_user_option_show(args: &[String]) -> bool {
-    args.iter().any(|arg| arg.starts_with('@'))
+    user_option_name_candidate(args).is_some_and(|name| name.starts_with('@'))
 }
 
 fn parse_user_option_args(args: &[String], is_set: bool) -> Result<UserOptionArgs> {
