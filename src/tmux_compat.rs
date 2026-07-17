@@ -3477,7 +3477,10 @@ fn forget_panes_and_user_options(
     update_store(|store| {
         for captured in captured_panes {
             let matches_captured_generation = captured.stored.as_ref().is_some_and(|before| {
-                before.immutable_id.as_deref() == Some(captured.immutable_id.as_str())
+                before
+                    .immutable_id
+                    .as_deref()
+                    .is_none_or(|id| id == captured.immutable_id)
                     && store.panes.get(&captured.pane_id) == Some(before)
             });
             if matches_captured_generation {

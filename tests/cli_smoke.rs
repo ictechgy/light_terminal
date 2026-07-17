@@ -11591,7 +11591,7 @@ fn tmux_compat_g003_kill_pane_cleanup_is_generation_safe_after_pane_id_reuse() -
         Some(old_id.as_str())
     );
 
-    let cmux_calls = wait_for_file_contents(&cmux_log)?;
+    let cmux_calls = std::fs::read_to_string(&cmux_log)?;
     assert!(
         cmux_calls.lines().any(|line| line
             == "close-surface --surface surface:old --workspace workspace:old --window window:old"),
@@ -11606,6 +11606,199 @@ fn tmux_compat_g003_kill_pane_cleanup_is_generation_safe_after_pane_id_reuse() -
     for scope in ["pane_user_options", "session_user_options"] {
         assert!(store[scope].get(&old_id).is_none(), "{scope}: {store}");
         assert_eq!(store[scope][new_id]["@owner"], "new", "{scope}: {store}");
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_successful_kill_removes_unchanged_legacy_pane_record() -> TestResult {
+    let env = TestEnv::new()?;
+    let old = fake_live_session(0);
+    let old_id = old["id"].as_str().ok_or("old id missing")?.to_string();
+    let store_path = data_store_path(&env);
+    let store_parent = store_path.parent().ok_or("store path has no parent")?;
+    std::fs::create_dir_all(store_parent)?;
+    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(
+        &store_path,
+        serde_json::to_vec(&serde_json::json!({
+            "panes": {
+                "%0": {
+                    "pane_id": "%0",
+                    "session_name": "legacy-generation",
+                    "cmux_surface_id": "surface:legacy",
+                    "cmux_workspace_id": "workspace:legacy",
+                    "cmux_window_id": "window:legacy"
+                }
+            },
+            "pane_user_options": {old_id.clone(): {"@owner": "old"}},
+            "session_user_options": {old_id.clone(): {"@owner": "old"}},
+            "wait_generations": {},
+            "wait_generation_touched_secs": {},
+            "managed_attaches": {}
+        }))?,
+    )?;
+    let fake_bin = env.temp.path().join("fake-cmux-legacy-kill-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-legacy-kill.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let old_for_server = old;
+    let old_id_for_server = old_id.clone();
+    let (killed, _) = run_tmux_with_scripted_daemon_and_path(
+        &env,
+        &["tmux-compat", "kill-pane", "-t", "%0"],
+        Some(path.as_os_str()),
+        move |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({"ok":true,"result":old_for_server})),
+            Some("kill") if request["target"] == old_id_for_server => {
+                Ok(serde_json::json!({"ok":true,"result":null}))
+            }
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(killed.status.success(), "{killed:?}");
+    assert_eq!(
+        std::fs::read_to_string(&cmux_log)?
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "close-surface --surface surface:legacy --workspace workspace:legacy --window window:legacy"
+        ]
+    );
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(&store_path)?)?;
+    assert!(store["panes"].get("%0").is_none(), "{store}");
+    assert!(store["pane_user_options"].get(&old_id).is_none(), "{store}");
+    assert!(
+        store["session_user_options"].get(&old_id).is_none(),
+        "{store}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_kill_session_cleanup_is_generation_safe_after_pane_id_reuse() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut root = fake_live_session(10);
+    root["name"] = serde_json::json!("old-session-root");
+    let root_id = root["id"].as_str().ok_or("root id missing")?.to_string();
+    let mut child = fake_live_session(11);
+    child["parent_pane_id"] = serde_json::json!("%10");
+    child["parent_session_id"] = serde_json::json!(root_id.clone());
+    let child_id = child["id"].as_str().ok_or("child id missing")?.to_string();
+    let new_root_id = "00000000-0000-4000-8000-eeeeeeeeeee0";
+    let new_child_id = "00000000-0000-4000-8000-eeeeeeeeeee1";
+    let store_path = data_store_path(&env);
+    let store_parent = store_path.parent().ok_or("store path has no parent")?;
+    std::fs::create_dir_all(store_parent)?;
+    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(
+        &store_path,
+        serde_json::to_vec(&serde_json::json!({
+            "panes": {
+                "%10": {
+                    "pane_id": "%10", "session_name": "old-session-root",
+                    "immutable_id": root_id.clone(), "cmux_surface_id": "surface:old-shared",
+                    "cmux_workspace_id": "workspace:old", "cmux_window_id": "window:old"
+                },
+                "%11": {
+                    "pane_id": "%11", "session_name": "old-session-child",
+                    "immutable_id": child_id.clone(), "cmux_surface_id": "surface:old-shared",
+                    "cmux_workspace_id": "workspace:old", "cmux_window_id": "window:old"
+                }
+            },
+            "pane_user_options": {
+                root_id.clone(): {"@owner": "old-root"}, child_id.clone(): {"@owner": "old-child"},
+                new_root_id: {"@owner": "new-root"}, new_child_id: {"@owner": "new-child"}
+            },
+            "session_user_options": {
+                root_id.clone(): {"@owner": "old-root"}, child_id.clone(): {"@owner": "old-child"},
+                new_root_id: {"@owner": "new-root"}, new_child_id: {"@owner": "new-child"}
+            },
+            "wait_generations": {}, "wait_generation_touched_secs": {}, "managed_attaches": {}
+        }))?,
+    )?;
+    let fake_bin = env.temp.path().join("fake-cmux-session-generation-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux-session-generation-kill.log");
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+    let sessions_for_server = vec![root, child];
+    let root_id_for_server = root_id.clone();
+    let store_path_for_server = store_path.clone();
+    let (killed, requests) = run_tmux_with_scripted_daemon_and_path(
+        &env,
+        &["tmux-compat", "kill-session", "-t", "old-session-root"],
+        Some(path.as_os_str()),
+        move |request| match request["type"].as_str() {
+            Some("list") => Ok(serde_json::json!({"ok":true,"result":sessions_for_server})),
+            Some("kill") => {
+                if request["target"].as_str() != Some(root_id_for_server.as_str()) {
+                    return Err(format!("kill used wrong root generation: {request}"));
+                }
+                let mut replacement: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&store_path_for_server).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                replacement["panes"]["%10"] = serde_json::json!({
+                    "pane_id": "%10", "session_name": "new-root", "immutable_id": new_root_id,
+                    "cmux_surface_id": "surface:new-root", "cmux_workspace_id": "workspace:new",
+                    "cmux_window_id": "window:new-root"
+                });
+                replacement["panes"]["%11"] = serde_json::json!({
+                    "pane_id": "%11", "session_name": "new-child", "immutable_id": new_child_id,
+                    "cmux_surface_id": "surface:new-child", "cmux_workspace_id": "workspace:new",
+                    "cmux_window_id": "window:new-child"
+                });
+                std::fs::write(
+                    &store_path_for_server,
+                    serde_json::to_vec(&replacement).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                Ok(serde_json::json!({"ok":true,"result":null}))
+            }
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(killed.status.success(), "{killed:?}");
+    assert_eq!(
+        requests
+            .iter()
+            .find(|request| request["type"] == "kill")
+            .and_then(|request| request["target"].as_str()),
+        Some(root_id.as_str())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cmux_log)?
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            "close-surface --surface surface:old-shared --workspace workspace:old --window window:old"
+        ]
+    );
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(&store_path)?)?;
+    assert_eq!(store["panes"]["%10"]["immutable_id"], new_root_id);
+    assert_eq!(store["panes"]["%11"]["immutable_id"], new_child_id);
+    for scope in ["pane_user_options", "session_user_options"] {
+        for old_id in [&root_id, &child_id] {
+            assert!(store[scope].get(old_id).is_none(), "{scope}: {store}");
+        }
+        assert_eq!(store[scope][new_root_id]["@owner"], "new-root");
+        assert_eq!(store[scope][new_child_id]["@owner"], "new-child");
     }
     Ok(())
 }
