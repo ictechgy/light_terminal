@@ -1489,8 +1489,14 @@ struct UserOptionArgs {
     value: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum UserOptionCommand {
+    Set,
+    Show,
+}
+
 fn set_option(args: &[String]) -> Result<i32> {
-    if !looks_like_user_option_set(args) {
+    if actual_user_option_name(args, UserOptionCommand::Set).is_none() {
         return Ok(0);
     }
     let parsed = parse_user_option_args(args, true)?;
@@ -1503,7 +1509,7 @@ fn set_option(args: &[String]) -> Result<i32> {
 }
 
 fn show_option(args: &[String]) -> Result<i32> {
-    if !looks_like_user_option_show(args) {
+    if actual_user_option_name(args, UserOptionCommand::Show).is_none() {
         return legacy_show_option(args);
     }
     let parsed = parse_user_option_args(args, false)?;
@@ -1540,11 +1546,9 @@ fn legacy_show_option(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn looks_like_user_option_set(args: &[String]) -> bool {
-    user_option_name_candidate(args).is_some_and(|name| name.starts_with('@'))
-}
-
-fn user_option_name_candidate(args: &[String]) -> Option<&str> {
+fn actual_user_option_name(args: &[String], command: UserOptionCommand) -> Option<&str> {
+    // This is only a routing scan: once an actual @-prefixed name is found, the
+    // strict parser below remains the single authority for flag and arity errors.
     let mut options = true;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
@@ -1561,23 +1565,44 @@ fn user_option_name_candidate(args: &[String]) -> Option<&str> {
             i += 1;
             continue;
         }
-        if options
-            && short_cluster(arg).is_some_and(|cluster| cluster.len() > 1 && cluster.contains('t'))
-        {
-            i += 2;
-            continue;
-        }
         if options && arg.starts_with('-') && arg != "-" {
+            let Some(cluster) = short_cluster(arg) else {
+                i += 1;
+                continue;
+            };
+            if let Some((value_pos, value_flag)) = cluster.char_indices().find(|(_, flag)| {
+                *flag == 't'
+                    || (!user_option_flag_supported(command, *flag)
+                        && is_value_taking_short_flag(*flag))
+            }) {
+                let attached_value = &cluster[value_pos + value_flag.len_utf8()..];
+                if value_flag == 't' {
+                    i += usize::from(attached_value.is_empty() && args.get(i + 1).is_some()) + 1;
+                } else if attached_value.is_empty() {
+                    let value = args.get(i + 1)?;
+                    if value.starts_with('@') {
+                        return Some(value);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
             i += 1;
             continue;
         }
-        return Some(arg);
+        return arg.starts_with('@').then_some(arg.as_str());
     }
     None
 }
 
-fn looks_like_user_option_show(args: &[String]) -> bool {
-    user_option_name_candidate(args).is_some_and(|name| name.starts_with('@'))
+fn user_option_flag_supported(command: UserOptionCommand, flag: char) -> bool {
+    matches!(flag, 'q' | 'p')
+        || matches!(
+            (command, flag),
+            (UserOptionCommand::Set, 'u') | (UserOptionCommand::Show, 'v')
+        )
 }
 
 fn parse_user_option_args(args: &[String], is_set: bool) -> Result<UserOptionArgs> {
@@ -6032,6 +6057,46 @@ mod tests {
             Some("focus-events")
         );
         assert!(!show_option_value_only(&args(["-g", "focus-events"])));
+    }
+
+    #[test]
+    fn user_option_name_classifier_tracks_real_positionals_and_fails_closed() {
+        let set_cases = [
+            (vec!["-t", "@42", "@owner", "value"], Some("@owner")),
+            (vec!["-t@42", "@owner", "value"], Some("@owner")),
+            (vec!["-pt", "%0", "@owner", "value"], Some("@owner")),
+            (vec!["-pt%0", "@owner", "value"], Some("@owner")),
+            (vec!["-F", "fmt", "@owner", "value"], Some("@owner")),
+            (vec!["-Ffmt", "@owner", "value"], Some("@owner")),
+            (vec!["-Fformat", "@owner", "value"], Some("@owner")),
+            (vec!["-F", "@owner", "value"], Some("@owner")),
+            (vec!["--", "@bad/name", "value"], Some("@bad/name")),
+            (vec!["-p", "status", "@legacy-value"], None),
+            (vec!["-F", "fmt", "status", "@legacy-value"], None),
+        ];
+        for (values, expected) in set_cases {
+            let values = args(values);
+            assert_eq!(
+                actual_user_option_name(&values, UserOptionCommand::Set),
+                expected,
+                "set args: {values:?}"
+            );
+        }
+
+        let show_cases = [
+            (vec!["-qv", "-t", "@42", "focus-events"], None),
+            (vec!["-qv", "-t@42", "focus-events"], None),
+            (vec!["-pt", "%0", "@owner"], Some("@owner")),
+            (vec!["focus-events", "@legacy-value"], None),
+        ];
+        for (values, expected) in show_cases {
+            let values = args(values);
+            assert_eq!(
+                actual_user_option_name(&values, UserOptionCommand::Show),
+                expected,
+                "show args: {values:?}"
+            );
+        }
     }
 
     #[test]

@@ -10468,6 +10468,10 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
             &["tmux-compat", "set-option", "-F", "@owner", "value"],
         ),
         (
+            "unsupported value-taking flag with separate value cannot hide user-option name",
+            &["tmux-compat", "set-option", "-F", "fmt", "@owner", "value"],
+        ),
+        (
             "unsupported window scope",
             &[
                 "tmux-compat",
@@ -10482,6 +10486,10 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
         (
             "target flag in cluster",
             &["tmux-compat", "show-option", "-pt", pane.as_str(), "@owner"],
+        ),
+        (
+            "target flag in set cluster cannot hide user-option name",
+            &["tmux-compat", "set-option", "-pt", "%0", "@owner", "value"],
         ),
         (
             "unknown flag",
@@ -10520,6 +10528,10 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
         failures.is_empty(),
         "invalid user-option grammar was accepted or misreported:\n{}",
         failures.join("\n")
+    );
+    assert!(
+        !data_store_path(&env).exists(),
+        "rejected user-option grammar must not create or mutate the option store"
     );
     Ok(())
 }
