@@ -30,11 +30,18 @@ const TMUX_BUFFER_MAX_BYTES: usize = MAX_SEND_DATA_BYTES;
 const MANAGED_ATTACH_ENV: &str = "LTERM_CMUX_MANAGED_ATTACH";
 const MANAGED_ATTACH_LEASE_TTL_SECS: u64 = 120;
 const MANAGED_ATTACH_RENEW_SECS: u64 = 30;
+const USER_OPTION_NAME_MAX_BYTES: usize = 128;
+const USER_OPTION_VALUE_MAX_BYTES: usize = 4_096;
+const USER_OPTIONS_PER_IDENTITY_MAX: usize = 64;
+const USER_OPTION_IDENTITIES_MAX: usize = 512;
+const USER_OPTION_ENTRIES_MAX: usize = 4_096;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct CompatStore {
     panes: HashMap<String, CompatPane>,
+    pane_user_options: HashMap<String, HashMap<String, String>>,
+    session_user_options: HashMap<String, HashMap<String, String>>,
     wait_generations: HashMap<String, u64>,
     wait_generation_touched_secs: HashMap<String, u64>,
     managed_attaches: HashMap<String, ManagedAttachLease>,
@@ -186,13 +193,10 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "select-pane" | "selectp" => Ok(0),
         "select-layout" | "selectl" => Ok(0),
         "set-hook" | "seth" => set_hook(rest),
-        "set-option" | "set" | "setw" | "set-window-option" => Ok(0),
-        "show-options"
-        | "show"
-        | "show-option"
-        | "showw"
-        | "show-window-option"
-        | "show-window-options" => show_option(rest),
+        "set-option" | "set" => set_option(rest),
+        "setw" | "set-window-option" => Ok(0),
+        "show-options" | "show" | "show-option" => show_option(rest),
+        "showw" | "show-window-option" | "show-window-options" => legacy_show_option(rest),
         "display-popup" | "popup" => display_popup(rest),
         "run-shell" | "run" => run_shell(rest),
         "wait-for" | "wait" => wait_for(rest),
