@@ -1692,13 +1692,24 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
 
         let identity_exists = store.pane_user_options.contains_key(&identity)
             || store.session_user_options.contains_key(&identity);
-        let identity_count = user_option_identity_count(store);
-        let entry_count = user_option_entry_count(store);
+        let identity_option_count = store
+            .pane_user_options
+            .get(&identity)
+            .map_or(0, HashMap::len)
+            + store
+                .session_user_options
+                .get(&identity)
+                .map_or(0, HashMap::len);
+        let identity_count = user_option_identity_count(&store);
+        let entry_count = user_option_entry_count(&store);
         if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
             bail!("tmux user-option identity limit reached");
         }
         if entry_count >= USER_OPTION_ENTRIES_MAX {
             bail!("tmux user-option entry limit reached");
+        }
+        if identity_option_count >= USER_OPTIONS_PER_IDENTITY_MAX {
+            bail!("tmux user-option per-identity limit reached");
         }
         let options = if args.pane {
             &mut store.pane_user_options
@@ -1706,9 +1717,6 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
             &mut store.session_user_options
         };
         let identity_options = options.entry(identity).or_default();
-        if identity_options.len() >= USER_OPTIONS_PER_IDENTITY_MAX {
-            bail!("tmux user-option per-identity limit reached");
-        }
         identity_options.insert(args.name.clone(), value.to_string());
         Ok(())
     })();
@@ -1779,12 +1787,12 @@ fn root_session_identity_from_snapshot(
 }
 
 fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<&str>) {
-    store
-        .pane_user_options
-        .retain(|identity, options| live_identities.contains(identity.as_str()) && !options.is_empty());
-    store
-        .session_user_options
-        .retain(|identity, options| live_identities.contains(identity.as_str()) && !options.is_empty());
+    store.pane_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
+    store.session_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
 }
 
 fn user_option_identity_count(store: &CompatStore) -> usize {
