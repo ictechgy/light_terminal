@@ -2045,9 +2045,15 @@ mod tests {
         let release_written = unsafe { libc::write(release[1], release_byte.as_ptr().cast(), 1) };
         // SAFETY: release is complete and waitpid receives a valid child pid and status pointer.
         let mut status = 0;
-        let waited = unsafe {
-            libc::close(release[1]);
-            libc::waitpid(child, &mut status, 0)
+        // SAFETY: release is complete; retrying waitpid only for EINTR guarantees the child is
+        // reaped without using time, sleeps, or a correctness retry loop.
+        unsafe { libc::close(release[1]) };
+        let waited = loop {
+            // SAFETY: child is the live fork result and status remains writable across EINTR.
+            let result = unsafe { libc::waitpid(child, &mut status, 0) };
+            if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
         };
 
         assert_eq!(ready_read, 1, "child readiness pipe closed unexpectedly");
