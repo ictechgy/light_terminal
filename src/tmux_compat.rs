@@ -759,15 +759,10 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
         .context("validated tmux session snapshot has no root")?
         .id
         .clone();
-    let pane_ids: Vec<String> = panes_before
-        .iter()
-        .map(|pane| pane.pane_id.clone())
-        .collect();
     let immutable_ids: Vec<String> = panes_before.iter().map(|pane| pane.id.clone()).collect();
-    let captured_panes: Vec<CapturedCompatPane> = pane_ids
+    let captured_panes: Vec<CapturedCompatPane> = panes_before
         .iter()
-        .zip(&immutable_ids)
-        .map(|(pane_id, immutable_id)| capture_compat_pane_best_effort(pane_id, immutable_id))
+        .map(|pane| capture_compat_pane_best_effort(&pane.pane_id, &pane.id))
         .collect();
 
     let cmux_surfaces: HashSet<CmuxSurfaceContext> = captured_panes

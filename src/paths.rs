@@ -421,14 +421,7 @@ mod tests {
         let guard = EnvGuard::capture(&PATH_ENV_NAMES);
         // SAFETY: caller holds crate::TEST_ENV_LOCK and EnvGuard restores values.
         unsafe {
-            for name in [
-                "LTERM_RUNTIME_DIR",
-                "LTERM_DATA_DIR",
-                "LTERM_SOCKET",
-                "XDG_RUNTIME_DIR",
-                "TMPDIR",
-                "HOME",
-            ] {
+            for name in PATH_ENV_NAMES {
                 std::env::remove_var(name);
             }
         }
@@ -447,6 +440,7 @@ mod tests {
         let test_name = current_thread
             .name()
             .expect("path test thread must have an exact libtest name");
+        let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
         match std::env::var_os(PATH_ENV_SELF_REEXEC) {
             Some(marker) => {
                 assert_eq!(
@@ -454,12 +448,10 @@ mod tests {
                     OsString::from(test_name),
                     "path test self-reexec marker must match the exact libtest name"
                 );
-                let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
                 let _env = reset_path_env();
                 body();
             }
             None => {
-                let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
                 let before = path_env_snapshot();
                 let output = Command::new(std::env::current_exe().expect("current test binary"))
                     .args(["--exact", test_name, "--nocapture"])

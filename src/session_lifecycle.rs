@@ -2032,11 +2032,10 @@ mod tests {
         // SAFETY: the readiness read is complete, so the parent no longer needs this descriptor.
         unsafe { libc::close(ready[0]) };
 
+        drop(first);
         let second = if ready_read == 1 {
-            drop(first);
             SecureStorage::open(temp.path())
         } else {
-            drop(first);
             Err(anyhow::anyhow!("fork child did not signal readiness"))
         };
 
