@@ -537,8 +537,12 @@ fn target_matches_info(target: &str, info: &SessionInfo) -> bool {
 fn list_sessions(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{session_name}".to_string());
+    let session_user_options = read_store(|store| Ok(store.session_user_options.clone()))?;
     for pane in root_session_rows()? {
-        println!("{}", expand_format(&format, &pane));
+        println!(
+            "{}",
+            expand_format_with_session_user_options(&format, &pane, Some(&session_user_options))
+        );
     }
     Ok(0)
 }
@@ -717,6 +721,7 @@ fn kill_session(args: &[String]) -> Result<i32> {
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let before = client::info(target).ok();
+    let immutable_id = before.as_ref().map(|info| info.id.clone());
     let pane_id = before
         .as_ref()
         .map(|info| info.pane_id.clone())
@@ -725,8 +730,10 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
         .as_deref()
         .and_then(stored_cmux_surface_for_pane_best_effort);
     client::kill(target)?;
-    if let Some(pane_id) = pane_id.as_deref() {
-        forget_pane_best_effort(pane_id);
+    let pane_ids: Vec<String> = pane_id.iter().cloned().collect();
+    let immutable_ids: Vec<String> = immutable_id.into_iter().collect();
+    if !pane_ids.is_empty() || !immutable_ids.is_empty() {
+        forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
     }
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
@@ -759,11 +766,16 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
             cmux_surfaces.insert(surface);
         }
     }
+    let pane_ids: Vec<String> = panes_before
+        .iter()
+        .map(|pane| pane.pane_id.clone())
+        .collect();
+    let immutable_ids: Vec<String> = panes_before.iter().map(|pane| pane.id.clone()).collect();
 
     client::kill(&kill_target)?;
 
-    for pane in panes_before {
-        forget_pane_best_effort(&pane.pane_id);
+    if !pane_ids.is_empty() || !immutable_ids.is_empty() {
+        forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
     }
     for surface in &cmux_surfaces {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
@@ -3260,19 +3272,23 @@ fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
 }
 
 fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) -> Result<()> {
-    update_store(|store| {
-        store.panes.insert(
-            info.pane_id.clone(),
-            CompatPane {
-                pane_id: info.pane_id.clone(),
-                session_name: info.name.clone(),
-                cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
-                cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
-                cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
-            },
-        );
-        Ok(())
-    })
+    let _lock = StoreLock::acquire()?;
+    let sessions = client::list_sessions()?;
+    let live_identities: HashSet<&str> =
+        sessions.iter().map(|session| session.id.as_str()).collect();
+    let mut store = load_store()?;
+    prune_user_options(&mut store, &live_identities);
+    store.panes.insert(
+        info.pane_id.clone(),
+        CompatPane {
+            pane_id: info.pane_id.clone(),
+            session_name: info.name.clone(),
+            cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
+            cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
+            cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
+        },
+    );
+    save_store(&store)
 }
 
 fn stored_cmux_surface_for_pane(pane_id: &str) -> Result<Option<CmuxSurfaceContext>> {
@@ -3333,18 +3349,28 @@ pub(crate) fn cmux_status_identity(pane_id: &str) -> Option<CmuxSurfaceContext> 
     }
 }
 
-fn forget_pane(pane_id: &str) -> Result<()> {
+fn forget_panes_and_user_options(pane_ids: &[String], immutable_ids: &[String]) -> Result<()> {
     update_store(|store| {
-        store.panes.remove(pane_id);
+        for pane_id in pane_ids {
+            store.panes.remove(pane_id);
+        }
+        for immutable_id in immutable_ids {
+            store.pane_user_options.remove(immutable_id);
+            store.session_user_options.remove(immutable_id);
+        }
         Ok(())
     })
 }
 
-fn forget_pane_best_effort(pane_id: &str) {
-    if let Err(err) = forget_pane(pane_id) {
+fn forget_panes_and_user_options_best_effort(
+    pane_ids: &[String],
+    immutable_ids: &[String],
+    target: &str,
+) {
+    if let Err(err) = forget_panes_and_user_options(pane_ids, immutable_ids) {
         eprintln!(
             "warning: tmux compat store cleanup failed for {}: {}",
-            sanitize::terminal_text(pane_id),
+            sanitize::terminal_text(target),
             sanitize::terminal_text(&err.to_string())
         );
     }
@@ -4112,6 +4138,14 @@ fn fish_quote(value: &str) -> String {
 }
 
 pub fn expand_format(format: &str, info: &SessionInfo) -> String {
+    expand_format_with_session_user_options(format, info, None)
+}
+
+fn expand_format_with_session_user_options(
+    format: &str,
+    info: &SessionInfo,
+    session_user_options: Option<&HashMap<String, HashMap<String, String>>>,
+) -> String {
     let current_command = current_command(&info.command);
     let mut out = String::new();
     let mut i = 0;
@@ -4123,6 +4157,11 @@ pub fn expand_format(format: &str, info: &SessionInfo) -> String {
         } else if rest.starts_with("#{pane_height}") {
             out.push_str(&info.rows.to_string());
             i += "#{pane_height}".len();
+        } else if let Some((len, value)) = session_user_options
+            .and_then(|options| session_user_option_format_replacement(rest, info, options))
+        {
+            out.push_str(&sanitize::terminal_text(value));
+            i += len;
         } else if let Some((needle, value)) = format_replacement(rest, info, &current_command) {
             out.push_str(&sanitize::terminal_text(value.as_ref()));
             i += needle.len();
@@ -4136,6 +4175,25 @@ pub fn expand_format(format: &str, info: &SessionInfo) -> String {
         }
     }
     out
+}
+
+fn session_user_option_format_replacement<'a>(
+    rest: &str,
+    info: &SessionInfo,
+    session_user_options: &'a HashMap<String, HashMap<String, String>>,
+) -> Option<(usize, &'a str)> {
+    rest.strip_prefix("#{@")?;
+    let end = rest.find('}')?;
+    let name = &rest[2..end];
+    if validate_user_option_name(name).is_err() {
+        return None;
+    }
+    let value = session_user_options
+        .get(&info.id)
+        .and_then(|options| options.get(name))
+        .map(String::as_str)
+        .unwrap_or_default();
+    Some((end + 1, value))
 }
 
 fn format_replacement<'a>(

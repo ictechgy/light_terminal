@@ -11536,7 +11536,18 @@ fn tmux_compat_g003_remember_pane_reconciles_natural_exit_identities() -> TestRe
     session_options.insert(stale_id.to_string(), serde_json::Value::Object(values));
     write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
 
-    create_sleep_session(&env, "g003-remember-reconcile")?;
+    let created = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "new-session",
+            "-d",
+            "-s",
+            "g003-remember-reconcile",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(created.status.success(), "{created:?}");
     let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
     assert!(
         store["pane_user_options"].get(stale_id).is_none()
