@@ -10153,18 +10153,20 @@ fn tmux_compat_user_option_contract_preserves_legacy_no_name_and_builtin_behavio
 
     let at_prefixed_target = env
         .cmd()
-        .args([
-            "tmux-compat",
-            "show-option",
-            "-qv",
-            "-t",
-            "@42",
-            "status",
-        ])
+        .args(["tmux-compat", "show-option", "-qv", "-t", "@42", "status"])
         .output()?;
-    assert!(at_prefixed_target.status.success(), "{at_prefixed_target:?}");
-    assert_eq!(at_prefixed_target.stdout, b"off\n", "{at_prefixed_target:?}");
-    assert!(at_prefixed_target.stderr.is_empty(), "{at_prefixed_target:?}");
+    assert!(
+        at_prefixed_target.status.success(),
+        "{at_prefixed_target:?}"
+    );
+    assert_eq!(
+        at_prefixed_target.stdout, b"off\n",
+        "{at_prefixed_target:?}"
+    );
+    assert!(
+        at_prefixed_target.stderr.is_empty(),
+        "{at_prefixed_target:?}"
+    );
 
     for (label, args) in [
         (
