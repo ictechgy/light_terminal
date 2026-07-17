@@ -47,13 +47,22 @@ struct CompatStore {
     managed_attaches: HashMap<String, ManagedAttachLease>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CompatPane {
     pane_id: String,
     session_name: String,
+    #[serde(default)]
+    immutable_id: Option<String>,
     cmux_surface_id: Option<String>,
     cmux_workspace_id: Option<String>,
     cmux_window_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCompatPane {
+    pane_id: String,
+    immutable_id: String,
+    stored: Option<CompatPane>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -727,9 +736,10 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let before = client::info(target)?;
     let immutable_id = before.id.clone();
     let pane_id = before.pane_id.clone();
+    let captured = capture_compat_pane_best_effort(&pane_id, &immutable_id);
     client::kill(&immutable_id)?;
-    let cmux_surface = stored_cmux_surface_for_pane_best_effort(&pane_id);
-    forget_panes_and_user_options_best_effort(&[pane_id], &[immutable_id], target);
+    let cmux_surface = captured.stored.as_ref().and_then(cmux_surface_from_pane);
+    forget_panes_and_user_options_best_effort(&[captured], &[immutable_id], target);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
     }
@@ -754,16 +764,20 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
         .map(|pane| pane.pane_id.clone())
         .collect();
     let immutable_ids: Vec<String> = panes_before.iter().map(|pane| pane.id.clone()).collect();
+    let captured_panes: Vec<CapturedCompatPane> = pane_ids
+        .iter()
+        .zip(&immutable_ids)
+        .map(|(pane_id, immutable_id)| capture_compat_pane_best_effort(pane_id, immutable_id))
+        .collect();
+
+    let cmux_surfaces: HashSet<CmuxSurfaceContext> = captured_panes
+        .iter()
+        .filter_map(|captured| captured.stored.as_ref().and_then(cmux_surface_from_pane))
+        .collect();
 
     client::kill(&kill_target)?;
 
-    let mut cmux_surfaces = HashSet::new();
-    for pane_id in &pane_ids {
-        if let Some(surface) = stored_cmux_surface_for_pane_best_effort(pane_id) {
-            cmux_surfaces.insert(surface);
-        }
-    }
-    forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
+    forget_panes_and_user_options_best_effort(&captured_panes, &immutable_ids, target);
     for surface in &cmux_surfaces {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
     }
@@ -3370,6 +3384,7 @@ fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) 
         CompatPane {
             pane_id: info.pane_id.clone(),
             session_name: info.name.clone(),
+            immutable_id: Some(info.id.clone()),
             cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
             cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
             cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
@@ -3379,15 +3394,34 @@ fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) 
 }
 
 fn stored_cmux_surface_for_pane(pane_id: &str) -> Result<Option<CmuxSurfaceContext>> {
-    read_store(|store| {
-        Ok(store.panes.get(pane_id).and_then(|pane| {
-            Some(CmuxSurfaceContext {
-                surface_ref: pane.cmux_surface_id.clone()?,
-                workspace_ref: pane.cmux_workspace_id.clone(),
-                window_ref: pane.cmux_window_id.clone(),
-            })
-        }))
+    read_store(|store| Ok(store.panes.get(pane_id).and_then(cmux_surface_from_pane)))
+}
+
+fn cmux_surface_from_pane(pane: &CompatPane) -> Option<CmuxSurfaceContext> {
+    Some(CmuxSurfaceContext {
+        surface_ref: pane.cmux_surface_id.clone()?,
+        workspace_ref: pane.cmux_workspace_id.clone(),
+        window_ref: pane.cmux_window_id.clone(),
     })
+}
+
+fn capture_compat_pane_best_effort(pane_id: &str, immutable_id: &str) -> CapturedCompatPane {
+    let stored = match read_store(|store| Ok(store.panes.get(pane_id).cloned())) {
+        Ok(stored) => stored,
+        Err(err) => {
+            eprintln!(
+                "warning: tmux compat store lookup failed for {}: {}",
+                sanitize::terminal_text(pane_id),
+                sanitize::terminal_text(&err.to_string())
+            );
+            None
+        }
+    };
+    CapturedCompatPane {
+        pane_id: pane_id.to_string(),
+        immutable_id: immutable_id.to_string(),
+        stored,
+    }
 }
 
 fn stored_cmux_surface_for_pane_best_effort(pane_id: &str) -> Option<CmuxSurfaceContext> {
@@ -3436,10 +3470,19 @@ pub(crate) fn cmux_status_identity(pane_id: &str) -> Option<CmuxSurfaceContext> 
     }
 }
 
-fn forget_panes_and_user_options(pane_ids: &[String], immutable_ids: &[String]) -> Result<()> {
+fn forget_panes_and_user_options(
+    captured_panes: &[CapturedCompatPane],
+    immutable_ids: &[String],
+) -> Result<()> {
     update_store(|store| {
-        for pane_id in pane_ids {
-            store.panes.remove(pane_id);
+        for captured in captured_panes {
+            let matches_captured_generation = captured.stored.as_ref().is_some_and(|before| {
+                before.immutable_id.as_deref() == Some(captured.immutable_id.as_str())
+                    && store.panes.get(&captured.pane_id) == Some(before)
+            });
+            if matches_captured_generation {
+                store.panes.remove(&captured.pane_id);
+            }
         }
         for immutable_id in immutable_ids {
             store.pane_user_options.remove(immutable_id);
@@ -3450,11 +3493,11 @@ fn forget_panes_and_user_options(pane_ids: &[String], immutable_ids: &[String]) 
 }
 
 fn forget_panes_and_user_options_best_effort(
-    pane_ids: &[String],
+    captured_panes: &[CapturedCompatPane],
     immutable_ids: &[String],
     target: &str,
 ) {
-    if let Err(err) = forget_panes_and_user_options(pane_ids, immutable_ids) {
+    if let Err(err) = forget_panes_and_user_options(captured_panes, immutable_ids) {
         eprintln!(
             "warning: tmux compat store cleanup failed for {}: {}",
             sanitize::terminal_text(target),
