@@ -1779,12 +1779,12 @@ fn root_session_identity_from_snapshot(
 }
 
 fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<&str>) {
-    store
-        .pane_user_options
-        .retain(|identity, options| live_identities.contains(identity.as_str()) && !options.is_empty());
-    store
-        .session_user_options
-        .retain(|identity, options| live_identities.contains(identity.as_str()) && !options.is_empty());
+    store.pane_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
+    store.session_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
 }
 
 fn user_option_identity_count(store: &CompatStore) -> usize {
