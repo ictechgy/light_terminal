@@ -521,6 +521,149 @@ fn data_store_path(env: &TestEnv) -> PathBuf {
     env.temp.path().join("data").join("tmux-compat-store.json")
 }
 
+#[cfg(unix)]
+fn fake_live_session(index: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("00000000-0000-4000-8000-{index:012x}"),
+        "name": format!("fake-session-{index}"),
+        "pane_id": format!("%{index}"),
+        "command": "sleep 30",
+        "cwd": "/tmp",
+        "created_unix_ms": index,
+        "alive": true,
+        "exit_code": null,
+        "rows": 24,
+        "cols": 80,
+        "parent_pane_id": null,
+        "parent_session_id": null,
+        "attached_clients": 0,
+        "process_id": null,
+        "process_group_id": null
+    })
+}
+
+#[cfg(unix)]
+fn run_tmux_with_fake_sessions(
+    env: &TestEnv,
+    args: &[&str],
+    sessions: Vec<serde_json::Value>,
+) -> TestResult<std::process::Output> {
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run_dir.join("lterm.sock");
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let child_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_child_done = std::sync::Arc::clone(&child_done);
+    let server = thread::spawn(move || -> Result<(), String> {
+        (|| -> TestResult {
+            const EXPECTED_REQUESTS: [&str; 3] = ["ping", "status", "list"];
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut request_count = 0usize;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        let request_type = request["type"]
+                            .as_str()
+                            .ok_or("fake daemon request missing type")?;
+                        if EXPECTED_REQUESTS.get(request_count) != Some(&request_type) {
+                            return Err(format!(
+                                "unexpected fake daemon request #{request_count}: {request}"
+                            )
+                            .into());
+                        }
+                        request_count += 1;
+                        let response = match request_type {
+                            "ping" => serde_json::json!({"ok":true,"result":{"pong":true}}),
+                            "status" => serde_json::json!({"ok":true,"result":{
+                                "version":env!("CARGO_PKG_VERSION"),
+                                "protocol_version":8,
+                                "session_count":sessions.len(),
+                                "active_connections":1,
+                                "shutting_down":false
+                            }}),
+                            "list" => serde_json::json!({"ok":true,"result":sessions}),
+                            _ => unreachable!("request type was checked above"),
+                        };
+                        stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_child_done.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "fake daemon timed out after {request_count} request(s); expected {EXPECTED_REQUESTS:?}"
+                            )
+                            .into());
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            if request_count != EXPECTED_REQUESTS.len() {
+                return Err(format!(
+                    "tmux user-option command issued {request_count} request(s); expected {EXPECTED_REQUESTS:?}"
+                )
+                .into());
+            }
+            Ok(())
+        })()
+        .map_err(|err| err.to_string())
+    });
+    let mut command = env.cmd();
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match command.spawn() {
+        Ok(child) => wait_for_child_output(
+            ChildCleanup::new(child),
+            Duration::from_secs(8),
+            "tmux user-option command with fake sessions",
+        ),
+        Err(err) => Err(err.into()),
+    };
+    child_done.store(true, std::sync::atomic::Ordering::Release);
+    let server_result = server.join().map_err(|_| "fake daemon panicked")?;
+    let _ = std::fs::remove_file(socket);
+    server_result?;
+    output
+}
+
+#[cfg(unix)]
+fn write_user_option_store(
+    env: &TestEnv,
+    pane_user_options: serde_json::Map<String, serde_json::Value>,
+    session_user_options: serde_json::Map<String, serde_json::Value>,
+    wait_generations: serde_json::Map<String, serde_json::Value>,
+) -> TestResult<Vec<u8>> {
+    let path = data_store_path(env);
+    let parent = path.parent().ok_or("store path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    let store = serde_json::json!({
+        "panes": {},
+        "pane_user_options": pane_user_options,
+        "session_user_options": session_user_options,
+        "wait_generations": wait_generations,
+        "wait_generation_touched_secs": {},
+        "managed_attaches": {}
+    });
+    let bytes = serde_json::to_vec(&store)?;
+    std::fs::write(path, &bytes)?;
+    Ok(bytes)
+}
+
 fn seed_managed_attach_store_with_token(
     env: &TestEnv,
     pane_id: &str,
@@ -10617,6 +10760,279 @@ fn tmux_compat_user_option_contract_migrates_old_store_and_keeps_window_aliases_
         "migration/window-alias failures:\n{}",
         failures.join("\n")
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_user_option_contract_combines_scope_cap_and_persists_immutable_root_ids()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let root = fake_live_session(0);
+    let root_id = root["id"].as_str().ok_or("root id missing")?.to_string();
+    let mut pane_values = serde_json::Map::new();
+    let mut session_values = serde_json::Map::new();
+    for index in 0..32 {
+        pane_values.insert(
+            format!("@p{index:02}"),
+            serde_json::json!(format!("p{index}")),
+        );
+        session_values.insert(
+            format!("@s{index:02}"),
+            serde_json::json!(format!("s{index}")),
+        );
+    }
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(root_id.clone(), serde_json::Value::Object(pane_values));
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(root_id.clone(), serde_json::Value::Object(session_values));
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+
+    let overwrite = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@p00",
+            "overwritten",
+        ],
+        vec![root.clone()],
+    )?;
+    assert!(overwrite.status.success(), "{overwrite:?}");
+    let at_cap = std::fs::read(data_store_path(&env))?;
+    let at_cap_store: serde_json::Value = serde_json::from_slice(&at_cap)?;
+    assert_eq!(
+        at_cap_store["pane_user_options"][&root_id]["@p00"],
+        "overwritten"
+    );
+
+    let rejected = run_tmux_with_fake_sessions(
+        &env,
+        &["tmux-compat", "set-option", "-t", "%0", "@new", "rejected"],
+        vec![root.clone()],
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert_stderr_contains(&rejected, "per-identity limit reached");
+    assert_eq!(std::fs::read(data_store_path(&env))?, at_cap);
+
+    let unset = run_tmux_with_fake_sessions(
+        &env,
+        &["tmux-compat", "set-option", "-u", "-p", "-t", "%0", "@p01"],
+        vec![root.clone()],
+    )?;
+    assert!(unset.status.success(), "{unset:?}");
+    let admitted = run_tmux_with_fake_sessions(
+        &env,
+        &["tmux-compat", "set-option", "-t", "%0", "@new", "admitted"],
+        vec![root.clone()],
+    )?;
+    assert!(admitted.status.success(), "{admitted:?}");
+
+    let mut renamed_root = root.clone();
+    renamed_root["name"] = serde_json::json!("renamed-root");
+    let shown = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-t",
+            "renamed-root",
+            "@new",
+        ],
+        vec![renamed_root.clone()],
+    )?;
+    assert!(shown.status.success(), "{shown:?}");
+    assert_eq!(shown.stdout, b"admitted\n");
+
+    let mut child = fake_live_session(1);
+    child["parent_pane_id"] = serde_json::json!("%0");
+    child["parent_session_id"] = serde_json::json!(root_id.clone());
+    let child_set = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-t",
+            "%1",
+            "@new",
+            "from-child",
+        ],
+        vec![renamed_root, child.clone()],
+    )?;
+    assert!(child_set.status.success(), "{child_set:?}");
+    let final_store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    assert_eq!(
+        final_store["session_user_options"][&root_id]["@new"],
+        "from-child"
+    );
+    assert!(
+        final_store["session_user_options"]
+            .get(child["id"].as_str().unwrap())
+            .is_none()
+    );
+    let encoded = final_store.to_string();
+    for mutable_identity in [
+        "%0",
+        "%1",
+        "fake-session-0",
+        "fake-session-1",
+        "renamed-root",
+    ] {
+        assert!(
+            !encoded.contains(mutable_identity),
+            "store used mutable identity {mutable_identity}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_user_option_contract_enforces_exact_512_combined_identity_cap_atomically()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let sessions: Vec<_> = (0..513).map(fake_live_session).collect();
+    let mut pane_options = serde_json::Map::new();
+    let mut session_options = serde_json::Map::new();
+    for (index, session) in sessions.iter().take(512).enumerate() {
+        let mut values = serde_json::Map::new();
+        values.insert("@owner".to_string(), serde_json::json!("original"));
+        let options = if index % 2 == 0 {
+            &mut pane_options
+        } else {
+            &mut session_options
+        };
+        options.insert(
+            session["id"].as_str().ok_or("fake id missing")?.to_string(),
+            serde_json::Value::Object(values),
+        );
+    }
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+    let overwrite = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@owner",
+            "updated",
+        ],
+        sessions.clone(),
+    )?;
+    assert!(overwrite.status.success(), "{overwrite:?}");
+    let at_cap = std::fs::read(data_store_path(&env))?;
+    let rejected = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%512",
+            "@owner",
+            "new",
+        ],
+        sessions,
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert_stderr_contains(&rejected, "identity limit reached");
+    assert_eq!(std::fs::read(data_store_path(&env))?, at_cap);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_user_option_contract_enforces_4096_entries_and_16mib_store_atomically() -> TestResult
+{
+    let env = TestEnv::new()?;
+    let sessions: Vec<_> = (0..65).map(fake_live_session).collect();
+    let mut pane_options = serde_json::Map::new();
+    let mut session_options = serde_json::Map::new();
+    for session in sessions.iter().take(64) {
+        let mut pane_values = serde_json::Map::new();
+        let mut session_values = serde_json::Map::new();
+        for option in 0..32 {
+            pane_values.insert(format!("@p{option:02}"), serde_json::json!("value"));
+            session_values.insert(format!("@s{option:02}"), serde_json::json!("value"));
+        }
+        let identity = session["id"].as_str().ok_or("fake id missing")?;
+        pane_options.insert(identity.to_string(), serde_json::Value::Object(pane_values));
+        session_options.insert(
+            identity.to_string(),
+            serde_json::Value::Object(session_values),
+        );
+    }
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+    let overwrite = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@p00",
+            "updated",
+        ],
+        sessions.clone(),
+    )?;
+    assert!(overwrite.status.success(), "{overwrite:?}");
+    let at_entry_cap = std::fs::read(data_store_path(&env))?;
+    let rejected = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%64",
+            "@new",
+            "value",
+        ],
+        sessions,
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert_stderr_contains(&rejected, "entry limit reached");
+    assert_eq!(std::fs::read(data_store_path(&env))?, at_entry_cap);
+
+    const STORE_LIMIT: usize = 16 * 1024 * 1024;
+    let large_env = TestEnv::new()?;
+    let mut wait_generations = serde_json::Map::new();
+    wait_generations.insert("x".repeat(STORE_LIMIT - 2_048), serde_json::json!(1));
+    let before = write_user_option_store(
+        &large_env,
+        serde_json::Map::new(),
+        serde_json::Map::new(),
+        wait_generations,
+    )?;
+    assert!(
+        before.len() < STORE_LIMIT,
+        "seed store unexpectedly oversized"
+    );
+    let value = "v".repeat(4_096);
+    let oversized = run_tmux_with_fake_sessions(
+        &large_env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@large",
+            &value,
+        ],
+        vec![fake_live_session(0)],
+    )?;
+    assert!(!oversized.status.success(), "{oversized:?}");
+    assert_stderr_contains(&oversized, "store exceeds");
+    assert_eq!(std::fs::read(data_store_path(&large_env))?, before);
     Ok(())
 }
 
