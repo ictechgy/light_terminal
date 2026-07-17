@@ -10150,6 +10150,44 @@ fn tmux_compat_user_option_contract_preserves_legacy_no_name_and_builtin_behavio
     assert!(query.status.success(), "{query:?}");
     assert_eq!(query.stdout, b"off\n", "{query:?}");
     assert!(query.stderr.is_empty(), "{query:?}");
+
+    for (label, args) in [
+        (
+            "pane-scoped legacy option",
+            vec!["tmux-compat", "set-option", "-p", "status", "on"],
+        ),
+        (
+            "legacy unset",
+            vec!["tmux-compat", "set-option", "-u", "status"],
+        ),
+        (
+            "legacy pane flags without a name",
+            vec!["tmux-compat", "set-option", "-p", "-t", "%999"],
+        ),
+        (
+            "at-prefixed legacy value",
+            vec![
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "pane-border-status",
+                "@legacy-value",
+            ],
+        ),
+        (
+            "at-prefixed target is not an option name",
+            vec!["tmux-compat", "set-option", "-t", "@42", "status", "on"],
+        ),
+    ] {
+        let output = env.cmd().args(args).output()?;
+        assert!(output.status.success(), "{label}: {output:?}");
+        assert!(output.stdout.is_empty(), "{label}: {output:?}");
+        assert!(output.stderr.is_empty(), "{label}: {output:?}");
+    }
+    assert!(
+        !data_store_path(&env).exists(),
+        "legacy set-option compatibility no-ops must not persist user-option state"
+    );
     Ok(())
 }
 
@@ -10341,10 +10379,6 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
             ],
         ),
         (
-            "missing set name",
-            &["tmux-compat", "set-option", "-p", "-t", pane.as_str()],
-        ),
-        (
             "unset with value",
             &[
                 "tmux-compat",
@@ -10399,6 +10433,10 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
         (
             "unsupported server scope",
             &["tmux-compat", "set-option", "-s", "@owner", "value"],
+        ),
+        (
+            "unsupported value-taking flag cannot hide user-option name",
+            &["tmux-compat", "set-option", "-F", "@owner", "value"],
         ),
         (
             "unsupported window scope",
@@ -10602,6 +10640,29 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
         failures.push(format!("exact maxima did not round-trip: {shown:?}"));
     }
 
+    for (name, value) in [
+        ("@ordinary_space", "ordinary printable space"),
+        ("@ordinary_combining", "e\u{0301}"),
+    ] {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                name,
+                value,
+            ])
+            .output()?;
+        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            failures.push(format!(
+                "safe printable value rejected for {name}: {output:?}"
+            ));
+        }
+    }
+
     for (label, name, value) in [
         ("oversized name", oversized_name.as_str(), "value"),
         ("invalid name alphabet", "@bad/name", "value"),
@@ -10611,6 +10672,19 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
         ("format control", "@owner", "word\u{2060}joiner"),
         ("bidi control", "@owner", "bidi\u{202e}override"),
         ("zero-width", "@owner", "zero\u{200b}width"),
+        ("Arabic number sign Cf", "@owner", "value\u{0600}"),
+        ("Arabic end of ayah Cf", "@owner", "value\u{06dd}"),
+        ("Syriac abbreviation mark Cf", "@owner", "value\u{070f}"),
+        ("Arabic pound mark above Cf", "@owner", "value\u{0890}"),
+        ("Arabic disputed end of ayah Cf", "@owner", "value\u{08e2}"),
+        ("interlinear annotation Cf", "@owner", "value\u{fff9}"),
+        ("Kaithi number sign Cf", "@owner", "value\u{110bd}"),
+        ("Kaithi number sign above Cf", "@owner", "value\u{110cd}"),
+        (
+            "Egyptian hieroglyph vertical joiner Cf",
+            "@owner",
+            "value\u{13430}",
+        ),
     ] {
         let output = env
             .cmd()
