@@ -944,9 +944,22 @@ struct LoadedEvents {
     degraded: bool,
 }
 
+struct JournalLock {
+    file: File,
+}
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // Best effort by design: Drop cannot report an unlock error, and the owned File closes
+        // immediately afterward. Explicit unlock prevents a fork child that inherited the same
+        // open-file description from extending the parent storage instance's lock lifetime.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 struct SecureStorage {
     dir: File,
-    _lock: File,
+    _lock: JournalLock,
     current: File,
     current_bytes: u64,
 }
@@ -979,6 +992,7 @@ impl SecureStorage {
         if lock_result != 0 {
             return Err(std::io::Error::last_os_error()).context("lock lifecycle journal");
         }
+        let lock = JournalLock { file: lock_file };
 
         let mut current = open_regular_at(dir.as_raw_fd(), leaf(CURRENT_SEGMENT), true, true)?
             .context("open current lifecycle journal segment")?;
@@ -993,7 +1007,7 @@ impl SecureStorage {
             .len();
         Ok(Self {
             dir,
-            _lock: lock_file,
+            _lock: lock,
             current,
             current_bytes,
         })
