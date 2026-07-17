@@ -10488,6 +10488,10 @@ fn tmux_compat_user_option_contract_rejects_closed_grammar_violations() -> TestR
             &["tmux-compat", "show-option", "-pt", pane.as_str(), "@owner"],
         ),
         (
+            "attached target in cluster cannot bypass user-option parsing",
+            &["tmux-compat", "show-option", "-qvt@42", "@owner"],
+        ),
+        (
             "target flag in set cluster cannot hide user-option name",
             &["tmux-compat", "set-option", "-pt", "%0", "@owner", "value"],
         ),
