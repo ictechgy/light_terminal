@@ -1644,13 +1644,12 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
     let live_identities = live_user_option_identities()?;
     update_store(|store| {
         prune_user_options(store, &live_identities);
-        let options = if args.pane {
-            &mut store.pane_user_options
-        } else {
-            &mut store.session_user_options
-        };
-
         if args.unset {
+            let options = if args.pane {
+                &mut store.pane_user_options
+            } else {
+                &mut store.session_user_options
+            };
             if let Some(identity_options) = options.get_mut(&identity) {
                 identity_options.remove(&args.name);
                 if identity_options.is_empty() {
@@ -1664,10 +1663,23 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
             .value
             .as_deref()
             .context("tmux user option value missing")?;
-        if options
-            .get(&identity)
-            .is_some_and(|identity_options| identity_options.contains_key(&args.name))
-        {
+        let option_exists = if args.pane {
+            store
+                .pane_user_options
+                .get(&identity)
+                .is_some_and(|options| options.contains_key(&args.name))
+        } else {
+            store
+                .session_user_options
+                .get(&identity)
+                .is_some_and(|options| options.contains_key(&args.name))
+        };
+        let options = if args.pane {
+            &mut store.pane_user_options
+        } else {
+            &mut store.session_user_options
+        };
+        if option_exists {
             options
                 .get_mut(&identity)
                 .expect("checked user-option identity exists")
@@ -1685,6 +1697,11 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
         if entry_count >= USER_OPTION_ENTRIES_MAX {
             bail!("tmux user-option entry limit reached");
         }
+        let options = if args.pane {
+            &mut store.pane_user_options
+        } else {
+            &mut store.session_user_options
+        };
         let identity_options = options.entry(identity).or_default();
         if identity_options.len() >= USER_OPTIONS_PER_IDENTITY_MAX {
             bail!("tmux user-option per-identity limit reached");
