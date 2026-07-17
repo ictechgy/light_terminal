@@ -537,11 +537,15 @@ fn target_matches_info(target: &str, info: &SessionInfo) -> bool {
 fn list_sessions(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{session_name}".to_string());
-    let session_user_options = read_store(|store| Ok(store.session_user_options.clone()))?;
+    let session_user_options = if format_uses_session_user_options(&format) {
+        Some(read_store(|store| Ok(store.session_user_options.clone()))?)
+    } else {
+        None
+    };
     for pane in root_session_rows()? {
         println!(
             "{}",
-            expand_format_with_session_user_options(&format, &pane, Some(&session_user_options))
+            expand_format_with_session_user_options(&format, &pane, session_user_options.as_ref())
         );
     }
     Ok(0)
@@ -723,8 +727,8 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let before = client::info(target)?;
     let immutable_id = before.id.clone();
     let pane_id = before.pane_id.clone();
+    client::kill(&immutable_id)?;
     let cmux_surface = stored_cmux_surface_for_pane_best_effort(&pane_id);
-    client::kill(target)?;
     forget_panes_and_user_options_best_effort(&[pane_id], &[immutable_id], target);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
@@ -733,35 +737,18 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
 }
 
 fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
-    let (kill_target, panes_before) = match window_pane_rows_for_target(target) {
-        Ok(panes_before) => {
-            let kill_target = panes_before
-                .first()
-                .map(|pane| pane.name.clone())
-                .unwrap_or_else(|| target.to_string());
-            (kill_target, panes_before)
-        }
-        Err(err) => {
-            eprintln!(
-                "warning: tmux compat pane enumeration failed for {}: {}",
-                sanitize::terminal_text(target),
-                sanitize::terminal_text(&err.to_string())
-            );
-            let fallback = vec![client::info(target).with_context(|| {
-                format!(
-                    "capture immutable identity for tmux session target {}",
-                    sanitize::terminal_text(target)
-                )
-            })?];
-            (target.to_string(), fallback)
-        }
-    };
-    let mut cmux_surfaces = HashSet::new();
-    for pane in &panes_before {
-        if let Some(surface) = stored_cmux_surface_for_pane_best_effort(&pane.pane_id) {
-            cmux_surfaces.insert(surface);
-        }
-    }
+    let sessions = client::list_sessions().with_context(|| {
+        format!(
+            "capture pre-kill tmux session snapshot for {}",
+            sanitize::terminal_text(target)
+        )
+    })?;
+    let panes_before = session_tree_from_snapshot(target, &sessions)?;
+    let kill_target = panes_before
+        .first()
+        .context("validated tmux session snapshot has no root")?
+        .id
+        .clone();
     let pane_ids: Vec<String> = panes_before
         .iter()
         .map(|pane| pane.pane_id.clone())
@@ -770,13 +757,117 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
 
     client::kill(&kill_target)?;
 
-    if !pane_ids.is_empty() || !immutable_ids.is_empty() {
-        forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
+    let mut cmux_surfaces = HashSet::new();
+    for pane_id in &pane_ids {
+        if let Some(surface) = stored_cmux_surface_for_pane_best_effort(pane_id) {
+            cmux_surfaces.insert(surface);
+        }
     }
+    forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
     for surface in &cmux_surfaces {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
     }
     Ok(())
+}
+
+fn session_tree_from_snapshot<'a>(
+    target: &str,
+    sessions: &'a [SessionInfo],
+) -> Result<Vec<&'a SessionInfo>> {
+    let mut by_id = HashMap::new();
+    let mut by_pane = HashMap::new();
+    let mut by_name = HashMap::new();
+    for pane in sessions {
+        if pane.id.is_empty() || pane.pane_id.is_empty() || pane.name.is_empty() {
+            bail!("tmux session snapshot contains an empty immutable, pane, or name identity");
+        }
+        if by_id.insert(pane.id.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate immutable identity");
+        }
+        if by_pane.insert(pane.pane_id.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate pane identity");
+        }
+        if by_name.insert(pane.name.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate session name");
+        }
+    }
+
+    let mut resolved = target
+        .starts_with('%')
+        .then(|| by_pane.get(target).copied())
+        .flatten()
+        .or_else(|| by_name.get(target).copied())
+        .or_else(|| by_id.get(target).copied());
+    if resolved.is_none() && !target.starts_with('%') {
+        resolved = by_pane.get(format!("%{target}").as_str()).copied();
+    }
+    let mut root = resolved.with_context(|| {
+        format!(
+            "tmux session target {} is absent from the pre-kill snapshot",
+            sanitize::terminal_text(target)
+        )
+    })?;
+
+    let mut ancestors = HashSet::new();
+    loop {
+        if !ancestors.insert(root.id.as_str()) {
+            bail!("tmux session snapshot contains a parent cycle");
+        }
+        let Some(parent) = snapshot_parent(root, &by_id)? else {
+            break;
+        };
+        root = parent;
+    }
+
+    let mut tree = vec![root];
+    let mut captured = HashSet::from([root.id.as_str()]);
+    let mut cursor = 0;
+    while cursor < tree.len() {
+        let parent = tree[cursor];
+        cursor += 1;
+        for child in sessions {
+            let references_parent_id =
+                child.parent_session_id.as_deref() == Some(parent.id.as_str());
+            let references_parent_pane =
+                child.parent_pane_id.as_deref() == Some(parent.pane_id.as_str());
+            if !references_parent_id && !references_parent_pane {
+                continue;
+            }
+            let actual_parent = snapshot_parent(child, &by_id)?
+                .context("tmux session snapshot descendant is missing its parent")?;
+            if actual_parent.id != parent.id {
+                bail!("tmux session snapshot contains inconsistent parent identities");
+            }
+            if !captured.insert(child.id.as_str()) {
+                bail!("tmux session snapshot contains a descendant cycle");
+            }
+            tree.push(child);
+        }
+    }
+    Ok(tree)
+}
+
+fn snapshot_parent<'a>(
+    pane: &SessionInfo,
+    by_id: &HashMap<&str, &'a SessionInfo>,
+) -> Result<Option<&'a SessionInfo>> {
+    match (
+        pane.parent_session_id.as_deref(),
+        pane.parent_pane_id.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(parent_id), Some(parent_pane_id)) => {
+            let parent = by_id
+                .get(parent_id)
+                .copied()
+                .context("tmux session snapshot references a missing parent")?;
+            if parent.pane_id != parent_pane_id {
+                bail!("tmux session snapshot parent identity does not match its pane identity");
+            }
+            Ok(Some(parent))
+        }
+        _ => bail!("tmux session snapshot contains an incomplete parent identity"),
+    }
 }
 
 /// Implements the tmux-compatible `rename-session [-t target] new-name` shim.
@@ -4173,23 +4264,34 @@ fn expand_format_with_session_user_options(
     out
 }
 
+fn format_uses_session_user_options(format: &str) -> bool {
+    format
+        .match_indices("#{@")
+        .any(|(start, _)| session_user_option_format_token(&format[start..]).is_some())
+}
+
 fn session_user_option_format_replacement<'a>(
     rest: &str,
     info: &SessionInfo,
     session_user_options: &'a HashMap<String, HashMap<String, String>>,
 ) -> Option<(usize, &'a str)> {
+    let (len, name) = session_user_option_format_token(rest)?;
+    let value = session_user_options
+        .get(&info.id)
+        .and_then(|options| options.get(name))
+        .map(String::as_str)
+        .unwrap_or_default();
+    Some((len, value))
+}
+
+fn session_user_option_format_token(rest: &str) -> Option<(usize, &str)> {
     rest.strip_prefix("#{@")?;
     let end = rest.find('}')?;
     let name = &rest[2..end];
     if validate_user_option_name(name).is_err() {
         return None;
     }
-    let value = session_user_options
-        .get(&info.id)
-        .and_then(|options| options.get(name))
-        .map(String::as_str)
-        .unwrap_or_default();
-    Some((end + 1, value))
+    Some((end + 1, name))
 }
 
 fn format_replacement<'a>(
