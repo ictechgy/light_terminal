@@ -2361,7 +2361,11 @@ fn doctor_reports_daemon_version_and_paths() -> TestResult {
         .and_then(|v| v.as_u64())
         .ok_or("tmux_compat.noop_command_count must be present")?;
     assert_eq!(supported, full + partial + noop, "{initial_report:?}");
-    assert!(supported > 0, "{initial_report:?}");
+    assert_eq!(
+        (supported, full, partial, noop),
+        (33, 10, 16, 7),
+        "doctor must publish the executable tmux compatibility tier counts: {initial_report:?}"
+    );
 
     let status = env
         .cmd()
@@ -13598,6 +13602,85 @@ fn tmux_compat_list_commands_includes_agent_query_surface() -> TestResult {
     assert_eq!(
         row.get("support").and_then(|value| value.as_str()),
         Some("partial")
+    );
+
+    let all_json = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "--json"])
+        .output()?;
+    assert!(all_json.status.success(), "{all_json:?}");
+    let all_commands: serde_json::Value = serde_json::from_slice(&all_json.stdout)?;
+    let all_commands = all_commands
+        .as_array()
+        .ok_or("list-commands --json must return an array")?;
+    let set_option = all_commands
+        .iter()
+        .find(|row| row.get("name").and_then(|value| value.as_str()) == Some("set-option"))
+        .ok_or("set-option missing from list-commands --json")?;
+    assert_eq!(
+        set_option,
+        &serde_json::json!({
+            "name": "set-option",
+            "alias": "set",
+            "aliases": [],
+            "usage": "[-pqu] [-t target] [--] @option [value]",
+            "support": "partial",
+        })
+    );
+    let set_option_verbose = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "--verbose", "set"])
+        .output()?;
+    assert!(
+        set_option_verbose.status.success(),
+        "{set_option_verbose:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&set_option_verbose.stdout).trim(),
+        "set-option\tset\tpartial\t[-pqu] [-t target] [--] @option [value]"
+    );
+
+    let set_window_option = all_commands
+        .iter()
+        .find(|row| row.get("name").and_then(|value| value.as_str()) == Some("set-window-option"))
+        .ok_or("set-window-option missing from list-commands --json")?;
+    assert_eq!(
+        set_window_option,
+        &serde_json::json!({
+            "name": "set-window-option",
+            "alias": "setw",
+            "aliases": [],
+            "usage": "[-t target-window] option [value]",
+            "support": "noop",
+        })
+    );
+    let set_window_option_verbose = env
+        .cmd()
+        .args(["tmux-compat", "list-commands", "--verbose", "setw"])
+        .output()?;
+    assert!(
+        set_window_option_verbose.status.success(),
+        "{set_window_option_verbose:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&set_window_option_verbose.stdout).trim(),
+        "set-window-option\tsetw\tnoop\t[-t target-window] option [value]"
+    );
+    let tier_count = |tier: &str| {
+        all_commands
+            .iter()
+            .filter(|row| row.get("support").and_then(|value| value.as_str()) == Some(tier))
+            .count()
+    };
+    assert_eq!(
+        (
+            all_commands.len(),
+            tier_count("full"),
+            tier_count("partial"),
+            tier_count("noop"),
+        ),
+        (33, 10, 16, 7),
+        "list-commands must publish the exact executable support-tier counts: {all_commands:?}"
     );
     let unsupported_filter = env
         .cmd()
