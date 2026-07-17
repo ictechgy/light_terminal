@@ -5053,9 +5053,8 @@ mod tests {
         let process_id =
             retain_process_identity.then(|| child.process_id().expect("test child process id"));
         let process_group_id = retain_process_identity.then(|| {
-            pair.master
-                .process_group_leader()
-                .expect("test child process group")
+            super::verified_process_group_id(pair.master.process_group_leader(), process_id, name)
+                .expect("verified test child process group")
         });
         let killer = child.clone_killer();
         drop(pair.slave);
@@ -5124,14 +5123,11 @@ mod tests {
     }
 
     fn build_long_lived_test_session(name: &str) -> Arc<Session> {
-        let shell_path = ["/bin/sh", "/usr/bin/sh"]
+        let cat_path = ["/bin/cat", "/usr/bin/cat"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file())
-            .expect("absolute shell for test session");
-        let mut command = CommandBuilder::new(shell_path);
-        command.arg("-c");
-        command.arg("trap 'exit 0' HUP TERM; while :; do sleep 1; done");
-        build_test_session_with_command(name, command, true)
+            .expect("absolute cat for test session");
+        build_test_session_with_command(name, CommandBuilder::new(cat_path), true)
     }
 
     fn install_test_capability(
@@ -6463,6 +6459,11 @@ mod tests {
             .process_group_id
             .expect("long-lived leader process group");
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "leader must start live");
+        assert_eq!(
+            super::verified_session_process_group_id(&session),
+            Some(pgid),
+            "fixture identity must pass the production process-group verification gate"
+        );
 
         let fallback_parked = Arc::new(Barrier::new(2));
         let release_fallback = Arc::new(Barrier::new(2));
