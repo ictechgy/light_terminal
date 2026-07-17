@@ -3368,12 +3368,27 @@ fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
 }
 
 fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) -> Result<()> {
+    // 순서 유지: StoreLock 획득 -> list_sessions -> load/prune/insert/save.
     let _lock = StoreLock::acquire()?;
     let sessions = client::list_sessions()?;
     let live_identities: HashSet<&str> =
         sessions.iter().map(|session| session.id.as_str()).collect();
+    remember_pane_with_live(info, cmux_surface, &live_identities)
+}
+
+/// `remember_pane`의 락-보존 내부 갱신 단계. 호출자가 StoreLock을 이미 보유하고
+/// 살아있는 세션 identity 집합을 명시적으로 제공한다고 가정한다.
+///
+/// 왜: 테스트가 데몬 접촉(list_sessions -> ensure_server) 없이 스토어를
+/// 결정적으로 시드할 수 있게 하기 위한 분리이며, 프로덕션 경로의 순서와
+/// 동작은 바꾸지 않는다.
+fn remember_pane_with_live(
+    info: &SessionInfo,
+    cmux_surface: Option<&CmuxSurfaceContext>,
+    live_identities: &HashSet<&str>,
+) -> Result<()> {
     let mut store = load_store()?;
-    prune_user_options(&mut store, &live_identities);
+    prune_user_options(&mut store, live_identities);
     store.panes.insert(
         info.pane_id.clone(),
         CompatPane {
@@ -7187,7 +7202,15 @@ mod tests {
             status_theme: None,
             lifecycle_state: None,
         };
-        remember_pane(&info, Some(&stored)).expect("seed stored cmux surface");
+        // 데몬 접촉 없이 결정적으로 시드: 살아있는 identity를 명시적으로 제공한다.
+        // 프로덕션 계약과 동일하게 StoreLock을 보유한 상태로 내부 헬퍼를 호출하고,
+        // 스코프 종료로 락을 해제해 cmux_status_identity가 다시 획득하게 한다.
+        {
+            let _store_lock = StoreLock::acquire().expect("acquire store lock for seeding");
+            let live_identities: HashSet<&str> = HashSet::from(["session-uuid"]);
+            remember_pane_with_live(&info, Some(&stored), &live_identities)
+                .expect("seed stored cmux surface");
+        }
 
         let resolved = cmux_status_identity("%42").expect("stored context should resolve");
         assert_eq!(resolved, stored);

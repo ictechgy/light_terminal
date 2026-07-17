@@ -435,11 +435,13 @@ mod tests {
             .collect()
     }
 
-    fn in_isolated_path_env(body: impl FnOnce()) {
-        let current_thread = std::thread::current();
-        let test_name = current_thread
-            .name()
-            .expect("path test thread must have an exact libtest name");
+    /// PATH 관련 env를 격리하기 위해 자기 자신을 `--exact <test_name>`으로 재실행한다.
+    ///
+    /// `test_name`은 반드시 libtest 전체 경로(예: `paths::tests::...`)를 명시적으로
+    /// 받는다. 왜: 스레드 이름에서 유도하면 `--test-threads=1`(스레드 "main")에서
+    /// 자식이 0개 테스트를 매칭해 본문이 조용히 건너뛰어지기 때문이다. 자식이
+    /// 정확히 1개 테스트를 실행했는지도 stdout으로 검증한다.
+    fn in_isolated_path_env(body: impl FnOnce(), test_name: &str) {
         let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
         match std::env::var_os(PATH_ENV_SELF_REEXEC) {
             Some(marker) => {
@@ -460,12 +462,17 @@ mod tests {
                 let after = path_env_snapshot();
                 assert_eq!(after, before, "self-reexec parent path environment changed");
                 let output = output.expect("spawn exact path-test self-reexec child");
+                let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(
                     output.status.success(),
                     "exact path-test self-reexec child failed: test={test_name:?} status={} stdout={} stderr={}",
                     output.status,
-                    String::from_utf8_lossy(&output.stdout),
+                    stdout,
                     String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    stdout.contains("test result: ok. 1 passed"),
+                    "self-reexec child must run exactly one test (zero-match silent pass is forbidden): test={test_name:?} stdout={stdout}"
                 );
             }
         }
@@ -473,7 +480,7 @@ mod tests {
 
     #[test]
     fn runtime_dir_rejects_relative_lterm_runtime_dir() {
-        in_isolated_path_env(|| {
+        let body = || {
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
                 std::env::set_var("LTERM_RUNTIME_DIR", "relative-runtime");
@@ -485,12 +492,16 @@ mod tests {
                     .contains("LTERM_RUNTIME_DIR must be an absolute path"),
                 "unexpected error: {err:#}"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::runtime_dir_rejects_relative_lterm_runtime_dir",
+        );
     }
 
     #[test]
     fn data_dir_rejects_relative_lterm_data_dir() {
-        in_isolated_path_env(|| {
+        let body = || {
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
                 std::env::set_var("LTERM_DATA_DIR", "relative-data");
@@ -502,12 +513,16 @@ mod tests {
                     .contains("LTERM_DATA_DIR must be an absolute path"),
                 "unexpected error: {err:#}"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::data_dir_rejects_relative_lterm_data_dir",
+        );
     }
 
     #[test]
     fn data_dir_without_home_falls_back_to_tmp_runtime_data_dir() {
-        in_isolated_path_env(|| {
+        let body = || {
             let tmp = tempfile::tempdir().expect("temp dir");
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
@@ -530,12 +545,16 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode & 0o077, 0, "fallback data dir must be private");
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::data_dir_without_home_falls_back_to_tmp_runtime_data_dir",
+        );
     }
 
     #[test]
     fn runtime_dir_uses_xdg_runtime_dir_child_and_preserves_private_base() {
-        in_isolated_path_env(|| {
+        let body = || {
             let xdg = tempfile::tempdir().expect("temp xdg runtime dir");
             fs::set_permissions(xdg.path(), fs::Permissions::from_mode(0o700))
                 .expect("private xdg dir");
@@ -552,12 +571,16 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode & 0o077, 0, "runtime child must be private");
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::runtime_dir_uses_xdg_runtime_dir_child_and_preserves_private_base",
+        );
     }
 
     #[test]
     fn socket_path_rejects_relative_lterm_socket() {
-        in_isolated_path_env(|| {
+        let body = || {
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
                 std::env::set_var("LTERM_SOCKET", "relative.sock");
@@ -569,7 +592,11 @@ mod tests {
                     .contains("LTERM_SOCKET must be an absolute path"),
                 "unexpected error: {err:#}"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::socket_path_rejects_relative_lterm_socket",
+        );
     }
 
     #[test]
@@ -591,7 +618,7 @@ mod tests {
 
     #[test]
     fn tmux_compat_socket_is_private_sibling_not_live_socket() {
-        in_isolated_path_env(|| {
+        let body = || {
             let dir = tempfile::tempdir().expect("temp socket dir");
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
                 .expect("private socket dir");
@@ -611,12 +638,16 @@ mod tests {
                 compat.file_name().and_then(|name| name.to_str()),
                 Some(".lterm.sock.tmux-compat")
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::tmux_compat_socket_is_private_sibling_not_live_socket",
+        );
     }
 
     #[test]
     fn socket_path_rejects_symlink_leaf() {
-        in_isolated_path_env(|| {
+        let body = || {
             let dir = tempfile::tempdir().expect("temp socket dir");
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
                 .expect("private socket dir");
@@ -634,12 +665,13 @@ mod tests {
                 err.to_string().contains("must not be a symlink"),
                 "unexpected error: {err:#}"
             );
-        });
+        };
+        in_isolated_path_env(body, "paths::tests::socket_path_rejects_symlink_leaf");
     }
 
     #[test]
     fn socket_path_reuses_recorded_default_socket_when_tmpdir_changes() {
-        in_isolated_path_env(|| {
+        let body = || {
             let data = tempfile::tempdir().expect("temp data dir");
             let tmp_a = tempfile::tempdir().expect("first temp dir");
             let tmp_b = tempfile::tempdir().expect("second temp dir");
@@ -667,12 +699,16 @@ mod tests {
                 first,
                 "default clients should rejoin the active daemon even if TMPDIR changes"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::socket_path_reuses_recorded_default_socket_when_tmpdir_changes",
+        );
     }
 
     #[test]
     fn socket_path_without_home_skips_default_marker_and_uses_tmp_runtime() {
-        in_isolated_path_env(|| {
+        let body = || {
             let tmp = tempfile::tempdir().expect("temp dir");
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
@@ -689,12 +725,16 @@ mod tests {
                 path.file_name().and_then(|name| name.to_str()),
                 Some("lterm.sock")
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::socket_path_without_home_skips_default_marker_and_uses_tmp_runtime",
+        );
     }
 
     #[test]
     fn explicit_data_dir_errors_remain_strict_for_default_marker_lookup() {
-        in_isolated_path_env(|| {
+        let body = || {
             let tmp = tempfile::tempdir().expect("temp dir");
             // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
             unsafe {
@@ -709,12 +749,16 @@ mod tests {
                     .contains("LTERM_DATA_DIR must be an absolute path"),
                 "unexpected error: {err:#}"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::explicit_data_dir_errors_remain_strict_for_default_marker_lookup",
+        );
     }
 
     #[test]
     fn explicit_runtime_dir_ignores_recorded_default_socket() {
-        in_isolated_path_env(|| {
+        let body = || {
             let data = tempfile::tempdir().expect("temp data dir");
             let tmp = tempfile::tempdir().expect("temp dir");
             let explicit = tempfile::tempdir().expect("explicit runtime dir");
@@ -739,7 +783,11 @@ mod tests {
                 explicit.path().join("lterm.sock"),
                 "explicit runtime overrides must not be hijacked by the default marker"
             );
-        });
+        };
+        in_isolated_path_env(
+            body,
+            "paths::tests::explicit_runtime_dir_ignores_recorded_default_socket",
+        );
     }
 
     #[test]

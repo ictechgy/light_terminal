@@ -12736,6 +12736,7 @@ fn tmux_compat_g003_executes_exact_raw_omx_vectors_and_list_format() -> TestResu
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn tmux_compat_missing_target_value_does_not_fall_back_to_default() -> TestResult {
     let env = TestEnv::new()?;
