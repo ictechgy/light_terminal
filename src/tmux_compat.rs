@@ -1518,7 +1518,10 @@ fn show_option(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         None if parsed.quiet => Ok(0),
-        None => bail!("unknown tmux user option: {}", sanitize::terminal_text(&parsed.name)),
+        None => bail!(
+            "unknown tmux user option: {}",
+            sanitize::terminal_text(&parsed.name)
+        ),
     }
 }
 
@@ -1636,11 +1639,157 @@ fn validate_user_option_value(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
+    let identity = user_option_identity(args)?;
+    let live_identities = live_user_option_identities()?;
+    update_store(|store| {
+        prune_user_options(store, &live_identities);
+        let options = if args.pane {
+            &mut store.pane_user_options
+        } else {
+            &mut store.session_user_options
+        };
+
+        if args.unset {
+            if let Some(identity_options) = options.get_mut(&identity) {
+                identity_options.remove(&args.name);
+                if identity_options.is_empty() {
+                    options.remove(&identity);
+                }
+            }
+            return Ok(());
+        }
+
+        let value = args
+            .value
+            .as_deref()
+            .context("tmux user option value missing")?;
+        if options
+            .get(&identity)
+            .is_some_and(|identity_options| identity_options.contains_key(&args.name))
+        {
+            options
+                .get_mut(&identity)
+                .expect("checked user-option identity exists")
+                .insert(args.name.clone(), value.to_string());
+            return Ok(());
+        }
+
+        let identity_exists = store.pane_user_options.contains_key(&identity)
+            || store.session_user_options.contains_key(&identity);
+        let identity_count = user_option_identity_count(store);
+        let entry_count = user_option_entry_count(store);
+        if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
+            bail!("tmux user-option identity limit reached");
+        }
+        if entry_count >= USER_OPTION_ENTRIES_MAX {
+            bail!("tmux user-option entry limit reached");
+        }
+        let identity_options = options.entry(identity).or_default();
+        if identity_options.len() >= USER_OPTIONS_PER_IDENTITY_MAX {
+            bail!("tmux user-option per-identity limit reached");
+        }
+        identity_options.insert(args.name.clone(), value.to_string());
+        Ok(())
+    })
+}
+
+fn read_user_option(args: &UserOptionArgs) -> Result<Option<String>> {
+    let identity = user_option_identity(args)?;
+    read_store(|store| {
+        let options = if args.pane {
+            &store.pane_user_options
+        } else {
+            &store.session_user_options
+        };
+        Ok(options
+            .get(&identity)
+            .and_then(|identity_options| identity_options.get(&args.name))
+            .cloned())
+    })
+}
+
+fn user_option_identity(args: &UserOptionArgs) -> Result<String> {
+    let target = args.target.clone().unwrap_or_else(default_target);
+    let info = info_for_tmux_target(&target)?;
+    if args.pane {
+        return Ok(info.id);
+    }
+    root_session_identity(info)
+}
+
+fn root_session_identity(mut info: SessionInfo) -> Result<String> {
+    let sessions = client::list_sessions()?;
+    let by_id: HashMap<String, SessionInfo> = sessions
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = info.parent_session_id.as_deref() {
+        if !seen.insert(info.id.clone()) {
+            bail!("tmux user-option target has a cyclic parent chain");
+        }
+        info = by_id.get(parent_id).cloned().with_context(|| {
+            format!(
+                "tmux user-option parent identity {} is unavailable",
+                sanitize::terminal_text(parent_id)
+            )
+        })?;
+    }
+    Ok(info.id)
+}
+
+fn live_user_option_identities() -> Result<HashSet<String>> {
+    Ok(client::list_sessions()?
+        .into_iter()
+        .map(|info| info.id)
+        .collect())
+}
+
+fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<String>) {
+    store
+        .pane_user_options
+        .retain(|identity, options| live_identities.contains(identity) && !options.is_empty());
+    store
+        .session_user_options
+        .retain(|identity, options| live_identities.contains(identity) && !options.is_empty());
+}
+
+fn user_option_identity_count(store: &CompatStore) -> usize {
+    store
+        .pane_user_options
+        .keys()
+        .chain(store.session_user_options.keys())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn user_option_entry_count(store: &CompatStore) -> usize {
+    store
+        .pane_user_options
+        .values()
+        .chain(store.session_user_options.values())
+        .map(HashMap::len)
+        .sum()
+}
+
 fn is_unsafe_user_option_char(ch: char) -> bool {
     ch.is_control()
-        || matches!(ch, '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}'
-            | '\u{17b4}' | '\u{17b5}' | '\u{2028}' | '\u{2029}' | '\u{3164}' | '\u{feff}'
-            | '\u{ffa0}')
+        || matches!(
+            ch,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{3164}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+        )
         || matches!(ch as u32,
             0x180b..=0x180f | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f
             | 0xfe00..=0xfe0f | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0000..=0xe0fff)
