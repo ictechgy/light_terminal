@@ -720,21 +720,12 @@ fn kill_session(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
-    let before = client::info(target).ok();
-    let immutable_id = before.as_ref().map(|info| info.id.clone());
-    let pane_id = before
-        .as_ref()
-        .map(|info| info.pane_id.clone())
-        .or_else(|| target.strip_prefix('%').map(|digits| format!("%{digits}")));
-    let cmux_surface = pane_id
-        .as_deref()
-        .and_then(stored_cmux_surface_for_pane_best_effort);
+    let before = client::info(target)?;
+    let immutable_id = before.id.clone();
+    let pane_id = before.pane_id.clone();
+    let cmux_surface = stored_cmux_surface_for_pane_best_effort(&pane_id);
     client::kill(target)?;
-    let pane_ids: Vec<String> = pane_id.iter().cloned().collect();
-    let immutable_ids: Vec<String> = immutable_id.into_iter().collect();
-    if !pane_ids.is_empty() || !immutable_ids.is_empty() {
-        forget_panes_and_user_options_best_effort(&pane_ids, &immutable_ids, target);
-    }
+    forget_panes_and_user_options_best_effort(&[pane_id], &[immutable_id], target);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
     }
@@ -756,7 +747,12 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
                 sanitize::terminal_text(target),
                 sanitize::terminal_text(&err.to_string())
             );
-            let fallback = client::info(target).ok().into_iter().collect();
+            let fallback = vec![client::info(target).with_context(|| {
+                format!(
+                    "capture immutable identity for tmux session target {}",
+                    sanitize::terminal_text(target)
+                )
+            })?];
             (target.to_string(), fallback)
         }
     };
