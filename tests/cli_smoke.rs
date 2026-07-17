@@ -690,7 +690,9 @@ fn run_tmux_with_fake_failed_kill(
                                 });
                                 match info {
                                     Some(info) => serde_json::json!({"ok":true,"result":info}),
-                                    None => serde_json::json!({"ok":false,"error":"target not found"}),
+                                    None => {
+                                        serde_json::json!({"ok":false,"error":"target not found"})
+                                    }
                                 }
                             }
                             "list" => serde_json::json!({"ok":true,"result":sessions}),
@@ -699,7 +701,9 @@ fn run_tmux_with_fake_failed_kill(
                                 "error":"injected fake daemon kill failure"
                             }),
                             other => {
-                                return Err(format!("unexpected fake daemon request: {other}").into());
+                                return Err(
+                                    format!("unexpected fake daemon request: {other}").into()
+                                );
                             }
                         };
                         stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
@@ -709,7 +713,9 @@ fn run_tmux_with_fake_failed_kill(
                             return Ok(requests);
                         }
                         if Instant::now() >= deadline {
-                            return Err(format!("fake daemon timed out; requests={requests:?}").into());
+                            return Err(
+                                format!("fake daemon timed out; requests={requests:?}").into()
+                            );
                         }
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -11332,8 +11338,324 @@ fn tmux_compat_user_option_contract_preserves_store_when_atomic_temp_write_fails
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_successful_pane_kill_removes_only_captured_immutable_id() -> TestResult {
+    let env = TestEnv::new()?;
+    let killed_pane = create_sleep_session(&env, "g003-pane-killed")?;
+    let survivor_pane = create_sleep_session(&env, "g003-pane-survivor")?;
+    let killed = read_session_json(&env, "g003-pane-killed")?;
+    let survivor = read_session_json(&env, "g003-pane-survivor")?;
+    let killed_id = killed["id"].as_str().ok_or("killed id missing")?;
+    let survivor_id = survivor["id"].as_str().ok_or("survivor id missing")?;
+
+    for (pane, value) in [
+        (killed_pane.as_str(), "killed-value"),
+        (survivor_pane.as_str(), "survivor-value"),
+    ] {
+        for pane_scope in [false, true] {
+            let mut args = vec!["tmux-compat", "set-option"];
+            if pane_scope {
+                args.push("-p");
+            }
+            args.extend(["-t", pane, "@owner", value]);
+            let output = env.cmd().args(args).output()?;
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+
+    let killed_output = env
+        .cmd()
+        .args(["tmux-compat", "kill-pane", "-t", killed_pane.as_str()])
+        .output()?;
+    assert!(killed_output.status.success(), "{killed_output:?}");
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    for scope in ["pane_user_options", "session_user_options"] {
+        assert!(
+            store[scope].get(killed_id).is_none(),
+            "successful pane kill retained captured immutable id {killed_id} in {scope}: {store}"
+        );
+        assert_eq!(
+            store[scope][survivor_id]["@owner"], "survivor-value",
+            "pane kill removed or changed unrelated immutable id {survivor_id} in {scope}: {store}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_successful_session_kill_removes_root_and_descendant_immutable_ids() -> TestResult
+{
+    let env = TestEnv::new()?;
+    let root_pane = create_sleep_session(&env, "g003-session-root")?;
+    let survivor_pane = create_sleep_session(&env, "g003-session-survivor")?;
+    let sleep = command_path("sleep")?.display().to_string();
+    let child_output = env
+        .cmd()
+        .args([
+            "tmux-compat",
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            root_pane.as_str(),
+            sleep.as_str(),
+            "30",
+        ])
+        .output()?;
+    assert!(child_output.status.success(), "{child_output:?}");
+    let child_pane = String::from_utf8(child_output.stdout)?.trim().to_string();
+    let all_output = env.cmd().args(["sessions", "--json", "--all"]).output()?;
+    assert!(all_output.status.success(), "{all_output:?}");
+    let all: Vec<serde_json::Value> = serde_json::from_slice(&all_output.stdout)?;
+    let root_id = all
+        .iter()
+        .find(|row| row["pane_id"].as_str() == Some(root_pane.as_str()))
+        .and_then(|row| row["id"].as_str())
+        .ok_or("root immutable id missing")?;
+    let child_id = all
+        .iter()
+        .find(|row| row["pane_id"].as_str() == Some(child_pane.as_str()))
+        .and_then(|row| row["id"].as_str())
+        .ok_or("child immutable id missing")?;
+    let survivor_id = all
+        .iter()
+        .find(|row| row["pane_id"].as_str() == Some(survivor_pane.as_str()))
+        .and_then(|row| row["id"].as_str())
+        .ok_or("survivor immutable id missing")?;
+
+    for pane in [&root_pane, &child_pane, &survivor_pane] {
+        let output = env
+            .cmd()
+            .args([
+                "tmux-compat",
+                "set-option",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "@owner",
+                "pane-value",
+            ])
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+    }
+    for (target, value) in [
+        (child_pane.as_str(), "root-session-value"),
+        (survivor_pane.as_str(), "survivor-session-value"),
+    ] {
+        let output = env
+            .cmd()
+            .args(["tmux-compat", "set-option", "-t", target, "@owner", value])
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let killed = env
+        .cmd()
+        .args(["tmux-compat", "kill-session", "-t", "g003-session-root"])
+        .output()?;
+    assert!(killed.status.success(), "{killed:?}");
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    for removed_id in [root_id, child_id] {
+        assert!(
+            store["pane_user_options"].get(removed_id).is_none(),
+            "successful session kill retained pane identity {removed_id}: {store}"
+        );
+        assert!(
+            store["session_user_options"].get(removed_id).is_none(),
+            "successful session kill retained session identity {removed_id}: {store}"
+        );
+    }
+    assert_eq!(
+        store["pane_user_options"][survivor_id]["@owner"], "pane-value",
+        "session cleanup removed unrelated pane identity: {store}"
+    );
+    assert_eq!(
+        store["session_user_options"][survivor_id]["@owner"], "survivor-session-value",
+        "session cleanup removed unrelated session identity: {store}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_failed_kill_retains_live_user_option_values() -> TestResult {
+    let env = TestEnv::new()?;
+    let live = fake_live_session(0);
+    let live_id = live["id"].as_str().ok_or("live id missing")?;
+    let mut values = serde_json::Map::new();
+    values.insert("@owner".to_string(), serde_json::json!("retained"));
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(
+        live_id.to_string(),
+        serde_json::Value::Object(values.clone()),
+    );
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(live_id.to_string(), serde_json::Value::Object(values));
+    let before =
+        write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+    let (output, requests) = run_tmux_with_fake_failed_kill(
+        &env,
+        &["tmux-compat", "kill-pane", "-t", "%0"],
+        vec![live],
+    )?;
+    assert!(!output.status.success(), "{output:?}");
+    assert_stderr_contains(&output, "injected fake daemon kill failure");
+    assert!(
+        requests.iter().any(|request| request == "info"),
+        "{requests:?}"
+    );
+    assert!(
+        requests.iter().any(|request| request == "kill"),
+        "{requests:?}"
+    );
+    assert_eq!(
+        std::fs::read(data_store_path(&env))?,
+        before,
+        "failed kill changed persisted user-option values"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_remember_pane_reconciles_natural_exit_identities() -> TestResult {
+    let env = TestEnv::new()?;
+    let stale_id = "00000000-0000-4000-8000-ffffffffffff";
+    let mut values = serde_json::Map::new();
+    values.insert("@owner".to_string(), serde_json::json!("stale"));
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(
+        stale_id.to_string(),
+        serde_json::Value::Object(values.clone()),
+    );
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(stale_id.to_string(), serde_json::Value::Object(values));
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+
+    create_sleep_session(&env, "g003-remember-reconcile")?;
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    assert!(
+        store["pane_user_options"].get(stale_id).is_none()
+            && store["session_user_options"].get(stale_id).is_none(),
+        "remember_pane did not reconcile naturally exited immutable id {stale_id}: {store}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_mutations_prune_reused_pane_ids_and_empty_maps_idempotently() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut old = fake_live_session(0);
+    old["id"] = serde_json::json!("00000000-0000-4000-8000-00000000aaaa");
+    let old_id = old["id"].as_str().ok_or("old id missing")?;
+    let mut replacement = fake_live_session(0);
+    replacement["id"] = serde_json::json!("00000000-0000-4000-8000-00000000bbbb");
+    replacement["name"] = serde_json::json!("replacement-session");
+    let replacement_id = replacement["id"].as_str().ok_or("replacement id missing")?;
+    let mut values = serde_json::Map::new();
+    values.insert("@owner".to_string(), serde_json::json!("old-owner"));
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(
+        old_id.to_string(),
+        serde_json::Value::Object(values.clone()),
+    );
+    pane_options.insert(
+        "00000000-0000-4000-8000-00000000cccc".to_string(),
+        serde_json::json!({}),
+    );
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(old_id.to_string(), serde_json::Value::Object(values));
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+
+    let absent = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            "%0",
+            "@owner",
+        ],
+        vec![replacement.clone()],
+    )?;
+    assert!(absent.status.success(), "{absent:?}");
+    assert!(
+        absent.stdout.is_empty() && absent.stderr.is_empty(),
+        "{absent:?}"
+    );
+
+    let set = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@owner",
+            "new-owner",
+        ],
+        vec![replacement.clone()],
+    )?;
+    assert!(set.status.success(), "{set:?}");
+    let after_set: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    assert!(
+        after_set["pane_user_options"].get(old_id).is_none(),
+        "{after_set}"
+    );
+    assert!(
+        after_set["session_user_options"].get(old_id).is_none(),
+        "{after_set}"
+    );
+    assert_eq!(
+        after_set["pane_user_options"][replacement_id]["@owner"],
+        "new-owner"
+    );
+
+    for _ in 0..2 {
+        let unset = run_tmux_with_fake_sessions(
+            &env,
+            &[
+                "tmux-compat",
+                "set-option",
+                "-u",
+                "-p",
+                "-t",
+                "%0",
+                "@owner",
+            ],
+            vec![replacement.clone()],
+        )?;
+        assert!(unset.status.success(), "{unset:?}");
+    }
+    let final_store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    assert!(
+        final_store["pane_user_options"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
+        "idempotent cleanup retained empty inner maps: {final_store}"
+    );
+    assert!(
+        final_store["session_user_options"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
+        "mutation reconciliation retained stale session maps: {final_store}"
+    );
+    Ok(())
+}
+
 // Pinned contract mirror, not authentication proof. Provenance:
-// oh-my-codex 0.20.2, src/team/managed-tmux.ts pane-first ownership evaluator.
+// oh-my-codex 0.20.2 release artifact,
+// src/scripts/notify-hook/managed-tmux.ts pane-first ownership evaluator.
 fn omx_pane_first_binds(
     candidate: &str,
     pane_read: Result<&str, ()>,
@@ -11379,6 +11701,113 @@ fn tmux_compat_user_option_contract_pins_omx_pane_first_classification_matrix() 
             "{name}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_executes_exact_raw_omx_vectors_and_list_format() -> TestResult {
+    let env = TestEnv::new()?;
+    let first = fake_live_session(0);
+    let second = fake_live_session(1);
+    let sessions = vec![first.clone(), second.clone()];
+    let candidate = "omx-instance-a";
+
+    for args in [
+        vec![
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%0",
+            "@omx_pane_instance_id",
+            candidate,
+        ],
+        vec![
+            "tmux-compat",
+            "set-option",
+            "-t",
+            "fake-session-0",
+            "@omx_instance_id",
+            candidate,
+        ],
+        vec![
+            "tmux-compat",
+            "set-option",
+            "-p",
+            "-t",
+            "%1",
+            "@omx_pane_instance_id",
+            "must-not-leak",
+        ],
+    ] {
+        let output = run_tmux_with_fake_sessions(&env, &args, sessions.clone())?;
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+    }
+
+    let pane = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            "%0",
+            "@omx_pane_instance_id",
+        ],
+        sessions.clone(),
+    )?;
+    let session = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-t",
+            "fake-session-0",
+            "@omx_instance_id",
+        ],
+        sessions.clone(),
+    )?;
+    assert_eq!(pane.stdout, b"omx-instance-a\n", "{pane:?}");
+    assert_eq!(session.stdout, b"omx-instance-a\n", "{session:?}");
+    assert!(pane.stderr.is_empty() && session.stderr.is_empty());
+    let pane_value = String::from_utf8(pane.stdout)?.trim().to_string();
+    let session_value = String::from_utf8(session.stdout)?.trim().to_string();
+    assert!(omx_pane_first_binds(
+        candidate,
+        Ok(&pane_value),
+        Ok(Some(&session_value))
+    ));
+
+    let list = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@omx_instance_id}",
+        ],
+        sessions,
+    )?;
+    assert!(list.status.success(), "{list:?}");
+    assert!(list.stderr.is_empty(), "{list:?}");
+    assert_eq!(
+        list.stdout, b"fake-session-0\tomx-instance-a\nfake-session-1\t\n",
+        "exact OMX list vector must expand the root option and an empty absent field without literal/pane leakage: {list:?}"
+    );
+    let encoded = String::from_utf8(list.stdout)?;
+    assert!(!encoded.contains("#{@omx_instance_id}"), "{encoded:?}");
+    assert!(!encoded.contains("must-not-leak"), "{encoded:?}");
+    assert!(
+        !encoded.contains("%0") && !encoded.contains("%1"),
+        "{encoded:?}"
+    );
+    Ok(())
 }
 
 #[test]
