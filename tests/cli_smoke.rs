@@ -11110,6 +11110,64 @@ fn tmux_compat_user_option_contract_enforces_4096_entries_and_16mib_store_atomic
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn tmux_compat_user_option_contract_preserves_store_when_atomic_temp_write_fails() -> TestResult {
+    let env = TestEnv::new()?;
+    let root = fake_live_session(0);
+    let root_id = root["id"].as_str().ok_or("root id missing")?.to_string();
+    let mut values = serde_json::Map::new();
+    values.insert("@owner".to_string(), serde_json::json!("original"));
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(root_id.clone(), serde_json::Value::Object(values));
+    let before = write_user_option_store(
+        &env,
+        serde_json::Map::new(),
+        session_options,
+        serde_json::Map::new(),
+    )?;
+    let store_path = data_store_path(&env);
+    let tmp_path = store_path.with_extension("json.tmp");
+    std::fs::create_dir(&tmp_path)?;
+
+    let rejected = run_tmux_with_fake_sessions(
+        &env,
+        &[
+            "tmux-compat",
+            "set-option",
+            "-t",
+            "%0",
+            "@owner",
+            "rejected",
+        ],
+        vec![root.clone()],
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert_stderr_contains(&rejected, "tmux-compat-store.json.tmp");
+    let after_failure = std::fs::read(&store_path)?;
+    assert_eq!(after_failure, before, "failed save changed store bytes");
+    let failed_store: serde_json::Value = serde_json::from_slice(&after_failure)?;
+    assert_eq!(
+        failed_store["session_user_options"][&root_id]["@owner"], "original",
+        "failed save partially mutated logical state"
+    );
+
+    std::fs::remove_dir(&tmp_path)?;
+    let updated = run_tmux_with_fake_sessions(
+        &env,
+        &["tmux-compat", "set-option", "-t", "%0", "@owner", "updated"],
+        vec![root],
+    )?;
+    assert!(updated.status.success(), "{updated:?}");
+    let final_store: serde_json::Value = serde_json::from_slice(&std::fs::read(&store_path)?)?;
+    assert_eq!(
+        final_store["session_user_options"][&root_id]["@owner"],
+        "updated"
+    );
+    assert!(!tmp_path.exists(), "successful save left tmp artifact");
+    Ok(())
+}
+
 // Pinned contract mirror, not authentication proof. Provenance:
 // oh-my-codex 0.20.2, src/team/managed-tmux.ts pane-first ownership evaluator.
 fn omx_pane_first_binds(
