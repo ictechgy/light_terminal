@@ -1677,40 +1677,30 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
                 .get(&identity)
                 .is_some_and(|options| options.contains_key(&args.name))
         };
-        let options = if args.pane {
-            &mut store.pane_user_options
-        } else {
-            &mut store.session_user_options
-        };
-        if option_exists {
-            options
-                .get_mut(&identity)
-                .expect("checked user-option identity exists")
-                .insert(args.name.clone(), value.to_string());
-            return Ok(());
+        if !option_exists {
+            let identity_exists = store.pane_user_options.contains_key(&identity)
+                || store.session_user_options.contains_key(&identity);
+            let identity_option_count = store
+                .pane_user_options
+                .get(&identity)
+                .map_or(0, HashMap::len)
+                + store
+                    .session_user_options
+                    .get(&identity)
+                    .map_or(0, HashMap::len);
+            let identity_count = user_option_identity_count(&store);
+            let entry_count = user_option_entry_count(&store);
+            if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
+                bail!("tmux user-option identity limit reached");
+            }
+            if entry_count >= USER_OPTION_ENTRIES_MAX {
+                bail!("tmux user-option entry limit reached");
+            }
+            if identity_option_count >= USER_OPTIONS_PER_IDENTITY_MAX {
+                bail!("tmux user-option per-identity limit reached");
+            }
         }
 
-        let identity_exists = store.pane_user_options.contains_key(&identity)
-            || store.session_user_options.contains_key(&identity);
-        let identity_option_count = store
-            .pane_user_options
-            .get(&identity)
-            .map_or(0, HashMap::len)
-            + store
-                .session_user_options
-                .get(&identity)
-                .map_or(0, HashMap::len);
-        let identity_count = user_option_identity_count(&store);
-        let entry_count = user_option_entry_count(&store);
-        if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
-            bail!("tmux user-option identity limit reached");
-        }
-        if entry_count >= USER_OPTION_ENTRIES_MAX {
-            bail!("tmux user-option entry limit reached");
-        }
-        if identity_option_count >= USER_OPTIONS_PER_IDENTITY_MAX {
-            bail!("tmux user-option per-identity limit reached");
-        }
         let options = if args.pane {
             &mut store.pane_user_options
         } else {
