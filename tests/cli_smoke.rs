@@ -6084,6 +6084,118 @@ fn child_sessions_are_hidden_from_default_list() -> TestResult {
 }
 
 #[test]
+#[cfg(unix)]
+fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() -> TestResult {
+    let env = TestEnv::new()?;
+    let direct_name = "nested-provenance-direct";
+    let indirect_name = "nested-provenance-indirect";
+    let indirect_launcher = env.temp.path().join("nested-provenance-indirect.sh");
+    write_executable(
+        &indirect_launcher,
+        &format!(
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {indirect_name} -- sleep 30\n"
+        ),
+    )?;
+    let direct_launcher = env.temp.path().join("nested-provenance-direct.sh");
+    write_executable(
+        &direct_launcher,
+        &format!(
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {direct_name} -- sleep 30\n{}\nsleep 30\n",
+            shlex::try_quote(&indirect_launcher.display().to_string())?
+        ),
+    )?;
+
+    let parent = env
+        .cmd()
+        .args([
+            "new",
+            "--tmux",
+            "--detach",
+            "-n",
+            "nested-provenance-parent",
+            "--",
+            direct_launcher
+                .to_str()
+                .ok_or("direct launcher path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(parent.status.success(), "{parent:?}");
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "direct and indirect nested sessions to appear in --all",
+        || {
+            let names = session_row_names(&session_rows_json(&env, true)?);
+            if names.contains(direct_name) && names.contains(indirect_name) {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("last --all names: {names:?}")))
+            }
+        },
+    )?;
+
+    let outside_name = "nested-provenance-outside-control";
+    let outside = env
+        .cmd()
+        .env("TMUX", "/tmp/real-tmux.sock,123,0")
+        .env("TMUX_PANE", "%0")
+        .args([
+            "start",
+            "--tmux",
+            "--detach",
+            "-n",
+            outside_name,
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(outside.status.success(), "{outside:?}");
+    wait_for_session_present(&env, outside_name)?;
+
+    let all = session_rows_json(&env, true)?;
+    let parent = all
+        .iter()
+        .find(|row| row.name == "nested-provenance-parent")
+        .ok_or_else(|| format!("parent missing from all sessions: {all:?}"))?;
+    for child_name in [direct_name, indirect_name] {
+        let child = all
+            .iter()
+            .find(|row| row.name == child_name)
+            .ok_or_else(|| format!("{child_name} missing from all sessions: {all:?}"))?;
+        assert_eq!(
+            child.parent_pane_id.as_deref(),
+            Some(parent.pane_id.as_str()),
+            "named nested launch lost explicit tmux parent provenance: {all:?}"
+        );
+    }
+
+    let roots = session_row_names(&session_rows_json(&env, false)?);
+    assert_eq!(
+        roots,
+        BTreeSet::from([
+            "nested-provenance-parent".to_string(),
+            outside_name.to_string(),
+        ]),
+        "default listing leaked nested named sessions"
+    );
+    let children = env.cmd().args(["ls", "--children", "--json"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let children: Vec<serde_json::Value> = serde_json::from_slice(&children.stdout)?;
+    let child_names: BTreeSet<_> = children
+        .iter()
+        .filter_map(|row| row.get("name").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(
+        child_names,
+        BTreeSet::from([direct_name.to_string(), indirect_name.to_string()])
+    );
+    Ok(())
+}
+
+#[test]
 fn terminating_parent_session_terminates_child_sessions() -> TestResult {
     let env = TestEnv::new()?;
     let child_pid_file = env.temp.path().join("child-kill.pid");

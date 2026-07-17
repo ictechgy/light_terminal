@@ -295,6 +295,12 @@ pub fn new_session(
     tmux_parent_pane_id: Option<String>,
 ) -> Result<SessionInfo> {
     ensure_server()?;
+    let capability_parent = current_parent_request();
+    let tmux_parent_pane_id = if tmux_parent_pane_id.is_none() && capability_parent.is_none() {
+        current_verified_lterm_tmux_parent(tmux)
+    } else {
+        tmux_parent_pane_id
+    };
     if tmux_parent_pane_id.is_some() {
         require_tmux_parent_pane_protocol()?;
     }
@@ -305,7 +311,7 @@ pub fn new_session(
     let parent = if tmux_parent_pane_id.is_some() {
         None
     } else {
-        current_parent_request()
+        capability_parent
     };
     inherit_client_session_home_env(&mut env);
     inherit_terminal_capability_env(&mut env);
@@ -598,6 +604,36 @@ fn current_parent_request() -> Option<ParentRequest> {
         .ok()
         .filter(|token| !token.is_empty())?;
     Some(ParentRequest { pane_id, token })
+}
+
+/// Recover the explicit pane identity exported by lterm's own tmux-compatible
+/// session when an intermediary tool deliberately omits the lterm capability
+/// pair. A real tmux socket is never accepted, and a missing/invalid pane stays
+/// unparented rather than being inferred from names, cwd, or process state.
+fn current_verified_lterm_tmux_parent(tmux: bool) -> Option<String> {
+    if !tmux {
+        return None;
+    }
+    let tmux_env = std::env::var("TMUX").ok()?;
+    let tmux_socket = tmux_env.split(',').next().unwrap_or("");
+    let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
+    let lterm_socket_path = paths::socket_path()
+        .ok()
+        .map(|path| path.display().to_string());
+    let tmux_compat_socket_path = paths::tmux_compat_socket_path()
+        .ok()
+        .map(|path| path.display().to_string());
+    if !is_self_provided_tmux(
+        tmux_socket,
+        lterm_socket_env.as_deref(),
+        lterm_socket_path.as_deref(),
+        tmux_compat_socket_path.as_deref(),
+    ) {
+        return None;
+    }
+    std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|pane_id| is_lterm_pane_id(pane_id))
 }
 
 fn is_lterm_pane_id(value: &str) -> bool {
