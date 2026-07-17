@@ -1730,38 +1730,36 @@ fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
                 .get(&identity)
                 .is_some_and(|options| options.contains_key(&args.name))
         };
-        let options = if args.pane {
-            &mut store.pane_user_options
-        } else {
-            &mut store.session_user_options
-        };
-        if option_exists {
-            options
-                .get_mut(&identity)
-                .expect("checked user-option identity exists")
-                .insert(args.name.clone(), value.to_string());
-            return Ok(());
+        if !option_exists {
+            let identity_exists = store.pane_user_options.contains_key(&identity)
+                || store.session_user_options.contains_key(&identity);
+            let identity_option_count = store
+                .pane_user_options
+                .get(&identity)
+                .map_or(0, HashMap::len)
+                + store
+                    .session_user_options
+                    .get(&identity)
+                    .map_or(0, HashMap::len);
+            let identity_count = user_option_identity_count(&store);
+            let entry_count = user_option_entry_count(&store);
+            if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
+                bail!("tmux user-option identity limit reached");
+            }
+            if entry_count >= USER_OPTION_ENTRIES_MAX {
+                bail!("tmux user-option entry limit reached");
+            }
+            if identity_option_count >= USER_OPTIONS_PER_IDENTITY_MAX {
+                bail!("tmux user-option per-identity limit reached");
+            }
         }
 
-        let identity_exists = store.pane_user_options.contains_key(&identity)
-            || store.session_user_options.contains_key(&identity);
-        let identity_count = user_option_identity_count(store);
-        let entry_count = user_option_entry_count(store);
-        if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
-            bail!("tmux user-option identity limit reached");
-        }
-        if entry_count >= USER_OPTION_ENTRIES_MAX {
-            bail!("tmux user-option entry limit reached");
-        }
         let options = if args.pane {
             &mut store.pane_user_options
         } else {
             &mut store.session_user_options
         };
         let identity_options = options.entry(identity).or_default();
-        if identity_options.len() >= USER_OPTIONS_PER_IDENTITY_MAX {
-            bail!("tmux user-option per-identity limit reached");
-        }
         identity_options.insert(args.name.clone(), value.to_string());
         Ok(())
     })();
@@ -1858,8 +1856,37 @@ fn user_option_entry_count(store: &CompatStore) -> usize {
         .sum()
 }
 
+// Unicode 17.0.0 General_Category=Cf ranges from the 2025-08-15 UCD UnicodeData.txt:
+// https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt
+const UNICODE_FORMAT_RANGES: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
 fn is_unsafe_user_option_char(ch: char) -> bool {
     ch.is_control()
+        || UNICODE_FORMAT_RANGES
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&(ch as u32)))
         || matches!(
             ch,
             '\u{00ad}'
