@@ -12,6 +12,8 @@ pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
 pub const PROTOCOL_VERSION: u32 = 8;
+#[allow(dead_code)]
+pub const SPECULATION_PROTOCOL_VERSION: u32 = 9;
 pub const MAX_METADATA_JOURNAL_ENTRIES: usize = 1024;
 pub const DEFAULT_RECENT_EXITS_LIMIT: u16 = 20;
 pub const MAX_RECENT_EXITS_LIMIT: u16 = 100;
@@ -23,6 +25,198 @@ pub const CMUX_CONTEXT_ENV: &[&str] = &[
 ];
 pub const CHILD_COLOR_POLICY_ENV: &[&str] =
     &["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationPhase {
+    Prepared,
+    Armed,
+    Starting,
+    Ready,
+    GoPending,
+    Running,
+    ResultPending,
+    PendingFinalize,
+    FinalizingLoser,
+    WinnerSelectionPending,
+    FinalizingWinner,
+    RollbackRequired,
+    DecisionUncertain,
+    RollbackPending,
+    Selected,
+    RolledBack,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpeculationSchemaVersion {
+    #[serde(rename = "lterm.speculation.status.v1")]
+    V1,
+}
+
+#[allow(dead_code)]
+impl SpeculationPhase {
+    pub const ALL: [Self; 16] = [
+        Self::Prepared,
+        Self::Armed,
+        Self::Starting,
+        Self::Ready,
+        Self::GoPending,
+        Self::Running,
+        Self::ResultPending,
+        Self::PendingFinalize,
+        Self::FinalizingLoser,
+        Self::WinnerSelectionPending,
+        Self::FinalizingWinner,
+        Self::RollbackRequired,
+        Self::DecisionUncertain,
+        Self::RollbackPending,
+        Self::Selected,
+        Self::RolledBack,
+    ];
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Selected | Self::RolledBack)
+    }
+
+    pub const fn is_rollback_only(self) -> bool {
+        matches!(
+            self,
+            Self::RollbackRequired | Self::DecisionUncertain | Self::RollbackPending
+        )
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationReasonCode {
+    PreparedLease,
+    ReadyLease,
+    RunningLease,
+    PendingFinalizeLease,
+    ControlAckTimeout,
+    ExplicitRollback,
+    DaemonShutdown,
+    BothCandidatesIneligible,
+    DecisionUncertainAfterRestart,
+    ContainmentEvidenceUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationErrorCode {
+    Unsupported,
+    ProtocolMismatch,
+    CapacityExhausted,
+    InvalidRequest,
+    InvalidTransition,
+    StaleGeneration,
+    GenerationExhausted,
+    ContainmentUnavailable,
+    OutputLimitExceeded,
+    RollbackRequired,
+    DecisionUncertain,
+    EvidenceUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationExitCategory {
+    ExitedZero,
+    ExitedNonzero,
+    Signaled,
+    SpawnFailed,
+    OutputLimitExceeded,
+    EvidenceIncomplete,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationScoreField {
+    EligibilityDescending,
+    ExitSuccessDescending,
+    ElapsedNsAscending,
+    OutputBytesAscending,
+    InputIndexAscending,
+}
+
+#[allow(dead_code)]
+pub const SPECULATION_SCORE_ORDER: [SpeculationScoreField; 5] = [
+    SpeculationScoreField::EligibilityDescending,
+    SpeculationScoreField::ExitSuccessDescending,
+    SpeculationScoreField::ElapsedNsAscending,
+    SpeculationScoreField::OutputBytesAscending,
+    SpeculationScoreField::InputIndexAscending,
+];
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationCleanupStatus {
+    pub runner_ack: bool,
+    pub bwrap_reaped: bool,
+    pub sync_eof: bool,
+    pub cgroup_empty: bool,
+    pub managed_tombstone: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationCandidateStatus {
+    pub candidate_uuid: uuid::Uuid,
+    pub index: u8,
+    pub ready: bool,
+    pub ready_elapsed_ns: Option<u64>,
+    pub go_received: bool,
+    pub go_received_elapsed_ns: Option<u64>,
+    pub result_accepted: bool,
+    pub exit_success: Option<bool>,
+    pub exit_category: Option<SpeculationExitCategory>,
+    pub elapsed_ns: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub eligible: bool,
+    pub cleanup: SpeculationCleanupStatus,
+}
+
+/// Exact-field, raw-free public status/result contract for speculation.
+///
+/// This allowlist intentionally has no command, environment, raw output,
+/// filesystem path, process identifier, socket/control, credential, or host
+/// cgroup locator field.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationStatus {
+    pub schema_version: SpeculationSchemaVersion,
+    pub tournament_uuid: uuid::Uuid,
+    pub daemon_instance_uuid: uuid::Uuid,
+    pub phase: SpeculationPhase,
+    pub generation: u64,
+    pub lease_deadline_unix_ms: u64,
+    pub reason_code: Option<SpeculationReasonCode>,
+    pub candidates: [SpeculationCandidateStatus; 2],
+    pub fixed_score_order: [SpeculationScoreField; 5],
+    pub selected_index: Option<u8>,
+    pub rollback_required: bool,
+    pub error_codes: Vec<SpeculationErrorCode>,
+}
+
+#[allow(dead_code)]
+impl SpeculationStatus {
+    pub fn is_terminal(&self) -> bool {
+        self.phase.is_terminal()
+    }
+
+    pub fn permits_finalize(&self) -> bool {
+        self.phase == SpeculationPhase::PendingFinalize && !self.rollback_required
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -932,9 +1126,177 @@ mod tests {
         InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES, MAX_METADATA_JOURNAL_ENTRIES,
         MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataJournalEntry,
         MetadataOperation, MetadataPurgeAggregate, MetadataValue, RecentSessionExit, Request,
-        SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
-        StatusTheme,
+        SPECULATION_PROTOCOL_VERSION, SPECULATION_SCORE_ORDER, SensitiveCapabilityRequest,
+        SessionExitTrigger, SessionInfo, SessionLifecycleState, SpeculationCandidateStatus,
+        SpeculationCleanupStatus, SpeculationErrorCode, SpeculationExitCategory, SpeculationPhase,
+        SpeculationReasonCode, SpeculationSchemaVersion, SpeculationStatus, StatusTheme,
     };
+
+    #[test]
+    fn speculation_status_is_strict_raw_free_and_has_exact_keys() {
+        let status = SpeculationStatus {
+            schema_version: SpeculationSchemaVersion::V1,
+            tournament_uuid: uuid::Uuid::nil(),
+            daemon_instance_uuid: uuid::Uuid::nil(),
+            phase: SpeculationPhase::PendingFinalize,
+            generation: 7,
+            lease_deadline_unix_ms: 42,
+            reason_code: Some(SpeculationReasonCode::PendingFinalizeLease),
+            candidates: [
+                SpeculationCandidateStatus {
+                    candidate_uuid: uuid::Uuid::nil(),
+                    index: 0,
+                    ready: true,
+                    ready_elapsed_ns: Some(1),
+                    go_received: true,
+                    go_received_elapsed_ns: Some(2),
+                    result_accepted: true,
+                    exit_success: Some(true),
+                    exit_category: Some(SpeculationExitCategory::ExitedZero),
+                    elapsed_ns: Some(9),
+                    output_bytes: Some(10),
+                    eligible: true,
+                    cleanup: SpeculationCleanupStatus::default(),
+                },
+                SpeculationCandidateStatus {
+                    candidate_uuid: uuid::Uuid::nil(),
+                    index: 1,
+                    ready: true,
+                    ready_elapsed_ns: Some(1),
+                    go_received: true,
+                    go_received_elapsed_ns: Some(2),
+                    result_accepted: true,
+                    exit_success: Some(false),
+                    exit_category: Some(SpeculationExitCategory::ExitedNonzero),
+                    elapsed_ns: Some(8),
+                    output_bytes: Some(9),
+                    eligible: true,
+                    cleanup: SpeculationCleanupStatus::default(),
+                },
+            ],
+            fixed_score_order: SPECULATION_SCORE_ORDER,
+            selected_index: Some(0),
+            rollback_required: false,
+            error_codes: vec![SpeculationErrorCode::Unsupported],
+        };
+
+        assert_eq!(SPECULATION_PROTOCOL_VERSION, 9);
+        let value = serde_json::to_value(&status).expect("serialize speculation status");
+        let object = value.as_object().expect("status is an object");
+        assert_eq!(object["phase"], "pending_finalize");
+        assert_eq!(object["schema_version"], "lterm.speculation.status.v1");
+        assert_eq!(object["reason_code"], "pending_finalize_lease");
+        assert_eq!(
+            object["fixed_score_order"],
+            serde_json::json!([
+                "eligibility_descending",
+                "exit_success_descending",
+                "elapsed_ns_ascending",
+                "output_bytes_ascending",
+                "input_index_ascending"
+            ])
+        );
+        let keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "candidates",
+                "daemon_instance_uuid",
+                "error_codes",
+                "fixed_score_order",
+                "generation",
+                "lease_deadline_unix_ms",
+                "phase",
+                "reason_code",
+                "rollback_required",
+                "schema_version",
+                "selected_index",
+                "tournament_uuid",
+            ]
+        );
+        let candidate_keys = object["candidates"][0]
+            .as_object()
+            .expect("candidate is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidate_keys,
+            [
+                "candidate_uuid",
+                "cleanup",
+                "elapsed_ns",
+                "eligible",
+                "exit_category",
+                "exit_success",
+                "go_received",
+                "go_received_elapsed_ns",
+                "index",
+                "output_bytes",
+                "ready",
+                "ready_elapsed_ns",
+                "result_accepted",
+            ]
+        );
+        let cleanup_keys = object["candidates"][0]["cleanup"]
+            .as_object()
+            .expect("cleanup is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cleanup_keys,
+            [
+                "bwrap_reaped",
+                "cgroup_empty",
+                "managed_tombstone",
+                "runner_ack",
+                "sync_eof",
+            ]
+        );
+        let encoded = serde_json::to_string(&status).expect("serialize speculation status");
+        for prohibited in [
+            "argv",
+            "command",
+            "environment",
+            "output_raw",
+            "path",
+            "pid",
+            "socket",
+            "credential",
+            "cgroup_root",
+        ] {
+            assert!(!encoded.contains(prohibited), "leaked key {prohibited}");
+        }
+
+        let mut with_unknown = value;
+        with_unknown
+            .as_object_mut()
+            .expect("status object")
+            .insert("unknown".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<SpeculationStatus>(with_unknown).is_err());
+
+        let mut candidate_unknown = serde_json::to_value(&status).expect("serialize status");
+        candidate_unknown["candidates"][0]
+            .as_object_mut()
+            .expect("candidate object")
+            .insert(
+                "raw_output".to_string(),
+                serde_json::Value::String("secret".into()),
+            );
+        assert!(serde_json::from_value::<SpeculationStatus>(candidate_unknown).is_err());
+
+        let mut cleanup_unknown = serde_json::to_value(&status).expect("serialize status");
+        cleanup_unknown["candidates"][0]["cleanup"]
+            .as_object_mut()
+            .expect("cleanup object")
+            .insert("pid".to_string(), serde_json::Value::from(1));
+        assert!(serde_json::from_value::<SpeculationStatus>(cleanup_unknown).is_err());
+
+        let mut unknown_phase = serde_json::to_value(&status).expect("serialize status");
+        unknown_phase["phase"] = serde_json::Value::String("future_phase".into());
+        assert!(serde_json::from_value::<SpeculationStatus>(unknown_phase).is_err());
+    }
 
     #[test]
     fn status_theme_parse_aliases_and_round_trips_canonical_names() {

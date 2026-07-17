@@ -5,6 +5,7 @@ mod paths;
 mod protocol;
 mod sanitize;
 mod server;
+mod speculation;
 mod tmux_compat;
 
 #[cfg(test)]
@@ -296,6 +297,11 @@ enum Commands {
     Capability {
         #[command(subcommand)]
         command: CapabilityCommands,
+    },
+    /// Run and decide an exact-two isolated speculative tournament.
+    Speculate {
+        #[command(subcommand)]
+        command: SpeculationCommands,
     },
     /// Capture scrollback from a session or pane.
     #[command(name = "logs", visible_alias = "capture")]
@@ -708,6 +714,52 @@ enum CapabilityCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum SpeculationCommands {
+    /// Prepare and run exactly two candidates with the same exact argv.
+    Run {
+        #[arg(long, value_name = "SOURCE")]
+        source: PathBuf,
+        #[arg(long, value_name = "WORKSPACE", action = clap::ArgAction::Append)]
+        candidate: Vec<PathBuf>,
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long, value_name = "DELEGATED_CGROUP_V2_DIR")]
+        cgroup_root: PathBuf,
+        #[arg(long, value_name = "DURATION", default_value = "10m", value_parser = parse_speculation_timeout_arg)]
+        timeout: Duration,
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<OsString>,
+    },
+    /// Read the current raw-free tournament status.
+    Status {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Seal the fixed-score winner without applying either workspace.
+    Finalize {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Idempotently abort and clean up both candidates.
+    Rollback {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MetadataCommands {
     /// Print the raw-free live metadata journal.
     History {
@@ -771,7 +823,7 @@ fn run() -> Result<()> {
     if launch_registry::dispatch_internal_test_driver()? {
         return Ok(());
     }
-    let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
+    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     match cli.command {
         Commands::Daemon => server::serve_forever(),
         Commands::New {
@@ -1072,6 +1124,7 @@ fn run() -> Result<()> {
             }
             CapabilityCommands::Revoke { capability } => client::revoke_capability(&capability),
         },
+        Commands::Speculate { command } => dispatch_speculation(command),
         Commands::Logs { target, start, end } => {
             let output = if end.is_some() {
                 client::capture_range(&target, start, end)?
@@ -2839,6 +2892,41 @@ fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String>
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_speculation_timeout_arg(value: &str) -> std::result::Result<Duration, String> {
+    let duration = parse_wait_duration_arg(value)?;
+    if duration < speculation::MIN_RUN_TIMEOUT {
+        return Err("speculation_timeout_below_minimum".to_string());
+    }
+    if duration > speculation::MAX_RUN_TIMEOUT {
+        return Err("speculation_timeout_above_maximum".to_string());
+    }
+    Ok(duration)
+}
+
+fn dispatch_speculation(_command: SpeculationCommands) -> Result<()> {
+    bail!("speculation_unsupported_phase1")
+}
+
+fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let cli = Cli::try_parse_from(expand_attach_short_flag(argv))?;
+    if let Commands::Speculate {
+        command: SpeculationCommands::Run { candidate, .. },
+    } = &cli.command
+        && candidate.len() != speculation::CANDIDATE_COUNT
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::WrongNumberOfValues,
+            "speculation_requires_exactly_two_candidates",
+        ));
+    }
+    Ok(cli)
+}
+
 fn parse_trace_max_bytes_arg(value: &str) -> std::result::Result<u64, String> {
     let value = value.trim();
     let bytes = value
@@ -3928,6 +4016,139 @@ fn validate_ssh_host(host: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculation_cli_requires_exact_two_candidates_and_bounded_timeout() {
+        let base = [
+            "lterm",
+            "speculate",
+            "run",
+            "--source",
+            "/source",
+            "--candidate",
+            "/left",
+            "--candidate",
+            "/right",
+            "--ledger-root",
+            "/ledger",
+            "--cgroup-root",
+            "/cgroup",
+        ];
+        let mut default_timeout = base.to_vec();
+        default_timeout.extend(["--", "true"]);
+        let parsed = parse_cli_from(default_timeout).expect("default timeout should parse");
+        let Commands::Speculate {
+            command: SpeculationCommands::Run {
+                candidate, timeout, ..
+            },
+        } = parsed.command
+        else {
+            panic!("expected speculate run");
+        };
+        assert_eq!(candidate, [PathBuf::from("/left"), PathBuf::from("/right")]);
+        assert_eq!(timeout, speculation::DEFAULT_RUN_TIMEOUT);
+
+        let mut valid = base.to_vec();
+        valid.extend(["--timeout", "1s", "--", "printf", "%s", "raw"]);
+        assert!(parse_cli_from(valid).is_ok());
+
+        let mut missing_separator = base.to_vec();
+        missing_separator.push("true");
+        assert!(parse_cli_from(missing_separator).is_err());
+
+        let mut one = base.to_vec();
+        one.splice(7..9, std::iter::empty());
+        one.extend(["--", "true"]);
+        assert!(parse_cli_from(one).is_err());
+
+        let mut three = base.to_vec();
+        three.splice(9..9, ["--candidate", "/third"]);
+        three.extend(["--", "true"]);
+        assert!(parse_cli_from(three).is_err());
+
+        for timeout in ["999ms", "3600001ms"] {
+            let mut args = base.to_vec();
+            args.extend(["--timeout", timeout, "--", "true"]);
+            assert!(parse_cli_from(args).is_err(), "accepted {timeout}");
+        }
+        for timeout in ["1s", "1h"] {
+            let mut args = base.to_vec();
+            args.extend(["--timeout", timeout, "--", "true"]);
+            assert!(parse_cli_from(args).is_ok(), "rejected {timeout}");
+        }
+    }
+
+    #[test]
+    fn speculation_decision_commands_require_private_root_tournament_and_json() {
+        for subcommand in ["status", "finalize", "rollback"] {
+            assert!(
+                parse_cli_from([
+                    "lterm",
+                    "speculate",
+                    subcommand,
+                    "--ledger-root",
+                    "/ledger",
+                    "--tournament",
+                    "00000000-0000-0000-0000-000000000000",
+                    "--json",
+                ])
+                .is_ok(),
+                "{subcommand} should parse"
+            );
+            assert!(
+                parse_cli_from([
+                    "lterm",
+                    "speculate",
+                    subcommand,
+                    "--ledger-root",
+                    "/ledger",
+                    "--tournament",
+                    "00000000-0000-0000-0000-000000000000",
+                ])
+                .is_err(),
+                "{subcommand} must require --json"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speculation_cli_preserves_non_utf8_exact_argv_and_dispatches_fail_closed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let marker = OsString::from_vec(vec![b'f', 0x80, b'o']);
+        let args = vec![
+            OsString::from("lterm"),
+            OsString::from("speculate"),
+            OsString::from("run"),
+            OsString::from("--source"),
+            OsString::from("/source"),
+            OsString::from("--candidate"),
+            OsString::from("/left"),
+            OsString::from("--candidate"),
+            OsString::from("/right"),
+            OsString::from("--ledger-root"),
+            OsString::from("/ledger"),
+            OsString::from("--cgroup-root"),
+            OsString::from("/cgroup"),
+            OsString::from("--"),
+            OsString::from("command"),
+            marker.clone(),
+        ];
+        let cli = parse_cli_from(args).expect("speculation argv should parse");
+        let Commands::Speculate {
+            command: command @ SpeculationCommands::Run { .. },
+        } = cli.command
+        else {
+            panic!("expected speculate run");
+        };
+        let SpeculationCommands::Run { command: argv, .. } = &command else {
+            unreachable!();
+        };
+        assert_eq!(argv, &[OsString::from("command"), marker]);
+        let error = dispatch_speculation(command).expect_err("phase 1 must fail closed");
+        assert_eq!(error.to_string(), "speculation_unsupported_phase1");
+    }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
