@@ -459,6 +459,7 @@ mod tests {
                 body();
             }
             None => {
+                let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
                 let before = path_env_snapshot();
                 let output = Command::new(std::env::current_exe().expect("current test binary"))
                     .args(["--exact", test_name, "--nocapture"])
