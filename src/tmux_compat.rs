@@ -738,7 +738,7 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
     let pane_id = before.pane_id.clone();
     let captured = capture_compat_pane_best_effort(&pane_id, &immutable_id);
     client::kill(&immutable_id)?;
-    let cmux_surface = captured.stored.as_ref().and_then(cmux_surface_from_pane);
+    let cmux_surface = cmux_surface_from_captured_pane(&captured);
     forget_panes_and_user_options_best_effort(&[captured], &[immutable_id], target);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
@@ -767,7 +767,7 @@ fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
 
     let cmux_surfaces: HashSet<CmuxSurfaceContext> = captured_panes
         .iter()
-        .filter_map(|captured| captured.stored.as_ref().and_then(cmux_surface_from_pane))
+        .filter_map(cmux_surface_from_captured_pane)
         .collect();
 
     client::kill(&kill_target)?;
@@ -3413,6 +3413,18 @@ fn cmux_surface_from_pane(pane: &CompatPane) -> Option<CmuxSurfaceContext> {
         workspace_ref: pane.cmux_workspace_id.clone(),
         window_ref: pane.cmux_window_id.clone(),
     })
+}
+
+fn cmux_surface_from_captured_pane(captured: &CapturedCompatPane) -> Option<CmuxSurfaceContext> {
+    let stored = captured.stored.as_ref()?;
+    if stored
+        .immutable_id
+        .as_deref()
+        .is_some_and(|id| id != captured.immutable_id)
+    {
+        return None;
+    }
+    cmux_surface_from_pane(stored)
 }
 
 fn capture_compat_pane_best_effort(pane_id: &str, immutable_id: &str) -> CapturedCompatPane {
