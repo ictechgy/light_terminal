@@ -641,6 +641,104 @@ fn run_tmux_with_fake_sessions(
 }
 
 #[cfg(unix)]
+fn run_tmux_with_fake_failed_kill(
+    env: &TestEnv,
+    args: &[&str],
+    sessions: Vec<serde_json::Value>,
+) -> TestResult<(std::process::Output, Vec<String>)> {
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run_dir.join("lterm.sock");
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let child_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_child_done = std::sync::Arc::clone(&child_done);
+    let server = thread::spawn(move || -> Result<Vec<String>, String> {
+        (|| -> TestResult<Vec<String>> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut requests = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+                        let mut bytes = Vec::new();
+                        stream.read_to_end(&mut bytes)?;
+                        let request: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        let request_type = request["type"]
+                            .as_str()
+                            .ok_or("fake daemon request missing type")?;
+                        requests.push(request_type.to_string());
+                        let response = match request_type {
+                            "ping" => serde_json::json!({"ok":true,"result":{"pong":true}}),
+                            "status" => serde_json::json!({"ok":true,"result":{
+                                "version":env!("CARGO_PKG_VERSION"),
+                                "protocol_version":8,
+                                "session_count":sessions.len(),
+                                "active_connections":1,
+                                "shutting_down":false
+                            }}),
+                            "info" => {
+                                let target = request["target"].as_str().unwrap_or_default();
+                                let info = sessions.iter().find(|session| {
+                                    session["id"].as_str() == Some(target)
+                                        || session["name"].as_str() == Some(target)
+                                        || session["pane_id"].as_str() == Some(target)
+                                });
+                                match info {
+                                    Some(info) => serde_json::json!({"ok":true,"result":info}),
+                                    None => serde_json::json!({"ok":false,"error":"target not found"}),
+                                }
+                            }
+                            "list" => serde_json::json!({"ok":true,"result":sessions}),
+                            "kill" => serde_json::json!({
+                                "ok":false,
+                                "error":"injected fake daemon kill failure"
+                            }),
+                            other => {
+                                return Err(format!("unexpected fake daemon request: {other}").into());
+                            }
+                        };
+                        stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_child_done.load(std::sync::atomic::Ordering::Acquire) {
+                            return Ok(requests);
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(format!("fake daemon timed out; requests={requests:?}").into());
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        })()
+        .map_err(|err| err.to_string())
+    });
+    let mut command = env.cmd();
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match command.spawn() {
+        Ok(child) => wait_for_child_output(
+            ChildCleanup::new(child),
+            Duration::from_secs(8),
+            "tmux command with injected failed kill",
+        ),
+        Err(err) => Err(err.into()),
+    };
+    child_done.store(true, std::sync::atomic::Ordering::Release);
+    let requests = server.join().map_err(|_| "fake daemon panicked")??;
+    let _ = std::fs::remove_file(socket);
+    Ok((output?, requests))
+}
+
+#[cfg(unix)]
 fn write_user_option_store(
     env: &TestEnv,
     pane_user_options: serde_json::Map<String, serde_json::Value>,
