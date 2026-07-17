@@ -641,6 +641,104 @@ fn run_tmux_with_fake_sessions(
 }
 
 #[cfg(unix)]
+fn run_tmux_with_scripted_daemon<F>(
+    env: &TestEnv,
+    args: &[&str],
+    mut respond: F,
+) -> TestResult<(std::process::Output, Vec<serde_json::Value>)>
+where
+    F: FnMut(&serde_json::Value) -> Result<serde_json::Value, String> + Send + 'static,
+{
+    let run_dir = env.temp.path().join("run");
+    std::fs::create_dir_all(&run_dir)?;
+    std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run_dir.join("lterm.sock");
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let child_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_child_done = std::sync::Arc::clone(&child_done);
+    let server = thread::spawn(move || -> Result<Vec<serde_json::Value>, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|err| err.to_string())?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .map_err(|err| err.to_string())?;
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .map_err(|err| err.to_string())?;
+                    let mut bytes = Vec::new();
+                    stream
+                        .read_to_end(&mut bytes)
+                        .map_err(|err| err.to_string())?;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+                    let request_type = request["type"]
+                        .as_str()
+                        .ok_or_else(|| "fake daemon request missing type".to_string())?;
+                    requests.push(request.clone());
+                    let response = match request_type {
+                        "ping" => serde_json::json!({"ok":true,"result":{"pong":true}}),
+                        "status" => serde_json::json!({"ok":true,"result":{
+                            "version":env!("CARGO_PKG_VERSION"),
+                            "protocol_version":8,
+                            "session_count":1,
+                            "active_connections":1,
+                            "shutting_down":false
+                        }}),
+                        _ => respond(&request)?,
+                    };
+                    stream
+                        .write_all(
+                            serde_json::to_string(&response)
+                                .map_err(|err| err.to_string())?
+                                .as_bytes(),
+                        )
+                        .map_err(|err| err.to_string())?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if server_child_done.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(requests);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "scripted fake daemon timed out; requests={requests:?}"
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+    });
+    let mut command = env.cmd();
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match command.spawn() {
+        Ok(child) => wait_for_child_output(
+            ChildCleanup::new(child),
+            Duration::from_secs(8),
+            "tmux command with scripted fake daemon",
+        ),
+        Err(err) => Err(err.into()),
+    };
+    child_done.store(true, std::sync::atomic::Ordering::Release);
+    let requests = server
+        .join()
+        .map_err(|_| "scripted fake daemon panicked")??;
+    let _ = std::fs::remove_file(socket);
+    Ok((output?, requests))
+}
+
+#[cfg(unix)]
 fn run_tmux_with_fake_failed_kill(
     env: &TestEnv,
     args: &[&str],
@@ -11385,6 +11483,109 @@ fn tmux_compat_g003_successful_pane_kill_removes_only_captured_immutable_id() ->
 
 #[test]
 #[cfg(unix)]
+fn tmux_compat_g003_kill_pane_targets_captured_immutable_id_and_lookup_failure_is_atomic()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let pane = fake_live_session(0);
+    let immutable_id = pane["id"].as_str().ok_or("pane id missing")?.to_string();
+    let mut values = serde_json::Map::new();
+    values.insert("@owner".to_string(), serde_json::json!("owned"));
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(
+        immutable_id.clone(),
+        serde_json::Value::Object(values.clone()),
+    );
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(
+        immutable_id.clone(),
+        serde_json::Value::Object(values.clone()),
+    );
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+
+    let pane_for_server = pane.clone();
+    let (killed, requests) = run_tmux_with_scripted_daemon(
+        &env,
+        &["tmux-compat", "kill-pane", "-t", "%0"],
+        move |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({"ok":true,"result":pane_for_server})),
+            Some("kill") => Ok(serde_json::json!({"ok":true,"result":null})),
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(killed.status.success(), "{killed:?}");
+    let info_index = requests
+        .iter()
+        .position(|request| request["type"] == "info")
+        .ok_or("kill-pane did not obtain pre-kill info")?;
+    let kill_index = requests
+        .iter()
+        .position(|request| request["type"] == "kill")
+        .ok_or("kill-pane did not issue kill")?;
+    let kill_target = requests[kill_index]["target"].as_str().unwrap_or_default();
+    let mut failures = Vec::new();
+    if info_index >= kill_index {
+        failures.push(format!(
+            "kill preceded immutable identity capture: {requests:?}"
+        ));
+    }
+    if kill_target != immutable_id {
+        failures.push(format!(
+            "kill used mutable target {kill_target:?}, expected captured immutable id {immutable_id:?}: {requests:?}"
+        ));
+    }
+
+    let failed_env = TestEnv::new()?;
+    let mut failed_pane_options = serde_json::Map::new();
+    failed_pane_options.insert(
+        immutable_id.clone(),
+        serde_json::Value::Object(values.clone()),
+    );
+    let mut failed_session_options = serde_json::Map::new();
+    failed_session_options.insert(immutable_id, serde_json::Value::Object(values));
+    let before = write_user_option_store(
+        &failed_env,
+        failed_pane_options,
+        failed_session_options,
+        serde_json::Map::new(),
+    )?;
+    let (missing, missing_requests) = run_tmux_with_scripted_daemon(
+        &failed_env,
+        &["tmux-compat", "kill-pane", "-t", "%0"],
+        |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({
+                "ok":false,
+                "error":"injected missing pre-kill target"
+            })),
+            Some("kill") => Ok(serde_json::json!({"ok":true,"result":null})),
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    if missing.status.success() {
+        failures.push(format!(
+            "failed pre-kill lookup unexpectedly succeeded: {missing:?}"
+        ));
+    }
+    if missing_requests
+        .iter()
+        .any(|request| request["type"] == "kill")
+    {
+        failures.push(format!(
+            "failed pre-kill lookup still issued kill: {missing_requests:?}"
+        ));
+    }
+    if std::fs::read(data_store_path(&failed_env))? != before {
+        failures.push("failed pre-kill lookup changed persisted store bytes".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "kill-pane immutable capture failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn tmux_compat_g003_successful_session_kill_removes_root_and_descendant_immutable_ids() -> TestResult
 {
     let env = TestEnv::new()?;
@@ -11476,6 +11677,258 @@ fn tmux_compat_g003_successful_session_kill_removes_root_and_descendant_immutabl
     assert_eq!(
         store["session_user_options"][survivor_id]["@owner"], "survivor-session-value",
         "session cleanup removed unrelated session identity: {store}"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_kill_session_fails_closed_on_incomplete_or_invalid_snapshot() -> TestResult {
+    let mut failures = Vec::new();
+    for case in ["enumeration-error", "missing-parent", "parent-cycle"] {
+        let env = TestEnv::new()?;
+        let mut target = fake_live_session(20);
+        target["name"] = serde_json::json!(format!("g003-{case}"));
+        let target_id = target["id"]
+            .as_str()
+            .ok_or("target id missing")?
+            .to_string();
+        let mut peer = fake_live_session(21);
+        let sessions = match case {
+            "enumeration-error" => vec![target.clone()],
+            "missing-parent" => {
+                target["parent_pane_id"] = serde_json::json!("%404");
+                target["parent_session_id"] =
+                    serde_json::json!("00000000-0000-4000-8000-00000000dead");
+                vec![target.clone()]
+            }
+            "parent-cycle" => {
+                let peer_id = peer["id"].as_str().ok_or("peer id missing")?.to_string();
+                target["parent_pane_id"] = serde_json::json!("%21");
+                target["parent_session_id"] = serde_json::json!(peer_id);
+                peer["parent_pane_id"] = serde_json::json!("%20");
+                peer["parent_session_id"] = serde_json::json!(target_id.clone());
+                vec![target.clone(), peer]
+            }
+            _ => unreachable!(),
+        };
+        let mut values = serde_json::Map::new();
+        values.insert("@owner".to_string(), serde_json::json!(case));
+        let mut pane_options = serde_json::Map::new();
+        pane_options.insert(target_id.clone(), serde_json::Value::Object(values.clone()));
+        let mut session_options = serde_json::Map::new();
+        session_options.insert(target_id, serde_json::Value::Object(values));
+        let before =
+            write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+        let target_for_server = target.clone();
+        let sessions_for_server = sessions.clone();
+        let fail_list = case == "enumeration-error";
+        let command_target = target["name"].as_str().ok_or("target name missing")?;
+        let (output, requests) = run_tmux_with_scripted_daemon(
+            &env,
+            &["tmux-compat", "kill-session", "-t", command_target],
+            move |request| match request["type"].as_str() {
+                Some("info") => Ok(serde_json::json!({"ok":true,"result":target_for_server})),
+                Some("list") if fail_list => Ok(serde_json::json!({
+                    "ok":false,
+                    "error":"injected session enumeration failure"
+                })),
+                Some("list") => Ok(serde_json::json!({"ok":true,"result":sessions_for_server})),
+                Some("kill") => Ok(serde_json::json!({"ok":true,"result":null})),
+                other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+            },
+        )?;
+        if output.status.success() {
+            failures.push(format!(
+                "{case}: invalid pre-kill snapshot was accepted: {output:?}"
+            ));
+        }
+        if requests.iter().any(|request| request["type"] == "kill") {
+            failures.push(format!(
+                "{case}: invalid pre-kill snapshot fell back to a kill: {requests:?}"
+            ));
+        }
+        if std::fs::read(data_store_path(&env))? != before {
+            failures.push(format!(
+                "{case}: invalid pre-kill snapshot changed persisted store bytes"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "kill-session fail-closed snapshot failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_failed_session_kill_is_byte_preserving_and_retry_cleans_snapshot() -> TestResult
+{
+    let env = TestEnv::new()?;
+    let mut root = fake_live_session(30);
+    root["name"] = serde_json::json!("g003-retry-root");
+    let root_id = root["id"].as_str().ok_or("root id missing")?.to_string();
+    let mut child = fake_live_session(31);
+    child["parent_pane_id"] = serde_json::json!("%30");
+    child["parent_session_id"] = serde_json::json!(root_id.clone());
+    let child_id = child["id"].as_str().ok_or("child id missing")?.to_string();
+    let survivor = fake_live_session(32);
+    let survivor_id = survivor["id"]
+        .as_str()
+        .ok_or("survivor id missing")?
+        .to_string();
+    let sessions = vec![root.clone(), child, survivor];
+    let mut pane_options = serde_json::Map::new();
+    let mut session_options = serde_json::Map::new();
+    for identity in [&root_id, &child_id, &survivor_id] {
+        pane_options.insert(identity.clone(), serde_json::json!({"@owner":"pane"}));
+        session_options.insert(identity.clone(), serde_json::json!({"@owner":"session"}));
+    }
+    let before =
+        write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+
+    let failed_root = root.clone();
+    let failed_sessions = sessions.clone();
+    let (failed, failed_requests) = run_tmux_with_scripted_daemon(
+        &env,
+        &["tmux-compat", "kill-session", "-t", "g003-retry-root"],
+        move |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({"ok":true,"result":failed_root})),
+            Some("list") => Ok(serde_json::json!({"ok":true,"result":failed_sessions})),
+            Some("kill") => Ok(serde_json::json!({
+                "ok":false,
+                "error":"injected session kill failure"
+            })),
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(!failed.status.success(), "{failed:?}");
+    assert_eq!(
+        std::fs::read(data_store_path(&env))?,
+        before,
+        "failed session kill changed store bytes"
+    );
+
+    let retry_root = root;
+    let retry_sessions = sessions;
+    let (retry, retry_requests) = run_tmux_with_scripted_daemon(
+        &env,
+        &["tmux-compat", "kill-session", "-t", "g003-retry-root"],
+        move |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({"ok":true,"result":retry_root})),
+            Some("list") => Ok(serde_json::json!({"ok":true,"result":retry_sessions})),
+            Some("kill") => Ok(serde_json::json!({"ok":true,"result":null})),
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(retry.status.success(), "{retry:?}");
+    let mut failures = Vec::new();
+    for (label, requests) in [
+        ("failed attempt", &failed_requests),
+        ("successful retry", &retry_requests),
+    ] {
+        let kill_target = requests
+            .iter()
+            .find(|request| request["type"] == "kill")
+            .and_then(|request| request["target"].as_str());
+        if kill_target != Some(root_id.as_str()) {
+            failures.push(format!(
+                "{label} killed {kill_target:?}, expected captured root id {root_id:?}: {requests:?}"
+            ));
+        }
+    }
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    for removed in [&root_id, &child_id] {
+        if store["pane_user_options"].get(removed).is_some()
+            || store["session_user_options"].get(removed).is_some()
+        {
+            failures.push(format!("retry retained killed identity {removed}: {store}"));
+        }
+    }
+    if store["pane_user_options"][&survivor_id]["@owner"] != "pane"
+        || store["session_user_options"][&survivor_id]["@owner"] != "session"
+    {
+        failures.push(format!("retry changed unrelated survivor tags: {store}"));
+    }
+    assert!(
+        failures.is_empty(),
+        "kill-session retry failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_g003_child_only_kill_preserves_root_sibling_and_root_session_tags() -> TestResult {
+    let env = TestEnv::new()?;
+    let root = fake_live_session(40);
+    let root_id = root["id"].as_str().ok_or("root id missing")?.to_string();
+    let mut child = fake_live_session(41);
+    child["parent_pane_id"] = serde_json::json!("%40");
+    child["parent_session_id"] = serde_json::json!(root_id.clone());
+    let child_id = child["id"].as_str().ok_or("child id missing")?.to_string();
+    let mut sibling = fake_live_session(42);
+    sibling["parent_pane_id"] = serde_json::json!("%40");
+    sibling["parent_session_id"] = serde_json::json!(root_id.clone());
+    let sibling_id = sibling["id"]
+        .as_str()
+        .ok_or("sibling id missing")?
+        .to_string();
+    let mut pane_options = serde_json::Map::new();
+    pane_options.insert(root_id.clone(), serde_json::json!({"@owner":"root-pane"}));
+    pane_options.insert(child_id.clone(), serde_json::json!({"@owner":"child-pane"}));
+    pane_options.insert(
+        sibling_id.clone(),
+        serde_json::json!({"@owner":"sibling-pane"}),
+    );
+    let mut session_options = serde_json::Map::new();
+    session_options.insert(
+        root_id.clone(),
+        serde_json::json!({"@owner":"root-session"}),
+    );
+    write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
+    let child_for_server = child;
+    let (output, requests) = run_tmux_with_scripted_daemon(
+        &env,
+        &["tmux-compat", "kill-pane", "-t", "%41"],
+        move |request| match request["type"].as_str() {
+            Some("info") => Ok(serde_json::json!({"ok":true,"result":child_for_server})),
+            Some("kill") => Ok(serde_json::json!({"ok":true,"result":null})),
+            other => Err(format!("unexpected scripted request: {other:?}: {request}")),
+        },
+    )?;
+    assert!(output.status.success(), "{output:?}");
+    let store: serde_json::Value = serde_json::from_slice(&std::fs::read(data_store_path(&env))?)?;
+    let kill_target = requests
+        .iter()
+        .find(|request| request["type"] == "kill")
+        .and_then(|request| request["target"].as_str());
+    let mut failures = Vec::new();
+    if kill_target != Some(child_id.as_str()) {
+        failures.push(format!(
+            "child kill used {kill_target:?}, expected immutable id {child_id:?}: {requests:?}"
+        ));
+    }
+    if store["pane_user_options"].get(&child_id).is_some() {
+        failures.push(format!("child pane tag survived child-only kill: {store}"));
+    }
+    for (identity, expected) in [(&root_id, "root-pane"), (&sibling_id, "sibling-pane")] {
+        if store["pane_user_options"][identity]["@owner"] != expected {
+            failures.push(format!("preserved pane tag {identity} changed: {store}"));
+        }
+    }
+    if store["session_user_options"][&root_id]["@owner"] != "root-session" {
+        failures.push(format!(
+            "root session tag changed on child-only kill: {store}"
+        ));
+    }
+    assert!(
+        failures.is_empty(),
+        "child-only kill failures:\n{}",
+        failures.join("\n")
     );
     Ok(())
 }
@@ -11665,7 +12118,7 @@ fn tmux_compat_g003_mutations_prune_reused_pane_ids_and_empty_maps_idempotently(
 }
 
 // Pinned contract mirror, not authentication proof. Provenance:
-// oh-my-codex 0.20.2 release artifact,
+// oh-my-codex v0.20.2, commit 2e666461d4147fa4718691f7b4d9a1a282380f16,
 // src/scripts/notify-hook/managed-tmux.ts pane-first ownership evaluator.
 fn omx_pane_first_binds(
     candidate: &str,
