@@ -1990,12 +1990,8 @@ fn parent_request(
     parent_pane_id: Option<String>,
     parent_token: Option<String>,
     tmux_parent_pane_id: Option<String>,
-    tmux: bool,
 ) -> Result<Option<ParentRequest>> {
     if let Some(tmux_parent_pane_id) = tmux_parent_pane_id {
-        if !tmux {
-            bail!("tmux parent pane requires a tmux-compatible new session");
-        }
         if parent_pane_id.is_some() || parent_token.is_some() {
             bail!("tmux parent pane cannot be combined with a parent capability");
         }
@@ -2068,7 +2064,6 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         params.parent_pane_id,
         params.parent_token,
         params.tmux_parent_pane_id,
-        params.tmux,
     )?;
     if let Some(parent_request) = parent_request.as_ref() {
         validate_parent_request(state, parent_request)?;

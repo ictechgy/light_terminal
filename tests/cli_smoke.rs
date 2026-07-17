@@ -6196,6 +6196,114 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
 }
 
 #[test]
+#[cfg(unix)]
+fn non_tmux_nested_named_session_keeps_parent_provenance_when_capability_env_is_stripped()
+-> TestResult {
+    let env = TestEnv::new()?;
+    let nested_name = "non-tmux-nested-provenance-child";
+    let launcher = env.temp.path().join("non-tmux-nested-provenance.sh");
+    write_executable(
+        &launcher,
+        &format!(
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" new --detach -n {nested_name} -- sleep 30\nsleep 30\n"
+        ),
+    )?;
+
+    let parent = env
+        .cmd()
+        .args([
+            "new",
+            "--tmux",
+            "--detach",
+            "-n",
+            "non-tmux-nested-provenance-parent",
+            "--",
+            launcher.to_str().ok_or("launcher path should be UTF-8")?,
+        ])
+        .output()?;
+    assert!(parent.status.success(), "{parent:?}");
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        "non-tmux nested session to appear in --all",
+        || {
+            let names = session_row_names(&session_rows_json(&env, true)?);
+            if names.contains(nested_name) {
+                Ok(PollStatus::Ready(()))
+            } else {
+                Ok(PollStatus::Pending(format!("last --all names: {names:?}")))
+            }
+        },
+    )?;
+
+    let outside_name = "non-tmux-nested-provenance-outside-control";
+    let outside = env
+        .cmd()
+        .env("TMUX", "/tmp/real-tmux.sock,123,0")
+        .env("TMUX_PANE", "%0")
+        .args([
+            "new",
+            "--detach",
+            "-n",
+            outside_name,
+            "--",
+            "sh",
+            "-lc",
+            "sleep 30",
+        ])
+        .output()?;
+    assert!(outside.status.success(), "{outside:?}");
+    wait_for_session_present(&env, outside_name)?;
+
+    let all = session_rows_json(&env, true)?;
+    let parent = all
+        .iter()
+        .find(|row| row.name == "non-tmux-nested-provenance-parent")
+        .ok_or_else(|| format!("parent missing from all sessions: {all:?}"))?;
+    let child = all
+        .iter()
+        .find(|row| row.name == nested_name)
+        .ok_or_else(|| format!("{nested_name} missing from all sessions: {all:?}"))?;
+    assert_eq!(
+        child.parent_pane_id.as_deref(),
+        Some(parent.pane_id.as_str()),
+        "non-tmux nested launch lost verified self-lterm parent provenance: {all:?}"
+    );
+    let outside = all
+        .iter()
+        .find(|row| row.name == outside_name)
+        .ok_or_else(|| format!("{outside_name} missing from all sessions: {all:?}"))?;
+    assert_eq!(
+        outside.parent_pane_id, None,
+        "external tmux root must stay unparented: {all:?}"
+    );
+
+    let roots = session_row_names(&session_rows_json(&env, false)?);
+    assert_eq!(
+        roots,
+        BTreeSet::from([
+            "non-tmux-nested-provenance-parent".to_string(),
+            outside_name.to_string(),
+        ]),
+        "default listing should hide the recovered non-tmux nested child"
+    );
+    let children = env.cmd().args(["ls", "--children", "--json"]).output()?;
+    assert!(children.status.success(), "{children:?}");
+    let children: Vec<serde_json::Value> = serde_json::from_slice(&children.stdout)?;
+    let child_names: BTreeSet<_> = children
+        .iter()
+        .filter_map(|row| row.get("name").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(
+        child_names,
+        BTreeSet::from([nested_name.to_string()]),
+        "ls --children must expose the recovered non-tmux nested child"
+    );
+    Ok(())
+}
+
+#[test]
 fn terminating_parent_session_terminates_child_sessions() -> TestResult {
     let env = TestEnv::new()?;
     let child_pid_file = env.temp.path().join("child-kill.pid");

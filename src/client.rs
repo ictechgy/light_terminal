@@ -297,7 +297,7 @@ pub fn new_session(
     ensure_server()?;
     let capability_parent = current_parent_request();
     let tmux_parent_pane_id = if tmux_parent_pane_id.is_none() && capability_parent.is_none() {
-        current_verified_lterm_tmux_parent(tmux)
+        current_verified_lterm_tmux_parent()
     } else {
         tmux_parent_pane_id
     };
@@ -610,10 +610,7 @@ fn current_parent_request() -> Option<ParentRequest> {
 /// session when an intermediary tool deliberately omits the lterm capability
 /// pair. A real tmux socket is never accepted, and a missing/invalid pane stays
 /// unparented rather than being inferred from names, cwd, or process state.
-fn current_verified_lterm_tmux_parent(tmux: bool) -> Option<String> {
-    if !tmux {
-        return None;
-    }
+fn current_verified_lterm_tmux_parent() -> Option<String> {
     let tmux_env = std::env::var("TMUX").ok()?;
     let tmux_socket = tmux_env.split(',').next().unwrap_or("");
     let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
