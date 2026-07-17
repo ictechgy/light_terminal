@@ -755,16 +755,38 @@ where
 }
 
 #[cfg(unix)]
+fn write_tmux_compat_store_bytes(env: &TestEnv, bytes: &[u8]) -> TestResult<PathBuf> {
+    let path = data_store_path(env);
+    let parent = path.parent().ok_or("store path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn precreated_cmux_call_log(env: &TestEnv) -> TestResult<(OsString, PathBuf)> {
+    let fake_bin = env.temp.path().join("fake-cmux-bin");
+    std::fs::create_dir(&fake_bin)?;
+    let cmux_log = env.temp.path().join("cmux.log");
+    std::fs::write(&cmux_log, b"")?;
+    write_executable(
+        &fake_bin.join("cmux"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            shlex::try_quote(&cmux_log.display().to_string())?
+        ),
+    )?;
+    Ok((path_with_prepended(&fake_bin)?, cmux_log))
+}
+
+#[cfg(unix)]
 fn write_user_option_store(
     env: &TestEnv,
     pane_user_options: serde_json::Map<String, serde_json::Value>,
     session_user_options: serde_json::Map<String, serde_json::Value>,
     wait_generations: serde_json::Map<String, serde_json::Value>,
 ) -> TestResult<Vec<u8>> {
-    let path = data_store_path(env);
-    let parent = path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     let store = serde_json::json!({
         "panes": {},
         "pane_user_options": pane_user_options,
@@ -774,7 +796,7 @@ fn write_user_option_store(
         "managed_attaches": {}
     });
     let bytes = serde_json::to_vec(&store)?;
-    std::fs::write(path, &bytes)?;
+    write_tmux_compat_store_bytes(env, &bytes)?;
     Ok(bytes)
 }
 
@@ -12063,9 +12085,6 @@ fn tmux_compat_g010_kill_pane_rejects_reused_surface_between_info_and_store_capt
         "cmux_workspace_id": "workspace:g010-survivor",
         "cmux_window_id": "window:g010-pane-survivor"
     });
-    let old_pane_options = serde_json::json!({"@owner":"old-pane","@mode":"old-pane-mode"});
-    let old_session_options =
-        serde_json::json!({"@owner":"old-session","@mode":"old-session-mode"});
     let replacement_pane_options =
         serde_json::json!({"@owner":"replacement-pane","@mode":"replacement-pane-mode"});
     let replacement_session_options = serde_json::json!({
@@ -12078,21 +12097,17 @@ fn tmux_compat_g010_kill_pane_rejects_reused_surface_between_info_and_store_capt
         "@owner":"survivor-session",
         "@mode":"survivor-session-mode"
     });
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::write(
-        &store_path,
-        serde_json::to_vec(&serde_json::json!({
+    let store_path = write_tmux_compat_store_bytes(
+        &env,
+        &serde_json::to_vec(&serde_json::json!({
             "panes": {"%60": old_row, "%61": survivor_row.clone()},
             "pane_user_options": {
-                old_id.clone(): old_pane_options,
+                old_id.clone(): {"@owner":"old-pane","@mode":"old-pane-mode"},
                 replacement_id: replacement_pane_options.clone(),
                 survivor_id.clone(): survivor_pane_options.clone()
             },
             "session_user_options": {
-                old_id.clone(): old_session_options,
+                old_id.clone(): {"@owner":"old-session","@mode":"old-session-mode"},
                 replacement_id: replacement_session_options.clone(),
                 survivor_id.clone(): survivor_session_options.clone()
             },
@@ -12115,18 +12130,7 @@ fn tmux_compat_g010_kill_pane_rejects_reused_surface_between_info_and_store_capt
         survivor_id: survivor_session_options
     });
 
-    let fake_bin = env.temp.path().join("fake-cmux-g010-pane-pre-capture-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-g010-pane-pre-capture.log");
-    std::fs::write(&cmux_log, b"")?;
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let store_path_for_server = store_path.clone();
     let old_for_server = old;
     let old_id_for_server = old_id.clone();
@@ -12229,11 +12233,6 @@ fn tmux_compat_g010_kill_session_rejects_reused_surfaces_between_list_snapshot_a
         "immutable_id":survivor_id.clone(), "cmux_surface_id":"surface:g010-session-survivor",
         "cmux_workspace_id":"workspace:g010-session-survivor", "cmux_window_id":"window:g010-session-survivor"
     });
-    let old_root_pane_options = serde_json::json!({"@owner":"old-root-pane","@slot":"root"});
-    let old_root_session_options = serde_json::json!({"@owner":"old-root-session","@slot":"root"});
-    let old_child_pane_options = serde_json::json!({"@owner":"old-child-pane","@slot":"child"});
-    let old_child_session_options =
-        serde_json::json!({"@owner":"old-child-session","@slot":"child"});
     let replacement_root_pane_options =
         serde_json::json!({"@owner":"new-root-pane","@slot":"new-root"});
     let replacement_root_session_options =
@@ -12246,24 +12245,20 @@ fn tmux_compat_g010_kill_session_rejects_reused_surfaces_between_list_snapshot_a
     let survivor_session_options =
         serde_json::json!({"@owner":"survivor-session","@slot":"survivor"});
 
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::write(
-        &store_path,
-        serde_json::to_vec(&serde_json::json!({
+    let store_path = write_tmux_compat_store_bytes(
+        &env,
+        &serde_json::to_vec(&serde_json::json!({
             "panes": {"%70":old_root_row, "%71":old_child_row, "%72":survivor_row.clone()},
             "pane_user_options": {
-                root_id.clone():old_root_pane_options,
-                child_id.clone():old_child_pane_options,
+                root_id.clone():{"@owner":"old-root-pane","@slot":"root"},
+                child_id.clone():{"@owner":"old-child-pane","@slot":"child"},
                 replacement_root_id:replacement_root_pane_options.clone(),
                 replacement_child_id:replacement_child_pane_options.clone(),
                 survivor_id.clone():survivor_pane_options.clone()
             },
             "session_user_options": {
-                root_id.clone():old_root_session_options,
-                child_id.clone():old_child_session_options,
+                root_id.clone():{"@owner":"old-root-session","@slot":"root"},
+                child_id.clone():{"@owner":"old-child-session","@slot":"child"},
                 replacement_root_id:replacement_root_session_options.clone(),
                 replacement_child_id:replacement_child_session_options.clone(),
                 survivor_id.clone():survivor_session_options.clone()
@@ -12289,21 +12284,7 @@ fn tmux_compat_g010_kill_session_rejects_reused_surfaces_between_list_snapshot_a
         survivor_id:survivor_session_options
     });
 
-    let fake_bin = env
-        .temp
-        .path()
-        .join("fake-cmux-g010-session-pre-capture-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-g010-session-pre-capture.log");
-    std::fs::write(&cmux_log, b"")?;
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let store_path_for_server = store_path.clone();
     let sessions_for_server = vec![root, child, survivor];
     let root_id_for_server = root_id.clone();
@@ -12385,31 +12366,16 @@ fn tmux_compat_g010_kill_pane_preserves_same_generation_row_changed_after_captur
         "immutable_id":old_id.clone(), "cmux_surface_id":"surface:g010-same-changed",
         "cmux_workspace_id":"workspace:g010-same-changed", "cmux_window_id":"window:g010-same-changed"
     });
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::write(
-        &store_path,
-        serde_json::to_vec(&serde_json::json!({
+    let store_path = write_tmux_compat_store_bytes(
+        &env,
+        &serde_json::to_vec(&serde_json::json!({
             "panes":{"%80":original_row},
             "pane_user_options":{old_id.clone():{"@owner":"same-pane","@mode":"same"}},
             "session_user_options":{old_id.clone():{"@owner":"same-session","@mode":"same"}},
             "wait_generations":{}, "wait_generation_touched_secs":{}, "managed_attaches":{}
         }))?,
     )?;
-    let fake_bin = env.temp.path().join("fake-cmux-g010-same-generation-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-g010-same-generation.log");
-    std::fs::write(&cmux_log, b"")?;
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let old_for_server = old;
     let old_id_for_server = old_id.clone();
     let store_path_for_server = store_path.clone();
@@ -12460,10 +12426,6 @@ fn tmux_compat_g010_failed_pane_kill_preserves_store_and_closes_no_surface() -> 
     let mut pane = fake_live_session(90);
     pane["name"] = serde_json::json!("g010-failed-pane");
     let immutable_id = pane["id"].as_str().ok_or("pane id missing")?.to_string();
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
     let before = serde_json::to_vec(&serde_json::json!({
         "panes":{"%90":{
             "pane_id":"%90", "session_name":"g010-failed-pane", "immutable_id":immutable_id.clone(),
@@ -12475,19 +12437,8 @@ fn tmux_compat_g010_failed_pane_kill_preserves_store_and_closes_no_surface() -> 
         "wait_generations":{"failed-pane":4}, "wait_generation_touched_secs":{"failed-pane":5},
         "managed_attaches":{}
     }))?;
-    std::fs::write(&store_path, &before)?;
-    let fake_bin = env.temp.path().join("fake-cmux-g010-failed-pane-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-g010-failed-pane.log");
-    std::fs::write(&cmux_log, b"")?;
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let store_path = write_tmux_compat_store_bytes(&env, &before)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let pane_for_server = pane;
     let immutable_id_for_server = immutable_id.clone();
     let (failed, requests) = run_tmux_with_scripted_daemon_and_path(
@@ -12507,7 +12458,7 @@ fn tmux_compat_g010_failed_pane_kill_preserves_store_and_closes_no_surface() -> 
     let primary = stderr
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or_default();
+        .ok_or("failed pane kill produced no substantive stderr")?;
     assert!(
         primary.contains(INJECTED_ERROR),
         "injected pane kill error was not primary: {stderr:?}"
@@ -12534,10 +12485,6 @@ fn tmux_compat_g010_failed_session_kill_preserves_store_and_closes_no_surface() 
     child["parent_pane_id"] = serde_json::json!("%100");
     child["parent_session_id"] = serde_json::json!(root_id.clone());
     let child_id = child["id"].as_str().ok_or("child id missing")?.to_string();
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
     let before = serde_json::to_vec(&serde_json::json!({
         "panes":{
             "%100":{
@@ -12563,19 +12510,8 @@ fn tmux_compat_g010_failed_session_kill_preserves_store_and_closes_no_surface() 
         "wait_generation_touched_secs":{"failed-session":7},
         "managed_attaches":{}
     }))?;
-    std::fs::write(&store_path, &before)?;
-    let fake_bin = env.temp.path().join("fake-cmux-g010-failed-session-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-g010-failed-session.log");
-    std::fs::write(&cmux_log, b"")?;
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let store_path = write_tmux_compat_store_bytes(&env, &before)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let sessions_for_server = vec![root, child];
     let root_id_for_server = root_id.clone();
     let (failed, requests) = run_tmux_with_scripted_daemon_and_path(
@@ -12600,7 +12536,7 @@ fn tmux_compat_g010_failed_session_kill_preserves_store_and_closes_no_surface() 
     let primary = stderr
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or_default();
+        .ok_or("failed session kill produced no substantive stderr")?;
     assert!(
         primary.contains(INJECTED_ERROR),
         "injected session kill error was not primary: {stderr:?}"
