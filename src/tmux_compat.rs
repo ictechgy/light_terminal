@@ -4399,8 +4399,8 @@ fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> St
 
 fn command_support_tier(command: &str) -> &'static str {
     match command {
-        "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-option"
-        | "set-hook" | "set-window-option" | "show-environment" => "noop",
+        "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-hook"
+        | "set-window-option" | "show-environment" => "noop",
         "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
         | "list-commands" | "list-sessions" | "rename-session" | "run-shell" | "send-keys" => {
             "full"
@@ -4543,7 +4543,7 @@ fn command_usage(command: &str) -> &'static str {
         "send-keys" => "[-l] [-t target-pane] [key ...]",
         "set-environment" => "[-t target-session] variable [value]",
         "set-hook" => "[-agpRuw] [-t target-session] hook-name [command]",
-        "set-option" => "[-t target-pane] option [value]",
+        "set-option" => "[-pqu] [-t target] [--] @option [value]",
         "set-window-option" => "[-t target-window] option [value]",
         "show-environment" => "[-t target-session] [variable]",
         "show-options" => "[-t target-pane] [option]",
@@ -5955,18 +5955,38 @@ mod tests {
     fn command_support_counts_match_public_coverage_rows() {
         let counts = command_support_counts();
         let coverage = command_coverage();
-        assert_eq!(counts.supported_command_count, coverage.len());
+        assert_eq!(
+            counts,
+            CommandSupportCounts {
+                supported_command_count: 33,
+                full_command_count: 10,
+                partial_command_count: 16,
+                noop_command_count: 7,
+            }
+        );
+        assert_eq!(coverage.len(), 33);
         assert_eq!(
             counts.supported_command_count,
             counts.full_command_count + counts.partial_command_count + counts.noop_command_count
         );
-        assert!(counts.full_command_count > 0, "{counts:?}");
-        assert!(counts.partial_command_count > 0, "{counts:?}");
-        assert!(counts.noop_command_count > 0, "{counts:?}");
         assert!(
             coverage
                 .iter()
                 .any(|command| command.name == "list-commands" && command.support == "full")
+        );
+        assert_eq!(
+            coverage
+                .iter()
+                .find(|command| command.name == "set-option")
+                .map(|command| command.support),
+            Some("partial")
+        );
+        assert_eq!(
+            coverage
+                .iter()
+                .find(|command| command.name == "set-window-option")
+                .map(|command| command.support),
+            Some("noop")
         );
         assert!(known_unsupported_common_commands().contains(&"join-pane"));
     }
