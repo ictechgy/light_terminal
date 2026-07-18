@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::protocol::SpeculationExitCategory;
 use crate::protocol::{
     SPECULATION_SCORE_ORDER, SpeculationArmRequest, SpeculationArmResponse,
     SpeculationCandidateStatus, SpeculationErrorCode, SpeculationFinalizeRequest,
@@ -6,18 +8,30 @@ use crate::protocol::{
     SpeculationRollbackResponse, SpeculationSchemaVersion, SpeculationStatus,
     SpeculationStatusRequest, SpeculationStatusResponse,
 };
-use crate::speculation::PREPARED_LEASE;
+#[cfg(target_os = "linux")]
+use crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES;
+use crate::speculation::{
+    DEFAULT_RUN_TIMEOUT, PENDING_FINALIZE_LEASE, PREPARED_LEASE, READY_LEASE,
+};
 use crate::speculation_ledger::{
     ClientLedgerEntry, ClientLedgerRecord, ClientRootIdentities, LedgerAction,
+};
+#[cfg(target_os = "linux")]
+use crate::speculation_linux::{
+    CandidateCleanupAction, CandidateControl, CandidateObserver, ContainmentEvent,
+    GoReceiptEvidence, OldBootRecoveryAction, OldBootRecoveryEvidence, PayloadPlacementEvidence,
+    RecoveryAction, RecoveryEvidence, TopologyAction, TopologyEvidence, TournamentCleanupAction,
+    TournamentTopology, acknowledge_output_cleanup_claimed, begin_topology, create_topology,
+    finish_containment, go_receipt_skew_ns, launch_fixed_probe, launch_runner,
+    observe_managed_reaped, observe_sync_eof, perform_candidate_cleanup_action,
+    perform_tournament_cleanup_action, receive_decision_ack, receive_execution_event,
+    receive_go_receipt, receive_output_drained, receive_payload_fd_ack,
+    receive_payload_placed_owned, reconcile_different_boot, reconcile_from_record, send_go,
+    send_payload_release, send_select_or_abort, transfer_payload_fd_owned,
 };
 use crate::speculation_linux::{
     ContainmentDeadline, ContainmentErrorCode, LiveTournamentContext, PrepareInputs,
     validate_prepare,
-};
-#[cfg(target_os = "linux")]
-use crate::speculation_linux::{
-    OldBootRecoveryAction, OldBootRecoveryEvidence, RecoveryAction, RecoveryEvidence,
-    reconcile_different_boot, reconcile_from_record,
 };
 use crate::speculation_registry::{
     CandidateCgroupEvidence, CgroupForwardState, CgroupLifecycleState, TournamentCgroupEvidence,
@@ -26,9 +40,13 @@ use crate::speculation_registry::{
 };
 #[cfg(target_os = "linux")]
 use crate::speculation_registry::{StoredTournamentUpdate, TournamentRecoveryRecord};
+#[cfg(target_os = "linux")]
+use crate::speculation_runner::{DecisionKind, RunnerExitCategory};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -126,6 +144,49 @@ enum ActorEvent {
     WatchdogTick {
         now_unix_ms: u64,
     },
+    #[cfg(target_os = "linux")]
+    Observed(Box<ObserverCompletion>),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ObserverOperation {
+    PayloadFdAck,
+    GoReceipt,
+    PayloadPlaced,
+    Execution,
+    OutputDrained,
+    DecisionAck(DecisionKind),
+    SyncEof,
+    ManagedReaped,
+}
+
+#[cfg(target_os = "linux")]
+enum ObserverEvidence {
+    Event(ContainmentEvent),
+    GoReceipt(GoReceiptEvidence),
+    PayloadPlaced(PayloadPlacementEvidence),
+}
+
+#[cfg(target_os = "linux")]
+struct ObserverCompletion {
+    authorization_generation: u64,
+    candidate: u8,
+    observer: CandidateObserver,
+    result: Result<ObserverEvidence, ContainmentErrorCode>,
+}
+
+#[cfg(target_os = "linux")]
+struct LiveCandidate {
+    control: CandidateControl,
+    observer: Option<CandidateObserver>,
+}
+
+#[cfg(target_os = "linux")]
+struct LivePipeline {
+    topology: TournamentTopology,
+    candidates: [Option<LiveCandidate>; 2],
+    authorization_generation: u64,
 }
 
 #[derive(Clone)]
@@ -442,7 +503,7 @@ impl SpeculationService {
             index.live.insert(
                 tournament_uuid,
                 ActorHandle {
-                    sender,
+                    sender: sender.clone(),
                     snapshot: Arc::clone(&snapshot),
                 },
             );
@@ -459,7 +520,11 @@ impl SpeculationService {
                     context,
                     ledger_entry,
                     snapshot,
+                    sender: sender.clone(),
                     receiver,
+                    #[cfg(target_os = "linux")]
+                    pipeline: None,
+                    interrupt_requested: false,
                 });
             })
             .map_err(|_| {
@@ -1036,7 +1101,11 @@ struct ActorState {
     context: LiveTournamentContext,
     ledger_entry: ClientLedgerEntry,
     snapshot: Arc<Mutex<SpeculationStatus>>,
+    sender: SyncSender<ActorEvent>,
     receiver: Receiver<ActorEvent>,
+    #[cfg(target_os = "linux")]
+    pipeline: Option<LivePipeline>,
+    interrupt_requested: bool,
 }
 
 fn actor_loop(mut actor: ActorState) {
@@ -1044,7 +1113,12 @@ fn actor_loop(mut actor: ActorState) {
         match event {
             ActorEvent::Arm { request, reply } => {
                 let result = actor.arm(request);
+                let _claimed = result.is_ok();
                 let _ = reply.send(result);
+                #[cfg(target_os = "linux")]
+                if _claimed && actor.run_to_pending_finalize().is_err() {
+                    actor.fail_closed_pipeline();
+                }
             }
             ActorEvent::Finalize { request, reply } => {
                 let result = actor.claim(
@@ -1054,7 +1128,12 @@ fn actor_loop(mut actor: ActorState) {
                     SpeculationPhase::FinalizingLoser,
                     None,
                 );
+                let _claimed = result.is_ok();
                 let _ = reply.send(result);
+                #[cfg(target_os = "linux")]
+                if _claimed && actor.finalize_pipeline().is_err() {
+                    actor.fail_closed_pipeline();
+                }
             }
             ActorEvent::Rollback {
                 request,
@@ -1068,7 +1147,12 @@ fn actor_loop(mut actor: ActorState) {
                     SpeculationPhase::RollbackPending,
                     Some(reason),
                 );
+                let _claimed = result.is_ok();
                 let _ = reply.send(result);
+                #[cfg(target_os = "linux")]
+                if _claimed {
+                    actor.rollback_pipeline();
+                }
             }
             ActorEvent::Shutdown { reply } => {
                 let result = actor
@@ -1081,6 +1165,8 @@ fn actor_loop(mut actor: ActorState) {
                     )
                     .map(|_| ());
                 let _ = reply.send(result);
+                #[cfg(target_os = "linux")]
+                actor.rollback_pipeline();
             }
             ActorEvent::WatchdogTick { now_unix_ms }
                 if now_unix_ms >= actor.record.status.lease_deadline_unix_ms =>
@@ -1096,8 +1182,19 @@ fn actor_loop(mut actor: ActorState) {
                         .reason_code
                         .or(Some(SpeculationReasonCode::ContainmentEvidenceUnavailable)),
                 );
+                #[cfg(target_os = "linux")]
+                actor.rollback_pipeline();
             }
             ActorEvent::WatchdogTick { .. } => {}
+            #[cfg(target_os = "linux")]
+            ActorEvent::Observed(_) => {
+                actor.fail_closed_pipeline();
+            }
+        }
+        if actor.record.status.is_terminal() {
+            #[cfg(target_os = "linux")]
+            actor.publish_terminal();
+            break;
         }
     }
 }
@@ -1168,6 +1265,22 @@ impl ActorState {
         if let Some(reason) = reason {
             next.status.reason_code = Some(reason);
         }
+        let lease = match phase {
+            SpeculationPhase::Ready | SpeculationPhase::GoPending => Some(READY_LEASE),
+            SpeculationPhase::Running | SpeculationPhase::ResultPending => {
+                Some(DEFAULT_RUN_TIMEOUT)
+            }
+            SpeculationPhase::PendingFinalize
+            | SpeculationPhase::FinalizingLoser
+            | SpeculationPhase::WinnerSelectionPending
+            | SpeculationPhase::FinalizingWinner => Some(PENDING_FINALIZE_LEASE),
+            _ => None,
+        };
+        if let Some(lease) = lease {
+            next.status.lease_deadline_unix_ms = unix_time_ms()?
+                .checked_add(lease.as_millis() as u64)
+                .ok_or(ServiceError::GenerationExhausted)?;
+        }
         next.status.rollback_required = phase.is_rollback_only();
         if phase.is_rollback_only() {
             next.status.selected_index = None;
@@ -1196,6 +1309,1244 @@ impl ActorState {
         })? = status.clone();
         Ok(status)
     }
+}
+
+#[cfg(target_os = "linux")]
+impl ActorState {
+    fn persist_same(
+        &mut self,
+        mutate: impl FnOnce(&mut TournamentRecord),
+    ) -> Result<SpeculationStatus, ServiceError> {
+        let mut next = self.record.clone();
+        next.status.generation = increment(self.key.generation())?;
+        mutate(&mut next);
+        let stored = self
+            .store
+            .write(
+                &self.key,
+                self.key.generation(),
+                next,
+                TournamentWriteKind::SamePhaseEvidence,
+            )
+            .map_err(map_store_error)?;
+        self.install_stored(stored)
+    }
+
+    fn install_stored(
+        &mut self,
+        stored: StoredTournamentUpdate,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.key = stored.key;
+        self.record = stored.record;
+        let status = self.record.status.clone();
+        *self.snapshot.lock().map_err(|_| {
+            self.core
+                .availability
+                .store(Availability::Unresolved as u8, Ordering::Release);
+            ServiceError::EvidenceUnavailable
+        })? = status.clone();
+        Ok(status)
+    }
+
+    fn transition(
+        &mut self,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.claim(
+            self.record.status.tournament_uuid,
+            self.record.status.daemon_instance_uuid,
+            self.record.status.generation,
+            phase,
+            reason,
+        )
+    }
+
+    fn spawn_observer(
+        &self,
+        candidate: u8,
+        observer: CandidateObserver,
+        operation: ObserverOperation,
+    ) -> Result<(), ServiceError> {
+        let sender = self.sender.clone();
+        let authorization_generation = self.pipeline.as_ref().map_or_else(
+            || self.context.identity().generation,
+            |pipeline| pipeline.authorization_generation,
+        );
+        thread::Builder::new()
+            .name("lterm-speculation-observer".into())
+            .spawn(move || {
+                let mut observer = observer;
+                let deadline = ContainmentDeadline::control_action();
+                let result = match operation {
+                    ObserverOperation::PayloadFdAck => {
+                        receive_payload_fd_ack(&mut observer, deadline).map(ObserverEvidence::Event)
+                    }
+                    ObserverOperation::GoReceipt => {
+                        receive_go_receipt(&mut observer, deadline).map(ObserverEvidence::GoReceipt)
+                    }
+                    ObserverOperation::PayloadPlaced => {
+                        receive_payload_placed_owned(&mut observer, deadline)
+                            .map(ObserverEvidence::PayloadPlaced)
+                    }
+                    ObserverOperation::Execution => {
+                        receive_execution_event(&mut observer, deadline)
+                            .map(ObserverEvidence::Event)
+                    }
+                    ObserverOperation::OutputDrained => {
+                        receive_output_drained(&mut observer, deadline).map(ObserverEvidence::Event)
+                    }
+                    ObserverOperation::DecisionAck(decision) => {
+                        receive_decision_ack(&mut observer, decision, deadline)
+                            .map(ObserverEvidence::Event)
+                    }
+                    ObserverOperation::SyncEof => {
+                        observe_sync_eof(&mut observer, deadline).map(ObserverEvidence::Event)
+                    }
+                    ObserverOperation::ManagedReaped => {
+                        observe_managed_reaped(&mut observer, deadline).map(ObserverEvidence::Event)
+                    }
+                };
+                let _ = sender.send(ActorEvent::Observed(Box::new(ObserverCompletion {
+                    authorization_generation,
+                    candidate,
+                    observer,
+                    result,
+                })));
+            })
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        Ok(())
+    }
+
+    fn wait_observer(
+        &mut self,
+        candidate: u8,
+        observer: CandidateObserver,
+        operation: ObserverOperation,
+    ) -> Result<(CandidateObserver, ObserverEvidence), ServiceError> {
+        let expected_generation = self.pipeline.as_ref().map_or_else(
+            || self.context.identity().generation,
+            |pipeline| pipeline.authorization_generation,
+        );
+        self.spawn_observer(candidate, observer, operation)?;
+        loop {
+            match self
+                .receiver
+                .recv()
+                .map_err(|_| ServiceError::EvidenceUnavailable)?
+            {
+                ActorEvent::Observed(completion)
+                    if completion.authorization_generation == expected_generation
+                        && completion.candidate == candidate =>
+                {
+                    let ObserverCompletion {
+                        observer, result, ..
+                    } = *completion;
+                    return result
+                        .map(|evidence| (observer, evidence))
+                        .map_err(ServiceError::from);
+                }
+                ActorEvent::Observed(_) => {}
+                event => self.handle_pipeline_event(event)?,
+            }
+        }
+    }
+
+    fn handle_pipeline_event(&mut self, event: ActorEvent) -> Result<(), ServiceError> {
+        match event {
+            ActorEvent::Rollback {
+                request,
+                reason,
+                reply,
+            } => {
+                let result = self.claim(
+                    request.tournament_uuid,
+                    request.daemon_instance_uuid,
+                    request.generation,
+                    SpeculationPhase::RollbackPending,
+                    Some(reason),
+                );
+                if result.is_ok() {
+                    self.interrupt_requested = true;
+                }
+                let _ = reply.send(result);
+            }
+            ActorEvent::Shutdown { reply } => {
+                let result = self
+                    .transition(
+                        shutdown_claim_phase(self.record.status.phase),
+                        Some(SpeculationReasonCode::DaemonShutdown),
+                    )
+                    .map(|_| ());
+                if result.is_ok() {
+                    self.interrupt_requested = true;
+                }
+                let _ = reply.send(result);
+            }
+            ActorEvent::WatchdogTick { now_unix_ms }
+                if now_unix_ms >= self.record.status.lease_deadline_unix_ms =>
+            {
+                self.transition(
+                    shutdown_claim_phase(self.record.status.phase),
+                    self.record
+                        .status
+                        .reason_code
+                        .or(Some(SpeculationReasonCode::ContainmentEvidenceUnavailable)),
+                )?;
+                self.interrupt_requested = true;
+            }
+            ActorEvent::WatchdogTick { .. } => {}
+            ActorEvent::Arm { reply, .. } => {
+                let _ = reply.send(Err(ServiceError::InvalidTransition));
+            }
+            ActorEvent::Finalize { reply, .. } => {
+                let _ = reply.send(Err(ServiceError::InvalidTransition));
+            }
+            ActorEvent::Observed(_) => {}
+        }
+        Ok(())
+    }
+
+    fn drain_pipeline_events(&mut self) -> Result<(), ServiceError> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(ActorEvent::Observed(_)) => return Err(ServiceError::EvidenceUnavailable),
+                Ok(event) => self.handle_pipeline_event(event)?,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Err(ServiceError::EvidenceUnavailable),
+            }
+        }
+    }
+
+    fn ensure_not_interrupted(&mut self) -> Result<(), ServiceError> {
+        self.drain_pipeline_events()?;
+        if self.interrupt_requested || self.record.status.phase.is_rollback_only() {
+            Err(ServiceError::RollbackRequired)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn run_to_pending_finalize(&mut self) -> Result<(), ServiceError> {
+        self.transition(SpeculationPhase::Starting, None)?;
+        self.pipeline = Some(LivePipeline {
+            topology: begin_topology(&self.context)?,
+            candidates: [None, None],
+            authorization_generation: self.context.identity().generation,
+        });
+        self.create_durable_topology()?;
+        for candidate in 0_u8..2 {
+            self.run_probe(candidate)?;
+            self.ensure_not_interrupted()?;
+        }
+
+        let authorization_generation = increment(self.record.status.generation)?;
+        self.context
+            .authorize_control_generation(authorization_generation)?;
+        self.pipeline
+            .as_mut()
+            .ok_or(ServiceError::EvidenceUnavailable)?
+            .authorization_generation = authorization_generation;
+        for candidate in 0_u8..2 {
+            self.persist_same(|record| {
+                record.cgroups[usize::from(candidate)].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ControlAttachPending);
+            })?;
+            let containment = {
+                let pipeline = self
+                    .pipeline
+                    .as_ref()
+                    .ok_or(ServiceError::EvidenceUnavailable)?;
+                launch_runner(
+                    &self.context,
+                    &pipeline.topology,
+                    candidate,
+                    ContainmentDeadline::control_action(),
+                )?
+            };
+            let observation = containment.observation();
+            let parts = containment.split();
+            self.persist_same(|record| {
+                let index = usize::from(candidate);
+                record.managed_owners[index] = Some(observation.managed_owner);
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ControlAttached);
+                record.status.candidates[index].ready = true;
+                record.status.candidates[index].ready_elapsed_ns = Some(elapsed_stamp());
+            })?;
+            self.pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?
+                .candidates[usize::from(candidate)] = Some(LiveCandidate {
+                control: parts.control,
+                observer: Some(parts.observer),
+            });
+            self.ensure_not_interrupted()?;
+        }
+        self.transition(
+            SpeculationPhase::Ready,
+            Some(SpeculationReasonCode::ReadyLease),
+        )?;
+        self.arm_payload_descriptors()?;
+        self.transition(SpeculationPhase::GoPending, None)?;
+        for candidate in 0_u8..2 {
+            self.persist_same(|record| {
+                record.cgroups[usize::from(candidate)].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadExecPending);
+            })?;
+        }
+        let sends = [self.send_go_for(0)?, self.send_go_for(1)?];
+        if sends[0]
+            .sent_monotonic_ns
+            .abs_diff(sends[1].sent_monotonic_ns)
+            > crate::speculation_linux::MAX_GO_RECEIPT_SKEW_NS
+        {
+            return Err(ServiceError::ContainmentUnavailable);
+        }
+        let receipts = [self.observe_go_receipt(0)?, self.observe_go_receipt(1)?];
+        go_receipt_skew_ns(receipts)?;
+        for (candidate, receipt) in receipts.into_iter().enumerate() {
+            self.persist_same(|record| {
+                let status = &mut record.status.candidates[candidate];
+                status.go_received = true;
+                status.go_received_elapsed_ns = Some(receipt.received_monotonic_ns);
+            })?;
+        }
+        for candidate in 0_u8..2 {
+            let placement = self.observe_payload_placement(candidate)?;
+            self.persist_same(|record| {
+                record.cgroups[usize::from(candidate)].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadAttached);
+            })?;
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            let live = pipeline.candidates[usize::from(candidate)]
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            send_payload_release(
+                &mut live.control,
+                placement,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.transition(
+            SpeculationPhase::Running,
+            Some(SpeculationReasonCode::RunningLease),
+        )?;
+        for candidate in 0_u8..2 {
+            self.collect_candidate_result(candidate)?;
+            self.ensure_not_interrupted()?;
+        }
+        self.transition(SpeculationPhase::ResultPending, None)?;
+        let decision = crate::speculation::score_candidates(std::array::from_fn(|index| {
+            let candidate = &self.record.status.candidates[index];
+            crate::speculation::CandidateResult {
+                input_index: index as u8,
+                exit_success: candidate.exit_success,
+                elapsed_ns: candidate.elapsed_ns,
+                output_bytes: candidate.output_bytes,
+                quiescent: self.record.cgroups[index].lifecycle
+                    == CgroupLifecycleState::Forward(CgroupForwardState::PayloadEmpty),
+                output_overflowed: candidate
+                    .output_bytes
+                    .is_some_and(|bytes| bytes > MAX_CANDIDATE_OUTPUT_BYTES),
+            }
+        }));
+        let crate::speculation::ScoreDecision::Selected(selected) = decision else {
+            self.transition(
+                SpeculationPhase::RollbackPending,
+                Some(SpeculationReasonCode::BothCandidatesIneligible),
+            )?;
+            return Err(ServiceError::RollbackRequired);
+        };
+        self.persist_same(|record| record.status.selected_index = Some(selected))?;
+        self.transition(
+            SpeculationPhase::PendingFinalize,
+            Some(SpeculationReasonCode::PendingFinalizeLease),
+        )?;
+        Ok(())
+    }
+
+    fn create_durable_topology(&mut self) -> Result<(), ServiceError> {
+        self.persist_same(|record| {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::CreatePending;
+        })?;
+        let TopologyEvidence::TournamentDomain(identity) =
+            self.topology_action(TopologyAction::CreateTournamentDomain)?
+        else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        self.persist_same(|record| {
+            record.tournament_cgroup.domain = Some(identity);
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Created;
+        })?;
+        for candidate in 0_u8..2 {
+            let index = usize::from(candidate);
+            self.persist_same(|record| {
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ParentCreatePending);
+            })?;
+            let TopologyEvidence::CandidateParent {
+                identity: parent, ..
+            } = self.topology_action(TopologyAction::CreateCandidateParent { candidate })?
+            else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            self.persist_same(|record| {
+                record.cgroups[index].parent = Some(parent);
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ParentCreated);
+            })?;
+            self.persist_same(|record| {
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ControlCreatePending);
+            })?;
+            let TopologyEvidence::ControlLeaf {
+                identity: control, ..
+            } = self.topology_action(TopologyAction::CreateControlLeaf { candidate })?
+            else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            self.persist_same(|record| {
+                record.cgroups[index].control = Some(control);
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::ControlCreated);
+            })?;
+            self.persist_same(|record| {
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadCreatePending);
+            })?;
+            let TopologyEvidence::PayloadLeaf {
+                identity: payload, ..
+            } = self.topology_action(TopologyAction::CreatePayloadLeaf { candidate })?
+            else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            self.persist_same(|record| {
+                record.cgroups[index].payload = Some(payload);
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadCreated);
+            })?;
+            self.persist_same(|_| {})?;
+            if !matches!(
+                self.topology_action(TopologyAction::ConfigurePayloadLimit { candidate })?,
+                TopologyEvidence::PayloadLimit {
+                    candidate: observed,
+                    pids_max: 256,
+                } if observed == candidate
+            ) {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    fn topology_action(
+        &mut self,
+        action: TopologyAction,
+    ) -> Result<TopologyEvidence, ServiceError> {
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        create_topology(&mut pipeline.topology, action).map_err(ServiceError::from)
+    }
+
+    fn candidate_action(
+        &mut self,
+        candidate: u8,
+        action: CandidateCleanupAction,
+        deadline: ContainmentDeadline,
+    ) -> Result<crate::speculation_linux::CandidateCleanupEvidence, ServiceError> {
+        let pipeline = self
+            .pipeline
+            .as_mut()
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        perform_candidate_cleanup_action(&mut pipeline.topology, candidate, action, deadline)
+            .map_err(ServiceError::from)
+    }
+
+    fn run_probe(&mut self, candidate: u8) -> Result<(), ServiceError> {
+        let index = usize::from(candidate);
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle =
+                CgroupLifecycleState::Forward(CgroupForwardState::ProbePending);
+        })?;
+        let containment = {
+            let pipeline = self
+                .pipeline
+                .as_ref()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            launch_fixed_probe(
+                &self.context,
+                pipeline.topology.candidate(candidate)?,
+                candidate,
+                ContainmentDeadline::control_action(),
+            )?
+        };
+        let observation = containment.observation();
+        let parts = containment.split();
+        self.persist_same(|record| {
+            record.managed_owners[index] = Some(observation.managed_owner);
+        })?;
+        self.pipeline
+            .as_mut()
+            .ok_or(ServiceError::EvidenceUnavailable)?
+            .candidates[index] = Some(LiveCandidate {
+            control: parts.control,
+            observer: Some(parts.observer),
+        });
+        self.persist_same(|_| {})?;
+        {
+            let live = self
+                .pipeline
+                .as_mut()
+                .and_then(|pipeline| pipeline.candidates[index].as_mut())
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            transfer_payload_fd_owned(&mut live.control, ContainmentDeadline::control_action())?;
+        }
+        let observer = self.take_observer(candidate)?;
+        let (observer, _) =
+            self.wait_observer(candidate, observer, ObserverOperation::PayloadFdAck)?;
+        self.restore_observer(candidate, observer)?;
+        self.ensure_not_interrupted()?;
+        self.persist_same(|_| {})?;
+        self.send_go_for(candidate)?;
+        let observer = self.take_observer(candidate)?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::GoReceipt)?;
+        self.restore_observer(candidate, observer)?;
+        if !matches!(evidence, ObserverEvidence::GoReceipt(_)) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        self.ensure_not_interrupted()?;
+        let observer = self.take_observer(candidate)?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::PayloadPlaced)?;
+        self.restore_observer(candidate, observer)?;
+        let ObserverEvidence::PayloadPlaced(observed) = evidence else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        self.ensure_not_interrupted()?;
+        self.persist_same(|_| {})?;
+        {
+            let live = self
+                .pipeline
+                .as_mut()
+                .and_then(|pipeline| pipeline.candidates[index].as_mut())
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            send_payload_release(
+                &mut live.control,
+                observed,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        let event = self.observe_event(candidate, ObserverOperation::Execution)?;
+        if !matches!(
+            event,
+            ContainmentEvent::LeaderExited {
+                category: RunnerExitCategory::ExitedZero,
+                ..
+            }
+        ) {
+            return Err(ServiceError::ContainmentUnavailable);
+        }
+        self.ensure_not_interrupted()?;
+        self.persist_same(|_| {})?;
+        self.candidate_action(
+            candidate,
+            CandidateCleanupAction::KillPayload,
+            ContainmentDeadline::control_action(),
+        )?;
+        self.persist_same(|_| {})?;
+        self.candidate_action(
+            candidate,
+            CandidateCleanupAction::ProvePayloadEmpty,
+            ContainmentDeadline::control_action(),
+        )?;
+        let evidence = self.observe_event(candidate, ObserverOperation::OutputDrained)?;
+        if !matches!(evidence, ContainmentEvent::OutputDrained { bytes: 0, .. }) {
+            return Err(ServiceError::ContainmentUnavailable);
+        }
+        self.ensure_not_interrupted()?;
+        self.persist_same(|_| {})?;
+        let mut live = self
+            .pipeline
+            .as_mut()
+            .and_then(|pipeline| pipeline.candidates[index].take())
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        send_select_or_abort(
+            &mut live.control,
+            DecisionKind::Abort,
+            ContainmentDeadline::control_action(),
+        )?;
+        let observer = live
+            .observer
+            .take()
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let (observer, _) = self.wait_observer(
+            candidate,
+            observer,
+            ObserverOperation::DecisionAck(DecisionKind::Abort),
+        )?;
+        let (observer, _) = self.wait_observer(candidate, observer, ObserverOperation::SyncEof)?;
+        let (observer, _) =
+            self.wait_observer(candidate, observer, ObserverOperation::ManagedReaped)?;
+        finish_containment(live.control, observer)?;
+        self.persist_same(|_| {})?;
+        self.candidate_action(
+            candidate,
+            CandidateCleanupAction::ProveParentEmpty,
+            ContainmentDeadline::control_action(),
+        )?;
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle =
+                CgroupLifecycleState::Forward(CgroupForwardState::ProbeEmpty);
+        })?;
+        Ok(())
+    }
+
+    fn arm_payload_descriptors(&mut self) -> Result<(), ServiceError> {
+        for candidate in 0_u8..2 {
+            let index = usize::from(candidate);
+            self.persist_same(|record| {
+                record.cgroups[index].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadFdTransferPending);
+            })?;
+            {
+                let live = self
+                    .pipeline
+                    .as_mut()
+                    .and_then(|pipeline| pipeline.candidates[index].as_mut())
+                    .ok_or(ServiceError::EvidenceUnavailable)?;
+                transfer_payload_fd_owned(
+                    &mut live.control,
+                    ContainmentDeadline::control_action(),
+                )?;
+            }
+        }
+        for candidate in 0_u8..2 {
+            let observer = self.take_observer(candidate)?;
+            let (observer, evidence) =
+                self.wait_observer(candidate, observer, ObserverOperation::PayloadFdAck)?;
+            self.restore_observer(candidate, observer)?;
+            if !matches!(
+                evidence,
+                ObserverEvidence::Event(ContainmentEvent::PayloadFdAck {
+                    candidate: observed,
+                }) if observed == candidate
+            ) {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            self.persist_same(|record| {
+                record.cgroups[usize::from(candidate)].lifecycle =
+                    CgroupLifecycleState::Forward(CgroupForwardState::PayloadArmed);
+            })?;
+            self.ensure_not_interrupted()?;
+        }
+        Ok(())
+    }
+
+    fn take_observer(&mut self, candidate: u8) -> Result<CandidateObserver, ServiceError> {
+        self.pipeline
+            .as_mut()
+            .and_then(|pipeline| pipeline.candidates[usize::from(candidate)].as_mut())
+            .and_then(|candidate| candidate.observer.take())
+            .ok_or(ServiceError::EvidenceUnavailable)
+    }
+
+    fn restore_observer(
+        &mut self,
+        candidate: u8,
+        observer: CandidateObserver,
+    ) -> Result<(), ServiceError> {
+        let slot = self
+            .pipeline
+            .as_mut()
+            .and_then(|pipeline| pipeline.candidates[usize::from(candidate)].as_mut())
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        if slot.observer.replace(observer).is_some() {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        Ok(())
+    }
+
+    fn send_go_for(
+        &mut self,
+        candidate: u8,
+    ) -> Result<crate::speculation_linux::GoSendEvidence, ServiceError> {
+        let live = self
+            .pipeline
+            .as_mut()
+            .and_then(|pipeline| pipeline.candidates[usize::from(candidate)].as_mut())
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        send_go(&mut live.control, ContainmentDeadline::control_action())
+            .map_err(ServiceError::from)
+    }
+
+    fn observe_go_receipt(&mut self, candidate: u8) -> Result<GoReceiptEvidence, ServiceError> {
+        let observer = self.take_observer(candidate)?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::GoReceipt)?;
+        self.restore_observer(candidate, observer)?;
+        let ObserverEvidence::GoReceipt(receipt) = evidence else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        if receipt.identity.generation
+            != self
+                .pipeline
+                .as_ref()
+                .ok_or(ServiceError::EvidenceUnavailable)?
+                .authorization_generation
+        {
+            return Err(ServiceError::StaleGeneration);
+        }
+        Ok(receipt)
+    }
+
+    fn observe_payload_placement(
+        &mut self,
+        candidate: u8,
+    ) -> Result<PayloadPlacementEvidence, ServiceError> {
+        let observer = self.take_observer(candidate)?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::PayloadPlaced)?;
+        self.restore_observer(candidate, observer)?;
+        let ObserverEvidence::PayloadPlaced(placement) = evidence else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        Ok(placement)
+    }
+
+    fn observe_event(
+        &mut self,
+        candidate: u8,
+        operation: ObserverOperation,
+    ) -> Result<ContainmentEvent, ServiceError> {
+        let observer = self.take_observer(candidate)?;
+        let (observer, evidence) = self.wait_observer(candidate, observer, operation)?;
+        self.restore_observer(candidate, observer)?;
+        let ObserverEvidence::Event(event) = evidence else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        Ok(event)
+    }
+
+    fn collect_candidate_result(&mut self, candidate: u8) -> Result<(), ServiceError> {
+        let index = usize::from(candidate);
+        let first = self.observe_event(candidate, ObserverOperation::Execution)?;
+        let (mut category, mut elapsed_ns, output_overflowed) = match first {
+            ContainmentEvent::LeaderExited {
+                candidate: observed,
+                category,
+                elapsed_ns,
+            } if observed == candidate => (category, elapsed_ns, false),
+            ContainmentEvent::OutputLimitExceeded {
+                candidate: observed,
+                bytes,
+            } if observed == candidate && bytes == MAX_CANDIDATE_OUTPUT_BYTES + 1 => {
+                let live = self
+                    .pipeline
+                    .as_mut()
+                    .and_then(|pipeline| pipeline.candidates[index].as_mut())
+                    .ok_or(ServiceError::EvidenceUnavailable)?;
+                acknowledge_output_cleanup_claimed(
+                    &mut live.control,
+                    ContainmentDeadline::control_action(),
+                )?;
+                (RunnerExitCategory::OutputLimitExceeded, 1, true)
+            }
+            _ => return Err(ServiceError::EvidenceUnavailable),
+        };
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle =
+                CgroupLifecycleState::Forward(CgroupForwardState::PayloadKillPending);
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::KillPayload,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|_| {})?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::ProvePayloadEmpty,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle =
+                CgroupLifecycleState::Forward(CgroupForwardState::PayloadEmpty);
+        })?;
+        if output_overflowed {
+            let event = self.observe_event(candidate, ObserverOperation::Execution)?;
+            let ContainmentEvent::LeaderExited {
+                candidate: observed,
+                category: observed_category,
+                elapsed_ns: observed_elapsed,
+            } = event
+            else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            if observed != candidate || observed_category != RunnerExitCategory::OutputLimitExceeded
+            {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            category = observed_category;
+            elapsed_ns = observed_elapsed;
+        }
+        let drained = self.observe_event(candidate, ObserverOperation::OutputDrained)?;
+        let ContainmentEvent::OutputDrained {
+            candidate: observed,
+            bytes: output_bytes,
+        } = drained
+        else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        if observed != candidate {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        let exit_category = public_exit_category(category);
+        let exit_success = category == RunnerExitCategory::ExitedZero;
+        let eligible = !output_overflowed
+            && output_bytes <= MAX_CANDIDATE_OUTPUT_BYTES
+            && !matches!(
+                category,
+                RunnerExitCategory::SpawnFailed
+                    | RunnerExitCategory::OutputLimitExceeded
+                    | RunnerExitCategory::EvidenceIncomplete
+            );
+        self.persist_same(|record| {
+            let status = &mut record.status.candidates[index];
+            status.result_accepted = true;
+            status.exit_success = Some(exit_success);
+            status.exit_category = Some(exit_category);
+            status.elapsed_ns = Some(elapsed_ns);
+            status.output_bytes = Some(output_bytes);
+            status.eligible = eligible;
+        })?;
+        Ok(())
+    }
+
+    fn finalize_pipeline(&mut self) -> Result<(), ServiceError> {
+        let selected = self
+            .record
+            .status
+            .selected_index
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let loser = 1_u8
+            .checked_sub(selected)
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        self.finish_live_candidate(loser, DecisionKind::Abort)?;
+        self.cleanup_candidate(loser)?;
+        self.transition(SpeculationPhase::WinnerSelectionPending, None)?;
+        self.transition(SpeculationPhase::FinalizingWinner, None)?;
+        self.finish_live_candidate(selected, DecisionKind::Select)?;
+        self.cleanup_candidate(selected)?;
+        self.cleanup_tournament()?;
+        self.transition_terminal(SpeculationPhase::Selected)?;
+        Ok(())
+    }
+
+    fn finish_live_candidate(
+        &mut self,
+        candidate: u8,
+        decision: DecisionKind,
+    ) -> Result<(), ServiceError> {
+        let index = usize::from(candidate);
+        let mut live = self
+            .pipeline
+            .as_mut()
+            .and_then(|pipeline| pipeline.candidates[index].take())
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        self.persist_same(|_| {})?;
+        send_select_or_abort(
+            &mut live.control,
+            decision,
+            ContainmentDeadline::control_action(),
+        )?;
+        let observer = live
+            .observer
+            .take()
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let (observer, evidence) = self.wait_observer(
+            candidate,
+            observer,
+            ObserverOperation::DecisionAck(decision),
+        )?;
+        if !matches!(
+            evidence,
+            ObserverEvidence::Event(ContainmentEvent::DecisionAck {
+                candidate: observed,
+                decision: observed_decision,
+            }) if observed == candidate && observed_decision == decision
+        ) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        self.persist_same(|record| {
+            record.status.candidates[index].cleanup.runner_ack = true;
+        })?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::SyncEof)?;
+        if !matches!(
+            evidence,
+            ObserverEvidence::Event(ContainmentEvent::SyncEof {
+                candidate: observed,
+            }) if observed == candidate
+        ) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        self.persist_same(|record| {
+            record.status.candidates[index].cleanup.sync_eof = true;
+        })?;
+        let (observer, evidence) =
+            self.wait_observer(candidate, observer, ObserverOperation::ManagedReaped)?;
+        if !matches!(
+            evidence,
+            ObserverEvidence::Event(ContainmentEvent::ManagedReaped {
+                candidate: observed,
+            }) if observed == candidate
+        ) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        self.persist_same(|record| {
+            let cleanup = &mut record.status.candidates[index].cleanup;
+            cleanup.bwrap_reaped = true;
+            cleanup.managed_tombstone = true;
+        })?;
+        finish_containment(live.control, observer)?;
+        Ok(())
+    }
+
+    fn cleanup_candidate(&mut self, candidate: u8) -> Result<(), ServiceError> {
+        let index = usize::from(candidate);
+        let from = match self.record.cgroups[index].lifecycle {
+            CgroupLifecycleState::Forward(from) => from,
+            CgroupLifecycleState::Removed => return Ok(()),
+            _ => return Err(ServiceError::EvidenceUnavailable),
+        };
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::CleanupPending { from };
+        })?;
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::ParentKillPending { from };
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::KillParent,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|_| {})?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::ProveParentEmpty,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::ParentEmpty { from };
+            record.status.candidates[index].cleanup.cgroup_empty = true;
+        })?;
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemovePending { from };
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::RemovePayload,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.cgroups[index].payload = None;
+            record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemoved { from };
+        })?;
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemovePending { from };
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::RemoveControl,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.cgroups[index].control = None;
+            record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemoved { from };
+        })?;
+        self.persist_same(|record| {
+            record.cgroups[index].lifecycle = CgroupLifecycleState::ParentRemovePending { from };
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_candidate_cleanup_action(
+                &mut pipeline.topology,
+                candidate,
+                CandidateCleanupAction::RemoveParent,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.cgroups[index].parent = None;
+            record.cgroups[index].lifecycle = CgroupLifecycleState::Removed;
+        })?;
+        Ok(())
+    }
+
+    fn cleanup_tournament(&mut self) -> Result<(), ServiceError> {
+        if self.record.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::Removed {
+            return Ok(());
+        }
+        self.persist_same(|record| {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
+        })?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_tournament_cleanup_action(
+                &mut pipeline.topology,
+                TournamentCleanupAction::ProveEmpty,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|_| {})?;
+        {
+            let pipeline = self
+                .pipeline
+                .as_mut()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            perform_tournament_cleanup_action(
+                &mut pipeline.topology,
+                TournamentCleanupAction::RemoveDomain,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        self.persist_same(|record| {
+            record.tournament_cgroup.domain = None;
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+        })?;
+        Ok(())
+    }
+
+    fn transition_terminal(
+        &mut self,
+        phase: SpeculationPhase,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        if !matches!(
+            phase,
+            SpeculationPhase::Selected | SpeculationPhase::RolledBack
+        ) || !crate::speculation::is_legal_transition(self.record.status.phase, phase)
+        {
+            return Err(ServiceError::InvalidTransition);
+        }
+        let mut next = self.record.clone();
+        next.status.generation = increment(self.key.generation())?;
+        next.status.phase = phase;
+        next.status.rollback_required = false;
+        if phase == SpeculationPhase::RolledBack {
+            next.status.selected_index = None;
+        }
+        next.terminal_completed_unix_ms = Some(unix_time_ms()?);
+        let stored = self
+            .store
+            .write(
+                &self.key,
+                self.key.generation(),
+                next,
+                TournamentWriteKind::LivePhaseTransition,
+            )
+            .map_err(map_store_error)?;
+        self.install_stored(stored)
+    }
+
+    fn fail_closed_pipeline(&mut self) {
+        if !self.record.status.phase.is_terminal() && !self.record.status.phase.is_rollback_only() {
+            let target = shutdown_claim_phase(self.record.status.phase);
+            let _ = self.transition(
+                target,
+                Some(SpeculationReasonCode::ContainmentEvidenceUnavailable),
+            );
+        }
+        self.rollback_pipeline();
+    }
+
+    fn rollback_pipeline(&mut self) {
+        if self.record.status.is_terminal() {
+            return;
+        }
+        if self.record.status.phase != SpeculationPhase::RollbackPending
+            && self
+                .transition(
+                    SpeculationPhase::RollbackPending,
+                    self.record
+                        .status
+                        .reason_code
+                        .or(Some(SpeculationReasonCode::ContainmentEvidenceUnavailable)),
+                )
+                .is_err()
+        {
+            self.core
+                .availability
+                .store(Availability::Unresolved as u8, Ordering::Release);
+            return;
+        }
+        if self.pipeline.is_none() {
+            if self.record.cgroups.iter().any(|candidate| {
+                candidate.lifecycle != CgroupLifecycleState::Forward(CgroupForwardState::Planned)
+            }) || self.record.tournament_cgroup.lifecycle
+                != TournamentCgroupLifecycleState::Planned
+            {
+                self.core
+                    .availability
+                    .store(Availability::Unresolved as u8, Ordering::Release);
+                return;
+            }
+            for candidate in 0..2 {
+                let _ = self.persist_same(|record| {
+                    record.cgroups[candidate].lifecycle = CgroupLifecycleState::Removed;
+                    record.status.candidates[candidate].cleanup = fully_closed_cleanup();
+                });
+            }
+            let _ = self.persist_same(|record| {
+                record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+            });
+        } else {
+            for candidate in 0_u8..2 {
+                if self
+                    .pipeline
+                    .as_ref()
+                    .and_then(|pipeline| pipeline.candidates[usize::from(candidate)].as_ref())
+                    .is_some()
+                {
+                    let _ = self.finish_live_candidate(candidate, DecisionKind::Abort);
+                } else {
+                    let _ = self.persist_same(|record| {
+                        record.status.candidates[usize::from(candidate)]
+                            .cleanup
+                            .runner_ack = true;
+                        record.status.candidates[usize::from(candidate)]
+                            .cleanup
+                            .sync_eof = true;
+                        record.status.candidates[usize::from(candidate)]
+                            .cleanup
+                            .bwrap_reaped = true;
+                        record.status.candidates[usize::from(candidate)]
+                            .cleanup
+                            .managed_tombstone = true;
+                    });
+                }
+                let _ = self.cleanup_candidate(candidate);
+            }
+            let _ = self.cleanup_tournament();
+        }
+        if self.record.is_positive_terminal() {
+            return;
+        }
+        if self
+            .record
+            .cgroups
+            .iter()
+            .all(|candidate| candidate.lifecycle == CgroupLifecycleState::Removed)
+            && self.record.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::Removed
+            && self.record.status.candidates.iter().all(|candidate| {
+                let cleanup = candidate.cleanup;
+                cleanup.runner_ack
+                    && cleanup.bwrap_reaped
+                    && cleanup.sync_eof
+                    && cleanup.cgroup_empty
+                    && cleanup.managed_tombstone
+            })
+        {
+            let _ = self.transition_terminal(SpeculationPhase::RolledBack);
+        } else {
+            self.core
+                .availability
+                .store(Availability::Unresolved as u8, Ordering::Release);
+        }
+    }
+
+    fn publish_terminal(&mut self) {
+        if !self.record.is_positive_terminal() {
+            return;
+        }
+        let terminal = Arc::new(self.record.status.clone());
+        let tournament_uuid = self.record.status.tournament_uuid;
+        match self.core.index.lock() {
+            Ok(mut index) => {
+                index.live.remove(&tournament_uuid);
+                index.terminal.insert(tournament_uuid, terminal);
+            }
+            Err(_) => self
+                .core
+                .availability
+                .store(Availability::Unresolved as u8, Ordering::Release),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn public_exit_category(category: RunnerExitCategory) -> SpeculationExitCategory {
+    match category {
+        RunnerExitCategory::ExitedZero => SpeculationExitCategory::ExitedZero,
+        RunnerExitCategory::ExitedNonzero => SpeculationExitCategory::ExitedNonzero,
+        RunnerExitCategory::Signaled => SpeculationExitCategory::Signaled,
+        RunnerExitCategory::SpawnFailed => SpeculationExitCategory::SpawnFailed,
+        RunnerExitCategory::OutputLimitExceeded => SpeculationExitCategory::OutputLimitExceeded,
+        RunnerExitCategory::EvidenceIncomplete => SpeculationExitCategory::EvidenceIncomplete,
+    }
+}
+
+fn elapsed_stamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(1)
 }
 
 fn shutdown_claim_phase(phase: SpeculationPhase) -> SpeculationPhase {
@@ -1286,9 +2637,227 @@ fn map_store_error(error: crate::speculation_fs::EvidenceError) -> ServiceError 
     }
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode> {
+    use crate::protocol::{SpeculationArgv, SpeculationUnixPath};
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let source = fixture.join("source");
+    let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
+    let ledger_path = fixture.join("ledger");
+    let control = fixture.join("control");
+    for path in [
+        &source,
+        &candidates[0],
+        &candidates[1],
+        &ledger_path,
+        &control,
+    ] {
+        std::fs::create_dir(path).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    for (path, script) in candidates.iter().zip([
+        b"#!/bin/sh\nprintf a\n".as_slice(),
+        b"#!/bin/sh\nsleep 0.05\nprintf bb\n".as_slice(),
+    ]) {
+        let script_path = path.join("run.sh");
+        std::fs::write(&script_path, script)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o500))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::Unsupported)?;
+    let store = Arc::new(
+        TournamentStore::open_or_create(&fixture.join("store"))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    );
+    let service = SpeculationService::new_reconciling(Uuid::new_v4())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    service
+        .install_ready(store, control)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let request = SpeculationPrepareRequest::new(
+        SpeculationUnixPath::from_path(&source)
+            .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+        [
+            SpeculationUnixPath::from_path(&candidates[0])
+                .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+            SpeculationUnixPath::from_path(&candidates[1])
+                .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+        ],
+        SpeculationUnixPath::from_path(&ledger_path)
+            .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+        SpeculationUnixPath::from_path(&cgroup_root)
+            .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+        60_000,
+        SpeculationArgv::from_os_strings(vec![
+            OsString::from("/bin/sh"),
+            OsString::from("/workspace/run.sh"),
+        ])
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+    )
+    .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let prepared = service
+        .prepare(request)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let ledger = crate::speculation_ledger::ClientLedger::new(
+        crate::speculation_fs::open_existing_private_dir(&ledger_path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    );
+    let current = ledger
+        .read_verified(
+            prepared.status.tournament_uuid,
+            prepared.status.daemon_instance_uuid,
+        )
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let mut arm_record = current.value.clone();
+    arm_record.action = LedgerAction::ArmRequested;
+    ledger
+        .write_before_action(
+            &current,
+            &arm_record,
+            LedgerAction::ArmRequested,
+            prepared.status.generation,
+        )
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let armed = service
+        .arm(SpeculationArmRequest {
+            tournament_uuid: prepared.status.tournament_uuid,
+            daemon_instance_uuid: prepared.status.daemon_instance_uuid,
+            generation: prepared.status.generation,
+        })
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if armed.status.phase != SpeculationPhase::Armed {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let pending = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(ContainmentErrorCode::Timeout);
+        }
+        let status = service
+            .status(SpeculationStatusRequest {
+                tournament_uuid: armed.status.tournament_uuid,
+                daemon_instance_uuid: armed.status.daemon_instance_uuid,
+                generation: armed.status.generation,
+            })
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .status;
+        if status.phase == SpeculationPhase::PendingFinalize {
+            break status;
+        }
+        if status.phase.is_rollback_only() || status.is_terminal() {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    if pending.selected_index != Some(0)
+        || pending.candidates.iter().any(|candidate| {
+            !candidate.ready || !candidate.go_received || !candidate.result_accepted
+        })
+    {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let finalizing = service
+        .finalize(SpeculationFinalizeRequest {
+            tournament_uuid: pending.tournament_uuid,
+            daemon_instance_uuid: pending.daemon_instance_uuid,
+            generation: pending.generation,
+        })
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if finalizing.status.phase != SpeculationPhase::FinalizingLoser {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(ContainmentErrorCode::Timeout);
+        }
+        let status = service
+            .status(SpeculationStatusRequest {
+                tournament_uuid: pending.tournament_uuid,
+                daemon_instance_uuid: pending.daemon_instance_uuid,
+                generation: pending.generation,
+            })
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .status;
+        if status.phase == SpeculationPhase::Selected {
+            if status.selected_index == Some(0)
+                && status.candidates.iter().all(|candidate| {
+                    let cleanup = candidate.cleanup;
+                    cleanup.runner_ack
+                        && cleanup.bwrap_reaped
+                        && cleanup.sync_eof
+                        && cleanup.cgroup_empty
+                        && cleanup.managed_tombstone
+                })
+            {
+                return Ok(());
+            }
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        if status.phase.is_rollback_only() || status.phase == SpeculationPhase::RolledBack {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeEffectStep {
+        Durable(&'static str, u64),
+        Action(&'static str, u64),
+        Observed(&'static str, u64),
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FakeEffectMachine {
+        generation: u64,
+        authorized: Option<(&'static str, u64)>,
+        trace: Vec<FakeEffectStep>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeEffectMachine {
+        fn new() -> Self {
+            Self {
+                generation: 1,
+                authorized: None,
+                trace: Vec::new(),
+            }
+        }
+
+        fn persist(&mut self, action: &'static str) -> u64 {
+            self.generation += 1;
+            self.authorized = Some((action, self.generation));
+            self.trace
+                .push(FakeEffectStep::Durable(action, self.generation));
+            self.generation
+        }
+
+        fn act(&mut self, action: &'static str, generation: u64) {
+            assert_eq!(self.authorized.take(), Some((action, generation)));
+            self.trace.push(FakeEffectStep::Action(action, generation));
+        }
+
+        fn observe(&mut self, event: &'static str, generation: u64) {
+            assert!(generation <= self.generation, "future observer evidence");
+            self.trace.push(FakeEffectStep::Observed(event, generation));
+        }
+    }
 
     #[test]
     fn disabled_default_has_no_store_threads_or_directories() {
@@ -1449,6 +3018,82 @@ mod tests {
         }
         assert_eq!(index.live.len(), crate::speculation::MAX_LIVE_TOURNAMENTS);
         assert!(index.terminal.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deterministic_fake_effect_machine_proves_actor_ordering_contract() {
+        let mut machine = FakeEffectMachine::new();
+        for action in ["topology", "probe-0", "probe-1", "runner-0", "runner-1"] {
+            let generation = machine.persist(action);
+            machine.act(action, generation);
+            machine.observe(action, generation);
+        }
+        let go_generation = machine.persist("go-both");
+        machine.act("go-both", go_generation);
+        machine.observe("go-0", go_generation);
+        machine.observe("go-1", go_generation);
+        for candidate in ["0", "1"] {
+            let placed = if candidate == "0" {
+                "placed-0"
+            } else {
+                "placed-1"
+            };
+            let release = if candidate == "0" {
+                "release-0"
+            } else {
+                "release-1"
+            };
+            let result = if candidate == "0" {
+                "result-0"
+            } else {
+                "result-1"
+            };
+            let generation = machine.persist(placed);
+            machine.observe(placed, generation);
+            let generation = machine.persist(release);
+            machine.act(release, generation);
+            let generation = machine.persist(result);
+            machine.observe(result, generation);
+        }
+        for action in [
+            "abort-loser-1",
+            "cleanup-loser-1",
+            "select-winner-0",
+            "cleanup-winner-0",
+            "cleanup-tournament",
+        ] {
+            let generation = machine.persist(action);
+            machine.act(action, generation);
+        }
+        let select = machine
+            .trace
+            .iter()
+            .position(|step| matches!(step, FakeEffectStep::Action("select-winner-0", _)))
+            .unwrap();
+        let loser_cleanup = machine
+            .trace
+            .iter()
+            .position(|step| matches!(step, FakeEffectStep::Action("cleanup-loser-1", _)))
+            .unwrap();
+        assert!(loser_cleanup < select);
+        for (index, step) in machine.trace.iter().enumerate() {
+            if let FakeEffectStep::Action(action, generation) = step {
+                assert!(machine.trace[..index].iter().any(|prior| {
+                    matches!(prior, FakeEffectStep::Durable(observed, observed_generation)
+                        if observed == action && observed_generation == generation)
+                }));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn deterministic_fake_effect_machine_rejects_action_without_exact_authorization() {
+        let mut machine = FakeEffectMachine::new();
+        let generation = machine.persist("go-both");
+        machine.act("release-0", generation);
     }
 
     #[cfg(target_os = "linux")]

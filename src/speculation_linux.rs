@@ -2700,6 +2700,7 @@ pub(crate) struct CandidateControl {
     identity: RunnerIdentity,
     peer: File,
     protocol: Arc<Mutex<CandidateProtocol>>,
+    payload_node: RetainedCgroupNode,
     payload_proof: Option<ManagedDescendantProof>,
     _lifetime: Arc<PrivateRunnerControl>,
 }
@@ -2712,6 +2713,7 @@ pub(crate) struct CandidateObserver {
     controller: ManagedController,
     waiter: Option<ManagedWaiter>,
     sync_read: File,
+    payload_node: RetainedCgroupNode,
     payload_membership: ManagedCgroupMembership,
     sync_eof_observed: bool,
     managed_reaped_observed: bool,
@@ -2984,6 +2986,8 @@ fn launch_runner_with_argv(
     let observer_peer = peer
         .try_clone()
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let control_payload_node = clone_cgroup_node(payload_node)?;
+    let observer_payload_node = clone_cgroup_node(payload_node)?;
     let protocol = Arc::new(Mutex::new(CandidateProtocol {
         validator,
         output_limit_observed: false,
@@ -2994,6 +2998,7 @@ fn launch_runner_with_argv(
             identity,
             peer,
             protocol: Arc::clone(&protocol),
+            payload_node: control_payload_node,
             payload_proof: None,
             _lifetime: Arc::clone(&lifetime),
         },
@@ -3004,12 +3009,25 @@ fn launch_runner_with_argv(
             controller: managed.controller,
             waiter: Some(managed.waiter),
             sync_read,
+            payload_node: observer_payload_node,
             payload_membership,
             sync_eof_observed: false,
             managed_reaped_observed: false,
             _lifetime: lifetime,
         },
         observation,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn clone_cgroup_node(node: &RetainedCgroupNode) -> ContainmentResult<RetainedCgroupNode> {
+    Ok(RetainedCgroupNode {
+        file: node
+            .file
+            .try_clone()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        identity: node.identity,
+        membership: node.membership.clone(),
     })
 }
 
@@ -3136,6 +3154,27 @@ pub(crate) fn transfer_payload_fd(
         return Err(ContainmentErrorCode::InvalidIdentity);
     }
     let payload = topology.payload()?;
+    if payload.identity != control.payload_node.identity {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    transfer_payload_fd_from_node(control, payload, deadline)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn transfer_payload_fd_owned(
+    control: &mut CandidateControl,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    let payload = clone_cgroup_node(&control.payload_node)?;
+    transfer_payload_fd_from_node(control, &payload, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn transfer_payload_fd_from_node(
+    control: &mut CandidateControl,
+    payload: &RetainedCgroupNode,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
     let placement_fd = open_cgroup_procs(payload)?;
     failpoint("before_payload_fd_evidence")?;
     let placement = placement_descriptor_evidence(&placement_fd, payload, control.identity)?;
@@ -3245,11 +3284,33 @@ pub(crate) fn receive_payload_placed(
     topology: &CandidateTopology,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<PayloadPlacementEvidence> {
+    let payload = topology.payload()?;
+    if payload.identity != observer.payload_node.identity {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let payload = clone_cgroup_node(payload)?;
+    receive_payload_placed_from_node(observer, &payload, deadline)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn receive_payload_placed_owned(
+    observer: &mut CandidateObserver,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<PayloadPlacementEvidence> {
+    let payload = clone_cgroup_node(&observer.payload_node)?;
+    receive_payload_placed_from_node(observer, &payload, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn receive_payload_placed_from_node(
+    observer: &mut CandidateObserver,
+    payload: &RetainedCgroupNode,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<PayloadPlacementEvidence> {
     let placed = receive_observer_frame(observer, deadline)?;
     if !matches!(placed.message, ControlMessage::PayloadPlaced) {
         return Err(ContainmentErrorCode::PlacementUnproven);
     }
-    let payload = topology.payload()?;
     let observed = read_single_cgroup_pid(payload)?;
     failpoint("before_payload_membership_proof")?;
     let proof = observer
@@ -4023,6 +4084,13 @@ pub(crate) fn dispatch_internal_containment_test_driver(
     return Err(ContainmentErrorCode::Unsupported);
     #[cfg(target_os = "linux")]
     {
+        if std::env::var_os("LTERM_INTERNAL_SPECULATION_ACTOR_SERVICE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            crate::speculation_service::run_real_actor_service_driver()?;
+            println!("speculation-actor-service=1");
+            return Ok(true);
+        }
         if let Some(mode) = std::env::var_os("LTERM_INTERNAL_SPECULATION_RESTART_MODE") {
             if matches!(mode.as_bytes(), b"crash-cleanup" | b"recover-cleanup") {
                 run_cleanup_restart_driver(&mode)?;
