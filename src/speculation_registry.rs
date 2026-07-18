@@ -575,7 +575,13 @@ fn validate_status_semantics(status: &SpeculationStatus) -> EvidenceResult<()> {
     match status.phase {
         SpeculationPhase::Selected => {
             let selected = status.selected_index.ok_or(EvidenceError::Corrupt)?;
-            if selected > 1 || score_selected_index(&status.candidates) != Some(selected) {
+            if selected > 1
+                || status.candidates.iter().any(|candidate| {
+                    !candidate.ready || !candidate.go_received || !candidate.result_accepted
+                })
+                || !status.candidates[selected as usize].eligible
+                || score_selected_index(&status.candidates) != Some(selected)
+            {
                 return Err(EvidenceError::Corrupt);
             }
         }
@@ -602,6 +608,8 @@ fn validate_candidate_status(candidate: &SpeculationCandidateStatus) -> Evidence
     if candidate.ready != candidate.ready_elapsed_ns.is_some()
         || candidate.go_received != candidate.go_received_elapsed_ns.is_some()
         || (candidate.go_received && !candidate.ready)
+        || (candidate.result_accepted && !candidate.go_received)
+        || (candidate.eligible && (!candidate.result_accepted || !candidate.go_received))
     {
         return Err(EvidenceError::Corrupt);
     }
@@ -1224,6 +1232,20 @@ mod tests {
         let mut partial_result = valid.clone();
         partial_result.status.candidates[0].result_accepted = false;
         malformed.push(partial_result);
+        let mut accepted_without_go = valid.clone();
+        let selected = &mut accepted_without_go.status.candidates[0];
+        selected.go_received = false;
+        selected.go_received_elapsed_ns = None;
+        malformed.push(accepted_without_go);
+        let mut missing_loser_result = valid.clone();
+        let loser = &mut missing_loser_result.status.candidates[1];
+        loser.result_accepted = false;
+        loser.exit_success = None;
+        loser.exit_category = None;
+        loser.elapsed_ns = None;
+        loser.output_bytes = None;
+        loser.eligible = false;
+        malformed.push(missing_loser_result);
         let mut wrong_candidate_uuid = valid.clone();
         wrong_candidate_uuid.cgroups[0].deterministic_name_uuid = Uuid::from_u128(99);
         malformed.push(wrong_candidate_uuid);
@@ -1235,15 +1257,16 @@ mod tests {
             assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
             assert!(!record.is_positive_terminal());
             let state = StoreState {
-                slots: std::iter::once(SlotState::Corrupt)
-                    .chain(
-                        (1..MAX_TOURNAMENT_RECORDS).map(|_| SlotState::Vacant { identity: None }),
-                    )
-                    .collect(),
+                slots: std::iter::once(SlotState::Valid {
+                    record: Box::new(record),
+                    identity: FileIdentity { dev: 1, ino: 1 },
+                })
+                .chain((1..MAX_TOURNAMENT_RECORDS).map(|_| SlotState::Corrupt))
+                .collect(),
                 unknown_corrupt_records: 0,
             };
-            assert_eq!(occupied_live_count(&state), 1);
-            assert!(matches!(state.slots[0], SlotState::Corrupt));
+            assert_eq!(occupied_live_count(&state), MAX_TOURNAMENT_RECORDS);
+            assert_eq!(select_allocation_slot(&state, u64::MAX), None);
         }
     }
 

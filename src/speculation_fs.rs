@@ -515,7 +515,12 @@ fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> Evidenc
             libc::AT_EMPTY_PATH,
         )
     };
-    if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+    let direct_error = if result != 0 {
+        std::io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    if matches!(direct_error, Some(libc::EPERM | libc::ENOENT)) {
         let proc_fd = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|_| EvidenceError::InvalidLeaf)?;
         result = unsafe {
@@ -531,9 +536,15 @@ fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> Evidenc
     if result != 0 {
         return match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::EEXIST) => Err(EvidenceError::AlreadyExists),
-            Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS | libc::EPERM) => {
-                Err(EvidenceError::Unsupported)
-            }
+            Some(
+                libc::EOPNOTSUPP
+                | libc::EINVAL
+                | libc::ENOSYS
+                | libc::EPERM
+                | libc::EACCES
+                | libc::ENOENT
+                | libc::EXDEV,
+            ) => Err(EvidenceError::Unsupported),
             _ => Err(EvidenceError::Io),
         };
     }
@@ -819,6 +830,66 @@ mod tests {
             .to_string(),
             "speculation_record_stale"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unprivileged_procfs_fallback_publishes_create_and_replace() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        assert_ne!(
+            current_euid(),
+            0,
+            "this regression must exercise an unprivileged Linux caller"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+
+        let probe = create_unnamed_temp(directory.file.as_raw_fd()).unwrap();
+        let direct_leaf = c"direct-empty-path-probe";
+        let direct_result = unsafe {
+            libc::linkat(
+                probe.as_raw_fd(),
+                c"".as_ptr(),
+                directory.file.as_raw_fd(),
+                direct_leaf.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        assert_eq!(direct_result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT),
+            "the test caller unexpectedly has CAP_DAC_READ_SEARCH"
+        );
+
+        let leaf = c"record.json";
+        let first = atomic_create_json(
+            &directory,
+            leaf,
+            &serde_json::json!({"generation": 1}),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert_eq!(first.value["generation"], 1);
+        let second = atomic_replace_json(
+            &directory,
+            leaf,
+            first.identity,
+            &serde_json::json!({"generation": 2}),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert_eq!(second.value["generation"], 2);
+        let readback =
+            read_json::<serde_json::Value>(&directory, leaf, MAX_SPECULATION_JSON_BYTES).unwrap();
+        assert_eq!(readback.identity, second.identity);
+        assert_eq!(readback.value["generation"], 2);
     }
 
     #[cfg(target_os = "linux")]
