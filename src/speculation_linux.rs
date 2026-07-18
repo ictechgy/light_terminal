@@ -5202,7 +5202,7 @@ fn run_real_component_driver() -> ContainmentResult<()> {
     run_real_execution_case(
         &fixture.join("i"),
         &cgroup_root,
-        vec![OsString::from("/usr/bin/yes")],
+        vec![OsString::from("/usr/bin/cat"), OsString::from("/dev/zero")],
         None,
         RealExecutionExpectation::Overflow,
     )?;
