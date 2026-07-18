@@ -5230,7 +5230,9 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         Some([migration, migration]),
         RealExecutionExpectation::Complete { output_bytes: 0 },
     )?;
-    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 512 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
+    // Exceed the fixed pids.max=256 boundary without making the real gate
+    // spend another full action deadline on hundreds of guaranteed failures.
+    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 300 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
     run_real_execution_case(
         &fixture.join("q"),
         &cgroup_root,
@@ -5707,6 +5709,45 @@ struct RealExecutionEvidence {
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
+struct RealTopologyCleanup(Option<TournamentTopology>);
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl RealTopologyCleanup {
+    fn new(topology: TournamentTopology) -> Self {
+        Self(Some(topology))
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl std::ops::Deref for RealTopologyCleanup {
+    type Target = TournamentTopology;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("real topology guard is armed")
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl std::ops::DerefMut for RealTopologyCleanup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("real topology guard is armed")
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl Drop for RealTopologyCleanup {
+    fn drop(&mut self) {
+        if let Some(mut topology) = self.0.take() {
+            let _ = cleanup_real_topology(&mut topology);
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
 impl RealExecutionEvidence {
     fn candidate_result(self, input_index: u8) -> crate::speculation::CandidateResult {
         crate::speculation::CandidateResult {
@@ -5770,7 +5811,7 @@ fn run_real_execution_case(
         },
         ContainmentDeadline::control_action(),
     )?;
-    let mut tournament = begin_topology(&context)?;
+    let mut tournament = RealTopologyCleanup::new(begin_topology(&context)?);
     create_topology(&mut tournament, TopologyAction::CreateTournamentDomain)?;
     for candidate in 0_u8..2 {
         create_topology(
@@ -6037,6 +6078,7 @@ fn run_real_execution_case(
         finish_containment(control, observer)?;
     }
     cleanup_real_topology(&mut tournament)?;
+    tournament.disarm();
     if std::fs::read_dir(&source)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
         .next()

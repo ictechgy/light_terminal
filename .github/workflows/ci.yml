@@ -201,6 +201,7 @@ jobs:
             --property "WorkingDirectory=${GITHUB_WORKSPACE}" \
             --property Delegate=pids \
             --property "DelegateSubgroup=${runner_subgroup}" \
+            --property Nice=-10 \
             --setenv "HOME=${HOME}" \
             --setenv "PATH=${PATH}" \
             --setenv "LTERM_REQUIRE_REAL_BWRAP=${LTERM_REQUIRE_REAL_BWRAP}" \
