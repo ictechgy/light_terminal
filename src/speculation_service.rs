@@ -1121,13 +1121,22 @@ impl ActorState {
             return Err(ServiceError::EvidenceUnavailable);
         }
         self.ledger_entry = exact;
-        self.claim(
+        let status = self.claim(
             request.tournament_uuid,
             request.daemon_instance_uuid,
             request.generation,
             SpeculationPhase::Armed,
             None,
-        )
+        )?;
+        self.context
+            .authorize_control_generation(status.generation)
+            .map_err(|_| {
+                self.core
+                    .availability
+                    .store(Availability::Unresolved as u8, Ordering::Release);
+                ServiceError::EvidenceUnavailable
+            })?;
+        Ok(status)
     }
 
     fn claim(
@@ -1147,6 +1156,9 @@ impl ActorState {
         )?;
         if self.record.status.phase == phase && phase.is_terminal() {
             return Ok(self.record.status.clone());
+        }
+        if !crate::speculation::is_legal_transition(self.record.status.phase, phase) {
+            return Err(ServiceError::InvalidTransition);
         }
         let mut next = self.record.clone();
         next.status.generation = generation
@@ -1351,6 +1363,92 @@ mod tests {
                 SpeculationPhase::RollbackPending | SpeculationPhase::RollbackRequired
             ));
         }
+    }
+
+    #[test]
+    fn poisoned_index_fails_closed_and_marks_service_unresolved() {
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        let core = Arc::clone(&service.core);
+        let _ = thread::spawn(move || {
+            let _guard = core.index.lock().unwrap();
+            panic!("poison speculation-only index");
+        })
+        .join();
+        assert!(service.index_lock().is_err());
+        assert_eq!(service.availability(), Availability::Unresolved);
+    }
+
+    #[test]
+    fn disconnected_actor_prevents_successful_shutdown_claim() {
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        service
+            .core
+            .availability
+            .store(Availability::Ready as u8, Ordering::Release);
+        let (sender, receiver) = sync_channel(ACTOR_MAILBOX_CAPACITY);
+        drop(receiver);
+        let status = prepared_status(
+            Uuid::from_u128(1),
+            service.core.daemon_instance_uuid,
+            [Uuid::from_u128(2), Uuid::from_u128(3)],
+            1,
+            2,
+        );
+        service.core.index.lock().unwrap().live.insert(
+            status.tournament_uuid,
+            ActorHandle {
+                sender,
+                snapshot: Arc::new(Mutex::new(status)),
+            },
+        );
+        assert_eq!(
+            service.claim_shutdown(Duration::from_millis(25)),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+        assert_eq!(service.availability(), Availability::ShuttingDown);
+    }
+
+    #[test]
+    fn actor_mailbox_is_exactly_bounded_and_ticks_coalesce() {
+        let (sender, _receiver) = sync_channel(ACTOR_MAILBOX_CAPACITY);
+        for tick in 0..ACTOR_MAILBOX_CAPACITY {
+            assert!(
+                sender
+                    .try_send(ActorEvent::WatchdogTick {
+                        now_unix_ms: tick as u64,
+                    })
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            sender.try_send(ActorEvent::WatchdogTick { now_unix_ms: 99 }),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn live_index_capacity_is_eight_without_touching_terminal_cache() {
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        let mut index = service.core.index.lock().unwrap();
+        for value in 1_u128..=8 {
+            let (sender, _receiver) = sync_channel(1);
+            let status = prepared_status(
+                Uuid::from_u128(value),
+                service.core.daemon_instance_uuid,
+                [Uuid::from_u128(value + 20), Uuid::from_u128(value + 40)],
+                1,
+                2,
+            );
+            index.live.insert(
+                status.tournament_uuid,
+                ActorHandle {
+                    sender,
+                    snapshot: Arc::new(Mutex::new(status)),
+                },
+            );
+        }
+        assert_eq!(index.live.len(), crate::speculation::MAX_LIVE_TOURNAMENTS);
+        assert!(index.terminal.is_empty());
     }
 
     #[cfg(target_os = "linux")]
