@@ -631,11 +631,17 @@ impl TournamentRecord {
             && self.status.candidates[1].candidate_uuid == next.status.candidates[1].candidate_uuid
     }
 
-    fn public_evidence_progresses_to(&self, next: &Self, retain_reason: bool) -> bool {
+    fn public_evidence_progresses_to(
+        &self,
+        next: &Self,
+        retain_reason: bool,
+        allow_rollback_selection_clear: bool,
+    ) -> bool {
         self.status.lease_deadline_unix_ms <= next.status.lease_deadline_unix_ms
             && (!retain_reason
                 || option_is_retained(self.status.reason_code, next.status.reason_code))
-            && option_is_retained(self.status.selected_index, next.status.selected_index)
+            && (allow_rollback_selection_clear
+                || option_is_retained(self.status.selected_index, next.status.selected_index))
             && slice_is_prefix(
                 self.status.error_codes.as_slice(),
                 next.status.error_codes.as_slice(),
@@ -1161,6 +1167,8 @@ impl TournamentStore {
             || !current.public_evidence_progresses_to(
                 &next,
                 matches!(kind, TournamentWriteKind::SamePhaseEvidence),
+                matches!(kind, TournamentWriteKind::LivePhaseTransition)
+                    && next.status.phase.is_rollback_only(),
             )
             || !(matches!(kind, TournamentWriteKind::OldBootAbsence { .. })
                 || current
@@ -1625,23 +1633,37 @@ mod tests {
         let current = armed_record_with_reused_managed_slot();
         let mut next = current.clone();
         next.status.generation += 1;
-        assert!(current.public_evidence_progresses_to(&next, true));
+        assert!(current.public_evidence_progresses_to(&next, true, false));
 
         next.managed_owners[0] = None;
-        assert!(!current.public_evidence_progresses_to(&next, true));
+        assert!(!current.public_evidence_progresses_to(&next, true, false));
 
         let mut probe = current.clone();
         probe.managed_owners[0].as_mut().unwrap().role = ManagedOwnerRoleEvidence::Probe;
         let mut runner = probe.clone();
         runner.managed_owners[0] = current.managed_owners[0].clone();
-        assert!(probe.public_evidence_progresses_to(&runner, true));
-        assert!(!runner.public_evidence_progresses_to(&probe, true));
+        assert!(probe.public_evidence_progresses_to(&runner, true, false));
+        assert!(!runner.public_evidence_progresses_to(&probe, true, false));
 
         let mut ready = current.clone();
         ready.status.candidates[0].ready = true;
         ready.status.candidates[0].ready_elapsed_ns = Some(1);
-        assert!(current.public_evidence_progresses_to(&ready, true));
-        assert!(!ready.public_evidence_progresses_to(&current, true));
+        assert!(current.public_evidence_progresses_to(&ready, true, false));
+        assert!(!ready.public_evidence_progresses_to(&current, true, false));
+    }
+
+    #[test]
+    fn rollback_transition_may_clear_a_scored_selection_but_same_phase_may_not() {
+        let mut current = terminal_record();
+        current.terminal_completed_unix_ms = None;
+        current.status.phase = SpeculationPhase::PendingFinalize;
+        let mut rollback = current.clone();
+        rollback.status.generation += 1;
+        rollback.status.phase = SpeculationPhase::RollbackPending;
+        rollback.status.selected_index = None;
+        rollback.status.rollback_required = true;
+        assert!(!current.public_evidence_progresses_to(&rollback, false, false));
+        assert!(current.public_evidence_progresses_to(&rollback, false, true));
     }
 
     #[cfg(target_os = "linux")]

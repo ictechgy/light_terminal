@@ -47,7 +47,7 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
     Some((fixture, output))
 }
 
-fn run_required_actor_service() -> Option<(tempfile::TempDir, Output)> {
+fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Output)> {
     if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
     }
@@ -69,6 +69,7 @@ fn run_required_actor_service() -> Option<(tempfile::TempDir, Output)> {
         .env("PATH", "/usr/bin:/bin")
         .env("LTERM_INTERNAL_TEST_MODE", "1")
         .env("LTERM_INTERNAL_SPECULATION_ACTOR_SERVICE", "1")
+        .env("LTERM_INTERNAL_SPECULATION_ACTOR_TERMINAL", terminal)
         .env("LTERM_INTERNAL_SPECULATION_SELF_EXE", &self_exe)
         .env("LTERM_DATA_DIR", &data)
         .env("LTERM_REQUIRE_REAL_BWRAP", "1")
@@ -274,7 +275,7 @@ fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
 
 #[test]
 fn required_real_actor_service_progresses_and_finalizes_loser_first() {
-    let Some((_fixture, output)) = run_required_actor_service() else {
+    let Some((_fixture, output)) = run_required_actor_service("finalize") else {
         return;
     };
     assert!(
@@ -289,6 +290,27 @@ fn required_real_actor_service_progresses_and_finalizes_loser_first() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_actor_service_rollback_expiry_and_shutdown_converge() {
+    for terminal in ["rollback", "expiry", "shutdown"] {
+        let Some((_fixture, output)) = run_required_actor_service(terminal) else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "actor service {terminal} failed with bounded stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"speculation-actor-service=1\n");
+        assert!(
+            output.stderr.is_empty(),
+            "actor service {terminal} emitted stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_no_tournament_domains();
+    }
 }
 
 #[test]

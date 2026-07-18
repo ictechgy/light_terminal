@@ -2767,30 +2767,76 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    let finalizing = service
-        .finalize(SpeculationFinalizeRequest {
-            tournament_uuid: pending.tournament_uuid,
-            daemon_instance_uuid: pending.daemon_instance_uuid,
-            generation: pending.generation,
-        })
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    if finalizing.status.phase != SpeculationPhase::FinalizingLoser {
-        return Err(ContainmentErrorCode::EvidenceUnavailable);
-    }
+    let terminal_phase = match std::env::var_os("LTERM_INTERNAL_SPECULATION_ACTOR_TERMINAL")
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("finalize")
+    {
+        "finalize" => {
+            let finalizing = service
+                .finalize(SpeculationFinalizeRequest {
+                    tournament_uuid: pending.tournament_uuid,
+                    daemon_instance_uuid: pending.daemon_instance_uuid,
+                    generation: pending.generation,
+                })
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if finalizing.status.phase != SpeculationPhase::FinalizingLoser {
+                return Err(ContainmentErrorCode::EvidenceUnavailable);
+            }
+            SpeculationPhase::Selected
+        }
+        "rollback" => {
+            let rolling_back = service
+                .rollback(SpeculationRollbackRequest {
+                    tournament_uuid: pending.tournament_uuid,
+                    daemon_instance_uuid: pending.daemon_instance_uuid,
+                    generation: pending.generation,
+                })
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if rolling_back.status.phase != SpeculationPhase::RollbackPending {
+                return Err(ContainmentErrorCode::EvidenceUnavailable);
+            }
+            SpeculationPhase::RolledBack
+        }
+        "expiry" => {
+            service
+                .enqueue_watchdog_tick(pending.lease_deadline_unix_ms.saturating_add(1))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            SpeculationPhase::RolledBack
+        }
+        "shutdown" => {
+            service
+                .claim_shutdown(Duration::from_secs(5))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            SpeculationPhase::RolledBack
+        }
+        _ => return Err(ContainmentErrorCode::InvalidIdentity),
+    };
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(ContainmentErrorCode::Timeout);
         }
-        let status = service
-            .status(SpeculationStatusRequest {
-                tournament_uuid: pending.tournament_uuid,
-                daemon_instance_uuid: pending.daemon_instance_uuid,
-                generation: pending.generation,
-            })
-            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
-            .status;
-        if status.phase == SpeculationPhase::Selected {
-            if status.selected_index == Some(0)
+        let status = if service.availability() == Availability::ShuttingDown {
+            service
+                .cached_status(pending.tournament_uuid)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        } else {
+            service
+                .status(SpeculationStatusRequest {
+                    tournament_uuid: pending.tournament_uuid,
+                    daemon_instance_uuid: pending.daemon_instance_uuid,
+                    generation: pending.generation,
+                })
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+                .status
+        };
+        if status.phase == terminal_phase {
+            if status.selected_index
+                == if terminal_phase == SpeculationPhase::Selected {
+                    Some(0)
+                } else {
+                    None
+                }
                 && status.candidates.iter().all(|candidate| {
                     let cleanup = candidate.cleanup;
                     cleanup.runner_ack
@@ -2804,7 +2850,9 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
             }
             return Err(ContainmentErrorCode::EvidenceUnavailable);
         }
-        if status.phase.is_rollback_only() || status.phase == SpeculationPhase::RolledBack {
+        if status.is_terminal()
+            || (terminal_phase == SpeculationPhase::Selected && status.phase.is_rollback_only())
+        {
             return Err(ContainmentErrorCode::EvidenceUnavailable);
         }
         thread::sleep(Duration::from_millis(10));
