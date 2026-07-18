@@ -1527,9 +1527,10 @@ fn parse_request_line(line: &str) -> Result<Request> {
     match serde_json::from_str(line) {
         Ok(request) => Ok(request),
         Err(_) if is_speculation_request_value(line) => bail!("speculation_invalid_request"),
-        Err(error) => {
-            Err(error).with_context(|| format!("parse request: {}", sanitized_preview(line)))
-        }
+        // Parsing diagnostics must not echo request bytes. Besides private
+        // speculation inputs, ordinary requests can carry session names and
+        // commands that are equally inappropriate for daemon logs.
+        Err(_) => bail!("invalid_request"),
     }
 }
 
@@ -6838,11 +6839,33 @@ mod tests {
         assert!(!logged.contains(raw_marker));
         assert!(!logged.contains(base64_marker));
 
+        let reordered_raw_marker = "G007_REORDERED_TRUNCATED_RAW_MARKER";
+        let reordered_base64_marker = "RzAwN19SRU9SREVSRURfVFJVTkNBVEVEX1JBV19NQVJLRVI=";
+        let reordered_truncated = format!(
+            concat!(
+                r#"{{"protocol_version":9,"type":"speculation","request":{{"action":"prepare","body":{{"source":"{}","argv":["{}""#
+            ),
+            reordered_base64_marker, reordered_raw_marker
+        );
+        let (server_stream, mut client_stream) =
+            UnixStream::pair().expect("reordered speculation request stream pair");
+        client_stream
+            .write_all(format!("{reordered_truncated}\n").as_bytes())
+            .expect("write reordered truncated speculation request");
+        let reordered_error =
+            super::handle_connection(Arc::new(super::State::default()), server_stream)
+                .expect_err("reordered truncated speculation request should fail closed");
+        let reordered_logged = super::connection_error_message(&reordered_error);
+        assert_eq!(reordered_logged, "connection error: invalid_request");
+        assert!(!reordered_logged.contains(reordered_raw_marker));
+        assert!(!reordered_logged.contains(reordered_base64_marker));
+
         let legacy_marker = "legacy-preview-marker";
         let legacy = format!(r#"{{"type":"send","target":"{legacy_marker}"}}"#);
         let legacy_error = super::parse_request_line(&legacy)
-            .expect_err("legacy malformed request should retain the v8 diagnostic path");
-        assert!(legacy_error.to_string().contains(legacy_marker));
+            .expect_err("legacy malformed request should use a raw-free diagnostic");
+        assert_eq!(legacy_error.to_string(), "invalid_request");
+        assert!(!legacy_error.to_string().contains(legacy_marker));
 
         let nested_marker = "ordinary-nested-speculation-marker";
         let nested = format!(
@@ -6850,7 +6873,8 @@ mod tests {
         );
         let nested_error = super::parse_request_line(&nested)
             .expect_err("a nested speculation string is still an ordinary malformed request");
-        assert!(nested_error.to_string().contains(nested_marker));
+        assert_eq!(nested_error.to_string(), "invalid_request");
+        assert!(!nested_error.to_string().contains(nested_marker));
     }
 
     #[test]
