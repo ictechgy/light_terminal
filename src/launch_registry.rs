@@ -188,10 +188,22 @@ struct GateExecFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedReconcileCode {
+    InvalidIntentState,
+    BusyGuardIdentityAbsent,
+    RegistrationUnavailable,
+    ProcessStillLive,
+    ProcessEvidenceUnavailable,
+    ReconciliationFailed,
+    UnknownSlot,
+    DuplicateOwner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReconcileOutcome {
     Absent,
     Live,
-    UnknownOrphanRisk(String),
+    UnknownOrphanRisk(ManagedReconcileCode),
     ResolvedTombstone,
 }
 
@@ -255,7 +267,7 @@ impl ManagedReconcileReport {
 pub(crate) enum ManagedOwnerOutcome {
     Absent,
     ResolvedTombstone(ManagedKey),
-    UnknownOrphanRisk(String),
+    UnknownOrphanRisk(ManagedReconcileCode),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,7 +556,9 @@ impl ManagedController {
         match verify_exact_process(&self.inner.identity) {
             Evidence::Present(_) => ReconcileOutcome::Live,
             Evidence::Absent => ReconcileOutcome::Absent,
-            Evidence::Unavailable(reason) => ReconcileOutcome::UnknownOrphanRisk(reason),
+            Evidence::Unavailable(_) => ReconcileOutcome::UnknownOrphanRisk(
+                ManagedReconcileCode::ProcessEvidenceUnavailable,
+            ),
         }
     }
 
@@ -974,7 +988,7 @@ impl Registry {
     #[cfg(target_os = "linux")]
     fn reconcile_intent(&self, record: &SlotRecord) -> ReconcileOutcome {
         let SlotState::IntentDurable { nonce, .. } = record.state else {
-            return ReconcileOutcome::UnknownOrphanRisk("not an intent record".into());
+            return ReconcileOutcome::UnknownOrphanRisk(ManagedReconcileCode::InvalidIntentState);
         };
         match OfdLock::try_acquire(&self.guards.join(guard_name(record.slot))) {
             Ok(_guard) => ReconcileOutcome::Absent,
@@ -991,19 +1005,16 @@ impl Registry {
                     match verify_exact_process(&registration.identity) {
                         Evidence::Present(_) => ReconcileOutcome::Live,
                         Evidence::Absent => ReconcileOutcome::UnknownOrphanRisk(
-                            "busy intent guard has an absent registered identity".into(),
+                            ManagedReconcileCode::BusyGuardIdentityAbsent,
                         ),
-                        Evidence::Unavailable(reason) => {
-                            ReconcileOutcome::UnknownOrphanRisk(reason)
-                        }
+                        Evidence::Unavailable(_) => ReconcileOutcome::UnknownOrphanRisk(
+                            ManagedReconcileCode::ProcessEvidenceUnavailable,
+                        ),
                     }
                 }
-                Ok(_) => ReconcileOutcome::UnknownOrphanRisk(
-                    "busy intent guard has missing or stale registration sidecar".into(),
+                Ok(_) | Err(_) => ReconcileOutcome::UnknownOrphanRisk(
+                    ManagedReconcileCode::RegistrationUnavailable,
                 ),
-                Err(err) => ReconcileOutcome::UnknownOrphanRisk(format!(
-                    "busy intent guard registration unavailable: {err:#}"
-                )),
             },
         }
     }
@@ -1058,15 +1069,17 @@ impl Registry {
                 match verify_exact_process(&identity) {
                     Evidence::Absent => self.persist_tombstone(&pending, nonce, Some(identity)),
                     Evidence::Present(_) => Ok(ReconcileOutcome::UnknownOrphanRisk(
-                        "matching process remained live after pidfd signal".into(),
+                        ManagedReconcileCode::ProcessStillLive,
                     )),
-                    Evidence::Unavailable(reason) => {
-                        Ok(ReconcileOutcome::UnknownOrphanRisk(reason))
-                    }
+                    Evidence::Unavailable(_) => Ok(ReconcileOutcome::UnknownOrphanRisk(
+                        ManagedReconcileCode::ProcessEvidenceUnavailable,
+                    )),
                 }
             }
             Evidence::Absent => self.persist_tombstone(&pending, nonce, Some(identity)),
-            Evidence::Unavailable(reason) => Ok(ReconcileOutcome::UnknownOrphanRisk(reason)),
+            Evidence::Unavailable(_) => Ok(ReconcileOutcome::UnknownOrphanRisk(
+                ManagedReconcileCode::ProcessEvidenceUnavailable,
+            )),
         }
     }
 
@@ -1120,16 +1133,16 @@ impl Registry {
                         generation: record.generation,
                     }),
                     owner: record.owner.clone(),
-                    outcome: self.cleanup(slot, record.generation).unwrap_or_else(|err| {
-                        ReconcileOutcome::UnknownOrphanRisk(format!(
-                            "slot {slot} reconciliation failed: {err:#}"
-                        ))
-                    }),
+                    outcome: self.cleanup(slot, record.generation).unwrap_or(
+                        ReconcileOutcome::UnknownOrphanRisk(
+                            ManagedReconcileCode::ReconciliationFailed,
+                        ),
+                    ),
                 }),
-                SlotRead::Unknown(reason) => Some(ManagedReconcileEntry {
+                SlotRead::Unknown(_) => Some(ManagedReconcileEntry {
                     key: None,
                     owner: None,
-                    outcome: ReconcileOutcome::UnknownOrphanRisk(reason),
+                    outcome: ReconcileOutcome::UnknownOrphanRisk(ManagedReconcileCode::UnknownSlot),
                 }),
             })
             .collect();
@@ -1144,16 +1157,16 @@ impl Registry {
             let slot = u16::try_from(slot).expect("validated registry slot count");
             let record = match self.read_slot(slot) {
                 SlotRead::Valid(record) => record,
-                SlotRead::Unknown(reason) => {
-                    return Ok(ManagedOwnerOutcome::UnknownOrphanRisk(format!(
-                        "managed owner lookup encountered unknown slot {slot}: {reason}"
-                    )));
+                SlotRead::Unknown(_) => {
+                    return Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
+                        ManagedReconcileCode::UnknownSlot,
+                    ));
                 }
             };
             if record.owner.as_ref() == Some(owner) {
                 if matched.is_some() {
                     return Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
-                        "duplicate managed owner records".into(),
+                        ManagedReconcileCode::DuplicateOwner,
                     ));
                 }
                 matched = Some(record);
@@ -1170,16 +1183,16 @@ impl Registry {
             SlotState::ResolvedTombstone { .. } => Ok(ManagedOwnerOutcome::ResolvedTombstone(key)),
             SlotState::Vacant => Ok(ManagedOwnerOutcome::Absent),
             _ => match self.cleanup(record.slot, record.generation) {
-                Err(err) => Ok(ManagedOwnerOutcome::UnknownOrphanRisk(format!(
-                    "managed owner reconciliation failed: {err:#}"
-                ))),
+                Err(_) => Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
+                    ManagedReconcileCode::ReconciliationFailed,
+                )),
                 Ok(outcome) => match outcome {
                     ReconcileOutcome::ResolvedTombstone => {
                         Ok(ManagedOwnerOutcome::ResolvedTombstone(key))
                     }
                     ReconcileOutcome::Absent => Ok(ManagedOwnerOutcome::Absent),
                     ReconcileOutcome::Live => Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
-                        "managed owner remained live after reconciliation".into(),
+                        ManagedReconcileCode::ProcessStillLive,
                     )),
                     ReconcileOutcome::UnknownOrphanRisk(reason) => {
                         Ok(ManagedOwnerOutcome::UnknownOrphanRisk(reason))
@@ -3645,8 +3658,7 @@ mod tests {
             registry
                 .cleanup(intent.record.slot, intent.record.generation)
                 .unwrap(),
-            ReconcileOutcome::UnknownOrphanRisk(reason)
-                if reason.contains("busy intent guard")
+            ReconcileOutcome::UnknownOrphanRisk(ManagedReconcileCode::BusyGuardIdentityAbsent)
         ));
         assert!(matches!(
             registry.read_valid_slot(intent.record.slot).unwrap().state,

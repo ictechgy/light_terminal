@@ -14,12 +14,16 @@ use crate::speculation_fs::{
     durable_identity_from_fd, open_existing_delegated_cgroup_root, open_existing_private_dir,
     open_existing_workspace_dir, validate_no_overlap,
 };
+use crate::speculation_ledger::ClientLedger;
 #[cfg(target_os = "linux")]
 use crate::speculation_registry::{
     AbsenceDisposition, CgroupForwardState, CgroupLifecycleState, ManagedOwnerEvidence,
-    TournamentCgroupLifecycleState, TournamentRecord, TournamentRecoveryRecord,
+    TournamentCgroupLifecycleState, TournamentRecoveryRecord,
 };
-use crate::speculation_registry::{CgroupComponent, ManagedOwnerRoleEvidence};
+use crate::speculation_registry::{
+    CgroupComponent, ManagedOwnerRoleEvidence, PrivateCgroupRootLocator, PrivateRootIdentities,
+    TournamentRecord,
+};
 #[cfg(target_os = "linux")]
 use crate::speculation_runner::{
     ControlFrame, ControlMessage, PlacementDescriptorEvidence, PlacementDescriptorKind,
@@ -271,6 +275,49 @@ impl LiveTournamentContext {
             candidate_index,
             ..self.identity
         })
+    }
+
+    pub(crate) fn authorize_control_generation(
+        &mut self,
+        generation: u64,
+    ) -> ContainmentResult<RunnerIdentity> {
+        if generation == 0 || generation <= self.identity.generation {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        self.identity.generation = generation;
+        Ok(self.identity)
+    }
+
+    pub(crate) fn durable_record_evidence(
+        &self,
+    ) -> ContainmentResult<(PrivateRootIdentities, PrivateCgroupRootLocator)> {
+        for directory in [
+            &self.source,
+            &self.candidates[0],
+            &self.candidates[1],
+            &self.ledger_root,
+            &self.cgroup_root,
+        ] {
+            directory.revalidate().map_err(map_evidence)?;
+        }
+        Ok((
+            PrivateRootIdentities {
+                source: self.source.identity(),
+                candidates: [self.candidates[0].identity(), self.candidates[1].identity()],
+                ledger_root: self.ledger_root.identity(),
+                cgroup_root: self.cgroup_root.identity(),
+            },
+            PrivateCgroupRootLocator::from_directory(&self.cgroup_root).map_err(map_evidence)?,
+        ))
+    }
+
+    pub(crate) fn verified_ledger(&self) -> ContainmentResult<ClientLedger> {
+        self.ledger_root.revalidate().map_err(map_evidence)?;
+        Ok(ClientLedger::new(
+            self.ledger_root
+                .try_clone_validated()
+                .map_err(map_evidence)?,
+        ))
     }
 
     fn candidate_path(&self, candidate_index: u8) -> ContainmentResult<PathBuf> {
@@ -1696,6 +1743,48 @@ pub(crate) enum RecoveryEvidence {
     RollbackRequired,
 }
 
+/// Closed recovery surface for records from an earlier boot. No path, PID, or
+/// cgroup authority is consumed by this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OldBootRecoveryAction {
+    ManagedOwner { candidate: u8 },
+    CandidateComponents { candidate: u8 },
+    TournamentDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OldBootRecoveryEvidence {
+    ManagedOwnerAbsent { candidate: u8 },
+    CandidateComponentsAbsent { candidate: u8 },
+    TournamentDomainAbsent,
+    RollbackRequired,
+}
+
+pub(crate) fn reconcile_different_boot(
+    record: &TournamentRecord,
+    current_private_root: DurableDirectoryIdentity,
+    action: OldBootRecoveryAction,
+) -> ContainmentResult<OldBootRecoveryEvidence> {
+    if record.validate().is_err()
+        || current_private_root.boot_uuid.is_nil()
+        || current_private_root.boot_uuid == record.boot_uuid
+    {
+        return Ok(OldBootRecoveryEvidence::RollbackRequired);
+    }
+    match action {
+        OldBootRecoveryAction::ManagedOwner { candidate } if candidate < 2 => {
+            Ok(OldBootRecoveryEvidence::ManagedOwnerAbsent { candidate })
+        }
+        OldBootRecoveryAction::CandidateComponents { candidate } if candidate < 2 => {
+            Ok(OldBootRecoveryEvidence::CandidateComponentsAbsent { candidate })
+        }
+        OldBootRecoveryAction::TournamentDomain => {
+            Ok(OldBootRecoveryEvidence::TournamentDomainAbsent)
+        }
+        _ => Ok(OldBootRecoveryEvidence::RollbackRequired),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn reconcile_from_record(
     recovery: &TournamentRecoveryRecord,
@@ -2602,8 +2691,6 @@ pub(crate) struct CandidateContainment {
 
 #[cfg(target_os = "linux")]
 struct CandidateProtocol {
-    identity: RunnerIdentity,
-    peer: File,
     validator: SequenceValidator,
     output_limit_observed: bool,
 }
@@ -2611,6 +2698,7 @@ struct CandidateProtocol {
 #[cfg(target_os = "linux")]
 pub(crate) struct CandidateControl {
     identity: RunnerIdentity,
+    peer: File,
     protocol: Arc<Mutex<CandidateProtocol>>,
     payload_proof: Option<ManagedDescendantProof>,
     _lifetime: Arc<PrivateRunnerControl>,
@@ -2619,6 +2707,7 @@ pub(crate) struct CandidateControl {
 #[cfg(target_os = "linux")]
 pub(crate) struct CandidateObserver {
     identity: RunnerIdentity,
+    peer: File,
     protocol: Arc<Mutex<CandidateProtocol>>,
     controller: ManagedController,
     waiter: Option<ManagedWaiter>,
@@ -2700,6 +2789,53 @@ pub(crate) fn launch_runner(
         candidate_index,
         &context.argv,
         ManagedOwnerRole::Runner,
+        deadline,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn receive_observer_frame(
+    observer: &CandidateObserver,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<ControlFrame> {
+    receive_protocol_frame(&observer.peer, &observer.protocol, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn receive_protocol_frame(
+    peer: &File,
+    protocol: &Arc<Mutex<CandidateProtocol>>,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<ControlFrame> {
+    // The observer owns the only receive handle. Crucially, no sequence lock is
+    // held while poll/recvmsg blocks, so an actor can always send the frame that
+    // makes this wait complete.
+    wait_fd_until(peer, libc::POLLIN, deadline)?;
+    let frame = receive_frame_packet(peer).map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        .validator
+        .accept(&frame)
+        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    Ok(frame)
+}
+
+#[cfg(target_os = "linux")]
+fn send_control_frame(
+    control: &CandidateControl,
+    message: ControlMessage,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    send_validated_frame(
+        &control.peer,
+        &mut protocol.validator,
+        message,
+        control.identity,
         deadline,
     )
 }
@@ -2845,9 +2981,10 @@ fn launch_runner_with_argv(
             generation: owner_receipt.generation(),
         },
     };
+    let observer_peer = peer
+        .try_clone()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let protocol = Arc::new(Mutex::new(CandidateProtocol {
-        identity,
-        peer,
         validator,
         output_limit_observed: false,
     }));
@@ -2855,12 +2992,14 @@ fn launch_runner_with_argv(
     Ok(CandidateContainment {
         control: CandidateControl {
             identity,
+            peer,
             protocol: Arc::clone(&protocol),
             payload_proof: None,
             _lifetime: Arc::clone(&lifetime),
         },
         observer: CandidateObserver {
             identity,
+            peer: observer_peer,
             protocol,
             controller: managed.controller,
             waiter: Some(managed.waiter),
@@ -2884,18 +3023,7 @@ pub(crate) fn run_fixed_probe(
     if topology.candidate_index() != candidate_index {
         return Err(ContainmentErrorCode::InvalidIdentity);
     }
-    let probe_argv = vec![
-        b"/run/lterm-control/lterm".to_vec(),
-        b"--internal-speculation-probe-v1".to_vec(),
-    ];
-    let containment = launch_runner_with_argv(
-        context,
-        topology,
-        candidate_index,
-        &probe_argv,
-        ManagedOwnerRole::Probe,
-        deadline,
-    )?;
+    let containment = launch_fixed_probe(context, topology, candidate_index, deadline)?;
     let CandidateContainmentParts {
         mut control,
         mut observer,
@@ -2944,6 +3072,30 @@ pub(crate) fn run_fixed_probe(
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_fixed_probe(
+    context: &LiveTournamentContext,
+    topology: &CandidateTopology,
+    candidate_index: u8,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<CandidateContainment> {
+    if topology.candidate_index() != candidate_index {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let probe_argv = vec![
+        b"/run/lterm-control/lterm".to_vec(),
+        b"--internal-speculation-probe-v1".to_vec(),
+    ];
+    launch_runner_with_argv(
+        context,
+        topology,
+        candidate_index,
+        &probe_argv,
+        ManagedOwnerRole::Probe,
+        deadline,
+    )
+}
+
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn run_fixed_probe(
     _context: &LiveTournamentContext,
@@ -2951,6 +3103,16 @@ pub(crate) fn run_fixed_probe(
     _topology: &CandidateTopology,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ProbeEvidence> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launch_fixed_probe(
+    _context: &LiveTournamentContext,
+    _topology: &CandidateTopology,
+    _candidate_index: u8,
+    _deadline: ContainmentDeadline,
+) -> ContainmentResult<CandidateContainment> {
     Err(ContainmentErrorCode::Unsupported)
 }
 
@@ -2992,8 +3154,8 @@ pub(crate) fn transfer_payload_fd(
         .accept(&frame)
         .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
     failpoint("before_payload_fd_send")?;
-    wait_fd_until(&protocol.peer, libc::POLLOUT, deadline)?;
-    send_frame_with_one_fd(&protocol.peer, &frame, &placement_fd)
+    wait_fd_until(&control.peer, libc::POLLOUT, deadline)?;
+    send_frame_with_one_fd(&control.peer, &frame, &placement_fd)
         .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
     failpoint("after_payload_fd_send")?;
     Ok(())
@@ -3004,14 +3166,7 @@ pub(crate) fn receive_payload_fd_ack(
     observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let ack = receive_validated_frame(peer, validator, deadline)?;
+    let ack = receive_observer_frame(observer, deadline)?;
     if !matches!(ack.message, ControlMessage::PayloadFdAck) {
         return Err(ContainmentErrorCode::DescriptorViolation);
     }
@@ -3043,20 +3198,7 @@ pub(crate) fn send_go(
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoSendEvidence> {
     let sent_monotonic_ns = monotonic_now_ns()?;
-    let mut protocol = control
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    send_validated_frame(
-        peer,
-        validator,
-        ControlMessage::Go,
-        control.identity,
-        deadline,
-    )?;
+    send_control_frame(control, ControlMessage::Go, deadline)?;
     Ok(GoSendEvidence {
         candidate: control.identity.candidate_index,
         sent_monotonic_ns,
@@ -3076,14 +3218,7 @@ pub(crate) fn receive_go_receipt(
     observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoReceiptEvidence> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let received = receive_validated_frame(peer, validator, deadline)?;
+    let received = receive_observer_frame(observer, deadline)?;
     let ControlMessage::GoReceived { monotonic_ns } = received.message else {
         return Err(ContainmentErrorCode::PeerRejected);
     };
@@ -3110,18 +3245,10 @@ pub(crate) fn receive_payload_placed(
     topology: &CandidateTopology,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<PayloadPlacementEvidence> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let placed = receive_validated_frame(peer, validator, deadline)?;
+    let placed = receive_observer_frame(observer, deadline)?;
     if !matches!(placed.message, ControlMessage::PayloadPlaced) {
         return Err(ContainmentErrorCode::PlacementUnproven);
     }
-    drop(protocol);
     let payload = topology.payload()?;
     let observed = read_single_cgroup_pid(payload)?;
     failpoint("before_payload_membership_proof")?;
@@ -3186,20 +3313,7 @@ pub(crate) fn send_payload_release(
     }
     control.payload_proof = Some(placement.proof);
     failpoint("before_payload_release")?;
-    let mut protocol = control
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    send_validated_frame(
-        peer,
-        validator,
-        ControlMessage::PayloadRelease,
-        control.identity,
-        deadline,
-    )?;
+    send_control_frame(control, ControlMessage::PayloadRelease, deadline)?;
     failpoint("after_payload_release")
 }
 
@@ -3247,14 +3361,7 @@ pub(crate) fn receive_execution_event(
     observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let leader = receive_validated_frame(peer, validator, deadline)?;
+    let leader = receive_observer_frame(observer, deadline)?;
     match leader.message {
         ControlMessage::LeaderExited {
             category,
@@ -3265,9 +3372,15 @@ pub(crate) fn receive_execution_event(
             elapsed_ns,
         }),
         ControlMessage::OutputLimitExceeded { bytes }
-            if bytes == crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1
-                && !protocol.output_limit_observed =>
+            if bytes == crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1 =>
         {
+            let mut protocol = observer
+                .protocol
+                .lock()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if protocol.output_limit_observed {
+                return Err(ContainmentErrorCode::PeerRejected);
+            }
             protocol.output_limit_observed = true;
             Ok(ContainmentEvent::OutputLimitExceeded {
                 candidate: observer.identity.candidate_index,
@@ -3299,23 +3412,15 @@ pub(crate) fn acknowledge_output_cleanup_claimed(
     control: &mut CandidateControl,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
-    let mut protocol = control
+    let protocol = control
         .protocol
         .lock()
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     if !protocol.output_limit_observed {
         return Err(ContainmentErrorCode::PeerRejected);
     }
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    send_validated_frame(
-        peer,
-        validator,
-        ControlMessage::OutputCleanupClaimed,
-        control.identity,
-        deadline,
-    )
+    drop(protocol);
+    send_control_frame(control, ControlMessage::OutputCleanupClaimed, deadline)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3331,18 +3436,16 @@ pub(crate) fn receive_output_drained(
     observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let drained = receive_validated_frame(peer, validator, deadline)?;
+    let drained = receive_observer_frame(observer, deadline)?;
     let ControlMessage::OutputDrained { bytes } = drained.message else {
         return Err(ContainmentErrorCode::PeerRejected);
     };
-    if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES && !protocol.output_limit_observed {
+    let output_limit_observed = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        .output_limit_observed;
+    if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES && !output_limit_observed {
         return Err(ContainmentErrorCode::PeerRejected);
     }
     Ok(ContainmentEvent::OutputDrained {
@@ -3365,27 +3468,8 @@ pub(crate) fn send_select_or_abort(
     decision: DecisionKind,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
-    let mut protocol = control
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    send_validated_frame(
-        peer,
-        validator,
-        ControlMessage::ResultAccepted,
-        control.identity,
-        deadline,
-    )?;
-    send_validated_frame(
-        peer,
-        validator,
-        ControlMessage::Decision { decision },
-        control.identity,
-        deadline,
-    )
+    send_control_frame(control, ControlMessage::ResultAccepted, deadline)?;
+    send_control_frame(control, ControlMessage::Decision { decision }, deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -3394,14 +3478,7 @@ pub(crate) fn receive_decision_ack(
     decision: DecisionKind,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let mut protocol = observer
-        .protocol
-        .lock()
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let CandidateProtocol {
-        peer, validator, ..
-    } = &mut *protocol;
-    let ack = receive_validated_frame(peer, validator, deadline)?;
+    let ack = receive_observer_frame(observer, deadline)?;
     if !matches!(ack.message, ControlMessage::Ack { decision: observed } if observed == decision) {
         return Err(ContainmentErrorCode::PeerRejected);
     }
@@ -4229,9 +4306,8 @@ fn send_duplicate_stale_payload_release(control: &mut CandidateControl) -> Conta
         .checked_sub(1)
         .ok_or(ContainmentErrorCode::PeerRejected)?;
     let duplicate = ControlFrame::new(control.identity, sequence, ControlMessage::PayloadRelease);
-    send_frame_packet(&protocol.peer, &duplicate)
-        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
-    let _ = send_frame_packet(&protocol.peer, &duplicate);
+    send_frame_packet(&control.peer, &duplicate).map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    let _ = send_frame_packet(&control.peer, &duplicate);
     Ok(())
 }
 
@@ -6423,6 +6499,56 @@ mod tests {
             &mut CandidateObserver,
             ContainmentDeadline,
         ) -> ContainmentResult<ContainmentEvent> = observe_managed_reaped;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observer_first_wait_never_holds_the_sequence_lock() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    descriptors.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let observer_peer = unsafe { File::from_raw_fd(descriptors[0]) };
+        let actor_peer = unsafe { File::from_raw_fd(descriptors[1]) };
+        let identity = RunnerIdentity {
+            tournament_uuid: Uuid::from_u128(7),
+            candidate_index: 0,
+            generation: 9,
+        };
+        let protocol = Arc::new(Mutex::new(CandidateProtocol {
+            validator: SequenceValidator::new(identity).unwrap(),
+            output_limit_observed: false,
+        }));
+        let observer_protocol = Arc::clone(&protocol);
+        let waiter = std::thread::spawn(move || {
+            receive_protocol_frame(
+                &observer_peer,
+                &observer_protocol,
+                ContainmentDeadline::from_now(Duration::from_secs(1)).unwrap(),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        {
+            assert!(protocol.try_lock().is_ok());
+        }
+        send_frame_packet(
+            &actor_peer,
+            &ControlFrame::new(identity, 0, ControlMessage::Hello),
+        )
+        .unwrap();
+        assert!(matches!(
+            waiter.join().unwrap().unwrap().message,
+            ControlMessage::Hello
+        ));
+        assert_eq!(protocol.lock().unwrap().validator.next_sequence(), 1);
     }
 
     #[cfg(target_os = "linux")]

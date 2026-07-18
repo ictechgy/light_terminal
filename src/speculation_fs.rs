@@ -153,6 +153,17 @@ impl ValidatedDirectory {
         clone_cloexec(&self.file)
     }
 
+    pub(crate) fn try_clone_validated(&self) -> EvidenceResult<Self> {
+        self.revalidate()?;
+        Ok(Self {
+            file: clone_cloexec(&self.file)?,
+            identity: self.identity,
+            canonical_locator: self.canonical_locator.clone(),
+            policy: self.policy,
+            mutation_lock: Mutex::new(()),
+        })
+    }
+
     pub(crate) fn live_mount_identity(&self) -> EvidenceResult<LiveMountIdentity> {
         live_mount_identity_from_fd(&self.file)
     }
