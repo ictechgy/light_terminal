@@ -220,22 +220,138 @@ pub(crate) enum ManagedOwnerOutcome {
     UnknownOrphanRisk(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedExecutablePolicy {
+    /// ADR-0004 compatibility for ordinary owner-less managed launches.
+    Legacy,
+    /// Exact retained `/usr/bin/bwrap` object required by speculation.
+    PinnedSystemBwrap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedCgroupDirectoryIdentity {
+    pub boot_uuid: Uuid,
+    pub dev: u64,
+    pub ino: u64,
+    pub statx_mnt_id_unique: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedCgroupMembership {
+    normalized_path: String,
+    leaf_identity: ManagedCgroupDirectoryIdentity,
+    candidate_index: u8,
+    generation: u64,
+}
+
+impl ManagedCgroupMembership {
+    pub(crate) fn new(
+        normalized_path: String,
+        leaf_identity: ManagedCgroupDirectoryIdentity,
+        candidate_index: u8,
+        generation: u64,
+    ) -> Result<Self> {
+        validate_cgroup_membership(&normalized_path)?;
+        ensure!(candidate_index < 2, "candidate index is out of range");
+        ensure!(generation != 0, "cgroup membership generation is zero");
+        ensure!(
+            !leaf_identity.boot_uuid.is_nil()
+                && leaf_identity.dev != 0
+                && leaf_identity.ino != 0
+                && leaf_identity.statx_mnt_id_unique != 0,
+            "cgroup leaf identity is incomplete"
+        );
+        Ok(Self {
+            normalized_path,
+            leaf_identity,
+            candidate_index,
+            generation,
+        })
+    }
+
+    pub(crate) fn normalized_path(&self) -> &str {
+        &self.normalized_path
+    }
+
+    pub(crate) fn candidate_index(&self) -> u8 {
+        self.candidate_index
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedEvidenceCode {
+    ProcessAbsent,
+    IdentityUnavailable,
+    NotDescendant,
+    MembershipMismatch,
+    InvalidEvidence,
+}
+
+impl std::fmt::Display for ManagedEvidenceCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ProcessAbsent => "managed_process_absent",
+            Self::IdentityUnavailable => "managed_identity_unavailable",
+            Self::NotDescendant => "managed_not_descendant",
+            Self::MembershipMismatch => "managed_membership_mismatch",
+            Self::InvalidEvidence => "managed_invalid_evidence",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ManagedDescendantProof {
+    _pidfd: PidFd,
+    _identity: ProcessIdentity,
+    membership: ManagedCgroupMembership,
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedDescendantProof {
+    pub(crate) fn membership(&self) -> &ManagedCgroupMembership {
+        &self.membership
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ControlCgroupPlacement {
     cgroup_procs: File,
-    expected_membership: String,
+    _control_leaf: File,
+    expected_membership: ManagedCgroupMembership,
 }
 
 impl ControlCgroupPlacement {
     #[cfg(target_os = "linux")]
-    pub(crate) fn new(cgroup_procs: File, expected_membership: String) -> Result<Self> {
-        validate_cgroup_membership(&expected_membership)?;
+    pub(crate) fn new(
+        cgroup_procs: File,
+        control_leaf: File,
+        expected_membership: ManagedCgroupMembership,
+    ) -> Result<Self> {
         validate_cgroup_procs_fd(&cgroup_procs)?;
+        validate_cgroup_leaf_fd(&control_leaf, expected_membership.leaf_identity)?;
         set_cloexec(cgroup_procs.as_raw_fd())?;
+        set_cloexec(control_leaf.as_raw_fd())?;
         Ok(Self {
             cgroup_procs,
+            _control_leaf: control_leaf,
             expected_membership,
         })
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    fn new_internal_test(cgroup_procs: File, expected_membership: String) -> Result<Self> {
+        let control_leaf = open_control_leaf_for_internal_test(&cgroup_procs)?;
+        let identity = observe_cgroup_directory_identity(&control_leaf)?;
+        Self::new(
+            cgroup_procs,
+            control_leaf,
+            ManagedCgroupMembership::new(expected_membership, identity, 0, 1)?,
+        )
     }
 }
 
@@ -275,6 +391,7 @@ pub(crate) enum ManagedAuxiliary {
 #[derive(Debug)]
 pub(crate) struct ManagedLaunchRequest {
     pub owner: Option<ManagedOwnerTag>,
+    pub executable_policy: ManagedExecutablePolicy,
     pub placement: ManagedPlacement,
     pub auxiliary: ManagedAuxiliary,
     pub executable: PathBuf,
@@ -319,6 +436,39 @@ impl ManagedController {
 
     pub(crate) fn identity(&self) -> &ProcessIdentity {
         &self.inner.identity
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prove_descendant_in_cgroup(
+        &self,
+        observed_host_pid: u32,
+        expected: &ManagedCgroupMembership,
+    ) -> std::result::Result<ManagedDescendantProof, ManagedEvidenceCode> {
+        let identity = match observe_identity(observed_host_pid) {
+            Evidence::Present(identity) => identity,
+            Evidence::Absent => return Err(ManagedEvidenceCode::ProcessAbsent),
+            Evidence::Unavailable(_) => return Err(ManagedEvidenceCode::IdentityUnavailable),
+        };
+        let pidfd = match open_verified_pidfd(&identity) {
+            Evidence::Present(pidfd) => pidfd,
+            Evidence::Absent => return Err(ManagedEvidenceCode::ProcessAbsent),
+            Evidence::Unavailable(_) => return Err(ManagedEvidenceCode::IdentityUnavailable),
+        };
+        if !prove_process_ancestry(&identity, &self.inner.identity)? {
+            return Err(ManagedEvidenceCode::NotDescendant);
+        }
+        verify_process_cgroup_membership(observed_host_pid, expected.normalized_path())
+            .map_err(|_| ManagedEvidenceCode::MembershipMismatch)?;
+        match verify_exact_process(&self.inner.identity) {
+            Evidence::Present(_) => {}
+            Evidence::Absent => return Err(ManagedEvidenceCode::ProcessAbsent),
+            Evidence::Unavailable(_) => return Err(ManagedEvidenceCode::IdentityUnavailable),
+        }
+        Ok(ManagedDescendantProof {
+            _pidfd: pidfd,
+            _identity: identity,
+            membership: expected.clone(),
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1330,6 +1480,7 @@ fn verify_exact_process(expected: &ProcessIdentity) -> Evidence<ProcessIdentity>
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct PidFd(File);
 
 #[cfg(target_os = "linux")]
@@ -1420,7 +1571,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         unreachable!("allocator returns intent")
     };
     let nonce = *nonce;
-    let target = match open_pinned_executable(&request.executable) {
+    let target = match open_pinned_executable(&request.executable, request.executable_policy) {
         Ok(target) => target,
         Err(err) => return Err(resolve_unspawned_intent(&registry, intent, err)),
     };
@@ -1477,7 +1628,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         if let Some(placement) = &placement {
             verify_process_cgroup_membership(
                 hello.registration.identity.pid,
-                &placement.expected_membership,
+                placement.expected_membership.normalized_path(),
             )?;
         }
         managed_test_failpoint("parent_after_hello");
@@ -1523,6 +1674,9 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         send_commit_with_fds(parent_control.as_raw_fd(), &commit, &commit_fds)?;
         managed_test_failpoint("parent_after_commit");
         wait_for_gate_exec(parent_control.as_raw_fd())?;
+        if request.executable_policy == ManagedExecutablePolicy::PinnedSystemBwrap {
+            prove_managed_executable_object(hello.registration.identity.pid, &target)?;
+        }
         Ok(identity.clone())
     })();
 
@@ -1757,7 +1911,9 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
                         OsString::from(file.as_raw_fd().to_string()),
                     ));
                 }
-                ManagedPlacement::CgroupV2(ControlCgroupPlacement::new(file, membership)?)
+                ManagedPlacement::CgroupV2(ControlCgroupPlacement::new_internal_test(
+                    file, membership,
+                )?)
             }
             _ => bail!("internal managed placement requires path and membership together"),
         };
@@ -1793,6 +1949,7 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
         };
         let process = launch_managed_process(ManagedLaunchRequest {
             owner,
+            executable_policy: ManagedExecutablePolicy::Legacy,
             placement,
             auxiliary,
             executable,
@@ -1982,7 +2139,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         Evidence::Present(ref actual) if actual == &identity
     ));
     let target = move_file_away_from_fd(target, MANAGED_SYNC_PIPE_TARGET_FD)?;
-    validate_pinned_executable(&target)?;
+    validate_pinned_executable(&target, ManagedExecutablePolicy::Legacy)?;
     prepare_target_fd_for_exec(&target)?;
     if let Some(sync_pipe) = sync_pipe {
         install_sync_pipe(sync_pipe, MANAGED_SYNC_PIPE_TARGET_FD)?;
@@ -2050,18 +2207,36 @@ fn validate_inherited_guard(registry: &Registry, slot: u16, inherited: &File) ->
 }
 
 #[cfg(target_os = "linux")]
-fn open_pinned_executable(path: &Path) -> Result<File> {
+fn open_pinned_executable(path: &Path, policy: ManagedExecutablePolicy) -> Result<File> {
+    if policy == ManagedExecutablePolicy::PinnedSystemBwrap {
+        ensure!(
+            path.as_os_str() == std::ffi::OsStr::new("/usr/bin/bwrap"),
+            "pinned system executable path is not exact"
+        );
+    }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("open pinned target executable {}", path.display()))?;
-    validate_pinned_executable(&file)?;
+    validate_pinned_executable(&file, policy)?;
+    if policy == ManagedExecutablePolicy::PinnedSystemBwrap {
+        let readback = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/usr/bin/bwrap")
+            .context("reopen pinned system executable")?;
+        validate_pinned_executable(&readback, policy)?;
+        ensure!(
+            same_file_object(&file, &readback)?,
+            "pinned system executable changed during validation"
+        );
+    }
     Ok(file)
 }
 
 #[cfg(target_os = "linux")]
-fn validate_pinned_executable(file: &File) -> Result<()> {
+fn validate_pinned_executable(file: &File, policy: ManagedExecutablePolicy) -> Result<()> {
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file(),
@@ -2070,6 +2245,43 @@ fn validate_pinned_executable(file: &File) -> Result<()> {
     ensure!(
         metadata.permissions().mode() & 0o111 != 0,
         "target is not executable"
+    );
+    if policy == ManagedExecutablePolicy::PinnedSystemBwrap {
+        ensure!(
+            metadata.uid() == 0,
+            "pinned system executable is not root-owned"
+        );
+        ensure!(
+            metadata.permissions().mode() & 0o022 == 0,
+            "pinned system executable is group/other writable"
+        );
+        ensure!(
+            metadata.nlink() == 1,
+            "pinned system executable has extra links"
+        );
+        ensure!(
+            !is_shebang_script(file)?,
+            "pinned system executable is not a native object"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn same_file_object(left: &File, right: &File) -> Result<bool> {
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn prove_managed_executable_object(pid: u32, expected: &File) -> Result<()> {
+    let actual = fs::metadata(format!("/proc/{pid}/exe"))
+        .context("read back managed executable identity")?;
+    let expected = expected.metadata()?;
+    ensure!(
+        actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+        "managed executable object does not match the pinned object"
     );
     Ok(())
 }
@@ -2135,7 +2347,6 @@ fn validate_seqpacket(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn validate_cgroup_membership(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty() && value.len() <= 1_024,
@@ -2188,6 +2399,70 @@ fn validate_cgroup_procs_fd(file: &File) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn observe_cgroup_directory_identity(file: &File) -> Result<ManagedCgroupDirectoryIdentity> {
+    const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_dir(), "cgroup leaf is not a directory");
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    ensure!(unsafe { libc::fstatfs(file.as_raw_fd(), &mut statfs) } == 0);
+    ensure!(statfs.f_type as u64 == libc::CGROUP2_SUPER_MAGIC as u64);
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    ensure!(
+        unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS | STATX_MNT_ID_UNIQUE,
+                statx.as_mut_ptr(),
+            )
+        } == 0,
+        "cgroup unique mount identity is unavailable"
+    );
+    let statx = unsafe { statx.assume_init() };
+    ensure!(
+        statx.stx_mask & STATX_MNT_ID_UNIQUE != 0 && statx.stx_mnt_id != 0,
+        "cgroup unique mount identity is unavailable"
+    );
+    let boot_uuid = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())
+        .context("boot identity is unavailable")?;
+    Ok(ManagedCgroupDirectoryIdentity {
+        boot_uuid,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        statx_mnt_id_unique: statx.stx_mnt_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cgroup_leaf_fd(file: &File, expected: ManagedCgroupDirectoryIdentity) -> Result<()> {
+    ensure!(
+        observe_cgroup_directory_identity(file)? == expected,
+        "cgroup leaf identity does not match durable evidence"
+    );
+    let cgroup_type = fs::read(format!("/proc/self/fd/{}/cgroup.type", file.as_raw_fd()))
+        .context("read cgroup leaf type")?;
+    ensure!(cgroup_type == b"domain\n", "cgroup leaf is not a domain");
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn open_control_leaf_for_internal_test(cgroup_procs: &File) -> Result<File> {
+    let target = fs::read_link(format!("/proc/self/fd/{}", cgroup_procs.as_raw_fd()))
+        .context("resolve internal test cgroup.procs")?;
+    let parent = target
+        .parent()
+        .context("internal test cgroup leaf is absent")?;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .context("open internal test cgroup leaf")
+}
+
+#[cfg(target_os = "linux")]
 fn place_gate_in_control_cgroup(file: File) -> Result<()> {
     validate_cgroup_procs_fd(&file)?;
     let bytes = b"0\n";
@@ -2214,6 +2489,57 @@ fn verify_process_cgroup_membership(pid: u32, expected: &str) -> Result<()> {
         "managed gate is not in the exact control cgroup"
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prove_process_ancestry(
+    descendant: &ProcessIdentity,
+    managed_root: &ProcessIdentity,
+) -> std::result::Result<bool, ManagedEvidenceCode> {
+    if descendant.pid == managed_root.pid {
+        return Ok(false);
+    }
+    let mut current = descendant.pid;
+    for _ in 0..256 {
+        let parent = read_proc_parent_pid(current)?;
+        if parent == managed_root.pid {
+            return Ok(
+                matches!(verify_exact_process(managed_root), Evidence::Present(_))
+                    && matches!(verify_exact_process(descendant), Evidence::Present(_)),
+            );
+        }
+        if parent <= 1 || parent == current {
+            return Ok(false);
+        }
+        current = parent;
+    }
+    Err(ManagedEvidenceCode::InvalidEvidence)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_parent_pid(pid: u32) -> std::result::Result<u32, ManagedEvidenceCode> {
+    let bytes = fs::read(format!("/proc/{pid}/stat")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ManagedEvidenceCode::ProcessAbsent
+        } else {
+            ManagedEvidenceCode::IdentityUnavailable
+        }
+    })?;
+    if bytes.len() > 4 * 1024 {
+        return Err(ManagedEvidenceCode::InvalidEvidence);
+    }
+    let close = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or(ManagedEvidenceCode::InvalidEvidence)?;
+    let suffix = std::str::from_utf8(bytes.get(close + 1..).unwrap_or_default())
+        .map_err(|_| ManagedEvidenceCode::InvalidEvidence)?;
+    suffix
+        .split_whitespace()
+        .nth(1)
+        .ok_or(ManagedEvidenceCode::InvalidEvidence)?
+        .parse()
+        .map_err(|_| ManagedEvidenceCode::InvalidEvidence)
 }
 
 #[cfg(target_os = "linux")]
@@ -2650,6 +2976,32 @@ mod tests {
     }
 
     #[test]
+    fn typed_cgroup_membership_binds_identity_candidate_and_generation() {
+        let identity = ManagedCgroupDirectoryIdentity {
+            boot_uuid: Uuid::from_u128(1),
+            dev: 2,
+            ino: 3,
+            statx_mnt_id_unique: 4,
+        };
+        let membership = ManagedCgroupMembership::new(
+            "/delegated/tournament/candidate-1/control".into(),
+            identity,
+            1,
+            9,
+        )
+        .unwrap();
+        assert_eq!(membership.candidate_index(), 1);
+        assert_eq!(membership.generation(), 9);
+        assert_eq!(
+            membership.normalized_path(),
+            "/delegated/tournament/candidate-1/control"
+        );
+        assert!(ManagedCgroupMembership::new("relative".into(), identity, 1, 9).is_err());
+        assert!(ManagedCgroupMembership::new("/valid".into(), identity, 2, 9).is_err());
+        assert!(ManagedCgroupMembership::new("/valid".into(), identity, 1, 0).is_err());
+    }
+
+    #[test]
     fn registration_is_bound_to_slot_generation_and_nonce() {
         let (_temp, registry) = registry(1);
         let registration = GateRegistration {
@@ -2691,6 +3043,7 @@ mod tests {
         {
             let result = launch_managed_process(ManagedLaunchRequest {
                 owner: None,
+                executable_policy: ManagedExecutablePolicy::Legacy,
                 placement: ManagedPlacement::None,
                 auxiliary: ManagedAuxiliary::None,
                 executable: PathBuf::from("/bin/echo"),
@@ -2722,7 +3075,8 @@ mod tests {
             let temp = tempfile::NamedTempFile::new().unwrap();
             fs::write(temp.path(), contents).unwrap();
             fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            let target = open_pinned_executable(temp.path()).unwrap();
+            let target =
+                open_pinned_executable(temp.path(), ManagedExecutablePolicy::Legacy).unwrap();
             assert_ne!(
                 unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
@@ -3046,8 +3400,11 @@ mod tests {
     fn placement_rejects_non_cgroup_fd_and_unbounded_or_non_normal_membership() {
         let ordinary = tempfile::NamedTempFile::new().unwrap();
         assert!(
-            ControlCgroupPlacement::new(ordinary.reopen().unwrap(), "/speculation/control".into())
-                .is_err()
+            ControlCgroupPlacement::new_internal_test(
+                ordinary.reopen().unwrap(),
+                "/speculation/control".into(),
+            )
+            .is_err()
         );
         assert!(validate_cgroup_membership("relative/control").is_err());
         assert!(validate_cgroup_membership("/speculation/../control").is_err());
