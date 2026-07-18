@@ -68,21 +68,31 @@ pub type EvidenceResult<T> = Result<T, EvidenceError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DirectoryIdentity {
+pub struct DurableDirectoryIdentity {
     pub boot_uuid: Uuid,
+    pub dev: u64,
+    pub ino: u64,
+    pub statx_mnt_id_unique: u64,
+}
+
+/// Same-incarnation identity that is valid only while the original directory
+/// handle remains open.  Ordinary `STATX_MNT_ID` is deliberately not
+/// serializable and must never authorize restart recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveMountIdentity {
     pub dev: u64,
     pub ino: u64,
     pub statx_mnt_id: u64,
 }
 
 #[cfg(test)]
-impl DirectoryIdentity {
+impl DurableDirectoryIdentity {
     pub fn test_value() -> Self {
         Self {
             boot_uuid: Uuid::from_u128(1),
             dev: 2,
             ino: 3,
-            statx_mnt_id: 4,
+            statx_mnt_id_unique: 4,
         }
     }
 }
@@ -95,9 +105,17 @@ pub struct FileIdentity {
 
 pub struct ValidatedDirectory {
     file: File,
-    identity: DirectoryIdentity,
+    identity: DurableDirectoryIdentity,
     canonical_locator: PathBuf,
+    policy: DirectoryPolicy,
     mutation_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryPolicy {
+    Private,
+    Workspace,
+    DelegatedCgroup,
 }
 
 impl fmt::Debug for ValidatedDirectory {
@@ -110,7 +128,7 @@ impl fmt::Debug for ValidatedDirectory {
 }
 
 impl ValidatedDirectory {
-    pub fn identity(&self) -> DirectoryIdentity {
+    pub fn identity(&self) -> DurableDirectoryIdentity {
         self.identity
     }
 
@@ -119,16 +137,24 @@ impl ValidatedDirectory {
         if current != self.identity {
             return Err(EvidenceError::Stale);
         }
-        validate_private_directory_metadata(&self.file)?;
+        validate_directory_policy(&self.file, self.policy)?;
         self.reopen_and_verify()
     }
 
     pub fn reopen_and_verify(&self) -> EvidenceResult<()> {
-        let reopened = open_existing_private_dir(&self.canonical_locator)?;
+        let reopened = open_directory(&self.canonical_locator, false, self.policy)?;
         if reopened.identity != self.identity {
             return Err(EvidenceError::Stale);
         }
         Ok(())
+    }
+
+    pub(crate) fn try_clone_retained_fd(&self) -> EvidenceResult<File> {
+        clone_cloexec(&self.file)
+    }
+
+    pub(crate) fn live_mount_identity(&self) -> EvidenceResult<LiveMountIdentity> {
+        live_mount_identity_from_fd(&self.file)
     }
 
     pub(crate) fn canonical_locator_bytes(&self) -> &[u8] {
@@ -184,15 +210,36 @@ impl Drop for DirectoryMutationGuard<'_> {
 }
 
 pub fn open_existing_private_dir(path: &Path) -> EvidenceResult<ValidatedDirectory> {
-    open_private_dir(path, false)
+    open_directory(path, false, DirectoryPolicy::Private)
 }
 
 pub fn open_or_create_private_dir(path: &Path) -> EvidenceResult<ValidatedDirectory> {
-    open_private_dir(path, true)
+    open_directory(path, true, DirectoryPolicy::Private)
+}
+
+/// Opens SOURCE or candidate workspace roots component-by-component without
+/// following symlinks.  Recursive entry validation remains the containment
+/// adapter's responsibility because it is an action-specific bounded scan.
+pub fn open_existing_workspace_dir(path: &Path) -> EvidenceResult<ValidatedDirectory> {
+    open_directory(path, false, DirectoryPolicy::Workspace)
+}
+
+/// Opens an already delegated cgroup-v2 domain root without requiring private
+/// directory mode.  The root must be controlled by the current euid, not
+/// group/other writable, task-free, and expose the required controller files.
+pub fn open_existing_delegated_cgroup_root(path: &Path) -> EvidenceResult<ValidatedDirectory> {
+    open_directory(path, false, DirectoryPolicy::DelegatedCgroup)
 }
 
 #[cfg(target_os = "linux")]
-fn open_private_dir(path: &Path, create: bool) -> EvidenceResult<ValidatedDirectory> {
+fn open_directory(
+    path: &Path,
+    create: bool,
+    policy: DirectoryPolicy,
+) -> EvidenceResult<ValidatedDirectory> {
+    if create && policy != DirectoryPolicy::Private {
+        return Err(EvidenceError::InvalidDirectory);
+    }
     validate_absolute_path(path)?;
     let canonical = if create {
         create_and_open_components(path)?
@@ -204,18 +251,23 @@ fn open_private_dir(path: &Path, create: bool) -> EvidenceResult<ValidatedDirect
     if canonical_path != path {
         return Err(EvidenceError::InvalidDirectory);
     }
-    validate_private_directory_metadata(&canonical)?;
+    validate_directory_policy(&canonical, policy)?;
     let identity = directory_identity(&canonical)?;
     Ok(ValidatedDirectory {
         file: canonical,
         identity,
         canonical_locator: canonical_path,
+        policy,
         mutation_lock: Mutex::new(()),
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_private_dir(_path: &Path, _create: bool) -> EvidenceResult<ValidatedDirectory> {
+fn open_directory(
+    _path: &Path,
+    _create: bool,
+    _policy: DirectoryPolicy,
+) -> EvidenceResult<ValidatedDirectory> {
     Err(EvidenceError::Unsupported)
 }
 
@@ -424,6 +476,97 @@ fn validate_private_directory_metadata(file: &File) -> EvidenceResult<()> {
     Ok(())
 }
 
+fn validate_workspace_directory_metadata(file: &File) -> EvidenceResult<()> {
+    let metadata = file.metadata().map_err(|_| EvidenceError::Io)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != current_euid()
+        || metadata.mode() & 0o6000 != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    Ok(())
+}
+
+fn validate_directory_policy(file: &File, policy: DirectoryPolicy) -> EvidenceResult<()> {
+    match policy {
+        DirectoryPolicy::Private => validate_private_directory_metadata(file),
+        DirectoryPolicy::Workspace => validate_workspace_directory_metadata(file),
+        DirectoryPolicy::DelegatedCgroup => validate_delegated_cgroup_root(file),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_delegated_cgroup_root(file: &File) -> EvidenceResult<()> {
+    let metadata = file.metadata().map_err(|_| EvidenceError::Io)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != current_euid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
+        return Err(EvidenceError::Io);
+    }
+    let statfs = unsafe { statfs.assume_init() };
+    if statfs.f_type as u64 != libc::CGROUP2_SUPER_MAGIC as u64 {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    let cgroup_type = read_small_leaf(file.as_raw_fd(), c"cgroup.type", 64)?;
+    if cgroup_type != b"domain\n" {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    if !read_small_leaf(file.as_raw_fd(), c"cgroup.procs", 4096)?.is_empty() {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    let controllers = read_small_leaf(file.as_raw_fd(), c"cgroup.controllers", 4096)?;
+    if !controllers
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|controller| controller == b"pids")
+    {
+        return Err(EvidenceError::InvalidDirectory);
+    }
+    for (leaf, flags) in [
+        (c"cgroup.kill", libc::O_WRONLY),
+        (c"cgroup.events", libc::O_RDONLY),
+        (c"cgroup.subtree_control", libc::O_RDWR),
+    ] {
+        let opened = openat_file(
+            file.as_raw_fd(),
+            leaf,
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        if !opened.metadata().map_err(|_| EvidenceError::Io)?.is_file() {
+            return Err(EvidenceError::InvalidDirectory);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_delegated_cgroup_root(_file: &File) -> EvidenceResult<()> {
+    Err(EvidenceError::Unsupported)
+}
+
+fn read_small_leaf(dirfd: RawFd, leaf: &CStr, cap: usize) -> EvidenceResult<Vec<u8>> {
+    let file = openat_file(
+        dirfd,
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let mut bytes = Vec::with_capacity(cap.min(4096));
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| EvidenceError::Io)?;
+    if bytes.len() > cap {
+        return Err(EvidenceError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 fn validate_absolute_path(path: &Path) -> EvidenceResult<()> {
     if !path.is_absolute()
         || path.as_os_str().as_bytes().len() > MAX_DIRECTORY_PATH_BYTES
@@ -476,6 +619,14 @@ fn openat_file(dirfd: RawFd, leaf: &CStr, flags: i32, mode: u32) -> EvidenceResu
         return Err(map_io_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn clone_cloexec(file: &File) -> EvidenceResult<File> {
+    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(EvidenceError::Io);
+    }
+    Ok(unsafe { File::from_raw_fd(duplicate) })
 }
 
 fn renameat(dirfd: RawFd, from: &CStr, to: &CStr) -> EvidenceResult<()> {
@@ -643,7 +794,7 @@ fn unlock_directory(_fd: RawFd) {}
 #[cfg(target_os = "linux")]
 fn enumerate_leaf_names_from_fd(
     directory: &File,
-    expected_identity: DirectoryIdentity,
+    expected_identity: DurableDirectoryIdentity,
 ) -> EvidenceResult<Vec<CString>> {
     if directory_identity(directory)? != expected_identity {
         return Err(EvidenceError::Stale);
@@ -690,7 +841,7 @@ fn enumerate_leaf_names_from_fd(
 #[cfg(not(target_os = "linux"))]
 fn enumerate_leaf_names_from_fd(
     _directory: &File,
-    _expected_identity: DirectoryIdentity,
+    _expected_identity: DurableDirectoryIdentity,
 ) -> EvidenceResult<Vec<CString>> {
     Err(EvidenceError::Unsupported)
 }
@@ -740,7 +891,7 @@ fn open_components(path: &Path, create: bool) -> EvidenceResult<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn directory_identity(file: &File) -> EvidenceResult<DirectoryIdentity> {
+pub(crate) fn durable_identity_from_fd(file: &File) -> EvidenceResult<DurableDirectoryIdentity> {
     const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
     let metadata = file.metadata().map_err(|_| EvidenceError::Io)?;
     let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -764,8 +915,45 @@ fn directory_identity(file: &File) -> EvidenceResult<DirectoryIdentity> {
         .ok()
         .and_then(|value| Uuid::parse_str(value.trim()).ok())
         .ok_or(EvidenceError::Unsupported)?;
-    Ok(DirectoryIdentity {
+    Ok(DurableDirectoryIdentity {
         boot_uuid,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        statx_mnt_id_unique: statx.stx_mnt_id,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn durable_identity_from_fd(_file: &File) -> EvidenceResult<DurableDirectoryIdentity> {
+    Err(EvidenceError::Unsupported)
+}
+
+fn directory_identity(file: &File) -> EvidenceResult<DurableDirectoryIdentity> {
+    durable_identity_from_fd(file)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn live_mount_identity_from_fd(file: &File) -> EvidenceResult<LiveMountIdentity> {
+    const STATX_MNT_ID: u32 = 0x0000_1000;
+    let metadata = file.metadata().map_err(|_| EvidenceError::Io)?;
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    if unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS | STATX_MNT_ID,
+            statx.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(EvidenceError::Unsupported);
+    }
+    let statx = unsafe { statx.assume_init() };
+    if statx.stx_mask & STATX_MNT_ID == 0 || statx.stx_mnt_id == 0 {
+        return Err(EvidenceError::Unsupported);
+    }
+    Ok(LiveMountIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
         statx_mnt_id: statx.stx_mnt_id,
@@ -773,7 +961,7 @@ fn directory_identity(file: &File) -> EvidenceResult<DirectoryIdentity> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn directory_identity(_file: &File) -> EvidenceResult<DirectoryIdentity> {
+pub(crate) fn live_mount_identity_from_fd(_file: &File) -> EvidenceResult<LiveMountIdentity> {
     Err(EvidenceError::Unsupported)
 }
 
@@ -858,8 +1046,11 @@ mod tests {
 
     #[test]
     fn evidence_identity_and_json_cap_are_fixed() {
-        let identity = DirectoryIdentity::test_value();
+        let identity = DurableDirectoryIdentity::test_value();
         assert_eq!(identity.dev, 2);
+        let serialized = serde_json::to_value(identity).unwrap();
+        assert_eq!(serialized["statx_mnt_id_unique"], 4);
+        assert!(serialized.get("statx_mnt_id").is_none());
         assert_eq!(MAX_SPECULATION_JSON_BYTES, 32 * 1024);
         assert_eq!(
             EvidenceError::Corrupt.to_string(),
@@ -885,6 +1076,14 @@ mod tests {
             "speculation_evidence_unsupported"
         );
         assert!(!target.exists());
+        assert_eq!(
+            open_existing_workspace_dir(root.path()).unwrap_err(),
+            EvidenceError::Unsupported
+        );
+        assert_eq!(
+            open_existing_delegated_cgroup_root(root.path()).unwrap_err(),
+            EvidenceError::Unsupported
+        );
     }
 
     #[cfg(target_os = "linux")]

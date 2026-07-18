@@ -4,9 +4,9 @@ use crate::protocol::{
     SpeculationUnixPath,
 };
 use crate::speculation_fs::{
-    DirectoryIdentity, EvidenceError, EvidenceResult, FileIdentity, MAX_SPECULATION_JSON_BYTES,
-    ValidatedDirectory, atomic_create_json, atomic_replace_json, open_or_create_private_dir,
-    read_json,
+    DurableDirectoryIdentity, EvidenceError, EvidenceResult, FileIdentity,
+    MAX_SPECULATION_JSON_BYTES, ValidatedDirectory, atomic_create_json, atomic_replace_json,
+    open_or_create_private_dir, read_json,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, OsStr};
@@ -122,17 +122,17 @@ impl TournamentSlotRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateRootIdentities {
-    pub source: DirectoryIdentity,
-    pub candidates: [DirectoryIdentity; 2],
-    pub ledger_root: DirectoryIdentity,
-    pub cgroup_root: DirectoryIdentity,
+    pub source: DurableDirectoryIdentity,
+    pub candidates: [DurableDirectoryIdentity; 2],
+    pub ledger_root: DurableDirectoryIdentity,
+    pub cgroup_root: DurableDirectoryIdentity,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateCgroupRootLocator {
     canonical_path: SpeculationUnixPath,
-    pub identity: DirectoryIdentity,
+    pub identity: DurableDirectoryIdentity,
 }
 
 impl std::fmt::Debug for PrivateCgroupRootLocator {
@@ -160,12 +160,85 @@ impl PrivateCgroupRootLocator {
     }
 
     pub fn reopen_and_verify(&self) -> EvidenceResult<ValidatedDirectory> {
-        let directory =
-            crate::speculation_fs::open_existing_private_dir(&self.canonical_path.to_path_buf())?;
+        let directory = crate::speculation_fs::open_existing_delegated_cgroup_root(
+            &self.canonical_path.to_path_buf(),
+        )?;
         if directory.identity() != self.identity {
             return Err(EvidenceError::Stale);
         }
         Ok(directory)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TournamentCgroupLifecycleState {
+    Planned,
+    CreatePending,
+    Created,
+    RemovePending,
+    Removed,
+    RollbackRequired,
+}
+
+impl TournamentCgroupLifecycleState {
+    pub fn is_legal_transition(self, next: Self) -> bool {
+        use TournamentCgroupLifecycleState as S;
+        matches!(
+            (self, next),
+            (
+                S::Planned,
+                S::Planned | S::CreatePending | S::Removed | S::RollbackRequired
+            ) | (
+                S::CreatePending,
+                S::CreatePending | S::Created | S::RollbackRequired
+            ) | (
+                S::Created,
+                S::Created | S::RemovePending | S::RollbackRequired
+            ) | (
+                S::RemovePending,
+                S::RemovePending | S::Removed | S::RollbackRequired
+            ) | (S::Removed, S::Removed | S::RollbackRequired)
+                | (S::RollbackRequired, S::RollbackRequired)
+        )
+    }
+}
+
+/// Durable evidence for the shared task-free tournament domain above the two
+/// candidate domains.  Its deterministic name is derived from the tournament
+/// UUID and its identity is independently persisted before child creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TournamentCgroupEvidence {
+    pub deterministic_name_uuid: Uuid,
+    pub lifecycle: TournamentCgroupLifecycleState,
+    pub domain: Option<DurableDirectoryIdentity>,
+}
+
+impl TournamentCgroupEvidence {
+    fn validate(&self, tournament_uuid: Uuid, boot_uuid: Uuid) -> EvidenceResult<()> {
+        if self.deterministic_name_uuid != tournament_uuid
+            || self.domain.is_some_and(|identity| {
+                identity.boot_uuid != boot_uuid || !valid_directory_identity(&identity)
+            })
+        {
+            return Err(EvidenceError::Corrupt);
+        }
+        let should_have_identity = matches!(
+            self.lifecycle,
+            TournamentCgroupLifecycleState::Created | TournamentCgroupLifecycleState::RemovePending
+        );
+        if self.domain.is_some() != should_have_identity {
+            return Err(EvidenceError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn immutable_identity_progresses_to(&self, next: &Self) -> bool {
+        self.deterministic_name_uuid == next.deterministic_name_uuid
+            && self
+                .domain
+                .is_none_or(|identity| next.domain == Some(identity))
     }
 }
 
@@ -370,9 +443,9 @@ pub struct CandidateCgroupEvidence {
     pub candidate_index: u8,
     pub deterministic_name_uuid: Uuid,
     pub lifecycle: CgroupLifecycleState,
-    pub parent: Option<DirectoryIdentity>,
-    pub control: Option<DirectoryIdentity>,
-    pub payload: Option<DirectoryIdentity>,
+    pub parent: Option<DurableDirectoryIdentity>,
+    pub control: Option<DurableDirectoryIdentity>,
+    pub payload: Option<DurableDirectoryIdentity>,
 }
 
 impl CandidateCgroupEvidence {
@@ -449,6 +522,7 @@ pub struct TournamentRecord {
     pub boot_uuid: Uuid,
     pub roots: PrivateRootIdentities,
     pub cgroup_root_locator: PrivateCgroupRootLocator,
+    pub tournament_cgroup: TournamentCgroupEvidence,
     pub cgroups: [CandidateCgroupEvidence; 2],
     pub managed_owners: [Option<ManagedOwnerEvidence>; 2],
     pub terminal_completed_unix_ms: Option<u64>,
@@ -484,6 +558,10 @@ impl TournamentRecord {
                 .iter()
                 .any(|identity| identity.boot_uuid != self.boot_uuid)
             || self.cgroup_root_locator.identity != self.roots.cgroup_root
+            || self
+                .tournament_cgroup
+                .validate(self.status.tournament_uuid, self.boot_uuid)
+                .is_err()
             || self.cgroups[0].validate(0, self.boot_uuid).is_err()
             || self.cgroups[1].validate(1, self.boot_uuid).is_err()
             || self.cgroups[0].deterministic_name_uuid != self.status.candidates[0].candidate_uuid
@@ -514,6 +592,7 @@ impl TournamentRecord {
                 .cgroups
                 .iter()
                 .all(|candidate| candidate.lifecycle == CgroupLifecycleState::Removed)
+            && self.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::Removed
             && self.status.candidates.iter().all(|candidate| {
                 let cleanup = &candidate.cleanup;
                 cleanup.runner_ack
@@ -528,6 +607,9 @@ impl TournamentRecord {
         self.boot_uuid == next.boot_uuid
             && self.roots == next.roots
             && self.cgroup_root_locator == next.cgroup_root_locator
+            && self
+                .tournament_cgroup
+                .immutable_identity_progresses_to(&next.tournament_cgroup)
             && self.status.tournament_uuid == next.status.tournament_uuid
             && self.status.daemon_instance_uuid == next.status.daemon_instance_uuid
             && self.status.candidates[0].candidate_uuid == next.status.candidates[0].candidate_uuid
@@ -535,11 +617,11 @@ impl TournamentRecord {
     }
 }
 
-fn valid_directory_identity(identity: &DirectoryIdentity) -> bool {
+fn valid_directory_identity(identity: &DurableDirectoryIdentity) -> bool {
     !identity.boot_uuid.is_nil()
         && identity.dev != 0
         && identity.ino != 0
-        && identity.statx_mnt_id != 0
+        && identity.statx_mnt_id_unique != 0
 }
 
 fn validate_status_semantics(status: &SpeculationStatus) -> EvidenceResult<()> {
@@ -923,6 +1005,10 @@ impl TournamentStore {
                     .ok_or(EvidenceError::GenerationMismatch)?
             || !current.immutable_identity_matches(&next)
             || !crate::speculation::is_legal_transition(current.status.phase, next.status.phase)
+            || !current
+                .tournament_cgroup
+                .lifecycle
+                .is_legal_transition(next.tournament_cgroup.lifecycle)
             || current
                 .cgroups
                 .iter()
@@ -1114,7 +1200,7 @@ mod tests {
     use super::*;
 
     fn terminal_record() -> TournamentRecord {
-        let identity = DirectoryIdentity::test_value();
+        let identity = DurableDirectoryIdentity::test_value();
         let candidate_uuids = [Uuid::from_u128(2), Uuid::from_u128(3)];
         let cleanup = crate::protocol::SpeculationCleanupStatus {
             runner_ack: true,
@@ -1154,6 +1240,11 @@ mod tests {
             cgroup_root_locator: PrivateCgroupRootLocator {
                 canonical_path: SpeculationUnixPath::from_path(Path::new("/cgroup")).unwrap(),
                 identity,
+            },
+            tournament_cgroup: TournamentCgroupEvidence {
+                deterministic_name_uuid: Uuid::from_u128(4),
+                lifecycle: TournamentCgroupLifecycleState::Removed,
+                domain: None,
             },
             cgroups: std::array::from_fn(|index| CandidateCgroupEvidence {
                 candidate_index: index as u8,
@@ -1390,6 +1481,34 @@ mod tests {
         assert_eq!(
             L::Forward(F::PayloadAttached).same_boot_absence(C::Payload),
             A::Forbidden
+        );
+    }
+
+    #[test]
+    fn shared_tournament_domain_has_independent_durable_lifecycle() {
+        use TournamentCgroupLifecycleState as S;
+        assert!(S::Planned.is_legal_transition(S::CreatePending));
+        assert!(S::CreatePending.is_legal_transition(S::Created));
+        assert!(S::Created.is_legal_transition(S::RemovePending));
+        assert!(S::RemovePending.is_legal_transition(S::Removed));
+        assert!(!S::Planned.is_legal_transition(S::Created));
+
+        let identity = DurableDirectoryIdentity::test_value();
+        let mut evidence = TournamentCgroupEvidence {
+            deterministic_name_uuid: Uuid::from_u128(4),
+            lifecycle: S::Created,
+            domain: Some(identity),
+        };
+        assert!(
+            evidence
+                .validate(Uuid::from_u128(4), identity.boot_uuid)
+                .is_ok()
+        );
+
+        evidence.deterministic_name_uuid = Uuid::from_u128(99);
+        assert_eq!(
+            evidence.validate(Uuid::from_u128(4), identity.boot_uuid),
+            Err(EvidenceError::Corrupt)
         );
     }
 }

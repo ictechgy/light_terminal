@@ -1,7 +1,7 @@
 use crate::protocol::{SpeculationPhase, SpeculationStatus};
 use crate::speculation_fs::{
-    DirectoryIdentity, EvidenceError, EvidenceResult, MAX_SPECULATION_JSON_BYTES, StoredJson,
-    ValidatedDirectory, atomic_create_json, atomic_replace_json, read_json,
+    DurableDirectoryIdentity, EvidenceError, EvidenceResult, MAX_SPECULATION_JSON_BYTES,
+    StoredJson, ValidatedDirectory, atomic_create_json, atomic_replace_json, read_json,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
@@ -26,10 +26,10 @@ pub enum LedgerAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientRootIdentities {
-    pub source: DirectoryIdentity,
-    pub candidates: [DirectoryIdentity; 2],
-    pub ledger_root: DirectoryIdentity,
-    pub cgroup_root: DirectoryIdentity,
+    pub source: DurableDirectoryIdentity,
+    pub candidates: [DurableDirectoryIdentity; 2],
+    pub ledger_root: DurableDirectoryIdentity,
+    pub cgroup_root: DurableDirectoryIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,7 +227,7 @@ mod tests {
     }
 
     fn roots() -> ClientRootIdentities {
-        let identity = DirectoryIdentity::test_value();
+        let identity = DurableDirectoryIdentity::test_value();
         ClientRootIdentities {
             source: identity,
             candidates: [identity, identity],
