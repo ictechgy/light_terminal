@@ -1740,24 +1740,22 @@ fn recover_pending_tournament_create(
     {
         return Ok(RecoveryEvidence::RollbackRequired);
     }
-    let root = reopen_recovery_root(record)?;
-    enable_pids(&root)?;
+    let root = match reopen_recovery_root(record) {
+        Ok(root) => root,
+        Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+    };
+    if enable_pids(&root).is_err() {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    }
     let name = cgroup_name(&format!("lterm-g003-{}", record.status.tournament_uuid))?;
     let membership = join_membership(&root.membership, name.to_bytes())?;
-    let (domain, adopted) = create_or_adopt_cgroup_child(&root, &name, membership)?;
-    for candidate in 0_u8..2 {
-        let candidate_name = cgroup_name(&format!("candidate-{candidate}"))?;
-        if open_observed_cgroup_child(
-            &domain,
-            &candidate_name,
-            join_membership(&domain.membership, candidate_name.to_bytes())?,
-        )?
-        .is_some()
-        {
-            return Ok(RecoveryEvidence::RollbackRequired);
-        }
+    let (domain, adopted) = match create_or_adopt_cgroup_child(&root, &name, membership) {
+        Ok(result) => result,
+        Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+    };
+    if prove_exact_recovery_subtree(&domain, &[]).is_err() || enable_pids(&domain).is_err() {
+        return Ok(RecoveryEvidence::RollbackRequired);
     }
-    enable_pids(&domain)?;
     Ok(RecoveryEvidence::TournamentCreateReconciled {
         identity: domain.identity,
         adopted,
@@ -1785,73 +1783,135 @@ fn recover_pending_candidate_create(
     {
         return Ok(RecoveryEvidence::RollbackRequired);
     }
-    let Some((_, _, domain)) = reopen_recovery_domain(record)? else {
-        return Ok(RecoveryEvidence::RollbackRequired);
+    let domain = match reopen_recovery_domain(record) {
+        Ok(Some((_, _, domain))) => domain,
+        Ok(None) | Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
     };
     let parent_name = cgroup_name(&format!("candidate-{candidate}"))?;
     let parent_membership = join_membership(&domain.membership, parent_name.to_bytes())?;
 
     let (node, adopted) = match component {
         CgroupComponent::Parent => {
-            let result = create_or_adopt_cgroup_child(&domain, &parent_name, parent_membership)?;
-            for leaf in [c"control", c"payload"] {
-                if open_observed_cgroup_child(
-                    &result.0,
-                    leaf,
-                    join_membership(&result.0.membership, leaf.to_bytes())?,
-                )?
-                .is_some()
-                {
-                    return Ok(RecoveryEvidence::RollbackRequired);
-                }
-            }
-            enable_pids(&result.0)?;
-            result
-        }
-        CgroupComponent::Control => {
-            let Some(parent) =
-                reopen_cgroup_child(&domain, &parent_name, parent_membership, evidence.parent)?
-            else {
-                return Ok(RecoveryEvidence::RollbackRequired);
+            let pending_exists = match open_observed_cgroup_child(
+                &domain,
+                &parent_name,
+                parent_membership.clone(),
+            ) {
+                Ok(observed) => observed.is_some(),
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
             };
-            if open_observed_cgroup_child(
-                &parent,
-                c"payload",
-                join_membership(&parent.membership, b"payload")?,
-            )?
-            .is_some()
+            if prove_create_recovery_preflight(
+                &domain,
+                record,
+                candidate,
+                component,
+                pending_exists,
+            )
+            .is_err()
             {
                 return Ok(RecoveryEvidence::RollbackRequired);
             }
-            create_or_adopt_cgroup_child(
+            match create_or_adopt_cgroup_child(&domain, &parent_name, parent_membership) {
+                Ok(result) => result,
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            }
+        }
+        CgroupComponent::Control => {
+            let parent = match reopen_cgroup_child(
+                &domain,
+                &parent_name,
+                parent_membership,
+                evidence.parent,
+            ) {
+                Ok(Some(parent)) => parent,
+                Ok(None) | Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            };
+            let pending_exists = match open_observed_cgroup_child(
                 &parent,
                 c"control",
                 join_membership(&parent.membership, b"control")?,
-            )?
+            ) {
+                Ok(observed) => observed.is_some(),
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            };
+            if prove_create_recovery_preflight(
+                &domain,
+                record,
+                candidate,
+                component,
+                pending_exists,
+            )
+            .is_err()
+            {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            }
+            match create_or_adopt_cgroup_child(
+                &parent,
+                c"control",
+                join_membership(&parent.membership, b"control")?,
+            ) {
+                Ok(result) => result,
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            }
         }
         CgroupComponent::Payload => {
-            let Some(parent) =
-                reopen_cgroup_child(&domain, &parent_name, parent_membership, evidence.parent)?
-            else {
-                return Ok(RecoveryEvidence::RollbackRequired);
+            let parent = match reopen_cgroup_child(
+                &domain,
+                &parent_name,
+                parent_membership,
+                evidence.parent,
+            ) {
+                Ok(Some(parent)) => parent,
+                Ok(None) | Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
             };
-            if reopen_cgroup_child(
+            match reopen_cgroup_child(
                 &parent,
                 c"control",
                 join_membership(&parent.membership, b"control")?,
                 evidence.control,
-            )?
-            .is_none()
-            {
-                return Ok(RecoveryEvidence::RollbackRequired);
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
             }
-            create_or_adopt_cgroup_child(
+            let pending_exists = match open_observed_cgroup_child(
                 &parent,
                 c"payload",
                 join_membership(&parent.membership, b"payload")?,
-            )?
+            ) {
+                Ok(observed) => observed.is_some(),
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            };
+            if prove_create_recovery_preflight(
+                &domain,
+                record,
+                candidate,
+                component,
+                pending_exists,
+            )
+            .is_err()
+            {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            }
+            match create_or_adopt_cgroup_child(
+                &parent,
+                c"payload",
+                join_membership(&parent.membership, b"payload")?,
+            ) {
+                Ok(result) => result,
+                Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+            }
         }
     };
+    let expected = match expected_recovery_subtree(record, candidate, component, true) {
+        Ok(expected) => expected,
+        Err(_) => return Ok(RecoveryEvidence::RollbackRequired),
+    };
+    if prove_exact_recovery_subtree(&domain, &expected).is_err() {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    }
+    if component == CgroupComponent::Parent && enable_pids(&node).is_err() {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    }
     Ok(RecoveryEvidence::CandidateCreateReconciled {
         candidate,
         component,
@@ -2166,10 +2226,232 @@ fn create_or_adopt_cgroup_child(
     membership: String,
 ) -> ContainmentResult<(RetainedCgroupNode, bool)> {
     if let Some(observed) = open_observed_cgroup_child(parent, name, membership.clone())? {
-        prove_domain_task_free(&observed)?;
+        prove_exact_recovery_subtree(&observed, &[])?;
         return Ok((observed, true));
     }
-    create_cgroup_child(parent, name, membership).map(|created| (created, false))
+    let created = create_cgroup_child(parent, name, membership)?;
+    prove_exact_recovery_subtree(&created, &[])?;
+    Ok((created, false))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ExpectedRecoveryCgroup {
+    name: CString,
+    identity: Option<DurableDirectoryIdentity>,
+    children: Vec<ExpectedRecoveryCgroup>,
+}
+
+#[cfg(target_os = "linux")]
+fn expected_recovery_subtree(
+    record: &TournamentRecord,
+    pending_candidate: u8,
+    pending_component: CgroupComponent,
+    include_pending: bool,
+) -> ContainmentResult<Vec<ExpectedRecoveryCgroup>> {
+    let mut expected = Vec::new();
+    for candidate in &record.cgroups {
+        let is_pending = candidate.candidate_index == pending_candidate;
+        let parent_pending =
+            include_pending && is_pending && pending_component == CgroupComponent::Parent;
+        let control_pending =
+            include_pending && is_pending && pending_component == CgroupComponent::Control;
+        let payload_pending =
+            include_pending && is_pending && pending_component == CgroupComponent::Payload;
+        if candidate.parent.is_none() && !parent_pending {
+            if candidate.control.is_some()
+                || candidate.payload.is_some()
+                || control_pending
+                || payload_pending
+            {
+                return Err(ContainmentErrorCode::InvalidIdentity);
+            }
+            continue;
+        }
+
+        let mut children = Vec::new();
+        if candidate.control.is_some() || control_pending {
+            children.push(ExpectedRecoveryCgroup {
+                name: cgroup_name("control")?,
+                identity: candidate.control,
+                children: Vec::new(),
+            });
+        }
+        if candidate.payload.is_some() || payload_pending {
+            if candidate.control.is_none() {
+                return Err(ContainmentErrorCode::InvalidIdentity);
+            }
+            children.push(ExpectedRecoveryCgroup {
+                name: cgroup_name("payload")?,
+                identity: candidate.payload,
+                children: Vec::new(),
+            });
+        }
+        expected.push(ExpectedRecoveryCgroup {
+            name: cgroup_name(&format!("candidate-{}", candidate.candidate_index))?,
+            identity: candidate.parent,
+            children,
+        });
+    }
+    Ok(expected)
+}
+
+#[cfg(target_os = "linux")]
+fn prove_create_recovery_preflight(
+    domain: &RetainedCgroupNode,
+    record: &TournamentRecord,
+    candidate: u8,
+    component: CgroupComponent,
+    pending_exists: bool,
+) -> ContainmentResult<()> {
+    let expected = expected_recovery_subtree(record, candidate, component, pending_exists)?;
+    prove_exact_recovery_subtree(domain, &expected)
+}
+
+#[cfg(target_os = "linux")]
+fn prove_exact_recovery_subtree(
+    node: &RetainedCgroupNode,
+    expected: &[ExpectedRecoveryCgroup],
+) -> ContainmentResult<()> {
+    prove_exact_owned_empty_domain(node)?;
+    prove_exact_child_names(node, expected)?;
+    for child in expected {
+        let membership = join_membership(&node.membership, child.name.to_bytes())?;
+        let observed = open_observed_cgroup_child(node, &child.name, membership)?
+            .ok_or(ContainmentErrorCode::TopologyFailure)?;
+        if child
+            .identity
+            .is_some_and(|identity| identity != observed.identity)
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        prove_exact_recovery_subtree(&observed, &child.children)?;
+    }
+    prove_exact_child_names(node, expected)?;
+    prove_exact_owned_empty_domain(node)
+}
+
+#[cfg(target_os = "linux")]
+fn prove_exact_owned_empty_domain(node: &RetainedCgroupNode) -> ContainmentResult<()> {
+    revalidate_cgroup_node(node)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(node.file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    let stat = unsafe { stat.assume_init() };
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(node.file.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stat.st_mode & 0o7777 != 0o755
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_gid != unsafe { libc::getegid() }
+        || unsafe { statfs.assume_init() }.f_type as u64 != libc::CGROUP2_SUPER_MAGIC as u64
+        || read_leaf(node, c"cgroup.type", 64)? != b"domain\n"
+        || !read_leaf(node, c"cgroup.procs", 4096)?.is_empty()
+        || parse_populated(&read_leaf(node, c"cgroup.events", 4096)?)? != 0
+    {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    revalidate_cgroup_node(node)
+}
+
+#[cfg(target_os = "linux")]
+fn prove_exact_child_names(
+    node: &RetainedCgroupNode,
+    expected: &[ExpectedRecoveryCgroup],
+) -> ContainmentResult<()> {
+    let mut observed = enumerate_cgroup_child_names(node)?;
+    let mut expected = expected
+        .iter()
+        .map(|child| child.name.to_bytes().to_vec())
+        .collect::<Vec<_>>();
+    observed.sort();
+    expected.sort();
+    if observed != expected {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_cgroup_child_names(node: &RetainedCgroupNode) -> ContainmentResult<Vec<Vec<u8>>> {
+    revalidate_cgroup_node(node)?;
+    let independent = unsafe {
+        libc::openat(
+            node.file.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if independent < 0 {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    let stream = unsafe { libc::fdopendir(independent) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(independent);
+        }
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+
+    let mut children = Vec::new();
+    loop {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let errno = unsafe { *libc::__errno_location() };
+            unsafe {
+                libc::closedir(stream);
+            }
+            if errno != 0 {
+                return Err(ContainmentErrorCode::TopologyFailure);
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                node.file.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            unsafe {
+                libc::closedir(stream);
+            }
+            return Err(ContainmentErrorCode::TopologyFailure);
+        }
+        match unsafe { stat.assume_init() }.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                if children.len() >= 16 {
+                    unsafe {
+                        libc::closedir(stream);
+                    }
+                    return Err(ContainmentErrorCode::TopologyFailure);
+                }
+                children.push(name.to_bytes().to_vec());
+            }
+            libc::S_IFREG => {}
+            _ => {
+                unsafe {
+                    libc::closedir(stream);
+                }
+                return Err(ContainmentErrorCode::TopologyFailure);
+            }
+        }
+    }
+    revalidate_cgroup_node(node)?;
+    Ok(children)
 }
 
 #[cfg(target_os = "linux")]

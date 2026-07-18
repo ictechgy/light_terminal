@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use uuid::Uuid;
 
 fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir, Output)> {
@@ -77,6 +78,37 @@ fn assert_bounded_raw_free_failure(output: &Output, fixture: &tempfile::TempDir,
         !stderr.contains(&fixture.path().to_string_lossy().into_owned()),
         "{seam} exposed its fixture path"
     );
+}
+
+fn tournament_domain(tournament_uuid: Uuid) -> std::path::PathBuf {
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .expect("required restart run needs LTERM_SPECULATION_CGROUP_ROOT");
+    std::path::PathBuf::from(cgroup_root).join(format!("lterm-g003-{tournament_uuid}"))
+}
+
+fn move_process_to_cgroup(child: &Child, cgroup: &std::path::Path) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(cgroup.join("cgroup.procs"))
+        .expect("open attack cgroup.procs")
+        .write_all(format!("{}\n", child.id()).as_bytes())
+        .expect("move attack process into descendant cgroup");
+}
+
+fn write_cgroup_leaf(cgroup: &std::path::Path, leaf: &str, bytes: &[u8]) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(cgroup.join(leaf))
+        .expect("open attack cgroup leaf")
+        .write_all(bytes)
+        .expect("write attack cgroup leaf");
+}
+
+fn reap_attack_process(child: &mut Child) {
+    if child.try_wait().expect("inspect attack process").is_none() {
+        child.kill().expect("kill surviving attack process");
+    }
+    child.wait().expect("reap attack process");
 }
 
 fn required_restart_fixture() -> Option<tempfile::TempDir> {
@@ -237,6 +269,245 @@ fn required_real_create_edges_recover_before_and_after_abrupt_restart() {
             "{failpoint} candidate {candidate} reconciliation mode"
         );
         assert!(recovered.stderr.is_empty());
+        assert_no_tournament_domains();
+    }
+}
+
+#[test]
+fn required_real_create_pending_rejects_unexpected_empty_child_without_adoption() {
+    let Some(fixture) = required_restart_fixture() else {
+        return;
+    };
+    let tournament_uuid = Uuid::new_v4();
+    let crashed = run_restart_component(
+        &fixture,
+        "crash-create",
+        tournament_uuid,
+        Some("after_tournament_create"),
+        0,
+    );
+    assert_eq!(
+        crashed.status.code(),
+        Some(86),
+        "crash setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&crashed.stdout),
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    assert!(crashed.stdout.is_empty());
+    assert!(crashed.stderr.is_empty());
+
+    let record_path = fixture.path().join("restart-record.json");
+    let record_before = fs::read(&record_path).expect("read create-pending record");
+    let domain = tournament_domain(tournament_uuid);
+    let unexpected = domain.join("unexpected-empty");
+    fs::create_dir(&unexpected).expect("create unexpected empty descendant");
+
+    let recovered = run_restart_component(&fixture, "recover-create", tournament_uuid, None, 0);
+    let foreign_topology_survived = unexpected.is_dir();
+    let record_after = fs::read(&record_path).expect("reread rejected create record");
+
+    fs::remove_dir(&unexpected).expect("remove owned empty attack child");
+    fs::remove_dir(&domain).expect("remove rejected tournament domain");
+
+    assert_bounded_raw_free_failure(&recovered, &fixture, "unexpected-empty-child");
+    assert!(
+        foreign_topology_survived,
+        "recovery deleted the foreign empty child"
+    );
+    assert!(
+        record_after == record_before,
+        "recovery adopted or mutated a record with unexpected topology"
+    );
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_create_pending_rejects_populated_descendant_without_signaling_it() {
+    let Some(fixture) = required_restart_fixture() else {
+        return;
+    };
+    let tournament_uuid = Uuid::new_v4();
+    let crashed = run_restart_component(
+        &fixture,
+        "crash-create",
+        tournament_uuid,
+        Some("after_tournament_create"),
+        0,
+    );
+    assert_eq!(
+        crashed.status.code(),
+        Some(86),
+        "crash setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&crashed.stdout),
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    assert!(crashed.stdout.is_empty());
+    assert!(crashed.stderr.is_empty());
+
+    let record_path = fixture.path().join("restart-record.json");
+    let record_before = fs::read(&record_path).expect("read create-pending record");
+    let domain = tournament_domain(tournament_uuid);
+    let unexpected = domain.join("unexpected");
+    let nested = unexpected.join("nested");
+    fs::create_dir(&unexpected).expect("create unexpected descendant");
+    fs::create_dir(&nested).expect("create nested descendant");
+    let mut foreign = Command::new("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn foreign descendant");
+    move_process_to_cgroup(&foreign, &nested);
+
+    let recovered = run_restart_component(&fixture, "recover-create", tournament_uuid, None, 0);
+    let foreign_survived = foreign
+        .try_wait()
+        .expect("inspect foreign descendant after recovery")
+        .is_none();
+    let foreign_topology_survived = nested.is_dir();
+    let record_after = fs::read(&record_path).expect("reread rejected create record");
+
+    reap_attack_process(&mut foreign);
+    fs::remove_dir(&nested).expect("remove owned populated attack leaf");
+    fs::remove_dir(&unexpected).expect("remove owned attack parent");
+    fs::remove_dir(&domain).expect("remove rejected tournament domain");
+
+    assert_bounded_raw_free_failure(&recovered, &fixture, "populated-descendant");
+    assert!(foreign_survived, "recovery signaled a foreign descendant");
+    assert!(
+        foreign_topology_survived,
+        "recovery deleted the foreign descendant topology"
+    );
+    assert!(
+        record_after == record_before,
+        "recovery adopted or mutated a record with a populated descendant"
+    );
+    assert_no_tournament_domains();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CreatePendingTopologyAttack {
+    DirectPopulation,
+    WrongMode,
+    WrongType,
+    WrongNameSibling,
+    PrematureNestedLeaf,
+    StaleParentIdentity,
+}
+
+#[test]
+fn required_real_create_pending_rejects_inexact_topology_matrix() {
+    let attacks = [
+        CreatePendingTopologyAttack::DirectPopulation,
+        CreatePendingTopologyAttack::WrongMode,
+        CreatePendingTopologyAttack::WrongType,
+        CreatePendingTopologyAttack::WrongNameSibling,
+        CreatePendingTopologyAttack::PrematureNestedLeaf,
+        CreatePendingTopologyAttack::StaleParentIdentity,
+    ];
+    for attack in attacks {
+        let Some(fixture) = required_restart_fixture() else {
+            return;
+        };
+        let tournament_uuid = Uuid::new_v4();
+        let (failpoint, candidate) = match attack {
+            CreatePendingTopologyAttack::DirectPopulation
+            | CreatePendingTopologyAttack::WrongMode
+            | CreatePendingTopologyAttack::WrongType => ("after_tournament_create", 0),
+            CreatePendingTopologyAttack::WrongNameSibling
+            | CreatePendingTopologyAttack::PrematureNestedLeaf => {
+                ("after_candidate_parent_create", 0)
+            }
+            CreatePendingTopologyAttack::StaleParentIdentity => ("after_control_create", 0),
+        };
+        let crashed = run_restart_component(
+            &fixture,
+            "crash-create",
+            tournament_uuid,
+            Some(failpoint),
+            candidate,
+        );
+        assert_eq!(
+            crashed.status.code(),
+            Some(86),
+            "{attack:?} crash setup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&crashed.stdout),
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+        assert!(crashed.stdout.is_empty());
+        assert!(crashed.stderr.is_empty());
+
+        let record_path = fixture.path().join("restart-record.json");
+        let record_before = fs::read(&record_path).expect("read attack create-pending record");
+        let domain = tournament_domain(tournament_uuid);
+        let parent = domain.join("candidate-0");
+        let control = parent.join("control");
+        let wrong_name = domain.join("candidate-wrong");
+        let mut foreign = None;
+        let cleanup = match attack {
+            CreatePendingTopologyAttack::DirectPopulation => {
+                let child = Command::new("/usr/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn directly populated attack process");
+                move_process_to_cgroup(&child, &domain);
+                foreign = Some(child);
+                vec![domain.clone()]
+            }
+            CreatePendingTopologyAttack::WrongMode => {
+                fs::set_permissions(&domain, fs::Permissions::from_mode(0o700))
+                    .expect("change deterministic domain mode");
+                vec![domain.clone()]
+            }
+            CreatePendingTopologyAttack::WrongType => {
+                let threaded = domain.join("threaded-child");
+                fs::create_dir(&threaded).expect("create threaded attack child");
+                write_cgroup_leaf(&threaded, "cgroup.type", b"threaded\n");
+                vec![threaded, domain.clone()]
+            }
+            CreatePendingTopologyAttack::WrongNameSibling => {
+                fs::create_dir(&wrong_name).expect("create wrong-name candidate sibling");
+                vec![wrong_name, parent, domain.clone()]
+            }
+            CreatePendingTopologyAttack::PrematureNestedLeaf => {
+                fs::create_dir(&control).expect("create premature nested control leaf");
+                vec![control, parent, domain.clone()]
+            }
+            CreatePendingTopologyAttack::StaleParentIdentity => {
+                fs::remove_dir(&control).expect("remove original control leaf");
+                fs::remove_dir(&parent).expect("remove original candidate parent");
+                fs::create_dir(&parent).expect("recreate stale candidate parent");
+                fs::create_dir(&control).expect("recreate control under stale parent");
+                vec![control, parent, domain.clone()]
+            }
+        };
+
+        let recovered =
+            run_restart_component(&fixture, "recover-create", tournament_uuid, None, candidate);
+        let record_after = fs::read(&record_path).expect("reread rejected topology record");
+        let foreign_survived = foreign
+            .as_mut()
+            .map(|child| {
+                child
+                    .try_wait()
+                    .expect("inspect directly populated attack process")
+                    .is_none()
+            })
+            .unwrap_or(true);
+        if let Some(child) = foreign.as_mut() {
+            reap_attack_process(child);
+        }
+        for path in cleanup {
+            fs::remove_dir(&path).expect("remove owned create-pending attack cgroup");
+        }
+
+        assert_bounded_raw_free_failure(&recovered, &fixture, &format!("{attack:?}"));
+        assert!(
+            foreign_survived,
+            "{attack:?} recovery signaled foreign work"
+        );
+        assert!(
+            record_after == record_before,
+            "{attack:?} recovery adopted or mutated inexact topology"
+        );
         assert_no_tournament_domains();
     }
 }
