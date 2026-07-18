@@ -5230,10 +5230,10 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         Some([migration, migration]),
         RealExecutionExpectation::Complete { output_bytes: 0 },
     )?;
-    // The runner and 255 children fill the fixed pids.max=256 boundary. A few
-    // additional attempts prove the kernel rejection without spending the
-    // action deadline on failures that cannot add evidence.
-    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 260 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
+    // The topology action above proves the fixed production pids.max=256.
+    // This debug-only execution case lowers its already-verified leaf to 32
+    // so hosted runners can prove kernel rejection inside one action bound.
+    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 36 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
     run_real_execution_case(
         &fixture.join("q"),
         &cgroup_root,
@@ -5831,6 +5831,18 @@ fn run_real_execution_case(
             &mut tournament,
             TopologyAction::ConfigurePayloadLimit { candidate },
         )?;
+    }
+    if matches!(expectation, RealExecutionExpectation::PidsExhausted) {
+        for candidate in 0_u8..2 {
+            let payload = tournament.candidate(candidate)?.payload()?;
+            if read_leaf(payload, c"pids.max", 64)? != b"256\n" {
+                return Err(ContainmentErrorCode::TopologyFailure);
+            }
+            write_leaf(payload, c"pids.max", b"32\n")?;
+            if read_leaf(payload, c"pids.max", 64)? != b"32\n" {
+                return Err(ContainmentErrorCode::TopologyFailure);
+            }
+        }
     }
     let first = tournament.candidate(0)?;
     if first.control()?.identity == first.payload()?.identity {
