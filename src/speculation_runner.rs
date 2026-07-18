@@ -859,6 +859,7 @@ fn run_internal_runner(
         identity,
         ControlMessage::PayloadFdAck,
     )?;
+    runner_failpoint("runner_after_payload_fd_ack")?;
     if runner_failpoint_enabled("runner_duplicate_payload_fd_ack") {
         let duplicate = ControlFrame::new(
             identity,
@@ -1181,6 +1182,7 @@ const RUNNER_FAILPOINTS: &[&str] = &[
     "runner_before_payload_fd_validation",
     "runner_after_payload_fd_validation",
     "runner_before_payload_fd_ack",
+    "runner_after_payload_fd_ack",
     "runner_duplicate_payload_fd_ack",
     "runner_before_candidate_fork",
     "runner_after_candidate_fork",
@@ -1686,6 +1688,7 @@ mod tests {
             assert!(names.contains(format!("runner_after_{seam}").as_str()));
         }
         assert!(names.contains("runner_before_payload_fd_ack"));
+        assert!(names.contains("runner_after_payload_fd_ack"));
         assert!(names.contains("runner_duplicate_payload_fd_ack"));
         assert!(names.contains("runner_before_child_exec"));
     }

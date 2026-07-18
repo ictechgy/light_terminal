@@ -613,6 +613,83 @@ fn required_real_cleanup_edges_recover_before_and_after_abrupt_restart() {
 }
 
 #[test]
+fn required_real_live_tournament_empty_proof_edges_recover_without_foreign_deletion() {
+    for side in ["before", "after"] {
+        let Some(fixture) = required_restart_fixture() else {
+            return;
+        };
+        let failpoint = format!("{side}_tournament_empty_proof");
+        let tournament_uuid = Uuid::new_v4();
+        let crashed = run_restart_component(
+            &fixture,
+            "crash-cleanup",
+            tournament_uuid,
+            Some(&failpoint),
+            0,
+        );
+        assert_eq!(
+            crashed.status.code(),
+            Some(86),
+            "{failpoint} did not abruptly stop the live cleanup driver"
+        );
+        assert_bounded_raw_free_failure(&crashed, &fixture, &failpoint);
+        let live_pid = fs::read_to_string(fixture.path().join("live-topology-populated"))
+            .expect("live cleanup observed populated topology")
+            .trim()
+            .parse::<u32>()
+            .expect("bounded live topology pid evidence");
+        assert_eq!(
+            fs::read(fixture.path().join("live-topology-quiescent"))
+                .expect("live cleanup observed quiescent topology"),
+            b"1\n"
+        );
+
+        let cgroup_root = std::path::PathBuf::from(
+            std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+                .expect("required restart run needs LTERM_SPECULATION_CGROUP_ROOT"),
+        );
+        let foreign_cgroup = cgroup_root.join(format!("lterm-g003-foreign-{tournament_uuid}"));
+        fs::create_dir(&foreign_cgroup).expect("create foreign sibling cgroup");
+        let mut foreign = Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn foreign sibling process");
+        move_process_to_cgroup(&foreign, &foreign_cgroup);
+
+        let recovered =
+            run_restart_component(&fixture, "recover-cleanup", tournament_uuid, None, 0);
+        let foreign_survived = foreign
+            .try_wait()
+            .expect("inspect foreign sibling process")
+            .is_none();
+        let foreign_topology_survived = foreign_cgroup.is_dir();
+        reap_attack_process(&mut foreign);
+        fs::remove_dir(&foreign_cgroup).expect("remove surviving foreign sibling cgroup");
+
+        assert!(
+            recovered.status.success(),
+            "{failpoint} recovery failed: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(recovered.stdout, b"speculation-cleanup-recovered=1\n");
+        assert!(recovered.stderr.is_empty());
+        assert_candidate_workspaces_empty(&fixture, &failpoint);
+        assert!(foreign_survived, "{failpoint} signaled foreign work");
+        assert!(
+            foreign_topology_survived,
+            "{failpoint} deleted foreign topology"
+        );
+        assert!(
+            !std::path::Path::new("/proc")
+                .join(live_pid.to_string())
+                .exists(),
+            "{failpoint} leaked the live topology process"
+        );
+        assert_no_tournament_domains();
+    }
+}
+
+#[test]
 fn required_real_missing_daemon_edges_die_abruptly_and_recover_separately() {
     let pids_edges = ["pids_enable_write", "pids_enable_readback"];
     for edge in pids_edges {
@@ -710,6 +787,7 @@ fn required_real_runner_abrupt_matrix_recovers_without_candidate_execution() {
         "runner_before_payload_fd_validation",
         "runner_after_payload_fd_validation",
         "runner_before_payload_fd_ack",
+        "runner_after_payload_fd_ack",
         "runner_duplicate_payload_fd_ack",
         "runner_before_candidate_fork",
         "runner_after_candidate_fork",
@@ -753,6 +831,7 @@ fn required_real_placement_ack_release_and_pre_exec_failpoints_cleanup() {
         "runner_before_payload_fd_validation",
         "runner_after_payload_fd_validation",
         "runner_before_payload_fd_ack",
+        "runner_after_payload_fd_ack",
         "runner_duplicate_payload_fd_ack",
         "runner_before_candidate_fork",
         "runner_after_candidate_fork",

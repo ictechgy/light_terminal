@@ -3977,7 +3977,7 @@ fn run_runtime_restart_driver(mode: &std::ffi::OsStr) -> ContainmentResult<()> {
         b"recover-runtime" => {
             let mut record = read_restart_record(&record_path)?;
             if fixture.join("expect-no-candidate-exec").exists() {
-                prove_no_candidate_exec(&record)?;
+                prove_no_candidate_exec(&record, &fixture)?;
             }
             let owner = ManagedOwnerTag {
                 kind: ManagedOwnerKind::Speculation,
@@ -4024,6 +4024,14 @@ fn run_runtime_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRe
             .create(path)
             .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     }
+    let argv = if failpoint.starts_with("runner_") {
+        vec![
+            OsString::from("/usr/bin/touch"),
+            OsString::from("/workspace/candidate-executed"),
+        ]
+    } else {
+        vec![OsString::from("/usr/bin/sleep"), OsString::from("30")]
+    };
     let context = validate_prepare(
         PrepareInputs {
             tournament_uuid,
@@ -4033,7 +4041,7 @@ fn run_runtime_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRe
             ledger_root: ledger,
             cgroup_root,
             control_root: control,
-            argv: vec![OsString::from("/usr/bin/sleep"), OsString::from("30")],
+            argv,
         },
         ContainmentDeadline::control_action(),
     )?;
@@ -4171,7 +4179,18 @@ fn run_runtime_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRe
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
-fn prove_no_candidate_exec(record: &TournamentRecord) -> ContainmentResult<()> {
+fn prove_no_candidate_exec(record: &TournamentRecord, fixture: &Path) -> ContainmentResult<()> {
+    for candidate in ["candidate-0", "candidate-1"] {
+        let path = fixture.join(candidate);
+        if path.is_dir()
+            && std::fs::read_dir(path)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+                .next()
+                .is_some()
+        {
+            return Err(ContainmentErrorCode::TerminalBoundaryFailure);
+        }
+    }
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .map(PathBuf::from)
         .ok_or(ContainmentErrorCode::Unsupported)?;
@@ -4187,7 +4206,10 @@ fn prove_no_candidate_exec(record: &TournamentRecord) -> ContainmentResult<()> {
             Ok(executable) => executable,
             Err(_) => continue,
         };
-        if executable == Path::new("/usr/bin/sleep") {
+        if matches!(
+            executable.as_path(),
+            path if path == Path::new("/usr/bin/sleep") || path == Path::new("/usr/bin/touch")
+        ) {
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         }
     }
@@ -4308,6 +4330,15 @@ fn run_cleanup_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRe
             }
             reconcile_valid_record(&record, action, ContainmentDeadline::control_action())?;
         }
+        CleanupRestartTarget::LiveTournament => {
+            run_live_tournament_empty_crash(
+                fixture,
+                record_path,
+                &mut record,
+                &mut topology,
+                candidate,
+            )?;
+        }
     }
     Err(ContainmentErrorCode::EvidenceUnavailable)
 }
@@ -4317,6 +4348,7 @@ fn run_cleanup_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRe
 enum CleanupRestartTarget {
     Candidate(RecoveryAction),
     Tournament(RecoveryAction),
+    LiveTournament,
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -4343,12 +4375,167 @@ fn cleanup_restart_target(name: &str, candidate: u8) -> ContainmentResult<Cleanu
         Some("recovery_tournament_empty_proof") => {
             CleanupRestartTarget::Tournament(RecoveryAction::ProveTournamentEmpty)
         }
+        Some("tournament_empty_proof") => CleanupRestartTarget::LiveTournament,
         Some("tournament_remove") => {
             CleanupRestartTarget::Tournament(RecoveryAction::RemoveTournamentDomain)
         }
         _ => return Err(ContainmentErrorCode::InvalidIdentity),
     };
     Ok(target)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_live_tournament_empty_crash(
+    fixture: &Path,
+    record_path: &Path,
+    record: &mut TournamentRecord,
+    topology: &mut TournamentTopology,
+    candidate: u8,
+) -> ContainmentResult<()> {
+    let index = usize::from(candidate);
+    let from = match record.cgroups[index].lifecycle {
+        CgroupLifecycleState::Forward(from) if from != CgroupForwardState::Planned => from,
+        _ => return Err(ContainmentErrorCode::EvidenceUnavailable),
+    };
+    let mut live = std::process::Command::new("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let live_pid = live.id();
+    let cleanup_result = (|| {
+        let candidate_topology = topology.candidate(candidate)?;
+        write_leaf(
+            candidate_topology.payload()?,
+            c"cgroup.procs",
+            format!("{live_pid}\n").as_bytes(),
+        )?;
+        wait_populated_one(
+            candidate_topology.payload()?,
+            ContainmentDeadline::control_action(),
+        )?;
+        wait_populated_one(
+            candidate_topology
+                .parent
+                .as_ref()
+                .ok_or(ContainmentErrorCode::TopologyFailure)?,
+            ContainmentDeadline::control_action(),
+        )?;
+        let domain = topology
+            .domain
+            .as_ref()
+            .ok_or(ContainmentErrorCode::TopologyFailure)?;
+        wait_populated_one(domain, ContainmentDeadline::control_action())?;
+        persist_live_cleanup_evidence(
+            fixture,
+            "live-topology-populated",
+            format!("{live_pid}\n").as_bytes(),
+        )?;
+
+        record.cgroups[index].lifecycle = CgroupLifecycleState::ParentKillPending { from };
+        persist_restart_record(record_path, record)?;
+        perform_candidate_cleanup_action(
+            topology,
+            candidate,
+            CandidateCleanupAction::KillParent,
+            ContainmentDeadline::control_action(),
+        )?;
+        perform_candidate_cleanup_action(
+            topology,
+            candidate,
+            CandidateCleanupAction::ProveParentEmpty,
+            ContainmentDeadline::control_action(),
+        )?;
+        Ok(())
+    })();
+    if cleanup_result.is_err() {
+        let _ = live.kill();
+    }
+    live.wait()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    cleanup_result?;
+    persist_live_cleanup_evidence(fixture, "live-topology-quiescent", b"1\n")?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentEmpty { from };
+    persist_restart_record(record_path, record)?;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    perform_candidate_cleanup_action(
+        topology,
+        candidate,
+        CandidateCleanupAction::RemovePayload,
+        ContainmentDeadline::control_action(),
+    )?;
+    record.cgroups[index].payload = None;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemoved { from };
+    persist_restart_record(record_path, record)?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    perform_candidate_cleanup_action(
+        topology,
+        candidate,
+        CandidateCleanupAction::RemoveControl,
+        ContainmentDeadline::control_action(),
+    )?;
+    record.cgroups[index].control = None;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemoved { from };
+    persist_restart_record(record_path, record)?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    perform_candidate_cleanup_action(
+        topology,
+        candidate,
+        CandidateCleanupAction::RemoveParent,
+        ContainmentDeadline::control_action(),
+    )?;
+    record.cgroups[index].parent = None;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::Removed;
+    let other = usize::from(1_u8 - candidate);
+    record.cgroups[other].lifecycle = CgroupLifecycleState::Removed;
+    record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
+    persist_restart_record(record_path, record)?;
+
+    perform_tournament_cleanup_action(
+        topology,
+        TournamentCleanupAction::ProveEmpty,
+        ContainmentDeadline::control_action(),
+    )?;
+    Err(ContainmentErrorCode::EvidenceUnavailable)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn wait_populated_one(
+    node: &RetainedCgroupNode,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    loop {
+        if parse_populated(&read_leaf(node, c"cgroup.events", 4096)?)? == 1 {
+            return Ok(());
+        }
+        deadline.remaining()?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn persist_live_cleanup_evidence(
+    fixture: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> ContainmentResult<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options
+        .open(fixture.join(name))
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    file.write_all(bytes)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    file.sync_all()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    File::open(fixture)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
