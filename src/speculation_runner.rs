@@ -5,11 +5,18 @@
 //! control input and are only counted by the Linux runner.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fmt;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use uuid::Uuid;
 
 pub(crate) const MAX_CONTROL_FRAME_BYTES: usize = 8 * 1024;
@@ -677,6 +684,665 @@ fn decode_base64_digit(byte: u8) -> RunnerResult<u8> {
     }
 }
 
+pub(crate) fn dispatch_internal_speculation_mode(arguments: &[OsString]) -> RunnerResult<bool> {
+    let Some(mode) = arguments.get(1).and_then(|value| value.to_str()) else {
+        return Ok(false);
+    };
+    if mode == "--internal-speculation-probe-v1" {
+        #[cfg(target_os = "linux")]
+        {
+            run_internal_probe()?;
+            return Ok(true);
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(RunnerProtocolError::Unsupported);
+    }
+    if mode != "--internal-speculation-runner-v1" {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (identity, control) = parse_internal_runner_arguments(arguments)?;
+        run_internal_runner(identity, &control)?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(RunnerProtocolError::Unsupported)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_internal_runner_arguments(
+    arguments: &[OsString],
+) -> RunnerResult<(RunnerIdentity, OsString)> {
+    if arguments.len() != 10
+        || arguments[2] != "--tournament"
+        || arguments[4] != "--candidate-index"
+        || arguments[6] != "--generation"
+        || arguments[8] != "--control"
+    {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    let identity = RunnerIdentity {
+        tournament_uuid: arguments[3]
+            .to_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or(RunnerProtocolError::InvalidIdentity)?,
+        candidate_index: arguments[5]
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or(RunnerProtocolError::InvalidIdentity)?,
+        generation: arguments[7]
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or(RunnerProtocolError::InvalidIdentity)?,
+    };
+    identity.validate()?;
+    let control = arguments[9].clone();
+    let bytes = control.as_os_str().as_bytes();
+    if !bytes.starts_with(b"/") || bytes.is_empty() || bytes.len() >= 108 || bytes.contains(&0) {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    Ok((identity, control))
+}
+
+#[cfg(target_os = "linux")]
+fn run_internal_runner(
+    identity: RunnerIdentity,
+    control_path: &std::ffi::OsStr,
+) -> RunnerResult<()> {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    unsafe { libc::close(10) };
+    let peer = connect_seqpacket(control_path)?;
+    let started = Instant::now();
+    let mut validator = SequenceValidator::new(identity)?;
+    send_runner_frame(&peer, &mut validator, identity, ControlMessage::Hello)?;
+    let hello_ack = receive_runner_frame(&peer, &mut validator)?;
+    if !matches!(hello_ack.message, ControlMessage::HelloAck) {
+        return Err(RunnerProtocolError::InvalidSequence);
+    }
+    let begin = receive_runner_frame(&peer, &mut validator)?;
+    let ControlMessage::ArgvBegin {
+        argument_count,
+        total_bytes,
+    } = begin.message
+    else {
+        return Err(RunnerProtocolError::InvalidSequence);
+    };
+    let mut assembler = ArgvAssembler::begin(argument_count, total_bytes)?;
+    loop {
+        let frame = receive_runner_frame(&peer, &mut validator)?;
+        match frame.message {
+            ControlMessage::ArgvChunk {
+                argument_index,
+                offset,
+                total,
+                data,
+            } => assembler.push_chunk(argument_index, offset, total, &data)?,
+            ControlMessage::ArgvEnd => break,
+            _ => return Err(RunnerProtocolError::InvalidSequence),
+        }
+    }
+    let argv = assembler.finish()?;
+    let pty = InternalPty::open()?;
+    send_runner_frame(&peer, &mut validator, identity, ControlMessage::Ready)?;
+    let (ready_ack, placement) = receive_frame_with_one_fd(&peer)?;
+    validator.accept(&ready_ack)?;
+    let ControlMessage::ReadyAck {
+        placement: expected,
+    } = ready_ack.message
+    else {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    };
+    validate_placement_fd(&placement, expected, identity)?;
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::PayloadFdAck,
+    )?;
+    let go = receive_runner_frame(&peer, &mut validator)?;
+    if !matches!(go.message, ControlMessage::Go) {
+        return Err(RunnerProtocolError::InvalidSequence);
+    }
+    let go_elapsed = started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::GoReceived {
+            elapsed_ns: go_elapsed,
+        },
+    )?;
+    let child = spawn_placement_blocked_child(placement, &pty, &argv)?;
+    drop(pty.slave);
+    drop(pty.dev_null);
+    wait_for_placed_ack(&child.placed_read)?;
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::PayloadPlaced,
+    )?;
+    let release = receive_runner_frame(&peer, &mut validator)?;
+    if !matches!(release.message, ControlMessage::PayloadRelease) {
+        return Err(RunnerProtocolError::InvalidSequence);
+    }
+    release_child(&child.release_write)?;
+    let completion = drain_and_wait(child.pid, &pty.master, started)?;
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::LeaderExited {
+            category: completion.category,
+        },
+    )?;
+    // The daemon receives LEADER_EXITED before this read reaches EOF and may
+    // now kill the payload cgroup.  Descendants retaining the PTY slave cannot
+    // make output-drained substitute for cgroup emptiness.
+    let bytes = drain_to_eof(&pty.master, completion.bytes)?;
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::OutputDrained { bytes },
+    )?;
+    let accepted = receive_runner_frame(&peer, &mut validator)?;
+    if !matches!(accepted.message, ControlMessage::ResultAccepted) {
+        return Err(RunnerProtocolError::InvalidSequence);
+    }
+    let decision = receive_runner_frame(&peer, &mut validator)?;
+    let ControlMessage::Decision { decision } = decision.message else {
+        return Err(RunnerProtocolError::InvalidSequence);
+    };
+    send_runner_frame(
+        &peer,
+        &mut validator,
+        identity,
+        ControlMessage::Ack { decision },
+    )?;
+    if !validator.is_complete() {
+        return Err(RunnerProtocolError::InvalidSequence);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_internal_probe() -> RunnerResult<()> {
+    let expected = [
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", "/home/lterm"),
+        ("TMPDIR", "/tmp"),
+        ("LANG", "C.UTF-8"),
+        ("LC_ALL", "C.UTF-8"),
+        ("TERM", "xterm-256color"),
+    ];
+    for (name, value) in expected {
+        if std::env::var(name).as_deref() != Ok(value) {
+            return Err(RunnerProtocolError::InvalidFrame);
+        }
+    }
+    if std::env::vars_os().count() != expected.len() {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    let status = std::fs::read("/proc/self/status").map_err(|_| RunnerProtocolError::Io)?;
+    let status = std::str::from_utf8(&status).map_err(|_| RunnerProtocolError::InvalidFrame)?;
+    if !status.lines().any(|line| line == "NoNewPrivs:\t1")
+        || !status
+            .lines()
+            .any(|line| line == "CapEff:\t0000000000000000")
+    {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    if std::path::Path::new("/sys").exists()
+        || std::path::Path::new("/sys/fs/cgroup").exists()
+        || std::path::Path::new("/run/docker.sock").exists()
+        || std::path::Path::new("/run/podman/podman.sock").exists()
+        || std::path::Path::new("/var/run/docker.sock").exists()
+        || std::path::Path::new("/run/dbus/system_bus_socket").exists()
+        || std::path::Path::new("/run/lterm-control/control.sock").exists()
+    {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    let mut stdin_byte = 0_u8;
+    if unsafe { libc::read(0, (&mut stdin_byte as *mut u8).cast(), 1) } != 0
+        || unsafe { libc::isatty(1) } != 1
+        || unsafe { libc::isatty(2) } != 1
+    {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    let controlling_tty = unsafe {
+        libc::open(
+            c"/dev/tty".as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if controlling_tty >= 0 {
+        unsafe { libc::close(controlling_tty) };
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    for fd in [0, 1, 2] {
+        if unsafe { libc::tcgetsid(fd) } >= 0 {
+            return Err(RunnerProtocolError::InvalidFrame);
+        }
+    }
+    audit_probe_descriptors()?;
+    let canary = std::path::Path::new("/workspace/.lterm-speculation-probe-v1");
+    std::fs::write(canary, b"probe").map_err(|_| RunnerProtocolError::Io)?;
+    std::fs::remove_file(canary).map_err(|_| RunnerProtocolError::Io)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn audit_probe_descriptors() -> RunnerResult<()> {
+    let directory = std::fs::read_dir("/proc/self/fd").map_err(|_| RunnerProtocolError::Io)?;
+    let mut enumeration_fds = 0_u8;
+    for entry in directory {
+        let entry = entry.map_err(|_| RunnerProtocolError::Io)?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<RawFd>().ok())
+        else {
+            return Err(RunnerProtocolError::InvalidFrame);
+        };
+        if fd < 3 {
+            continue;
+        }
+        let target = std::fs::read_link(entry.path()).map_err(|_| RunnerProtocolError::Io)?;
+        let target = target.as_os_str().as_bytes();
+        if target.starts_with(b"/proc/") && target.ends_with(b"/fd") {
+            enumeration_fds = enumeration_fds.saturating_add(1);
+            continue;
+        }
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    if enumeration_fds > 1 {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn connect_seqpacket(path: &std::ffi::OsStr) -> RunnerResult<File> {
+    let bytes = path.as_bytes();
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    let address_mut = unsafe { address.assume_init_mut() };
+    if bytes.len() >= address_mut.sun_path.len() {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    address_mut.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address_mut.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(RunnerProtocolError::Unsupported);
+    }
+    let socket = unsafe { File::from_raw_fd(fd) };
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+        .try_into()
+        .map_err(|_| RunnerProtocolError::InvalidFrame)?;
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            address_mut as *const libc::sockaddr_un as *const libc::sockaddr,
+            length,
+        )
+    } != 0
+    {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn send_runner_frame(
+    peer: &File,
+    validator: &mut SequenceValidator,
+    identity: RunnerIdentity,
+    message: ControlMessage,
+) -> RunnerResult<()> {
+    let frame = ControlFrame::new(identity, validator.next_sequence(), message);
+    validator.accept(&frame)?;
+    send_frame_packet(peer, &frame)
+}
+
+#[cfg(target_os = "linux")]
+fn receive_runner_frame(
+    peer: &File,
+    validator: &mut SequenceValidator,
+) -> RunnerResult<ControlFrame> {
+    let frame = receive_frame_packet(peer)?;
+    validator.accept(&frame)?;
+    Ok(frame)
+}
+
+#[cfg(target_os = "linux")]
+struct InternalPty {
+    master: File,
+    slave: File,
+    dev_null: File,
+}
+
+#[cfg(target_os = "linux")]
+impl InternalPty {
+    fn open() -> RunnerResult<Self> {
+        let master_fd =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if master_fd < 0
+            || unsafe { libc::grantpt(master_fd) } != 0
+            || unsafe { libc::unlockpt(master_fd) } != 0
+        {
+            if master_fd >= 0 {
+                unsafe { libc::close(master_fd) };
+            }
+            return Err(RunnerProtocolError::Io);
+        }
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        let mut name = [0_i8; 256];
+        if unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) } != 0 {
+            return Err(RunnerProtocolError::Io);
+        }
+        let slave_fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if slave_fd < 0 {
+            return Err(RunnerProtocolError::Io);
+        }
+        let dev_null_fd = unsafe {
+            libc::open(
+                c"/dev/null".as_ptr(),
+                libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if dev_null_fd < 0 {
+            unsafe { libc::close(slave_fd) };
+            return Err(RunnerProtocolError::Io);
+        }
+        Ok(Self {
+            master,
+            slave: unsafe { File::from_raw_fd(slave_fd) },
+            dev_null: unsafe { File::from_raw_fd(dev_null_fd) },
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PlacementBlockedChild {
+    pid: libc::pid_t,
+    placed_read: File,
+    release_write: File,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_placement_blocked_child(
+    placement: File,
+    pty: &InternalPty,
+    arguments: &[Vec<u8>],
+) -> RunnerResult<PlacementBlockedChild> {
+    let argv = arguments
+        .iter()
+        .map(|argument| std::ffi::CString::new(argument.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| RunnerProtocolError::InvalidArgv)?;
+    let env = [
+        c"PATH=/usr/bin:/bin",
+        c"HOME=/home/lterm",
+        c"TMPDIR=/tmp",
+        c"LANG=C.UTF-8",
+        c"LC_ALL=C.UTF-8",
+        c"TERM=xterm-256color",
+    ];
+    let mut argv_ptrs = argv
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .collect::<Vec<_>>();
+    argv_ptrs.push(std::ptr::null());
+    let mut env_ptrs = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    env_ptrs.push(std::ptr::null());
+    let placement = relocate_high(placement)?;
+    let (placed_read, placed_write) = cloexec_pipe()?;
+    let placed_write = relocate_high(placed_write)?;
+    let (release_read, release_write) = cloexec_pipe()?;
+    let release_read = relocate_high(release_read)?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    if pid == 0 {
+        unsafe {
+            if libc::dup2(pty.dev_null.as_raw_fd(), 0) < 0
+                || libc::dup2(pty.slave.as_raw_fd(), 1) < 0
+                || libc::dup2(pty.slave.as_raw_fd(), 2) < 0
+                || libc::dup3(placement.as_raw_fd(), 3, libc::O_CLOEXEC) < 0
+                || libc::dup3(placed_write.as_raw_fd(), 4, libc::O_CLOEXEC) < 0
+                || libc::dup3(release_read.as_raw_fd(), 5, libc::O_CLOEXEC) < 0
+            {
+                libc::_exit(125);
+            }
+            close_child_fds_from(6);
+            if libc::write(3, b"0\n".as_ptr().cast(), 2) != 2 {
+                libc::_exit(125);
+            }
+            libc::close(3);
+            if libc::write(4, b"P".as_ptr().cast(), 1) != 1 {
+                libc::_exit(125);
+            }
+            libc::close(4);
+            let mut release = 0_u8;
+            if libc::read(5, (&mut release as *mut u8).cast(), 1) != 1 || release != b'R' {
+                libc::_exit(125);
+            }
+            libc::close(5);
+            libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+            libc::_exit(126);
+        }
+    }
+    drop((placement, placed_write, release_read));
+    Ok(PlacementBlockedChild {
+        pid,
+        placed_read,
+        release_write,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn relocate_high(file: File) -> RunnerResult<File> {
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+    if fd < 64 {
+        return Err(RunnerProtocolError::Io);
+    }
+    drop(file);
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn cloexec_pipe() -> RunnerResult<(File, File)> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn close_child_fds_from(first: RawFd) {
+    if unsafe { libc::syscall(libc::SYS_close_range, first as libc::c_uint, u32::MAX, 0) } == 0 {
+        return;
+    }
+    for fd in first..65_536 {
+        unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_placed_ack(file: &File) -> RunnerResult<()> {
+    let mut byte = 0_u8;
+    let read = unsafe { libc::read(file.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+    if read != 1 || byte != b'P' {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn release_child(file: &File) -> RunnerResult<()> {
+    if unsafe { libc::write(file.as_raw_fd(), b"R".as_ptr().cast(), 1) } != 1 {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct LeaderCompletion {
+    category: RunnerExitCategory,
+    bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn drain_and_wait(
+    pid: libc::pid_t,
+    master: &File,
+    _started: Instant,
+) -> RunnerResult<LeaderCompletion> {
+    set_nonblocking(master)?;
+    let mut bytes = 0_u64;
+    loop {
+        bytes = drain_available(master, bytes)?;
+        let mut status = 0_i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            let category = if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES {
+                RunnerExitCategory::OutputLimitExceeded
+            } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                RunnerExitCategory::ExitedZero
+            } else if libc::WIFEXITED(status) {
+                RunnerExitCategory::ExitedNonzero
+            } else if libc::WIFSIGNALED(status) {
+                RunnerExitCategory::Signaled
+            } else {
+                RunnerExitCategory::EvidenceIncomplete
+            };
+            return Ok(LeaderCompletion { category, bytes });
+        }
+        if waited < 0 {
+            return Err(RunnerProtocolError::Io);
+        }
+        let mut pollfd = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pollfd, 1, 10) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_to_eof(master: &File, mut bytes: u64) -> RunnerResult<u64> {
+    loop {
+        match drain_available_with_eof(master, bytes)? {
+            (next, true) => return Ok(next),
+            (next, false) => bytes = next,
+        }
+        let mut pollfd = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pollfd, 1, 5_000) } <= 0 {
+            return Err(RunnerProtocolError::Io);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_available(master: &File, bytes: u64) -> RunnerResult<u64> {
+    drain_available_with_eof(master, bytes).map(|(bytes, _)| bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn drain_available_with_eof(master: &File, mut bytes: u64) -> RunnerResult<(u64, bool)> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read =
+            unsafe { libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read > 0 {
+            bytes = bytes.saturating_add(read as u64);
+            continue;
+        }
+        if read == 0 {
+            return Ok((bytes, true));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok((bytes, false));
+        }
+        if error.raw_os_error() == Some(libc::EIO) {
+            return Ok((bytes, true));
+        }
+        return Err(RunnerProtocolError::Io);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_nonblocking(file: &File) -> RunnerResult<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
+    {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_placement_fd(
+    file: &File,
+    expected: PlacementDescriptorEvidence,
+    identity: RunnerIdentity,
+) -> RunnerResult<()> {
+    expected.validate(identity)?;
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 || !matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR) {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| RunnerProtocolError::DescriptorViolation)?;
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0
+        || unsafe { statfs.assume_init() }.f_type as u64 != libc::CGROUP2_SUPER_MAGIC as u64
+        || metadata.dev() != expected.dev
+        || metadata.ino() != expected.ino
+    {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    }
+    const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    if unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS | STATX_MNT_ID_UNIQUE,
+            statx.as_mut_ptr(),
+        )
+    } != 0
+        || unsafe { statx.assume_init() }.stx_mnt_id != expected.statx_mnt_id_unique
+    {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1479,120 @@ mod tests {
             bad.validate(identity()),
             Err(RunnerProtocolError::DescriptorViolation)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn seqpacket_pair() -> (File, File) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn raw_send_with_fds(socket: &File, bytes: &[u8], files: &[&File]) {
+        let mut iovec = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let payload_bytes = files.len() * std::mem::size_of::<RawFd>();
+        let mut control = vec![0_u8; unsafe { libc::CMSG_SPACE(payload_bytes as u32) } as usize];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        if !files.is_empty() {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = control.len();
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                assert!(!header.is_null());
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(payload_bytes as u32) as usize;
+                for (index, file) in files.iter().enumerate() {
+                    std::ptr::write_unaligned(
+                        libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                        file.as_raw_fd(),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancillary_receive_accepts_exactly_one_cloexec_fd() {
+        let (sender, receiver) = seqpacket_pair();
+        let transferred = File::open("/dev/null").unwrap();
+        let frame = ControlFrame::new(identity(), 0, ControlMessage::Hello);
+        send_frame_with_one_fd(&sender, &frame, &transferred).unwrap();
+        let (observed, received) = receive_frame_with_one_fd(&receiver).unwrap();
+        assert_eq!(observed, frame);
+        let descriptor_flags = unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) };
+        assert!(descriptor_flags >= 0 && descriptor_flags & libc::FD_CLOEXEC != 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancillary_rejections_close_missing_extra_malformed_and_truncated_descriptors() {
+        let frame = ControlFrame::new(identity(), 0, ControlMessage::Hello);
+        let encoded = encode_frame(&frame).unwrap();
+        let transferred = File::open("/dev/null").unwrap();
+
+        let (sender, receiver) = seqpacket_pair();
+        send_frame_packet(&sender, &frame).unwrap();
+        assert!(matches!(
+            receive_frame_with_one_fd(&receiver),
+            Err(RunnerProtocolError::DescriptorViolation)
+        ));
+
+        let (sender, receiver) = seqpacket_pair();
+        let before = open_fd_count();
+        raw_send_with_fds(&sender, &encoded, &[&transferred, &transferred]);
+        assert!(matches!(
+            receive_frame_with_one_fd(&receiver),
+            Err(RunnerProtocolError::DescriptorViolation)
+        ));
+        assert_eq!(open_fd_count(), before);
+
+        let (sender, receiver) = seqpacket_pair();
+        let before = open_fd_count();
+        raw_send_with_fds(&sender, b"{", &[&transferred]);
+        assert!(matches!(
+            receive_frame_with_one_fd(&receiver),
+            Err(RunnerProtocolError::InvalidFrame)
+        ));
+        assert_eq!(open_fd_count(), before);
+
+        let (sender, receiver) = seqpacket_pair();
+        let before = open_fd_count();
+        raw_send_with_fds(
+            &sender,
+            &vec![b'x'; MAX_CONTROL_FRAME_BYTES + 1],
+            &[&transferred],
+        );
+        assert!(matches!(
+            receive_frame_with_one_fd(&receiver),
+            Err(RunnerProtocolError::DescriptorViolation)
+        ));
+        assert_eq!(open_fd_count(), before);
     }
 }

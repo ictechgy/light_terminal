@@ -833,7 +833,15 @@ fn run() -> Result<()> {
     if launch_registry::dispatch_internal_test_driver()? {
         return Ok(());
     }
-    let cli = parse_cli_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if speculation_runner::dispatch_internal_speculation_mode(&arguments)? {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if speculation_linux::dispatch_internal_containment_test_driver(&arguments)? {
+        return Ok(());
+    }
+    let cli = parse_cli_from(arguments).unwrap_or_else(|error| error.exit());
     match cli.command {
         Commands::Daemon => server::serve_forever(),
         Commands::New {
