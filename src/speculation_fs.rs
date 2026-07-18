@@ -17,6 +17,11 @@ const MAX_LEAF_BYTES: usize = 255;
 const TRANSACTION_TEMP_PREFIX: &str = ".lterm-speculation-txn-v1-";
 const TRANSACTION_TEMP_SUFFIX: &str = ".tmp";
 
+#[cfg(all(target_os = "linux", test))]
+std::thread_local! {
+    static FORCE_DIRECT_LINK_ENOENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceError {
     Unsupported,
@@ -505,8 +510,18 @@ fn create_unnamed_temp(_dirfd: RawFd) -> EvidenceResult<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
-    let mut result = unsafe {
+fn direct_link_unnamed(file: &File, dirfd: RawFd, leaf: &CStr) -> i32 {
+    #[cfg(test)]
+    if FORCE_DIRECT_LINK_ENOENT.with(std::cell::Cell::get) {
+        unsafe {
+            *libc::__errno_location() = libc::ENOENT;
+        }
+        return -1;
+    }
+
+    // Linux open(2)/linkat(2) explicitly permit O_TMPFILE without O_EXCL to be
+    // linked with AT_EMPTY_PATH even when CAP_DAC_READ_SEARCH is absent.
+    unsafe {
         libc::linkat(
             file.as_raw_fd(),
             c"".as_ptr(),
@@ -514,7 +529,12 @@ fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> Evidenc
             leaf.as_ptr(),
             libc::AT_EMPTY_PATH,
         )
-    };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
+    let mut result = direct_link_unnamed(file, dirfd, leaf);
     let direct_error = if result != 0 {
         std::io::Error::last_os_error().raw_os_error()
     } else {
@@ -762,84 +782,26 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    const CAPABILITY_TEST_CHILD: &str = "LTERM_SPECULATION_CAPABILITY_TEST_CHILD";
+    struct DirectLinkEnoentGuard;
 
     #[cfg(target_os = "linux")]
-    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
-    #[cfg(target_os = "linux")]
-    const CAP_DAC_READ_SEARCH_NUMBER: usize = 2;
-
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Copy, Default)]
-    #[repr(C)]
-    struct LinuxCapabilityData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
+    impl DirectLinkEnoentGuard {
+        fn install() -> Self {
+            FORCE_DIRECT_LINK_ENOENT.with(|enabled| {
+                assert!(
+                    !enabled.replace(true),
+                    "direct-link failpoint already active"
+                );
+            });
+            Self
+        }
     }
 
     #[cfg(target_os = "linux")]
-    #[repr(C)]
-    struct LinuxCapabilityHeader {
-        version: u32,
-        pid: i32,
-    }
-
-    #[cfg(target_os = "linux")]
-    fn linux_capabilities() -> [LinuxCapabilityData; 2] {
-        let mut header = LinuxCapabilityHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [LinuxCapabilityData::default(); 2];
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_capget,
-                &mut header as *mut LinuxCapabilityHeader,
-                data.as_mut_ptr(),
-            )
-        };
-        assert_eq!(
-            result,
-            0,
-            "capget failed: {}",
-            std::io::Error::last_os_error()
-        );
-        assert_eq!(header.version, LINUX_CAPABILITY_VERSION_3);
-        data
-    }
-
-    #[cfg(target_os = "linux")]
-    fn clear_and_verify_dac_read_search_capability() {
-        let mut header = LinuxCapabilityHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = linux_capabilities();
-        let word = CAP_DAC_READ_SEARCH_NUMBER / 32;
-        let mask = 1_u32 << (CAP_DAC_READ_SEARCH_NUMBER % 32);
-        data[word].effective &= !mask;
-        data[word].permitted &= !mask;
-        data[word].inheritable &= !mask;
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_capset,
-                &mut header as *mut LinuxCapabilityHeader,
-                data.as_ptr(),
-            )
-        };
-        assert_eq!(
-            result,
-            0,
-            "capset failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        let verified = linux_capabilities();
-        assert_eq!(verified[word].effective & mask, 0);
-        assert_eq!(verified[word].permitted & mask, 0);
-        assert_eq!(verified[word].inheritable & mask, 0);
+    impl Drop for DirectLinkEnoentGuard {
+        fn drop(&mut self) {
+            FORCE_DIRECT_LINK_ENOENT.with(|enabled| enabled.set(false));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -986,24 +948,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn procfs_fallback_publishes_after_explicit_capability_drop() {
+    fn procfs_fallback_publishes_when_direct_link_returns_enoent() {
         use std::os::unix::fs::DirBuilderExt;
 
-        if std::env::var_os(CAPABILITY_TEST_CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "speculation_fs::tests::procfs_fallback_publishes_after_explicit_capability_drop",
-                    "--nocapture",
-                ])
-                .env(CAPABILITY_TEST_CHILD, "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "capability-free child test failed");
-            return;
-        }
-
-        clear_and_verify_dac_read_search_capability();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("private");
         std::fs::DirBuilder::new()
@@ -1011,26 +958,7 @@ mod tests {
             .create(&path)
             .unwrap();
         let directory = open_existing_private_dir(&path).unwrap();
-
-        let probe = create_unnamed_temp(directory.file.as_raw_fd()).unwrap();
-        let direct_leaf = c"direct-empty-path-probe";
-        let direct_result = unsafe {
-            libc::linkat(
-                probe.as_raw_fd(),
-                c"".as_ptr(),
-                directory.file.as_raw_fd(),
-                direct_leaf.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        assert_eq!(direct_result, -1);
-        assert!(
-            matches!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOENT | libc::EPERM)
-            ),
-            "direct AT_EMPTY_PATH publication did not fail at the capability boundary"
-        );
+        let _failpoint = DirectLinkEnoentGuard::install();
 
         assert_atomic_publication_behavior(&directory);
     }
