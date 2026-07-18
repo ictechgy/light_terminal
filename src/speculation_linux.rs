@@ -3320,6 +3320,39 @@ fn create_seqpacket_listener(path: &Path) -> ContainmentResult<File> {
 }
 
 #[cfg(target_os = "linux")]
+fn connect_seqpacket_test(path: &Path) -> ContainmentResult<File> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    let address_mut = unsafe { address.assume_init_mut() };
+    if bytes.is_empty() || bytes.len() >= address_mut.sun_path.len() {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    address_mut.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address_mut.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(ContainmentErrorCode::Unsupported);
+    }
+    let socket = unsafe { File::from_raw_fd(fd) };
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+        .try_into()
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            address_mut as *const libc::sockaddr_un as *const libc::sockaddr,
+            length,
+        )
+    } != 0
+    {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
 fn accept_authenticated_peer(
     listener: &File,
     controller: &ManagedController,
@@ -3588,9 +3621,27 @@ fn read_single_cgroup_pid(node: &RetainedCgroupNode) -> ContainmentResult<u32> {
 pub(crate) fn dispatch_internal_containment_test_driver(
     arguments: &[OsString],
 ) -> ContainmentResult<bool> {
-    if arguments.get(1).and_then(|value| value.to_str())
-        != Some("--internal-speculation-containment-test-v1")
-    {
+    let mode = arguments.get(1).and_then(|value| value.to_str());
+    if mode == Some("--internal-speculation-peer-connect-test-v1") {
+        if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(ContainmentErrorCode::Unsupported);
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(ContainmentErrorCode::Unsupported);
+        #[cfg(target_os = "linux")]
+        {
+            let path = std::env::var_os("LTERM_INTERNAL_SPECULATION_PEER_SOCKET")
+                .map(PathBuf::from)
+                .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+            let mut peer = connect_seqpacket_test(&path)?;
+            let mut byte = [0_u8; 1];
+            let _ = peer.read(&mut byte);
+            return Ok(true);
+        }
+    }
+    if mode != Some("--internal-speculation-containment-test-v1") {
         return Ok(false);
     }
     if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
@@ -3600,9 +3651,760 @@ pub(crate) fn dispatch_internal_containment_test_driver(
     return Err(ContainmentErrorCode::Unsupported);
     #[cfg(target_os = "linux")]
     {
+        if let Some(mode) = std::env::var_os("LTERM_INTERNAL_SPECULATION_RESTART_MODE") {
+            if matches!(mode.as_bytes(), b"crash-cleanup" | b"recover-cleanup") {
+                run_cleanup_restart_driver(&mode)?;
+                println!("speculation-cleanup-recovered=1");
+                return Ok(true);
+            }
+            let adopted = run_create_restart_driver(&mode)?;
+            println!("speculation-restart-recovered=1 adopted={adopted}");
+            return Ok(true);
+        }
         run_real_component_driver()?;
-        println!("speculation-real-cases=4");
+        println!("speculation-real-cases=11");
         Ok(true)
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_cleanup_restart_driver(mode: &std::ffi::OsStr) -> ContainmentResult<()> {
+    let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let record_path = fixture.join("restart-record.json");
+    match mode.as_bytes() {
+        b"crash-cleanup" => run_cleanup_crash_driver(&fixture, &record_path),
+        b"recover-cleanup" => {
+            let mut record = read_restart_record(&record_path)?;
+            cleanup_restart_record(&record_path, &mut record)
+        }
+        _ => Err(ContainmentErrorCode::InvalidIdentity),
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_cleanup_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentResult<()> {
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::Unsupported)?;
+    let tournament_uuid = std::env::var("LTERM_INTERNAL_SPECULATION_TOURNAMENT_UUID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let candidate = std::env::var("LTERM_INTERNAL_SPECULATION_CREATE_CANDIDATE")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0);
+    if candidate > 1 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let source = fixture.join("source");
+    let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
+    let ledger = fixture.join("ledger");
+    let control = fixture.join("control");
+    for path in [&source, &candidates[0], &candidates[1], &ledger, &control] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let context = validate_prepare(
+        PrepareInputs {
+            tournament_uuid,
+            generation: 1,
+            source,
+            candidates,
+            ledger_root: ledger,
+            cgroup_root,
+            control_root: control,
+            argv: vec![OsString::from("/usr/bin/true")],
+        },
+        ContainmentDeadline::control_action(),
+    )?;
+    let mut record = restart_record_from_context(&context)?;
+    let mut topology = begin_topology(&context)?;
+    for action in [
+        TopologyAction::CreateTournamentDomain,
+        TopologyAction::CreateCandidateParent { candidate },
+        TopologyAction::CreateControlLeaf { candidate },
+        TopologyAction::CreatePayloadLeaf { candidate },
+    ] {
+        let evidence = create_topology(&mut topology, action)?;
+        apply_topology_evidence(&mut record, evidence)?;
+    }
+    create_topology(
+        &mut topology,
+        TopologyAction::ConfigurePayloadLimit { candidate },
+    )?;
+    persist_restart_record(record_path, &record)?;
+
+    let failpoint = std::env::var("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let target = cleanup_restart_target(&failpoint, candidate)?;
+    match target {
+        CleanupRestartTarget::Candidate(action) => {
+            prepare_candidate_cleanup_action(record_path, &mut record, candidate, action)?;
+            reconcile_valid_record(&record, action, ContainmentDeadline::control_action())?;
+        }
+        CleanupRestartTarget::Tournament(action) => {
+            complete_candidate_to_removed(record_path, &mut record, candidate)?;
+            let other = 1_u8 - candidate;
+            record.cgroups[usize::from(other)].lifecycle = CgroupLifecycleState::Removed;
+            persist_restart_record(record_path, &record)?;
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
+            persist_restart_record(record_path, &record)?;
+            if action == RecoveryAction::RemoveTournamentDomain {
+                require_recovery_action_complete(reconcile_valid_record(
+                    &record,
+                    RecoveryAction::ProveTournamentEmpty,
+                    ContainmentDeadline::control_action(),
+                )?)?;
+            }
+            reconcile_valid_record(&record, action, ContainmentDeadline::control_action())?;
+        }
+    }
+    Err(ContainmentErrorCode::EvidenceUnavailable)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum CleanupRestartTarget {
+    Candidate(RecoveryAction),
+    Tournament(RecoveryAction),
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn cleanup_restart_target(name: &str, candidate: u8) -> ContainmentResult<CleanupRestartTarget> {
+    let target = match name
+        .strip_prefix("before_")
+        .or_else(|| name.strip_prefix("after_"))
+    {
+        Some("recovery_parent_kill") => {
+            CleanupRestartTarget::Candidate(RecoveryAction::KillParent { candidate })
+        }
+        Some("recovery_parent_empty_proof") => {
+            CleanupRestartTarget::Candidate(RecoveryAction::ProveParentEmpty { candidate })
+        }
+        Some("payload_remove") => {
+            CleanupRestartTarget::Candidate(RecoveryAction::RemovePayload { candidate })
+        }
+        Some("control_remove") => {
+            CleanupRestartTarget::Candidate(RecoveryAction::RemoveControl { candidate })
+        }
+        Some("parent_remove") => {
+            CleanupRestartTarget::Candidate(RecoveryAction::RemoveParent { candidate })
+        }
+        Some("recovery_tournament_empty_proof") => {
+            CleanupRestartTarget::Tournament(RecoveryAction::ProveTournamentEmpty)
+        }
+        Some("tournament_remove") => {
+            CleanupRestartTarget::Tournament(RecoveryAction::RemoveTournamentDomain)
+        }
+        _ => return Err(ContainmentErrorCode::InvalidIdentity),
+    };
+    Ok(target)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn prepare_candidate_cleanup_action(
+    record_path: &Path,
+    record: &mut TournamentRecord,
+    candidate: u8,
+    target: RecoveryAction,
+) -> ContainmentResult<()> {
+    let index = usize::from(candidate);
+    let from = match record.cgroups[index].lifecycle {
+        CgroupLifecycleState::Forward(from) if from != CgroupForwardState::Planned => from,
+        _ => return Err(ContainmentErrorCode::EvidenceUnavailable),
+    };
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentKillPending { from };
+    persist_restart_record(record_path, record)?;
+    if target == (RecoveryAction::KillParent { candidate }) {
+        return Ok(());
+    }
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::KillParent { candidate },
+        ContainmentDeadline::control_action(),
+    )?)?;
+    if target == (RecoveryAction::ProveParentEmpty { candidate }) {
+        return Ok(());
+    }
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::ProveParentEmpty { candidate },
+        ContainmentDeadline::control_action(),
+    )?)?;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentEmpty { from };
+    persist_restart_record(record_path, record)?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    if target == (RecoveryAction::RemovePayload { candidate }) {
+        return Ok(());
+    }
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::RemovePayload { candidate },
+        ContainmentDeadline::control_action(),
+    )?)?;
+    record.cgroups[index].payload = None;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemoved { from };
+    persist_restart_record(record_path, record)?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    if target == (RecoveryAction::RemoveControl { candidate }) {
+        return Ok(());
+    }
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::RemoveControl { candidate },
+        ContainmentDeadline::control_action(),
+    )?)?;
+    record.cgroups[index].control = None;
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemoved { from };
+    persist_restart_record(record_path, record)?;
+
+    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentRemovePending { from };
+    persist_restart_record(record_path, record)?;
+    if target == (RecoveryAction::RemoveParent { candidate }) {
+        return Ok(());
+    }
+    Err(ContainmentErrorCode::InvalidIdentity)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn complete_candidate_to_removed(
+    record_path: &Path,
+    record: &mut TournamentRecord,
+    candidate: u8,
+) -> ContainmentResult<()> {
+    prepare_candidate_cleanup_action(
+        record_path,
+        record,
+        candidate,
+        RecoveryAction::RemoveParent { candidate },
+    )?;
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::RemoveParent { candidate },
+        ContainmentDeadline::control_action(),
+    )?)?;
+    let candidate = &mut record.cgroups[usize::from(candidate)];
+    candidate.parent = None;
+    candidate.lifecycle = CgroupLifecycleState::Removed;
+    persist_restart_record(record_path, record)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_create_restart_driver(mode: &std::ffi::OsStr) -> ContainmentResult<bool> {
+    let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let record_path = fixture.join("restart-record.json");
+    match mode.as_bytes() {
+        b"crash-create" => run_create_crash_driver(&fixture, &record_path).map(|()| false),
+        b"recover-create" => {
+            let mut record = read_restart_record(&record_path)?;
+            let action = pending_create_recovery_action(&record)?;
+            let evidence =
+                reconcile_valid_record(&record, action, ContainmentDeadline::control_action())?;
+            let adopted = match evidence {
+                RecoveryEvidence::TournamentCreateReconciled { adopted, .. }
+                | RecoveryEvidence::CandidateCreateReconciled { adopted, .. } => adopted,
+                _ => return Err(ContainmentErrorCode::EvidenceUnavailable),
+            };
+            apply_recovered_create(&mut record, evidence)?;
+            persist_restart_record(&record_path, &record)?;
+            cleanup_restart_record(&record_path, &mut record)?;
+            Ok(adopted)
+        }
+        _ => Err(ContainmentErrorCode::InvalidIdentity),
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_create_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentResult<()> {
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::Unsupported)?;
+    let tournament_uuid = std::env::var("LTERM_INTERNAL_SPECULATION_TOURNAMENT_UUID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let candidate = std::env::var("LTERM_INTERNAL_SPECULATION_CREATE_CANDIDATE")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0);
+    if candidate > 1 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let source = fixture.join("source");
+    let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
+    let ledger = fixture.join("ledger");
+    let control = fixture.join("control");
+    for path in [&source, &candidates[0], &candidates[1], &ledger, &control] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let context = validate_prepare(
+        PrepareInputs {
+            tournament_uuid,
+            generation: 1,
+            source,
+            candidates,
+            ledger_root: ledger,
+            cgroup_root,
+            control_root: control,
+            argv: vec![OsString::from("/usr/bin/true")],
+        },
+        ContainmentDeadline::control_action(),
+    )?;
+    let mut record = restart_record_from_context(&context)?;
+    let mut topology = begin_topology(&context)?;
+    let failpoint = std::env::var("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+
+    if matches!(
+        failpoint.as_str(),
+        "before_tournament_create" | "after_tournament_create"
+    ) {
+        record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::CreatePending;
+        persist_restart_record(record_path, &record)?;
+        create_topology(&mut topology, TopologyAction::CreateTournamentDomain)?;
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    apply_topology_evidence(
+        &mut record,
+        create_topology(&mut topology, TopologyAction::CreateTournamentDomain)?,
+    )?;
+
+    if matches!(
+        failpoint.as_str(),
+        "before_candidate_parent_create" | "after_candidate_parent_create"
+    ) {
+        record.cgroups[usize::from(candidate)].lifecycle =
+            CgroupLifecycleState::Forward(CgroupForwardState::ParentCreatePending);
+        persist_restart_record(record_path, &record)?;
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateCandidateParent { candidate },
+        )?;
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    apply_topology_evidence(
+        &mut record,
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateCandidateParent { candidate },
+        )?,
+    )?;
+
+    if matches!(
+        failpoint.as_str(),
+        "before_control_create" | "after_control_create"
+    ) {
+        record.cgroups[usize::from(candidate)].lifecycle =
+            CgroupLifecycleState::Forward(CgroupForwardState::ControlCreatePending);
+        persist_restart_record(record_path, &record)?;
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateControlLeaf { candidate },
+        )?;
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    apply_topology_evidence(
+        &mut record,
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateControlLeaf { candidate },
+        )?,
+    )?;
+
+    if matches!(
+        failpoint.as_str(),
+        "before_payload_create" | "after_payload_create"
+    ) {
+        record.cgroups[usize::from(candidate)].lifecycle =
+            CgroupLifecycleState::Forward(CgroupForwardState::PayloadCreatePending);
+        persist_restart_record(record_path, &record)?;
+        create_topology(
+            &mut topology,
+            TopologyAction::CreatePayloadLeaf { candidate },
+        )?;
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    Err(ContainmentErrorCode::InvalidIdentity)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn restart_record_from_context(
+    context: &LiveTournamentContext,
+) -> ContainmentResult<TournamentRecord> {
+    let candidate_uuids = [Uuid::new_v4(), Uuid::new_v4()];
+    let candidate_status = |index: u8| crate::protocol::SpeculationCandidateStatus {
+        candidate_uuid: candidate_uuids[usize::from(index)],
+        index,
+        ready: false,
+        ready_elapsed_ns: None,
+        go_received: false,
+        go_received_elapsed_ns: None,
+        result_accepted: false,
+        exit_success: None,
+        exit_category: None,
+        elapsed_ns: None,
+        output_bytes: None,
+        eligible: false,
+        cleanup: Default::default(),
+    };
+    let record = TournamentRecord {
+        schema_version: crate::speculation_registry::TournamentRecordSchema::V1,
+        boot_uuid: context.source.identity().boot_uuid,
+        roots: crate::speculation_registry::PrivateRootIdentities {
+            source: context.source.identity(),
+            candidates: [
+                context.candidates[0].identity(),
+                context.candidates[1].identity(),
+            ],
+            ledger_root: context.ledger_root.identity(),
+            cgroup_root: context.cgroup_root.identity(),
+        },
+        cgroup_root_locator: crate::speculation_registry::PrivateCgroupRootLocator::from_directory(
+            &context.cgroup_root,
+        )
+        .map_err(map_evidence)?,
+        tournament_cgroup: crate::speculation_registry::TournamentCgroupEvidence {
+            deterministic_name_uuid: context.identity.tournament_uuid,
+            lifecycle: TournamentCgroupLifecycleState::Planned,
+            domain: None,
+        },
+        cgroups: std::array::from_fn(|index| {
+            crate::speculation_registry::CandidateCgroupEvidence {
+                candidate_index: index as u8,
+                deterministic_name_uuid: candidate_uuids[index],
+                lifecycle: CgroupLifecycleState::Forward(CgroupForwardState::Planned),
+                parent: None,
+                control: None,
+                payload: None,
+            }
+        }),
+        managed_owners: [None, None],
+        terminal_completed_unix_ms: None,
+        status: crate::protocol::SpeculationStatus {
+            schema_version: crate::protocol::SpeculationSchemaVersion::V1,
+            tournament_uuid: context.identity.tournament_uuid,
+            daemon_instance_uuid: Uuid::new_v4(),
+            phase: crate::protocol::SpeculationPhase::Prepared,
+            generation: context.identity.generation,
+            lease_deadline_unix_ms: 1,
+            reason_code: Some(crate::protocol::SpeculationReasonCode::PreparedLease),
+            candidates: [candidate_status(0), candidate_status(1)],
+            fixed_score_order: crate::protocol::SPECULATION_SCORE_ORDER,
+            selected_index: None,
+            rollback_required: false,
+            error_codes: Default::default(),
+        },
+    };
+    record
+        .validate()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    Ok(record)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn apply_topology_evidence(
+    record: &mut TournamentRecord,
+    evidence: TopologyEvidence,
+) -> ContainmentResult<()> {
+    match evidence {
+        TopologyEvidence::TournamentDomain(identity) => {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Created;
+            record.tournament_cgroup.domain = Some(identity);
+        }
+        TopologyEvidence::CandidateParent {
+            candidate,
+            identity,
+        } => {
+            let candidate = &mut record.cgroups[usize::from(candidate)];
+            candidate.lifecycle = CgroupLifecycleState::Forward(CgroupForwardState::ParentCreated);
+            candidate.parent = Some(identity);
+        }
+        TopologyEvidence::ControlLeaf {
+            candidate,
+            identity,
+        } => {
+            let candidate = &mut record.cgroups[usize::from(candidate)];
+            candidate.lifecycle = CgroupLifecycleState::Forward(CgroupForwardState::ControlCreated);
+            candidate.control = Some(identity);
+        }
+        TopologyEvidence::PayloadLeaf {
+            candidate,
+            identity,
+        } => {
+            let candidate = &mut record.cgroups[usize::from(candidate)];
+            candidate.lifecycle = CgroupLifecycleState::Forward(CgroupForwardState::PayloadCreated);
+            candidate.payload = Some(identity);
+        }
+        TopologyEvidence::PayloadLimit { .. } => {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+    }
+    record
+        .validate()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn pending_create_recovery_action(record: &TournamentRecord) -> ContainmentResult<RecoveryAction> {
+    if record.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::CreatePending {
+        return Ok(RecoveryAction::ReconcileTournamentCreate);
+    }
+    record
+        .cgroups
+        .iter()
+        .find_map(|candidate| {
+            let component = match candidate.lifecycle {
+                CgroupLifecycleState::Forward(CgroupForwardState::ParentCreatePending) => {
+                    CgroupComponent::Parent
+                }
+                CgroupLifecycleState::Forward(CgroupForwardState::ControlCreatePending) => {
+                    CgroupComponent::Control
+                }
+                CgroupLifecycleState::Forward(CgroupForwardState::PayloadCreatePending) => {
+                    CgroupComponent::Payload
+                }
+                _ => return None,
+            };
+            Some(RecoveryAction::ReconcileCandidateCreate {
+                candidate: candidate.candidate_index,
+                component,
+            })
+        })
+        .ok_or(ContainmentErrorCode::InvalidIdentity)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn apply_recovered_create(
+    record: &mut TournamentRecord,
+    evidence: RecoveryEvidence,
+) -> ContainmentResult<()> {
+    match evidence {
+        RecoveryEvidence::TournamentCreateReconciled { identity, .. } => {
+            apply_topology_evidence(record, TopologyEvidence::TournamentDomain(identity))
+        }
+        RecoveryEvidence::CandidateCreateReconciled {
+            candidate,
+            component: CgroupComponent::Parent,
+            identity,
+            ..
+        } => apply_topology_evidence(
+            record,
+            TopologyEvidence::CandidateParent {
+                candidate,
+                identity,
+            },
+        ),
+        RecoveryEvidence::CandidateCreateReconciled {
+            candidate,
+            component: CgroupComponent::Control,
+            identity,
+            ..
+        } => apply_topology_evidence(
+            record,
+            TopologyEvidence::ControlLeaf {
+                candidate,
+                identity,
+            },
+        ),
+        RecoveryEvidence::CandidateCreateReconciled {
+            candidate,
+            component: CgroupComponent::Payload,
+            identity,
+            ..
+        } => apply_topology_evidence(
+            record,
+            TopologyEvidence::PayloadLeaf {
+                candidate,
+                identity,
+            },
+        ),
+        _ => Err(ContainmentErrorCode::EvidenceUnavailable),
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn persist_restart_record(path: &Path, record: &TournamentRecord) -> ContainmentResult<()> {
+    record
+        .validate()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let bytes =
+        serde_json::to_vec(record).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if bytes.is_empty() || bytes.len() > 64 * 1024 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    file.write_all(&bytes)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    file.sync_all()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    File::open(
+        path.parent()
+            .ok_or(ContainmentErrorCode::EvidenceUnavailable)?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn read_restart_record(path: &Path) -> ContainmentResult<TournamentRecord> {
+    let bytes = std::fs::read(path).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if bytes.is_empty() || bytes.len() > 64 * 1024 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let record = serde_json::from_slice::<TournamentRecord>(&bytes)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    record
+        .validate()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    Ok(record)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn cleanup_restart_record(
+    record_path: &Path,
+    record: &mut TournamentRecord,
+) -> ContainmentResult<()> {
+    for candidate_index in 0_u8..2 {
+        let index = usize::from(candidate_index);
+        loop {
+            match record.cgroups[index].lifecycle {
+                CgroupLifecycleState::Forward(CgroupForwardState::Planned) => {
+                    record.cgroups[index].lifecycle = CgroupLifecycleState::Removed;
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::Forward(from)
+                | CgroupLifecycleState::CleanupPending { from } => {
+                    record.cgroups[index].lifecycle =
+                        CgroupLifecycleState::ParentKillPending { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::ParentKillPending { from } => {
+                    require_recovery_action_complete(reconcile_valid_record(
+                        record,
+                        RecoveryAction::KillParent {
+                            candidate: candidate_index,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    require_recovery_action_complete(reconcile_valid_record(
+                        record,
+                        RecoveryAction::ProveParentEmpty {
+                            candidate: candidate_index,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    record.cgroups[index].lifecycle = CgroupLifecycleState::ParentEmpty { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::ParentEmpty { from } => {
+                    record.cgroups[index].lifecycle =
+                        CgroupLifecycleState::PayloadRemovePending { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::PayloadRemovePending { from } => {
+                    require_recovery_action_complete(reconcile_valid_record(
+                        record,
+                        RecoveryAction::RemovePayload {
+                            candidate: candidate_index,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    record.cgroups[index].payload = None;
+                    record.cgroups[index].lifecycle = CgroupLifecycleState::PayloadRemoved { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::PayloadRemoved { from } => {
+                    record.cgroups[index].lifecycle =
+                        CgroupLifecycleState::ControlRemovePending { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::ControlRemovePending { from } => {
+                    require_recovery_action_complete(reconcile_valid_record(
+                        record,
+                        RecoveryAction::RemoveControl {
+                            candidate: candidate_index,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    record.cgroups[index].control = None;
+                    record.cgroups[index].lifecycle = CgroupLifecycleState::ControlRemoved { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::ControlRemoved { from } => {
+                    record.cgroups[index].lifecycle =
+                        CgroupLifecycleState::ParentRemovePending { from };
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::ParentRemovePending { .. } => {
+                    require_recovery_action_complete(reconcile_valid_record(
+                        record,
+                        RecoveryAction::RemoveParent {
+                            candidate: candidate_index,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    record.cgroups[index].parent = None;
+                    record.cgroups[index].lifecycle = CgroupLifecycleState::Removed;
+                    persist_restart_record(record_path, record)?;
+                }
+                CgroupLifecycleState::Removed => break,
+                CgroupLifecycleState::RollbackRequired => {
+                    return Err(ContainmentErrorCode::EvidenceUnavailable);
+                }
+            }
+        }
+    }
+
+    match record.tournament_cgroup.lifecycle {
+        TournamentCgroupLifecycleState::Created => {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
+            persist_restart_record(record_path, record)?;
+        }
+        TournamentCgroupLifecycleState::RemovePending => {}
+        TournamentCgroupLifecycleState::Removed => return Ok(()),
+        _ => return Err(ContainmentErrorCode::EvidenceUnavailable),
+    }
+    if reopen_recovery_domain(record)?.is_some() {
+        require_recovery_action_complete(reconcile_valid_record(
+            record,
+            RecoveryAction::ProveTournamentEmpty,
+            ContainmentDeadline::control_action(),
+        )?)?;
+    }
+    require_recovery_action_complete(reconcile_valid_record(
+        record,
+        RecoveryAction::RemoveTournamentDomain,
+        ContainmentDeadline::control_action(),
+    )?)?;
+    record.tournament_cgroup.domain = None;
+    record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+    persist_restart_record(record_path, record)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn require_recovery_action_complete(evidence: RecoveryEvidence) -> ContainmentResult<()> {
+    match evidence {
+        RecoveryEvidence::CandidateActionComplete { .. }
+        | RecoveryEvidence::TournamentActionComplete { .. } => Ok(()),
+        _ => Err(ContainmentErrorCode::EvidenceUnavailable),
     }
 }
 
@@ -3614,6 +4416,8 @@ fn run_real_component_driver() -> ContainmentResult<()> {
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .map(PathBuf::from)
         .ok_or(ContainmentErrorCode::Unsupported)?;
+    run_real_topology_attack_matrix(&cgroup_root)?;
+    run_real_peer_attack_matrix(&fixture.join("p"), &cgroup_root)?;
     let elapsed = run_real_execution_case(
         &fixture.join("e"),
         &cgroup_root,
@@ -3665,7 +4469,293 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         None,
         RealExecutionExpectation::Overflow,
     )?;
+    let fork_storm = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 64 ]; do /usr/bin/sleep 30 & i=$((i + 1)); done\nexit 0\n";
+    run_real_execution_case(
+        &fixture.join("f"),
+        &cgroup_root,
+        vec![OsString::from("/workspace/run.sh")],
+        Some([fork_storm, fork_storm]),
+        RealExecutionExpectation::Complete { output_bytes: 0 },
+    )?;
     Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_real_topology_attack_matrix(cgroup_root: &Path) -> ContainmentResult<()> {
+    let root = open_existing_delegated_cgroup_root(cgroup_root).map_err(map_evidence)?;
+    let root = RetainedCgroupNode {
+        file: root.try_clone_retained_fd().map_err(map_evidence)?,
+        identity: root.identity(),
+        membership: membership_for_cgroup_path(cgroup_root)?,
+    };
+    prove_domain_task_free(&root)?;
+    enable_pids(&root)?;
+
+    let prefix = format!("lterm-g003-attack-{}", Uuid::new_v4());
+    let missing_parent_name = cgroup_name(&format!("{prefix}-missing-parent"))?;
+    let missing_parent = create_cgroup_child(
+        &root,
+        &missing_parent_name,
+        join_membership(&root.membership, missing_parent_name.to_bytes())?,
+    )?;
+    let missing_leaf_name = cgroup_name("missing-controller")?;
+    let missing_leaf = create_cgroup_child(
+        &missing_parent,
+        &missing_leaf_name,
+        join_membership(&missing_parent.membership, missing_leaf_name.to_bytes())?,
+    )?;
+    if enable_pids(&missing_leaf).is_ok() {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    remove_cgroup_child(
+        &missing_parent,
+        &missing_leaf_name,
+        missing_leaf.identity,
+        "payload",
+    )?;
+    remove_cgroup_child(
+        &root,
+        &missing_parent_name,
+        missing_parent.identity,
+        "parent",
+    )?;
+
+    let flat_name = cgroup_name(&format!("{prefix}-flat"))?;
+    let flat = create_cgroup_child(
+        &root,
+        &flat_name,
+        join_membership(&root.membership, flat_name.to_bytes())?,
+    )?;
+    let mut flat_task = std::process::Command::new("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    write_leaf(
+        &flat,
+        c"cgroup.procs",
+        format!("{}\n", flat_task.id()).as_bytes(),
+    )?;
+    if prove_domain_task_free(&flat).is_ok() {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    write_leaf(&flat, c"cgroup.kill", b"1\n")?;
+    wait_populated_zero(&flat, ContainmentDeadline::control_action())?;
+    flat_task
+        .wait()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    remove_cgroup_child(&root, &flat_name, flat.identity, "parent")?;
+
+    let threaded_name = cgroup_name(&format!("{prefix}-threaded"))?;
+    let threaded = create_cgroup_child(
+        &root,
+        &threaded_name,
+        join_membership(&root.membership, threaded_name.to_bytes())?,
+    )?;
+    match write_leaf(&threaded, c"cgroup.type", b"threaded\n") {
+        Ok(()) if prove_domain_task_free(&threaded).is_ok() => {
+            return Err(ContainmentErrorCode::TopologyFailure);
+        }
+        Ok(()) | Err(ContainmentErrorCode::TopologyFailure) => {}
+        Err(error) => return Err(error),
+    }
+    remove_cgroup_child(&root, &threaded_name, threaded.identity, "parent")?;
+
+    let replaced_name = cgroup_name(&format!("{prefix}-replaced"))?;
+    let replaced_membership = join_membership(&root.membership, replaced_name.to_bytes())?;
+    let replaced = create_cgroup_child(&root, &replaced_name, replaced_membership.clone())?;
+    let stale_identity = replaced.identity;
+    remove_cgroup_child(&root, &replaced_name, stale_identity, "parent")?;
+    let replacement = create_cgroup_child(&root, &replaced_name, replaced_membership.clone())?;
+    if !matches!(
+        reopen_cgroup_child(
+            &root,
+            &replaced_name,
+            replaced_membership,
+            Some(stale_identity),
+        ),
+        Err(ContainmentErrorCode::InvalidIdentity)
+    ) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    remove_cgroup_child(&root, &replaced_name, replacement.identity, "parent")
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> ContainmentResult<()> {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let source = fixture.join("source");
+    let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
+    let ledger = fixture.join("ledger");
+    let control = fixture.join("control");
+    for path in [&source, &candidates[0], &candidates[1], &ledger, &control] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let context = validate_prepare(
+        PrepareInputs {
+            tournament_uuid: Uuid::new_v4(),
+            generation: 1,
+            source,
+            candidates,
+            ledger_root: ledger,
+            cgroup_root: cgroup_root.to_path_buf(),
+            control_root: control,
+            argv: vec![OsString::from("/usr/bin/true")],
+        },
+        ContainmentDeadline::control_action(),
+    )?;
+    let mut topology = begin_topology(&context)?;
+    create_topology(&mut topology, TopologyAction::CreateTournamentDomain)?;
+    for candidate in 0_u8..2 {
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateCandidateParent { candidate },
+        )?;
+        create_topology(
+            &mut topology,
+            TopologyAction::CreateControlLeaf { candidate },
+        )?;
+    }
+    let identity = context.candidate_identity(0)?;
+    let expected_membership = managed_membership(topology.candidate(0)?.control()?, identity)?;
+
+    let same_uid_control = prepare_runner_control(&context, 0)?;
+    let mut sleep = launch_peer_test_process(
+        topology.candidate(1)?.control()?,
+        context.candidate_identity(1)?,
+        PathBuf::from("/usr/bin/sleep"),
+        vec![OsString::from("0.2")],
+        Vec::new(),
+    )?;
+    let same_uid_connector = connect_seqpacket_test(&same_uid_control.socket_path)?;
+    if !matches!(
+        accept_authenticated_peer(
+            same_uid_control
+                .listener
+                .as_ref()
+                .ok_or(ContainmentErrorCode::PeerRejected)?,
+            &sleep.controller,
+            &expected_membership,
+            identity,
+            ContainmentDeadline::control_action(),
+        ),
+        Err(ContainmentErrorCode::PeerRejected)
+    ) {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    drop(same_uid_connector);
+    sleep
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    drop(same_uid_control);
+
+    let sibling_control = prepare_runner_control(&context, 0)?;
+    let self_exe = std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
+    let mut sibling = launch_peer_test_process(
+        topology.candidate(1)?.control()?,
+        context.candidate_identity(1)?,
+        self_exe,
+        vec![OsString::from(
+            "--internal-speculation-peer-connect-test-v1",
+        )],
+        vec![
+            (
+                OsString::from("LTERM_INTERNAL_TEST_MODE"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("LTERM_INTERNAL_SPECULATION_PEER_SOCKET"),
+                sibling_control.socket_path.as_os_str().to_owned(),
+            ),
+        ],
+    )?;
+    if !matches!(
+        accept_authenticated_peer(
+            sibling_control
+                .listener
+                .as_ref()
+                .ok_or(ContainmentErrorCode::PeerRejected)?,
+            &sibling.controller,
+            &expected_membership,
+            identity,
+            ContainmentDeadline::control_action(),
+        ),
+        Err(ContainmentErrorCode::PeerRejected)
+    ) {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    drop(sibling_control);
+    sibling
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+
+    for candidate in 0_u8..2 {
+        let candidate_topology = topology.candidate(candidate)?;
+        let control_node = candidate_topology.control()?;
+        wait_populated_zero(control_node, ContainmentDeadline::control_action())?;
+        let parent = candidate_topology
+            .parent
+            .as_ref()
+            .ok_or(ContainmentErrorCode::TopologyFailure)?;
+        remove_cgroup_child(parent, c"control", control_node.identity, "control")?;
+    }
+    for candidate in 0_u8..2 {
+        let candidate_topology = topology.candidate(candidate)?;
+        let parent = candidate_topology
+            .parent
+            .as_ref()
+            .ok_or(ContainmentErrorCode::TopologyFailure)?;
+        let domain = topology
+            .domain
+            .as_ref()
+            .ok_or(ContainmentErrorCode::TopologyFailure)?;
+        let name = cgroup_name(&format!("candidate-{candidate}"))?;
+        remove_cgroup_child(domain, &name, parent.identity, "parent")?;
+    }
+    let domain = topology
+        .domain
+        .as_ref()
+        .ok_or(ContainmentErrorCode::TopologyFailure)?;
+    wait_populated_zero(domain, ContainmentDeadline::control_action())?;
+    let name = cgroup_name(&format!("lterm-g003-{}", context.identity.tournament_uuid))?;
+    remove_cgroup_child(&topology.root, &name, domain.identity, "tournament")
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn launch_peer_test_process(
+    control: &RetainedCgroupNode,
+    identity: RunnerIdentity,
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+) -> ContainmentResult<crate::launch_registry::ManagedLaunch> {
+    let membership = managed_membership(control, identity)?;
+    let placement = ControlCgroupPlacement::new(
+        open_cgroup_procs(control)?,
+        clone_file(&control.file)?,
+        membership,
+    )
+    .map_err(|_| ContainmentErrorCode::PlacementUnproven)?;
+    launch_managed_process(ManagedLaunchRequest {
+        owner: None,
+        executable_policy: ManagedExecutablePolicy::Legacy,
+        placement: ManagedPlacement::CgroupV2(placement),
+        auxiliary: ManagedAuxiliary::None,
+        executable,
+        arguments,
+        current_dir: None,
+        environment,
+    })
+    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
