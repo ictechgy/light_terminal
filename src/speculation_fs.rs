@@ -527,8 +527,13 @@ fn validate_delegated_cgroup_root(file: &File) -> EvidenceResult<()> {
     {
         return Err(EvidenceError::InvalidDirectory);
     }
+    // A systemd-delegated boundary may deliberately retain root ownership of
+    // its own `cgroup.kill` while granting the delegate authority to create
+    // children whose kill files are owned and writable by the delegate.  The
+    // adapter acts only on those retained child domains, so prove the boundary
+    // file exists here and prove write authority operationally on the child.
+    validate_cgroup_leaf_exists(file.as_raw_fd(), c"cgroup.kill")?;
     for (leaf, flags) in [
-        (c"cgroup.kill", libc::O_WRONLY),
         (c"cgroup.events", libc::O_RDONLY),
         (c"cgroup.subtree_control", libc::O_RDWR),
     ] {
@@ -541,6 +546,27 @@ fn validate_delegated_cgroup_root(file: &File) -> EvidenceResult<()> {
         if !opened.metadata().map_err(|_| EvidenceError::Io)?.is_file() {
             return Err(EvidenceError::InvalidDirectory);
         }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cgroup_leaf_exists(directory_fd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe {
+        libc::fstatat(
+            directory_fd,
+            leaf.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(EvidenceError::Io);
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(EvidenceError::InvalidDirectory);
     }
     Ok(())
 }
