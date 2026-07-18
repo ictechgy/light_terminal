@@ -2072,7 +2072,10 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
         if std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_NO_WAIT").as_deref()
             == Some(std::ffi::OsStr::new("1"))
         {
-            drop(process);
+            // This debug-only path models abrupt daemon death.  Bypass the
+            // normal `ManagedWaiter::drop` cleanup so restart reconciliation
+            // sees the durable live intent left by a vanished owner process.
+            std::mem::forget(process);
             return Ok(true);
         }
         let terminate = std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_TERMINATE").as_deref()
