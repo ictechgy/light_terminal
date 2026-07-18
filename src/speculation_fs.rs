@@ -560,13 +560,16 @@ fn validate_temp_leaf_for_recovery(dirfd: RawFd, leaf: &CStr) -> EvidenceResult<
     if !is_transaction_temp_leaf(leaf) {
         return Err(EvidenceError::InvalidLeaf);
     }
-    let file = openat_file(
+    let mut file = openat_file(
         dirfd,
         leaf,
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )?;
-    validate_record_file(&file).map(|_| ())
+    validate_record_file(&file)?;
+    let bytes = read_bounded(&mut file, MAX_SPECULATION_JSON_BYTES)?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| EvidenceError::Corrupt)?;
+    Ok(())
 }
 
 fn unlinkat(dirfd: RawFd, leaf: &CStr) {
@@ -758,6 +761,139 @@ fn directory_identity(_file: &File) -> EvidenceResult<DirectoryIdentity> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    const CAPABILITY_TEST_CHILD: &str = "LTERM_SPECULATION_CAPABILITY_TEST_CHILD";
+
+    #[cfg(target_os = "linux")]
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    #[cfg(target_os = "linux")]
+    const CAP_DAC_READ_SEARCH_NUMBER: usize = 2;
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct LinuxCapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct LinuxCapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_capabilities() -> [LinuxCapabilityData; 2] {
+        let mut header = LinuxCapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [LinuxCapabilityData::default(); 2];
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &mut header as *mut LinuxCapabilityHeader,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "capget failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(header.version, LINUX_CAPABILITY_VERSION_3);
+        data
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_and_verify_dac_read_search_capability() {
+        let mut header = LinuxCapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = linux_capabilities();
+        let word = CAP_DAC_READ_SEARCH_NUMBER / 32;
+        let mask = 1_u32 << (CAP_DAC_READ_SEARCH_NUMBER % 32);
+        data[word].effective &= !mask;
+        data[word].permitted &= !mask;
+        data[word].inheritable &= !mask;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_capset,
+                &mut header as *mut LinuxCapabilityHeader,
+                data.as_ptr(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "capset failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let verified = linux_capabilities();
+        assert_eq!(verified[word].effective & mask, 0);
+        assert_eq!(verified[word].permitted & mask, 0);
+        assert_eq!(verified[word].inheritable & mask, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_atomic_publication_behavior(directory: &ValidatedDirectory) {
+        let leaf = c"record.json";
+        let first = atomic_create_json(
+            directory,
+            leaf,
+            &serde_json::json!({"generation": 1}),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert_eq!(first.value["generation"], 1);
+        assert_eq!(
+            atomic_create_json(
+                directory,
+                leaf,
+                &serde_json::json!({"generation": 99}),
+                MAX_SPECULATION_JSON_BYTES,
+            )
+            .unwrap_err(),
+            EvidenceError::AlreadyExists
+        );
+        let second = atomic_replace_json(
+            directory,
+            leaf,
+            first.identity,
+            &serde_json::json!({"generation": 2}),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert_eq!(second.value["generation"], 2);
+        let readback =
+            read_json::<serde_json::Value>(directory, leaf, MAX_SPECULATION_JSON_BYTES).unwrap();
+        assert_eq!(readback.identity, second.identity);
+        assert_eq!(readback.value["generation"], 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_private_fixture(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o7777, 0o600);
+    }
+
     #[test]
     fn evidence_identity_and_json_cap_are_fixed() {
         let identity = DirectoryIdentity::test_value();
@@ -834,14 +970,40 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn unprivileged_procfs_fallback_publishes_create_and_replace() {
+    fn atomic_publication_publishes_create_replace_readback_and_no_replace() {
         use std::os::unix::fs::DirBuilderExt;
 
-        assert_ne!(
-            current_euid(),
-            0,
-            "this regression must exercise an unprivileged Linux caller"
-        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+
+        assert_atomic_publication_behavior(&directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_fallback_publishes_after_explicit_capability_drop() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        if std::env::var_os(CAPABILITY_TEST_CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "speculation_fs::tests::procfs_fallback_publishes_after_explicit_capability_drop",
+                    "--nocapture",
+                ])
+                .env(CAPABILITY_TEST_CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "capability-free child test failed");
+            return;
+        }
+
+        clear_and_verify_dac_read_search_capability();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("private");
         std::fs::DirBuilder::new()
@@ -862,34 +1024,15 @@ mod tests {
             )
         };
         assert_eq!(direct_result, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ENOENT),
-            "the test caller unexpectedly has CAP_DAC_READ_SEARCH"
+        assert!(
+            matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOENT | libc::EPERM)
+            ),
+            "direct AT_EMPTY_PATH publication did not fail at the capability boundary"
         );
 
-        let leaf = c"record.json";
-        let first = atomic_create_json(
-            &directory,
-            leaf,
-            &serde_json::json!({"generation": 1}),
-            MAX_SPECULATION_JSON_BYTES,
-        )
-        .unwrap();
-        assert_eq!(first.value["generation"], 1);
-        let second = atomic_replace_json(
-            &directory,
-            leaf,
-            first.identity,
-            &serde_json::json!({"generation": 2}),
-            MAX_SPECULATION_JSON_BYTES,
-        )
-        .unwrap();
-        assert_eq!(second.value["generation"], 2);
-        let readback =
-            read_json::<serde_json::Value>(&directory, leaf, MAX_SPECULATION_JSON_BYTES).unwrap();
-        assert_eq!(readback.identity, second.identity);
-        assert_eq!(readback.value["generation"], 2);
+        assert_atomic_publication_behavior(&directory);
     }
 
     #[cfg(target_os = "linux")]
@@ -1047,17 +1190,43 @@ mod tests {
                 .unwrap_err(),
             EvidenceError::Missing
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invalid_and_oversized_transaction_temps_remain_corruption_evidence() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
 
         let corrupt_temp = transaction_temp_leaf();
         let corrupt_path = path.join(std::ffi::OsStr::from_bytes(corrupt_temp.to_bytes()));
-        std::fs::write(&corrupt_path, b"incomplete").unwrap();
-        assert!(
-            directory
-                .list_leaf_names()
-                .unwrap()
-                .iter()
-                .any(|leaf| leaf == &corrupt_temp)
+        write_private_fixture(&corrupt_path, br#"{"complete":"#);
+        assert_eq!(
+            validate_temp_leaf_for_recovery(directory.file.as_raw_fd(), &corrupt_temp),
+            Err(EvidenceError::Corrupt)
         );
+
+        let oversized_temp = transaction_temp_leaf();
+        let oversized_path = path.join(std::ffi::OsStr::from_bytes(oversized_temp.to_bytes()));
+        let mut oversized_json = vec![b' '; MAX_SPECULATION_JSON_BYTES];
+        oversized_json.extend_from_slice(b"null");
+        write_private_fixture(&oversized_path, &oversized_json);
+        assert_eq!(
+            validate_temp_leaf_for_recovery(directory.file.as_raw_fd(), &oversized_temp),
+            Err(EvidenceError::TooLarge)
+        );
+
+        let leaves = directory.list_leaf_names().unwrap();
+        assert!(leaves.iter().any(|leaf| leaf == &corrupt_temp));
+        assert!(leaves.iter().any(|leaf| leaf == &oversized_temp));
         assert!(corrupt_path.exists());
+        assert!(oversized_path.exists());
     }
 }
