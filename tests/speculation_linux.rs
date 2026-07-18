@@ -72,12 +72,27 @@ fn assert_bounded_raw_free_failure(output: &Output, fixture: &tempfile::TempDir,
         stderr
             .lines()
             .all(|line| line.starts_with("error: speculation_")),
-        "{seam} emitted an unbounded error category"
+        "{seam} emitted an unbounded error category: {stderr:?}"
     );
     assert!(
         !stderr.contains(&fixture.path().to_string_lossy().into_owned()),
         "{seam} exposed its fixture path"
     );
+}
+
+fn assert_candidate_workspaces_empty(fixture: &tempfile::TempDir, seam: &str) {
+    for candidate in ["candidate-0", "candidate-1"] {
+        let path = fixture.path().join(candidate);
+        if path.exists() {
+            assert!(
+                fs::read_dir(path)
+                    .expect("inspect restart candidate workspace")
+                    .next()
+                    .is_none(),
+                "{seam} mutated {candidate}"
+            );
+        }
+    }
 }
 
 fn tournament_domain(tournament_uuid: Uuid) -> std::path::PathBuf {
@@ -179,8 +194,12 @@ fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
         "component driver failed with bounded stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"speculation-real-cases=11\n");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"speculation-real-cases=14\n");
+    assert!(
+        output.stderr.is_empty(),
+        "positive component emitted stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_no_tournament_domains();
 }
 
@@ -594,12 +613,147 @@ fn required_real_cleanup_edges_recover_before_and_after_abrupt_restart() {
 }
 
 #[test]
+fn required_real_missing_daemon_edges_die_abruptly_and_recover_separately() {
+    let pids_edges = ["pids_enable_write", "pids_enable_readback"];
+    for edge in pids_edges {
+        for side in ["before", "after"] {
+            let Some(fixture) = required_restart_fixture() else {
+                return;
+            };
+            let failpoint = format!("{side}_{edge}");
+            let tournament_uuid = Uuid::new_v4();
+            let crashed = run_restart_component(
+                &fixture,
+                "crash-create",
+                tournament_uuid,
+                Some(&failpoint),
+                0,
+            );
+            assert_eq!(crashed.status.code(), Some(86), "{failpoint}");
+            assert!(crashed.stdout.is_empty(), "{failpoint} emitted stdout");
+            assert!(crashed.stderr.is_empty(), "{failpoint} emitted stderr");
+            let recovered =
+                run_restart_component(&fixture, "recover-create", tournament_uuid, None, 0);
+            assert!(
+                recovered.status.success(),
+                "{failpoint} recovery failed: {}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            assert_eq!(
+                recovered.stdout,
+                b"speculation-restart-recovered=1 adopted=false\n"
+            );
+            assert!(recovered.stderr.is_empty());
+            assert_candidate_workspaces_empty(&fixture, &failpoint);
+            assert_no_tournament_domains();
+        }
+    }
+
+    let runtime_edges = [
+        "payload_limit_write",
+        "payload_limit_readback",
+        "managed_launch",
+        "control_accept",
+        "control_unlink",
+        "argv_frame_send",
+        "payload_fd_evidence",
+        "payload_fd_send",
+        "payload_membership_proof",
+        "payload_release",
+        "payload_kill",
+        "payload_empty_proof",
+        "parent_kill",
+        "parent_empty_proof",
+    ];
+    for edge in runtime_edges {
+        for side in ["before", "after"] {
+            let Some(fixture) = required_restart_fixture() else {
+                return;
+            };
+            let failpoint = format!("{side}_{edge}");
+            let tournament_uuid = Uuid::new_v4();
+            let crashed = run_restart_component(
+                &fixture,
+                "crash-runtime",
+                tournament_uuid,
+                Some(&failpoint),
+                0,
+            );
+            assert_eq!(
+                crashed.status.code(),
+                Some(86),
+                "{failpoint} did not kill the daemon: stdout={} stderr={}",
+                String::from_utf8_lossy(&crashed.stdout),
+                String::from_utf8_lossy(&crashed.stderr)
+            );
+            assert_bounded_raw_free_failure(&crashed, &fixture, &failpoint);
+            let recovered =
+                run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+            assert!(
+                recovered.status.success(),
+                "{failpoint} recovery failed: {}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            assert_eq!(recovered.stdout, b"speculation-runtime-recovered=1\n");
+            assert!(recovered.stderr.is_empty());
+            assert_candidate_workspaces_empty(&fixture, &failpoint);
+            assert_no_tournament_domains();
+        }
+    }
+}
+
+#[test]
+fn required_real_runner_abrupt_matrix_recovers_without_candidate_execution() {
+    let seams = [
+        "runner_before_payload_fd_receive",
+        "runner_after_payload_fd_receive",
+        "runner_before_payload_fd_validation",
+        "runner_after_payload_fd_validation",
+        "runner_before_payload_fd_ack",
+        "runner_duplicate_payload_fd_ack",
+        "runner_before_candidate_fork",
+        "runner_after_candidate_fork",
+        "runner_before_child_placement",
+        "runner_after_child_placement",
+        "runner_before_payload_placed_send",
+        "runner_after_payload_placed_send",
+        "runner_before_release_receive",
+        "runner_after_release_receive",
+        "runner_before_child_exec",
+        "runner_duplicate_payload_release",
+        "runner_payload_release_after_rollback",
+    ];
+    for seam in seams {
+        let Some(fixture) = required_restart_fixture() else {
+            return;
+        };
+        let tournament_uuid = Uuid::new_v4();
+        let crashed =
+            run_restart_component(&fixture, "crash-runtime", tournament_uuid, Some(seam), 0);
+        assert_bounded_raw_free_failure(&crashed, &fixture, seam);
+        let recovered =
+            run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+        assert!(
+            recovered.status.success(),
+            "{seam} recovery failed: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        assert_eq!(recovered.stdout, b"speculation-runtime-recovered=1\n");
+        assert!(recovered.stderr.is_empty());
+        assert_candidate_workspaces_empty(&fixture, seam);
+        assert_no_tournament_domains();
+    }
+}
+
+#[test]
 fn required_real_placement_ack_release_and_pre_exec_failpoints_cleanup() {
     let seams = [
         "runner_before_payload_fd_receive",
         "runner_after_payload_fd_receive",
         "runner_before_payload_fd_validation",
         "runner_after_payload_fd_validation",
+        "runner_before_payload_fd_ack",
+        "runner_duplicate_payload_fd_ack",
         "runner_before_candidate_fork",
         "runner_after_candidate_fork",
         "runner_before_child_placement",

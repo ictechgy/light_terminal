@@ -380,16 +380,26 @@ pub(crate) fn build_fixed_bwrap_invocation(
     arguments.push(control_path.as_os_str().to_owned());
     arguments.push(OsString::from("/run/lterm-control"));
     #[cfg(all(debug_assertions, target_os = "linux"))]
-    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && let Some(value) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT")
-        && value.as_bytes().starts_with(b"runner_")
-        && value.as_bytes().len() <= 96
-    {
-        arguments.extend([
-            OsString::from("--setenv"),
-            OsString::from("LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT"),
-            value,
-        ]);
+    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        if let Some(value) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+            && value.as_bytes().starts_with(b"runner_")
+            && value.as_bytes().len() <= 96
+        {
+            arguments.extend([
+                OsString::from("--setenv"),
+                OsString::from("LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT"),
+                value,
+            ]);
+        }
+        if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
+            == Some(std::ffi::OsStr::new("exit"))
+        {
+            arguments.extend([
+                OsString::from("--setenv"),
+                OsString::from("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION"),
+                OsString::from("exit"),
+            ]);
+        }
     }
     arguments.extend(
         [
@@ -3680,6 +3690,8 @@ fn accept_authenticated_peer(
     controller
         .prove_descendant_in_cgroup(credentials.pid as u32, membership)
         .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    prove_namespace_isolation(credentials.pid as u32)
+        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
     Ok(peer)
 }
 
@@ -3939,14 +3951,265 @@ pub(crate) fn dispatch_internal_containment_test_driver(
                 println!("speculation-cleanup-recovered=1");
                 return Ok(true);
             }
+            if matches!(mode.as_bytes(), b"crash-runtime" | b"recover-runtime") {
+                run_runtime_restart_driver(&mode)?;
+                println!("speculation-runtime-recovered=1");
+                return Ok(true);
+            }
             let adopted = run_create_restart_driver(&mode)?;
             println!("speculation-restart-recovered=1 adopted={adopted}");
             return Ok(true);
         }
         run_real_component_driver()?;
-        println!("speculation-real-cases=11");
+        println!("speculation-real-cases=14");
         Ok(true)
     }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_runtime_restart_driver(mode: &std::ffi::OsStr) -> ContainmentResult<()> {
+    let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let record_path = fixture.join("restart-record.json");
+    match mode.as_bytes() {
+        b"crash-runtime" => run_runtime_crash_driver(&fixture, &record_path),
+        b"recover-runtime" => {
+            let mut record = read_restart_record(&record_path)?;
+            if fixture.join("expect-no-candidate-exec").exists() {
+                prove_no_candidate_exec(&record)?;
+            }
+            let owner = ManagedOwnerTag {
+                kind: ManagedOwnerKind::Speculation,
+                tournament_uuid: record.status.tournament_uuid,
+                candidate_index: 0,
+                role: ManagedOwnerRole::Runner,
+            };
+            match reconcile_managed_owner(&owner)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            {
+                ManagedOwnerOutcome::Absent | ManagedOwnerOutcome::ResolvedTombstone(_) => {}
+                ManagedOwnerOutcome::UnknownOrphanRisk(_) => {
+                    return Err(ContainmentErrorCode::EvidenceUnavailable);
+                }
+            }
+            cleanup_restart_record(&record_path, &mut record)
+        }
+        _ => Err(ContainmentErrorCode::InvalidIdentity),
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_runtime_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentResult<()> {
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::Unsupported)?;
+    let tournament_uuid = std::env::var("LTERM_INTERNAL_SPECULATION_TOURNAMENT_UUID")
+        .ok()
+        .and_then(|value| Uuid::parse_str(&value).ok())
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let failpoint = std::env::var("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    if failpoint.starts_with("runner_") {
+        std::fs::write(fixture.join("expect-no-candidate-exec"), b"1\n")
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let source = fixture.join("source");
+    let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
+    let ledger = fixture.join("ledger");
+    let control = fixture.join("control");
+    for path in [&source, &candidates[0], &candidates[1], &ledger, &control] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    let context = validate_prepare(
+        PrepareInputs {
+            tournament_uuid,
+            generation: 1,
+            source,
+            candidates,
+            ledger_root: ledger,
+            cgroup_root,
+            control_root: control,
+            argv: vec![OsString::from("/usr/bin/sleep"), OsString::from("30")],
+        },
+        ContainmentDeadline::control_action(),
+    )?;
+    let mut record = restart_record_from_context(&context)?;
+    let mut topology = begin_topology(&context)?;
+    for action in [
+        TopologyAction::CreateTournamentDomain,
+        TopologyAction::CreateCandidateParent { candidate: 0 },
+        TopologyAction::CreateControlLeaf { candidate: 0 },
+        TopologyAction::CreatePayloadLeaf { candidate: 0 },
+    ] {
+        let evidence = create_topology(&mut topology, action)?;
+        apply_topology_evidence(&mut record, evidence)?;
+        persist_restart_record(record_path, &record)?;
+    }
+    create_topology(
+        &mut topology,
+        TopologyAction::ConfigurePayloadLimit { candidate: 0 },
+    )?;
+    persist_restart_record(record_path, &record)?;
+
+    let containment = launch_runner(
+        &context,
+        &topology,
+        0,
+        ContainmentDeadline::control_action(),
+    )?;
+    let observation = containment.observation();
+    record.managed_owners[0] = Some(observation.managed_owner);
+    persist_restart_record(record_path, &record)?;
+    let CandidateContainmentParts {
+        mut control,
+        mut observer,
+        ..
+    } = containment.split();
+    transfer_payload_fd(
+        &mut control,
+        topology.candidate(0)?,
+        ContainmentDeadline::control_action(),
+    )?;
+    receive_payload_fd_ack(&mut observer, ContainmentDeadline::control_action())?;
+    send_go(&mut control, ContainmentDeadline::control_action())?;
+    receive_go_receipt(&mut observer, ContainmentDeadline::control_action())?;
+    let placement = receive_payload_placed(
+        &mut observer,
+        topology.candidate(0)?,
+        ContainmentDeadline::control_action(),
+    )?;
+    if failpoint == "runner_duplicate_payload_release" {
+        send_duplicate_stale_payload_release(&mut control)?;
+        unsafe { libc::_exit(86) };
+    }
+    if failpoint == "runner_payload_release_after_rollback" {
+        perform_candidate_cleanup_action(
+            &mut topology,
+            0,
+            CandidateCleanupAction::KillPayload,
+            ContainmentDeadline::control_action(),
+        )?;
+        perform_candidate_cleanup_action(
+            &mut topology,
+            0,
+            CandidateCleanupAction::ProvePayloadEmpty,
+            ContainmentDeadline::control_action(),
+        )?;
+        let _ = send_payload_release(
+            &mut control,
+            placement,
+            ContainmentDeadline::control_action(),
+        );
+        unsafe { libc::_exit(86) };
+    }
+    send_payload_release(
+        &mut control,
+        placement,
+        ContainmentDeadline::control_action(),
+    )?;
+
+    if failpoint == "runner_before_child_exec" {
+        receive_execution_event(&mut observer, ContainmentDeadline::control_action())?;
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let edge = failpoint
+        .strip_prefix("before_")
+        .or_else(|| failpoint.strip_prefix("after_"))
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    match edge {
+        "payload_kill" => {
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::KillPayload,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        "payload_empty_proof" => {
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::KillPayload,
+                ContainmentDeadline::control_action(),
+            )?;
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::ProvePayloadEmpty,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        "parent_kill" => {
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::KillParent,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        "parent_empty_proof" => {
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::KillParent,
+                ContainmentDeadline::control_action(),
+            )?;
+            perform_candidate_cleanup_action(
+                &mut topology,
+                0,
+                CandidateCleanupAction::ProveParentEmpty,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+        _ => return Err(ContainmentErrorCode::EvidenceUnavailable),
+    }
+    Err(ContainmentErrorCode::EvidenceUnavailable)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn prove_no_candidate_exec(record: &TournamentRecord) -> ContainmentResult<()> {
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::Unsupported)?;
+    let payload = cgroup_root
+        .join(format!("lterm-g003-{}", record.status.tournament_uuid))
+        .join("candidate-0")
+        .join("payload")
+        .join("cgroup.procs");
+    let pids =
+        std::fs::read_to_string(payload).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    for pid in pids.lines() {
+        let executable = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(executable) => executable,
+            Err(_) => continue,
+        };
+        if executable == Path::new("/usr/bin/sleep") {
+            return Err(ContainmentErrorCode::TerminalBoundaryFailure);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn send_duplicate_stale_payload_release(control: &mut CandidateControl) -> ContainmentResult<()> {
+    let protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let sequence = protocol
+        .validator
+        .next_sequence()
+        .checked_sub(1)
+        .ok_or(ContainmentErrorCode::PeerRejected)?;
+    let duplicate = ControlFrame::new(control.identity, sequence, ControlMessage::PayloadRelease);
+    send_frame_packet(&protocol.peer, &duplicate)
+        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    let _ = send_frame_packet(&protocol.peer, &duplicate);
+    Ok(())
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -4253,7 +4516,12 @@ fn run_create_crash_driver(fixture: &Path, record_path: &Path) -> ContainmentRes
 
     if matches!(
         failpoint.as_str(),
-        "before_tournament_create" | "after_tournament_create"
+        "before_tournament_create"
+            | "after_tournament_create"
+            | "before_pids_enable_write"
+            | "after_pids_enable_write"
+            | "before_pids_enable_readback"
+            | "after_pids_enable_readback"
     ) {
         record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::CreatePending;
         persist_restart_record(record_path, &record)?;
@@ -4759,6 +5027,30 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         Some([fork_storm, fork_storm]),
         RealExecutionExpectation::Complete { output_bytes: 0 },
     )?;
+    let orphan_and_setsid = b"#!/bin/sh\n( ( /usr/bin/sleep 30 & exit 0 ) & exit 0 ) &\n/usr/bin/setsid /usr/bin/sleep 30 >/dev/null 2>&1 &\nexit 0\n";
+    run_real_execution_case(
+        &fixture.join("d"),
+        &cgroup_root,
+        vec![OsString::from("/workspace/run.sh")],
+        Some([orphan_and_setsid, orphan_and_setsid]),
+        RealExecutionExpectation::DescendantsRemain,
+    )?;
+    let migration = b"#!/bin/sh\nif /usr/bin/grep -q ' - cgroup2 ' /proc/self/mountinfo; then exit 91; fi\n{ printf '0\\n' > /proc/1/root/sys/fs/cgroup/cgroup.procs; } 2>/dev/null && exit 92\nexit 0\n";
+    run_real_execution_case(
+        &fixture.join("m"),
+        &cgroup_root,
+        vec![OsString::from("/workspace/run.sh")],
+        Some([migration, migration]),
+        RealExecutionExpectation::Complete { output_bytes: 0 },
+    )?;
+    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 512 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
+    run_real_execution_case(
+        &fixture.join("q"),
+        &cgroup_root,
+        vec![OsString::from("/workspace/run.sh")],
+        Some([pids_exhaustion, pids_exhaustion]),
+        RealExecutionExpectation::PidsExhausted,
+    )?;
     Ok(())
 }
 
@@ -4905,6 +5197,9 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
     }
     let identity = context.candidate_identity(0)?;
     let expected_membership = managed_membership(topology.candidate(0)?.control()?, identity)?;
+    let self_exe = std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE")
+        .map(PathBuf::from)
+        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
 
     let same_uid_control = prepare_runner_control(&context, 0)?;
     let mut sleep = launch_peer_test_process(
@@ -4915,6 +5210,7 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
         Vec::new(),
     )?;
     let same_uid_connector = connect_seqpacket_test(&same_uid_control.socket_path)?;
+    let before = test_open_fd_count()?;
     if !matches!(
         accept_authenticated_peer(
             same_uid_control
@@ -4930,6 +5226,9 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
     ) {
         return Err(ContainmentErrorCode::PeerRejected);
     }
+    if test_open_fd_count()? != before {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
     drop(same_uid_connector);
     sleep
         .waiter
@@ -4938,13 +5237,10 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
     drop(same_uid_control);
 
     let sibling_control = prepare_runner_control(&context, 0)?;
-    let self_exe = std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE")
-        .map(PathBuf::from)
-        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
     let mut sibling = launch_peer_test_process(
         topology.candidate(1)?.control()?,
         context.candidate_identity(1)?,
-        self_exe,
+        self_exe.clone(),
         vec![OsString::from(
             "--internal-speculation-peer-connect-test-v1",
         )],
@@ -4959,6 +5255,7 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
             ),
         ],
     )?;
+    let before = test_open_fd_count()?;
     if !matches!(
         accept_authenticated_peer(
             sibling_control
@@ -4974,11 +5271,168 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
     ) {
         return Err(ContainmentErrorCode::PeerRejected);
     }
+    if test_open_fd_count()? != before {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
     drop(sibling_control);
     sibling
         .waiter
         .wait_until(ContainmentDeadline::control_action().instant())
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+
+    let wrong_namespace_control = prepare_runner_control(&context, 0)?;
+    let mut wrong_namespace = launch_peer_test_process(
+        topology.candidate(0)?.control()?,
+        identity,
+        PathBuf::from("/usr/bin/dash"),
+        vec![
+            OsString::from("-c"),
+            OsString::from("\"$0\" --internal-speculation-peer-connect-test-v1 & wait"),
+            self_exe.clone().into_os_string(),
+        ],
+        vec![
+            (
+                OsString::from("LTERM_INTERNAL_TEST_MODE"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("LTERM_INTERNAL_SPECULATION_PEER_SOCKET"),
+                wrong_namespace_control.socket_path.as_os_str().to_owned(),
+            ),
+        ],
+    )?;
+    let before = test_open_fd_count()?;
+    if !matches!(
+        accept_authenticated_peer(
+            wrong_namespace_control
+                .listener
+                .as_ref()
+                .ok_or(ContainmentErrorCode::PeerRejected)?,
+            &wrong_namespace.controller,
+            &expected_membership,
+            identity,
+            ContainmentDeadline::control_action(),
+        ),
+        Err(ContainmentErrorCode::PeerRejected)
+    ) {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    if test_open_fd_count()? != before {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
+    drop(wrong_namespace_control);
+    wrong_namespace
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+
+    let mut stale = launch_peer_test_process(
+        topology.candidate(0)?.control()?,
+        identity,
+        PathBuf::from("/usr/bin/true"),
+        Vec::new(),
+        Vec::new(),
+    )?;
+    let stale_controller = stale.controller.clone();
+    stale
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let stale_control = prepare_runner_control(&context, 0)?;
+    let mut replacement = launch_peer_test_process(
+        topology.candidate(0)?.control()?,
+        identity,
+        self_exe.clone(),
+        vec![OsString::from(
+            "--internal-speculation-peer-connect-test-v1",
+        )],
+        vec![
+            (
+                OsString::from("LTERM_INTERNAL_TEST_MODE"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("LTERM_INTERNAL_SPECULATION_PEER_SOCKET"),
+                stale_control.socket_path.as_os_str().to_owned(),
+            ),
+        ],
+    )?;
+    let before = test_open_fd_count()?;
+    if !matches!(
+        accept_authenticated_peer(
+            stale_control
+                .listener
+                .as_ref()
+                .ok_or(ContainmentErrorCode::PeerRejected)?,
+            &stale_controller,
+            &expected_membership,
+            identity,
+            ContainmentDeadline::control_action(),
+        ),
+        Err(ContainmentErrorCode::PeerRejected)
+    ) {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    if test_open_fd_count()? != before {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
+    drop(stale_control);
+    replacement
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+
+    let wrong_generation_control = prepare_runner_control(&context, 0)?;
+    let mut wrong_generation = launch_peer_test_process(
+        topology.candidate(0)?.control()?,
+        identity,
+        self_exe,
+        vec![OsString::from(
+            "--internal-speculation-peer-connect-test-v1",
+        )],
+        vec![
+            (
+                OsString::from("LTERM_INTERNAL_TEST_MODE"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("LTERM_INTERNAL_SPECULATION_PEER_SOCKET"),
+                wrong_generation_control.socket_path.as_os_str().to_owned(),
+            ),
+        ],
+    )?;
+    let wrong_identity = RunnerIdentity {
+        generation: identity.generation + 1,
+        ..identity
+    };
+    let before = test_open_fd_count()?;
+    if !matches!(
+        accept_authenticated_peer(
+            wrong_generation_control
+                .listener
+                .as_ref()
+                .ok_or(ContainmentErrorCode::PeerRejected)?,
+            &wrong_generation.controller,
+            &expected_membership,
+            wrong_identity,
+            ContainmentDeadline::control_action(),
+        ),
+        Err(ContainmentErrorCode::PeerRejected)
+    ) {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    if test_open_fd_count()? != before {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
+    wrong_generation
+        .controller
+        .terminate()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    wrong_generation
+        .waiter
+        .wait_until(ContainmentDeadline::control_action().instant())
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    drop(wrong_generation_control);
 
     for candidate in 0_u8..2 {
         let candidate_topology = topology.candidate(candidate)?;
@@ -5013,6 +5467,13 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
+fn test_open_fd_count() -> ContainmentResult<usize> {
+    std::fs::read_dir("/proc/self/fd")
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
+        .map(|entries| entries.count())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
 fn launch_peer_test_process(
     control: &RetainedCgroupNode,
     identity: RunnerIdentity,
@@ -5044,6 +5505,8 @@ fn launch_peer_test_process(
 #[derive(Clone, Copy)]
 enum RealExecutionExpectation {
     Complete { output_bytes: u64 },
+    DescendantsRemain,
+    PidsExhausted,
     Overflow,
 }
 
@@ -5191,12 +5654,17 @@ fn run_real_execution_case(
         .map(CandidateContainment::observation);
     for (candidate, containment) in containments.iter().enumerate() {
         let observation = containment.observation();
+        let before_second_connect = test_open_fd_count()?;
+        let second_connect = connect_seqpacket_test(&containment.control._lifetime.socket_path);
+        let second_connect_accepted = second_connect.is_ok();
+        drop(second_connect);
+        let after_second_connect = test_open_fd_count()?;
         if usize::from(observation.identity.candidate_index) != candidate
             || usize::from(observation.managed_owner.candidate_index) != candidate
             || observation.managed_owner.role != ManagedOwnerRoleEvidence::Runner
             || containment.control._lifetime.socket_path.exists()
-            || std::os::unix::net::UnixStream::connect(&containment.control._lifetime.socket_path)
-                .is_ok()
+            || second_connect_accepted
+            || after_second_connect != before_second_connect
         {
             return Err(ContainmentErrorCode::InvalidIdentity);
         }
@@ -5253,7 +5721,9 @@ fn run_real_execution_case(
         overflowed: false,
     }; 2];
     match expectation {
-        RealExecutionExpectation::Complete { .. } => {
+        RealExecutionExpectation::Complete { .. }
+        | RealExecutionExpectation::DescendantsRemain
+        | RealExecutionExpectation::PidsExhausted => {
             for candidate in 0_u8..2 {
                 let index = usize::from(candidate);
                 let event = receive_execution_event(
@@ -5270,6 +5740,16 @@ fn run_real_execution_case(
                 };
                 evidence[index].elapsed_ns = elapsed_ns;
                 evidence[index].exited_zero = category == RunnerExitCategory::ExitedZero;
+                match expectation {
+                    RealExecutionExpectation::DescendantsRemain => {
+                        prove_descendants_remain(tournament.candidate(candidate)?.payload()?)?
+                    }
+                    RealExecutionExpectation::PidsExhausted => {
+                        prove_pids_limit_hit(tournament.candidate(candidate)?.payload()?)?
+                    }
+                    RealExecutionExpectation::Complete { .. }
+                    | RealExecutionExpectation::Overflow => {}
+                }
                 perform_candidate_cleanup_action(
                     &mut tournament,
                     candidate,
@@ -5345,6 +5825,9 @@ fn run_real_execution_case(
         };
         match expectation {
             RealExecutionExpectation::Complete { output_bytes } if bytes == output_bytes => {}
+            RealExecutionExpectation::DescendantsRemain
+            | RealExecutionExpectation::PidsExhausted
+                if bytes == 0 => {}
             RealExecutionExpectation::Overflow
                 if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES => {}
             _ => return Err(ContainmentErrorCode::OutputLimit),
@@ -5390,6 +5873,35 @@ fn run_real_execution_case(
         }
     }
     Ok(evidence)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn prove_descendants_remain(payload: &RetainedCgroupNode) -> ContainmentResult<()> {
+    let procs = read_leaf(payload, c"cgroup.procs", 4096)?;
+    if procs
+        .split(|byte| *byte == b'\n')
+        .any(|pid| !pid.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(ContainmentErrorCode::TerminalBoundaryFailure)
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn prove_pids_limit_hit(payload: &RetainedCgroupNode) -> ContainmentResult<()> {
+    let events = read_leaf(payload, c"pids.events", 4096)?;
+    let events =
+        std::str::from_utf8(&events).map_err(|_| ContainmentErrorCode::TerminalBoundaryFailure)?;
+    if events.lines().any(|line| {
+        line.strip_prefix("max ")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value > 0)
+    }) {
+        Ok(())
+    } else {
+        Err(ContainmentErrorCode::TerminalBoundaryFailure)
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]

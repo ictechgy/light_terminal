@@ -730,10 +730,30 @@ pub(crate) fn dispatch_internal_speculation_mode(arguments: &[OsString]) -> Runn
     if mode != "--internal-speculation-runner-v1" {
         return Ok(false);
     }
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
+        == Some(std::ffi::OsStr::new("exit"))
+    {
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if null >= 0 {
+            unsafe {
+                libc::dup2(null, 2);
+                libc::close(null);
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         let (identity, control) = parse_internal_runner_arguments(arguments)?;
-        run_internal_runner(identity, &control)?;
+        let result = run_internal_runner(identity, &control);
+        #[cfg(debug_assertions)]
+        if result.is_err()
+            && std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
+                == Some(std::ffi::OsStr::new("exit"))
+        {
+            unsafe { libc::_exit(86) };
+        }
+        result?;
         Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
@@ -831,12 +851,22 @@ fn run_internal_runner(
     runner_failpoint("runner_before_payload_fd_validation")?;
     validate_placement_fd(&placement, expected, identity)?;
     runner_failpoint("runner_after_payload_fd_validation")?;
+    runner_failpoint("runner_before_payload_fd_ack")?;
+    let payload_fd_ack_sequence = validator.next_sequence();
     send_runner_frame(
         &peer,
         &mut validator,
         identity,
         ControlMessage::PayloadFdAck,
     )?;
+    if runner_failpoint_enabled("runner_duplicate_payload_fd_ack") {
+        let duplicate = ControlFrame::new(
+            identity,
+            payload_fd_ack_sequence,
+            ControlMessage::PayloadFdAck,
+        );
+        send_frame_packet(&peer, &duplicate)?;
+    }
     let go = receive_runner_frame(&peer, &mut validator)?;
     if !matches!(go.message, ControlMessage::Go) {
         return Err(RunnerProtocolError::InvalidSequence);
@@ -1133,6 +1163,12 @@ fn receive_runner_frame(
 #[cfg(target_os = "linux")]
 fn runner_failpoint(name: &str) -> RunnerResult<()> {
     if runner_failpoint_enabled(name) {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
+            == Some(std::ffi::OsStr::new("exit"))
+        {
+            unsafe { libc::_exit(86) };
+        }
         return Err(RunnerProtocolError::Io);
     }
     Ok(())
@@ -1144,6 +1180,8 @@ const RUNNER_FAILPOINTS: &[&str] = &[
     "runner_after_payload_fd_receive",
     "runner_before_payload_fd_validation",
     "runner_after_payload_fd_validation",
+    "runner_before_payload_fd_ack",
+    "runner_duplicate_payload_fd_ack",
     "runner_before_candidate_fork",
     "runner_after_candidate_fork",
     "runner_before_child_placement",
@@ -1647,6 +1685,8 @@ mod tests {
             assert!(names.contains(format!("runner_before_{seam}").as_str()));
             assert!(names.contains(format!("runner_after_{seam}").as_str()));
         }
+        assert!(names.contains("runner_before_payload_fd_ack"));
+        assert!(names.contains("runner_duplicate_payload_fd_ack"));
         assert!(names.contains("runner_before_child_exec"));
     }
 
@@ -1916,11 +1956,13 @@ mod tests {
         let transferred = File::open("/dev/null").unwrap();
 
         let (sender, receiver) = seqpacket_pair();
+        let before = open_fd_count();
         send_frame_packet(&sender, &frame).unwrap();
         assert!(matches!(
             receive_frame_with_one_fd(&receiver),
             Err(RunnerProtocolError::DescriptorViolation)
         ));
+        assert_eq!(open_fd_count(), before);
 
         let (sender, receiver) = seqpacket_pair();
         let before = open_fd_count();
