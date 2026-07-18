@@ -236,9 +236,11 @@ impl TournamentCgroupEvidence {
 
     fn immutable_identity_progresses_to(&self, next: &Self) -> bool {
         self.deterministic_name_uuid == next.deterministic_name_uuid
-            && self
-                .domain
-                .is_none_or(|identity| next.domain == Some(identity))
+            && self.domain.is_none_or(|identity| {
+                next.domain == Some(identity)
+                    || (next.lifecycle == TournamentCgroupLifecycleState::Removed
+                        && next.domain.is_none())
+            })
     }
 }
 
@@ -326,6 +328,7 @@ impl CgroupLifecycleState {
         match (self, next) {
             (L::Forward(from), L::CleanupPending { from: retained }) => from == retained,
             (L::Forward(F::Planned), L::Forward(F::ParentCreatePending))
+            | (L::Forward(F::Planned), L::Removed)
             | (L::Forward(F::ParentCreatePending), L::Forward(F::ParentCreated))
             | (L::Forward(F::ParentCreated), L::Forward(F::ControlCreatePending))
             | (L::Forward(F::ControlCreatePending), L::Forward(F::ControlCreated))
@@ -849,6 +852,7 @@ pub struct TournamentKey {
 pub enum TournamentWriteKind {
     LivePhaseTransition,
     SamePhaseEvidence,
+    OldBootAbsence { current_boot_uuid: Uuid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1132,20 +1136,45 @@ impl TournamentStore {
                     current.status.phase == next.status.phase
                         && current.restart_prior_phase == next.restart_prior_phase
                 }
+                TournamentWriteKind::OldBootAbsence { current_boot_uuid } => {
+                    !current_boot_uuid.is_nil()
+                        && current.boot_uuid != current_boot_uuid
+                        && current.status.phase == SpeculationPhase::RollbackPending
+                        && next.status.phase == SpeculationPhase::RollbackPending
+                        && current.restart_prior_phase == next.restart_prior_phase
+                        && current.managed_owners == next.managed_owners
+                        && next
+                            .cgroups
+                            .iter()
+                            .all(|candidate| candidate.lifecycle == CgroupLifecycleState::Removed)
+                        && next.tournament_cgroup.lifecycle
+                            == TournamentCgroupLifecycleState::Removed
+                        && next.status.candidates.iter().all(|candidate| {
+                            candidate.cleanup.runner_ack
+                                && candidate.cleanup.bwrap_reaped
+                                && candidate.cleanup.sync_eof
+                                && candidate.cleanup.cgroup_empty
+                                && candidate.cleanup.managed_tombstone
+                        })
+                }
             }
             || !current.public_evidence_progresses_to(
                 &next,
-                kind == TournamentWriteKind::SamePhaseEvidence,
+                matches!(kind, TournamentWriteKind::SamePhaseEvidence),
             )
-            || !current
-                .tournament_cgroup
-                .lifecycle
-                .is_legal_transition(next.tournament_cgroup.lifecycle)
+            || !(matches!(kind, TournamentWriteKind::OldBootAbsence { .. })
+                || current
+                    .tournament_cgroup
+                    .lifecycle
+                    .is_legal_transition(next.tournament_cgroup.lifecycle))
             || current
                 .cgroups
                 .iter()
                 .zip(next.cgroups.iter())
-                .any(|(current, next)| !current.lifecycle.is_legal_transition(next.lifecycle))
+                .any(|(current, next)| {
+                    !matches!(kind, TournamentWriteKind::OldBootAbsence { .. })
+                        && !current.lifecycle.is_legal_transition(next.lifecycle)
+                })
         {
             return Err(EvidenceError::GenerationMismatch);
         }

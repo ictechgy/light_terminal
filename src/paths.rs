@@ -63,6 +63,11 @@ pub(crate) fn tournament_registry_dir() -> Result<PathBuf> {
         .join("tournament-registry-v1"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn speculation_control_dir() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("speculation").join("control-v1"))
+}
+
 pub fn socket_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("LTERM_SOCKET") {
         let path = PathBuf::from(path);

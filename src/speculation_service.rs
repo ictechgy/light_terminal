@@ -14,11 +14,18 @@ use crate::speculation_linux::{
     ContainmentDeadline, ContainmentErrorCode, LiveTournamentContext, PrepareInputs,
     validate_prepare,
 };
+#[cfg(target_os = "linux")]
+use crate::speculation_linux::{
+    OldBootRecoveryAction, OldBootRecoveryEvidence, RecoveryAction, RecoveryEvidence,
+    reconcile_different_boot, reconcile_from_record,
+};
 use crate::speculation_registry::{
     CandidateCgroupEvidence, CgroupForwardState, CgroupLifecycleState, TournamentCgroupEvidence,
     TournamentCgroupLifecycleState, TournamentKey, TournamentRecord, TournamentRecordSchema,
     TournamentStore, TournamentWriteKind,
 };
+#[cfg(target_os = "linux")]
+use crate::speculation_registry::{StoredTournamentUpdate, TournamentRecoveryRecord};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -163,6 +170,22 @@ impl Default for SpeculationService {
 }
 
 impl SpeculationService {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn production() -> Result<Self, ServiceError> {
+        let service = Self::new_reconciling(Uuid::new_v4())?;
+        let worker = service.clone();
+        thread::Builder::new()
+            .name("lterm-speculation-recovery".into())
+            .spawn(move || worker.reconcile_startup())
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        Ok(service)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn production() -> Result<Self, ServiceError> {
+        Ok(Self::default())
+    }
+
     pub(crate) fn new_reconciling(daemon_instance_uuid: Uuid) -> Result<Self, ServiceError> {
         if daemon_instance_uuid.is_nil() {
             return Err(ServiceError::InvalidRequest);
@@ -205,6 +228,111 @@ impl SpeculationService {
         self.core
             .availability
             .store(Availability::Unresolved as u8, Ordering::Release);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_startup(&self) {
+        if self.reconcile_startup_inner().is_err() {
+            self.mark_unresolved();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_startup_inner(&self) -> Result<(), ServiceError> {
+        let control_path = crate::paths::speculation_control_dir()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let control_root = crate::speculation_fs::open_or_create_private_dir(&control_path)
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let current_private_identity = control_root.identity();
+        control_root
+            .revalidate()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let store_path = crate::paths::tournament_registry_dir()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let store = Arc::new(
+            TournamentStore::open_or_create(&store_path)
+                .map_err(|_| ServiceError::EvidenceUnavailable)?,
+        );
+        let managed = crate::launch_registry::reconcile_managed_processes()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        if managed.entries.iter().any(|entry| {
+            entry.owner.is_none()
+                || matches!(
+                    entry.outcome,
+                    crate::launch_registry::ReconcileOutcome::Live
+                        | crate::launch_registry::ReconcileOutcome::UnknownOrphanRisk(_)
+                )
+        }) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        let recovery = store
+            .scan_recovery()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let mut terminal = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in recovery {
+            let TournamentRecoveryRecord::Valid { key, record } = entry else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            if !seen.insert(record.status.tournament_uuid) {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            if record.is_positive_terminal() {
+                terminal.insert(
+                    record.status.tournament_uuid,
+                    Arc::new(record.status.clone()),
+                );
+                continue;
+            }
+            let mut normalized = store
+                .normalize_after_daemon_restart(
+                    &key,
+                    key.generation(),
+                    self.core.daemon_instance_uuid,
+                )
+                .map_err(map_store_error)?;
+            if normalized.record.status.phase != SpeculationPhase::RollbackRequired {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            if normalized.record.boot_uuid != current_private_identity.boot_uuid {
+                normalized = close_different_boot(&store, normalized, current_private_identity)?;
+            } else {
+                normalized = close_same_boot(&store, normalized)?;
+            }
+            if !normalized.record.is_positive_terminal() {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            terminal.insert(
+                normalized.record.status.tournament_uuid,
+                Arc::new(normalized.record.status),
+            );
+        }
+        {
+            let mut index = self.index_lock()?;
+            index.terminal = terminal;
+        }
+        self.install_ready(store, control_path)?;
+        self.start_watchdog()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_watchdog(&self) -> Result<(), ServiceError> {
+        let service = self.clone();
+        thread::Builder::new()
+            .name("lterm-speculation-watchdog".into())
+            .spawn(move || {
+                while !service.core.watchdog_stop.load(Ordering::Acquire) {
+                    if service.availability() == Availability::Ready {
+                        if let Ok(now) = unix_time_ms() {
+                            let _ = service.enqueue_watchdog_tick(now);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            })
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        Ok(())
     }
 
     pub(crate) fn prepare(
@@ -525,6 +653,376 @@ impl SpeculationService {
             ServiceError::EvidenceUnavailable
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn close_different_boot(
+    store: &Arc<TournamentStore>,
+    mut update: StoredTournamentUpdate,
+    current_private_identity: crate::speculation_fs::DurableDirectoryIdentity,
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    update = transition_recovery_phase(store, update, SpeculationPhase::RollbackPending)?;
+    for candidate in 0..2 {
+        if !matches!(
+            reconcile_different_boot(
+                &update.record,
+                current_private_identity,
+                OldBootRecoveryAction::ManagedOwner { candidate },
+            )?,
+            OldBootRecoveryEvidence::ManagedOwnerAbsent { candidate: observed }
+                if observed == candidate
+        ) || !matches!(
+            reconcile_different_boot(
+                &update.record,
+                current_private_identity,
+                OldBootRecoveryAction::CandidateComponents { candidate },
+            )?,
+            OldBootRecoveryEvidence::CandidateComponentsAbsent { candidate: observed }
+                if observed == candidate
+        ) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+    }
+    if reconcile_different_boot(
+        &update.record,
+        current_private_identity,
+        OldBootRecoveryAction::TournamentDomain,
+    )? != OldBootRecoveryEvidence::TournamentDomainAbsent
+    {
+        return Err(ServiceError::EvidenceUnavailable);
+    }
+    let mut next = update.record.clone();
+    next.status.generation = increment(update.key.generation())?;
+    for (index, candidate) in next.cgroups.iter_mut().enumerate() {
+        candidate.lifecycle = CgroupLifecycleState::Removed;
+        candidate.parent = None;
+        candidate.control = None;
+        candidate.payload = None;
+        next.status.candidates[index].cleanup = fully_closed_cleanup();
+    }
+    next.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+    next.tournament_cgroup.domain = None;
+    update = store
+        .write(
+            &update.key,
+            update.key.generation(),
+            next,
+            TournamentWriteKind::OldBootAbsence {
+                current_boot_uuid: current_private_identity.boot_uuid,
+            },
+        )
+        .map_err(map_store_error)?;
+    finish_recovery(store, update)
+}
+
+#[cfg(target_os = "linux")]
+fn close_same_boot(
+    store: &Arc<TournamentStore>,
+    mut update: StoredTournamentUpdate,
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    update = transition_recovery_phase(store, update, SpeculationPhase::RollbackPending)?;
+    for candidate in 0_u8..2 {
+        let index = usize::from(candidate);
+        if let Some(owner) = update.record.managed_owners[index].as_ref() {
+            require_recovery_complete(reconcile_from_record(
+                &recovery_entry(&update),
+                RecoveryAction::ReconcileManagedOwner {
+                    candidate,
+                    role: owner.role,
+                },
+                ContainmentDeadline::control_action(),
+            )?)?;
+        }
+        loop {
+            use CgroupForwardState as F;
+            use CgroupLifecycleState as L;
+            let lifecycle = update.record.cgroups[index].lifecycle;
+            match lifecycle {
+                L::Forward(F::Planned) => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::Removed;
+                    })?;
+                }
+                L::Forward(F::ParentCreatePending) => {
+                    let evidence = reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::ReconcileCandidateCreate {
+                            candidate,
+                            component: crate::speculation_registry::CgroupComponent::Parent,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?;
+                    let RecoveryEvidence::CandidateCreateReconciled { identity, .. } = evidence
+                    else {
+                        return Err(ServiceError::EvidenceUnavailable);
+                    };
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].parent = Some(identity);
+                        record.cgroups[index].lifecycle = L::Forward(F::ParentCreated);
+                    })?;
+                }
+                L::Forward(F::ControlCreatePending) => {
+                    let evidence = reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::ReconcileCandidateCreate {
+                            candidate,
+                            component: crate::speculation_registry::CgroupComponent::Control,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?;
+                    let RecoveryEvidence::CandidateCreateReconciled { identity, .. } = evidence
+                    else {
+                        return Err(ServiceError::EvidenceUnavailable);
+                    };
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].control = Some(identity);
+                        record.cgroups[index].lifecycle = L::Forward(F::ControlCreated);
+                    })?;
+                }
+                L::Forward(F::PayloadCreatePending) => {
+                    let evidence = reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::ReconcileCandidateCreate {
+                            candidate,
+                            component: crate::speculation_registry::CgroupComponent::Payload,
+                        },
+                        ContainmentDeadline::control_action(),
+                    )?;
+                    let RecoveryEvidence::CandidateCreateReconciled { identity, .. } = evidence
+                    else {
+                        return Err(ServiceError::EvidenceUnavailable);
+                    };
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].payload = Some(identity);
+                        record.cgroups[index].lifecycle = L::Forward(F::PayloadCreated);
+                    })?;
+                }
+                L::Forward(from) => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::CleanupPending { from };
+                    })?;
+                }
+                L::CleanupPending { from } => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::ParentKillPending { from };
+                    })?;
+                }
+                L::ParentKillPending { from } => {
+                    for action in [
+                        RecoveryAction::KillParent { candidate },
+                        RecoveryAction::ProveParentEmpty { candidate },
+                    ] {
+                        require_recovery_complete(reconcile_from_record(
+                            &recovery_entry(&update),
+                            action,
+                            ContainmentDeadline::control_action(),
+                        )?)?;
+                    }
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::ParentEmpty { from };
+                    })?;
+                }
+                L::ParentEmpty { from } => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::PayloadRemovePending { from };
+                    })?;
+                }
+                L::PayloadRemovePending { from } => {
+                    require_recovery_complete(reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::RemovePayload { candidate },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].payload = None;
+                        record.cgroups[index].lifecycle = L::PayloadRemoved { from };
+                    })?;
+                }
+                L::PayloadRemoved { from } => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::ControlRemovePending { from };
+                    })?;
+                }
+                L::ControlRemovePending { from } => {
+                    require_recovery_complete(reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::RemoveControl { candidate },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].control = None;
+                        record.cgroups[index].lifecycle = L::ControlRemoved { from };
+                    })?;
+                }
+                L::ControlRemoved { from } => {
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].lifecycle = L::ParentRemovePending { from };
+                    })?;
+                }
+                L::ParentRemovePending { .. } => {
+                    require_recovery_complete(reconcile_from_record(
+                        &recovery_entry(&update),
+                        RecoveryAction::RemoveParent { candidate },
+                        ContainmentDeadline::control_action(),
+                    )?)?;
+                    update = mutate_same(store, update, |record| {
+                        record.cgroups[index].parent = None;
+                        record.cgroups[index].lifecycle = L::Removed;
+                    })?;
+                }
+                L::Removed => break,
+                L::RollbackRequired => return Err(ServiceError::EvidenceUnavailable),
+            }
+        }
+        update = mutate_same(store, update, |record| {
+            record.status.candidates[index].cleanup = fully_closed_cleanup();
+        })?;
+    }
+    update = match update.record.tournament_cgroup.lifecycle {
+        TournamentCgroupLifecycleState::Planned => mutate_same(store, update, |record| {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+        })?,
+        TournamentCgroupLifecycleState::CreatePending => {
+            let RecoveryEvidence::TournamentCreateReconciled { identity, .. } =
+                reconcile_from_record(
+                    &recovery_entry(&update),
+                    RecoveryAction::ReconcileTournamentCreate,
+                    ContainmentDeadline::control_action(),
+                )?
+            else {
+                return Err(ServiceError::EvidenceUnavailable);
+            };
+            mutate_same(store, update, |record| {
+                record.tournament_cgroup.domain = Some(identity);
+                record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Created;
+            })?
+        }
+        _ => update,
+    };
+    if update.record.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::Created {
+        update = mutate_same(store, update, |record| {
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
+        })?;
+    }
+    if update.record.tournament_cgroup.lifecycle == TournamentCgroupLifecycleState::RemovePending {
+        for action in [
+            RecoveryAction::ProveTournamentEmpty,
+            RecoveryAction::RemoveTournamentDomain,
+        ] {
+            require_recovery_complete(reconcile_from_record(
+                &recovery_entry(&update),
+                action,
+                ContainmentDeadline::control_action(),
+            )?)?;
+        }
+        update = mutate_same(store, update, |record| {
+            record.tournament_cgroup.domain = None;
+            record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+        })?;
+    }
+    if update.record.tournament_cgroup.lifecycle != TournamentCgroupLifecycleState::Removed {
+        return Err(ServiceError::EvidenceUnavailable);
+    }
+    finish_recovery(store, update)
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_entry(update: &StoredTournamentUpdate) -> TournamentRecoveryRecord {
+    TournamentRecoveryRecord::Valid {
+        key: update.key,
+        record: Box::new(update.record.clone()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_recovery_complete(evidence: RecoveryEvidence) -> Result<(), ServiceError> {
+    match evidence {
+        RecoveryEvidence::CandidateActionComplete { .. }
+        | RecoveryEvidence::TournamentActionComplete { .. }
+        | RecoveryEvidence::ManagedOwnerReconciled { .. } => Ok(()),
+        _ => Err(ServiceError::EvidenceUnavailable),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn transition_recovery_phase(
+    store: &Arc<TournamentStore>,
+    update: StoredTournamentUpdate,
+    phase: SpeculationPhase,
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    if update.record.status.phase == phase {
+        return Ok(update);
+    }
+    let mut next = update.record.clone();
+    next.status.generation = increment(update.key.generation())?;
+    next.status.phase = phase;
+    next.status.rollback_required = phase.is_rollback_only();
+    next.status.selected_index = None;
+    store
+        .write(
+            &update.key,
+            update.key.generation(),
+            next,
+            TournamentWriteKind::LivePhaseTransition,
+        )
+        .map_err(map_store_error)
+}
+
+#[cfg(target_os = "linux")]
+fn mutate_same(
+    store: &Arc<TournamentStore>,
+    update: StoredTournamentUpdate,
+    mutate: impl FnOnce(&mut TournamentRecord),
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    let mut next = update.record.clone();
+    next.status.generation = increment(update.key.generation())?;
+    mutate(&mut next);
+    store
+        .write(
+            &update.key,
+            update.key.generation(),
+            next,
+            TournamentWriteKind::SamePhaseEvidence,
+        )
+        .map_err(map_store_error)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_recovery(
+    store: &Arc<TournamentStore>,
+    update: StoredTournamentUpdate,
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    let mut next = update.record.clone();
+    next.status.generation = increment(update.key.generation())?;
+    next.status.phase = SpeculationPhase::RolledBack;
+    next.status.rollback_required = false;
+    next.status.selected_index = None;
+    next.terminal_completed_unix_ms = Some(unix_time_ms()?);
+    store
+        .write(
+            &update.key,
+            update.key.generation(),
+            next,
+            TournamentWriteKind::LivePhaseTransition,
+        )
+        .map_err(map_store_error)
+}
+
+#[cfg(target_os = "linux")]
+fn fully_closed_cleanup() -> crate::protocol::SpeculationCleanupStatus {
+    crate::protocol::SpeculationCleanupStatus {
+        runner_ack: true,
+        bwrap_reaped: true,
+        sync_eof: true,
+        cgroup_empty: true,
+        managed_tombstone: true,
+    }
+}
+
+fn increment(generation: u64) -> Result<u64, ServiceError> {
+    generation
+        .checked_add(1)
+        .ok_or(ServiceError::GenerationExhausted)
 }
 
 struct ActorState {
@@ -849,6 +1347,49 @@ mod tests {
                 claim,
                 SpeculationPhase::RollbackPending | SpeculationPhase::RollbackRequired
             ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_startup_reconciles_before_ready_and_starts_one_watchdog() {
+        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let data = root.path().join("data");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous_runtime = std::env::var_os("LTERM_RUNTIME_DIR");
+        let previous_data = std::env::var_os("LTERM_DATA_DIR");
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var("LTERM_RUNTIME_DIR", &runtime);
+            std::env::set_var("LTERM_DATA_DIR", &data);
+        }
+        let service = SpeculationService::production().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while service.availability() == Availability::Reconciling
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(service.availability(), Availability::Ready);
+        assert!(service.core.store.get().is_some());
+        assert!(service.core.control_root.get().is_some());
+        service.core.watchdog_stop.store(true, Ordering::Release);
+        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
+        unsafe {
+            match previous_runtime {
+                Some(value) => std::env::set_var("LTERM_RUNTIME_DIR", value),
+                None => std::env::remove_var("LTERM_RUNTIME_DIR"),
+            }
+            match previous_data {
+                Some(value) => std::env::set_var("LTERM_DATA_DIR", value),
+                None => std::env::remove_var("LTERM_DATA_DIR"),
+            }
         }
     }
 }
