@@ -8,9 +8,9 @@ use crate::protocol::{
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
     MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
     MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
-    MetadataValue, PROTOCOL_VERSION, Request, Response, SensitiveCapabilityRequest,
-    SessionExitTrigger, SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult,
-    WaitExitResult,
+    MetadataValue, PROTOCOL_VERSION, Request, Response, SPECULATION_UNSUPPORTED_ERROR_CODE,
+    SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
+    StatusTheme, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1493,8 +1493,7 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     if line.trim().is_empty() {
         return Ok(());
     }
-    let request: Request = serde_json::from_str(&line)
-        .with_context(|| format!("parse request: {}", sanitized_preview(&line)))?;
+    let request = parse_request_line(&line)?;
 
     if let Request::Attach { target, rows, cols } = request {
         return handle_attach(state, stream, &target, rows, cols, frame.buffered);
@@ -1521,6 +1520,23 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         std::process::exit(0);
     }
     Ok(())
+}
+
+fn parse_request_line(line: &str) -> Result<Request> {
+    match serde_json::from_str(line) {
+        Ok(request) => Ok(request),
+        Err(_) if is_speculation_request_value(line) => bail!("speculation_invalid_request"),
+        Err(error) => {
+            Err(error).with_context(|| format!("parse request: {}", sanitized_preview(line)))
+        }
+    }
+}
+
+fn is_speculation_request_value(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
+        .is_some_and(|request_type| request_type == "speculation")
 }
 
 fn handle_capability_channel(
@@ -1710,6 +1726,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 started_at_unix_secs: state.started_at_unix_secs,
             }))
         }
+        Request::Speculation(_) => Ok(Response::err(SPECULATION_UNSUPPORTED_ERROR_CODE)),
         Request::New {
             name,
             command,
@@ -4525,7 +4542,8 @@ mod tests {
     use crate::protocol::{
         CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
         MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request,
-        SessionExitTrigger, SessionLifecycleState, StatusTheme,
+        SPECULATION_UNSUPPORTED_ERROR_CODE, SessionExitTrigger, SessionLifecycleState,
+        SpeculationRequest, SpeculationRequestEnvelope, SpeculationStatusRequest, StatusTheme,
     };
     use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -6680,6 +6698,61 @@ mod tests {
             .expect_err("invalid raw limit must fail");
             assert!(err.to_string().contains("recent exit limit"));
         }
+    }
+
+    #[test]
+    fn speculation_rpc_placeholder_is_bounded_and_has_no_session_side_effects() {
+        let state = Arc::new(State::default());
+        let response = super::handle_request(
+            &state,
+            Request::Speculation(SpeculationRequestEnvelope::new(SpeculationRequest::Status(
+                SpeculationStatusRequest {
+                    tournament_uuid: Uuid::nil(),
+                    daemon_instance_uuid: Uuid::nil(),
+                    generation: 0,
+                },
+            ))),
+        )
+        .expect("unsupported speculation request should receive a bounded response");
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(SPECULATION_UNSUPPORTED_ERROR_CODE)
+        );
+        assert!(response.result.is_none());
+        assert!(super::lock(&state.sessions).by_pane.is_empty());
+    }
+
+    #[test]
+    fn malformed_speculation_wire_errors_do_not_echo_encoded_inputs() {
+        let marker = "raw-secret-path-and-argv";
+        let request = serde_json::json!({
+            "type": "speculation",
+            "protocol_version": 9,
+            "request": {
+                "action": "prepare",
+                "body": {
+                    "source": marker,
+                    "candidates": ["L2xlZnQ=", "L3JpZ2h0"],
+                    "ledger_root": "L2xlZGdlcg==",
+                    "cgroup_root": "L2Nncm91cA==",
+                    "timeout_ms": 1000,
+                    "argv": [marker]
+                }
+            }
+        })
+        .to_string();
+        let error = super::parse_request_line(&request)
+            .expect_err("malformed speculation request should fail");
+        assert_eq!(error.to_string(), "speculation_invalid_request");
+        assert!(!error.to_string().contains(marker));
+
+        let legacy_marker = "legacy-preview-marker";
+        let legacy = format!(r#"{{"type":"send","target":"{legacy_marker}"}}"#);
+        let legacy_error = super::parse_request_line(&legacy)
+            .expect_err("legacy malformed request should retain the v8 diagnostic path");
+        assert!(legacy_error.to_string().contains(legacy_marker));
     }
 
     #[test]
