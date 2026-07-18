@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           rustc --version
           cargo --version
       - name: Format check
@@ -43,6 +44,10 @@ jobs:
           python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Linux target checks
+        run: |
+          cargo check --locked --target x86_64-unknown-linux-gnu --tests
+          cargo check --locked --target aarch64-unknown-linux-gnu --tests
       - name: Tests
         run: cargo test --locked -- --test-threads=1
       - name: Release build
@@ -125,10 +130,13 @@ jobs:
             set +e
             cleanup_status=0
             shopt -s nullglob
-            fixtures=("$LTERM_G003_CGROUP_ROOT"/lterm-g003-gate-*)
+            fixtures=("$LTERM_G003_CGROUP_ROOT"/lterm-g003-*)
             for fixture in "${fixtures[@]}"; do
-              if [[ -f "$fixture/candidate-0/cgroup.kill" ]]; then
-                printf '1\n' >"$fixture/candidate-0/cgroup.kill"
+              if [[ "$(basename "$fixture")" == "lterm-g003-runner" ]]; then
+                continue
+              fi
+              if [[ -f "$fixture/cgroup.kill" ]]; then
+                printf '1\n' >"$fixture/cgroup.kill"
                 operation_status=$?
                 if (( operation_status != 0 )); then
                   cleanup_status=$operation_status
@@ -136,8 +144,8 @@ jobs:
               fi
               for _ in {1..500}; do
                 populated=0
-                if [[ -r "$fixture/candidate-0/cgroup.events" ]]; then
-                  populated="$(awk '$1 == "populated" { print $2 }' "$fixture/candidate-0/cgroup.events")"
+                if [[ -r "$fixture/cgroup.events" ]]; then
+                  populated="$(awk '$1 == "populated" { print $2 }' "$fixture/cgroup.events")"
                 fi
                 if [[ "$populated" == "0" ]]; then
                   break
@@ -147,7 +155,10 @@ jobs:
               for directory in \
                 "$fixture/candidate-0/control" \
                 "$fixture/candidate-0/payload" \
+                "$fixture/candidate-1/control" \
+                "$fixture/candidate-1/payload" \
                 "$fixture/candidate-0" \
+                "$fixture/candidate-1" \
                 "$fixture"; do
                 if [[ -d "$directory" ]]; then
                   rmdir "$directory" >/dev/null 2>&1
@@ -172,6 +183,9 @@ jobs:
           cargo test --locked --test g003_linux_feasibility \
             g003_real_bwrap_cgroup_feasibility -- \
             --exact --ignored --nocapture --test-threads=1
+          export LTERM_SPECULATION_CGROUP_ROOT="$LTERM_G003_CGROUP_ROOT"
+          cargo test --locked --test speculation_linux -- \
+            --nocapture --test-threads=1
           GATE_SCRIPT
           chmod 0700 "$gate_script"
 
