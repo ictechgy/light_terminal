@@ -826,14 +826,20 @@ fn enumerate_leaf_names_from_fd(
         return Err(EvidenceError::Stale);
     }
     validate_private_directory_metadata(directory)?;
-    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
+    let independent = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if independent < 0 {
         return Err(EvidenceError::Io);
     }
-    let stream = unsafe { libc::fdopendir(duplicate) };
+    let stream = unsafe { libc::fdopendir(independent) };
     if stream.is_null() {
         unsafe {
-            libc::close(duplicate);
+            libc::close(independent);
         }
         return Err(EvidenceError::Io);
     }
