@@ -383,6 +383,22 @@
       "stability_scope": "Capability is an opt-in cooperative input attenuation surface inside the existing same-UID trust boundary, not a sandbox. Tokens exist only in validated private files and a same-connection v5 sensitive frame; raw Attach and legacy Send remain unchanged. Attempt bytes are atomically charged before one PTY write and are not refunded on failure."
     },
     {
+      "command": "lterm speculate",
+      "aliases": [],
+      "text_output_stability": "none",
+      "json_output_stability": "none",
+      "schema_path": null,
+      "tests": [
+        "cargo test --bin lterm speculation_cli_requires_exact_two_candidates_and_bounded_timeout",
+        "cargo test --bin lterm speculation_decision_commands_require_private_root_tournament_and_json",
+        "cargo test --bin lterm speculation_cli_preserves_non_utf8_exact_argv_and_dispatches_fail_closed"
+      ],
+      "docs_owner": "docs/public-contract.md",
+      "classification": "internal",
+      "raw_stream_policy": "not-applicable",
+      "stability_scope": "Phase 1 exposes the nested syntax for contract testing but every subcommand fails closed before daemon or candidate work; no output schema is promoted yet."
+    },
+    {
       "command": "lterm metadata",
       "aliases": [],
       "text_output_stability": "none",

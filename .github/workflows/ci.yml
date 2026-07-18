@@ -56,13 +56,36 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Install stable Rust and exact bubblewrap package
+      - name: Install stable Rust, exact bubblewrap package, and targeted AppArmor policy
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap
+          sudo apt-get install --yes --no-install-recommends \
+            apparmor apparmor-profiles bubblewrap
+
+          profile_src=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          profile_dst=/etc/apparmor.d/bwrap-userns-restrict
+          test "$(dpkg-query --search "$profile_src")" = "apparmor-profiles: $profile_src"
+          test "$(readlink --canonicalize-existing "$profile_src")" = "$profile_src"
+          test "$(stat --format=%F "$profile_src")" = "regular file"
+          test "$(stat --format=%u "$profile_src")" = "0"
+          test "$(stat --format=%g "$profile_src")" = "0"
+          test "$((8#$(stat --format=%a "$profile_src") & 8#022))" = "0"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+
+          sudo install --owner=root --group=root --mode=0644 \
+            "$profile_src" "$profile_dst"
+          test "$(sudo stat --format=%F "$profile_dst")" = "regular file"
+          test "$(sudo stat --format=%u:%g:%a "$profile_dst")" = "0:0:644"
+          sudo apparmor_parser --replace "$profile_dst"
+
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+          sudo grep --fixed-strings --line-regexp --quiet \
+            'bwrap (enforce)' /sys/kernel/security/apparmor/profiles
+          sudo grep --fixed-strings --line-regexp --quiet \
+            'unpriv_bwrap (enforce)' /sys/kernel/security/apparmor/profiles
           test "$(dpkg-query --search /usr/bin/bwrap)" = "bubblewrap: /usr/bin/bwrap"
           test "$(stat --format=%F /usr/bin/bwrap)" = "regular file"
           test "$(stat --format=%u /usr/bin/bwrap)" = "0"
