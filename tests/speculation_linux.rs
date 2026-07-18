@@ -184,14 +184,34 @@ fn run_restart_component(
     command.output().expect("run restart component driver")
 }
 
+fn required_component_stage(fixture: &tempfile::TempDir) -> &'static str {
+    for (directory, stage) in [
+        ("q", "pids-exhaustion"),
+        ("m", "migration"),
+        ("d", "detached-descendants"),
+        ("f", "fork-storm"),
+        ("i", "stream-overflow"),
+        ("o", "bounded-overflow"),
+        ("x", "output-boundary"),
+        ("e", "timing-score"),
+        ("p", "peer-attacks"),
+    ] {
+        if fixture.path().join(directory).is_dir() {
+            return stage;
+        }
+    }
+    "topology-attacks"
+}
+
 #[test]
 fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
-    let Some((_fixture, output)) = run_required_component(None) else {
+    let Some((fixture, output)) = run_required_component(None) else {
         return;
     };
     assert!(
         output.status.success(),
-        "component driver failed with bounded stderr: {}",
+        "component driver failed at {} with bounded stderr: {}",
+        required_component_stage(&fixture),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"speculation-real-cases=14\n");
