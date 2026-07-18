@@ -4831,6 +4831,7 @@ fn restart_record_from_context(
             }
         }),
         managed_owners: [None, None],
+        restart_prior_phase: None,
         terminal_completed_unix_ms: None,
         status: crate::protocol::SpeculationStatus {
             schema_version: crate::protocol::SpeculationSchemaVersion::V1,

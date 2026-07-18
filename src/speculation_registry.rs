@@ -1,7 +1,7 @@
 use crate::protocol::{
     MAX_SPECULATION_ERROR_CODES, SPECULATION_SCORE_ORDER, SpeculationCandidateStatus,
-    SpeculationExitCategory, SpeculationPhase, SpeculationSchemaVersion, SpeculationStatus,
-    SpeculationUnixPath,
+    SpeculationExitCategory, SpeculationPhase, SpeculationReasonCode, SpeculationSchemaVersion,
+    SpeculationStatus, SpeculationUnixPath,
 };
 use crate::speculation_fs::{
     DurableDirectoryIdentity, EvidenceError, EvidenceResult, FileIdentity,
@@ -525,6 +525,10 @@ pub struct TournamentRecord {
     pub tournament_cgroup: TournamentCgroupEvidence,
     pub cgroups: [CandidateCgroupEvidence; 2],
     pub managed_owners: [Option<ManagedOwnerEvidence>; 2],
+    /// Private recovery-only evidence. This is never projected into the public
+    /// status or client ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_prior_phase: Option<SpeculationPhase>,
     pub terminal_completed_unix_ms: Option<u64>,
     pub status: SpeculationStatus,
 }
@@ -576,6 +580,16 @@ impl TournamentRecord {
                         owner.candidate_index != index as u8 || owner.generation == 0
                     })
                 })
+            || self.restart_prior_phase.is_some_and(|prior| {
+                prior.is_terminal()
+                    || prior == SpeculationPhase::RollbackRequired
+                    || !matches!(
+                        self.status.phase,
+                        SpeculationPhase::RollbackRequired
+                            | SpeculationPhase::RollbackPending
+                            | SpeculationPhase::RolledBack
+                    )
+            })
         {
             return Err(EvidenceError::Corrupt);
         }
@@ -612,6 +626,81 @@ impl TournamentRecord {
             && self.status.daemon_instance_uuid == next.status.daemon_instance_uuid
             && self.status.candidates[0].candidate_uuid == next.status.candidates[0].candidate_uuid
             && self.status.candidates[1].candidate_uuid == next.status.candidates[1].candidate_uuid
+    }
+
+    fn public_evidence_progresses_to(&self, next: &Self) -> bool {
+        self.status.lease_deadline_unix_ms <= next.status.lease_deadline_unix_ms
+            && option_is_retained(self.status.reason_code, next.status.reason_code)
+            && option_is_retained(self.status.selected_index, next.status.selected_index)
+            && slice_is_prefix(
+                self.status.error_codes.as_slice(),
+                next.status.error_codes.as_slice(),
+            )
+            && self
+                .status
+                .candidates
+                .iter()
+                .zip(next.status.candidates.iter())
+                .all(|(current, next)| candidate_progresses_to(current, next))
+            && self
+                .managed_owners
+                .iter()
+                .zip(next.managed_owners.iter())
+                .all(|(current, next)| managed_owner_progresses_to(current.as_ref(), next.as_ref()))
+    }
+}
+
+fn option_is_retained<T: Copy + Eq>(current: Option<T>, next: Option<T>) -> bool {
+    current.is_none_or(|value| next == Some(value))
+}
+
+fn slice_is_prefix<T: Eq>(current: &[T], next: &[T]) -> bool {
+    next.starts_with(current)
+}
+
+fn candidate_progresses_to(
+    current: &SpeculationCandidateStatus,
+    next: &SpeculationCandidateStatus,
+) -> bool {
+    current.candidate_uuid == next.candidate_uuid
+        && current.index == next.index
+        && (!current.ready || next.ready)
+        && option_is_retained(current.ready_elapsed_ns, next.ready_elapsed_ns)
+        && (!current.go_received || next.go_received)
+        && option_is_retained(current.go_received_elapsed_ns, next.go_received_elapsed_ns)
+        && (!current.result_accepted || next.result_accepted)
+        && option_is_retained(current.exit_success, next.exit_success)
+        && option_is_retained(current.exit_category, next.exit_category)
+        && option_is_retained(current.elapsed_ns, next.elapsed_ns)
+        && option_is_retained(current.output_bytes, next.output_bytes)
+        && (!current.eligible || next.eligible)
+        && cleanup_progresses_to(current.cleanup, next.cleanup)
+}
+
+fn cleanup_progresses_to(
+    current: crate::protocol::SpeculationCleanupStatus,
+    next: crate::protocol::SpeculationCleanupStatus,
+) -> bool {
+    (!current.runner_ack || next.runner_ack)
+        && (!current.bwrap_reaped || next.bwrap_reaped)
+        && (!current.sync_eof || next.sync_eof)
+        && (!current.cgroup_empty || next.cgroup_empty)
+        && (!current.managed_tombstone || next.managed_tombstone)
+}
+
+fn managed_owner_progresses_to(
+    current: Option<&ManagedOwnerEvidence>,
+    next: Option<&ManagedOwnerEvidence>,
+) -> bool {
+    match (current, next) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(current), Some(next)) if current == next => true,
+        (Some(current), Some(next)) => {
+            current.candidate_index == next.candidate_index
+                && current.role == ManagedOwnerRoleEvidence::Probe
+                && next.role == ManagedOwnerRoleEvidence::Runner
+        }
     }
 }
 
@@ -753,6 +842,18 @@ pub struct TournamentKey {
     slot: u16,
     generation: u64,
     tournament_uuid: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TournamentWriteKind {
+    LivePhaseTransition,
+    SamePhaseEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTournamentUpdate {
+    pub key: TournamentKey,
+    pub record: TournamentRecord,
 }
 
 impl TournamentKey {
@@ -981,6 +1082,22 @@ impl TournamentStore {
         expected_generation: u64,
         next: TournamentRecord,
     ) -> EvidenceResult<TournamentKey> {
+        self.write(
+            key,
+            expected_generation,
+            next,
+            TournamentWriteKind::LivePhaseTransition,
+        )
+        .map(|stored| stored.key)
+    }
+
+    pub fn write(
+        &self,
+        key: &TournamentKey,
+        expected_generation: u64,
+        next: TournamentRecord,
+        kind: TournamentWriteKind,
+    ) -> EvidenceResult<StoredTournamentUpdate> {
         next.validate()?;
         let mut state = self.state.lock().map_err(|_| EvidenceError::Poisoned)?;
         let slot_state = state
@@ -1002,7 +1119,20 @@ impl TournamentStore {
                     .checked_add(1)
                     .ok_or(EvidenceError::GenerationMismatch)?
             || !current.immutable_identity_matches(&next)
-            || !crate::speculation::is_legal_transition(current.status.phase, next.status.phase)
+            || !match kind {
+                TournamentWriteKind::LivePhaseTransition => {
+                    current.restart_prior_phase == next.restart_prior_phase
+                        && crate::speculation::is_legal_transition(
+                            current.status.phase,
+                            next.status.phase,
+                        )
+                }
+                TournamentWriteKind::SamePhaseEvidence => {
+                    current.status.phase == next.status.phase
+                        && current.restart_prior_phase == next.restart_prior_phase
+                }
+            }
+            || !current.public_evidence_progresses_to(&next)
             || !current
                 .tournament_cgroup
                 .lifecycle
@@ -1039,11 +1169,132 @@ impl TournamentStore {
             return Err(EvidenceError::Corrupt);
         };
         let next_key = key_for(key.slot, &stored_record);
+        let stored_update = StoredTournamentUpdate {
+            key: next_key,
+            record: (*stored_record).clone(),
+        };
         *slot_state = SlotState::Valid {
             record: stored_record,
             identity: entry.identity,
         };
-        Ok(next_key)
+        Ok(stored_update)
+    }
+
+    pub fn normalize_after_daemon_restart(
+        &self,
+        key: &TournamentKey,
+        expected_generation: u64,
+        current_daemon_instance_uuid: Uuid,
+    ) -> EvidenceResult<StoredTournamentUpdate> {
+        if current_daemon_instance_uuid.is_nil() {
+            return Err(EvidenceError::Corrupt);
+        }
+        let current = self
+            .load_by_uuid(key.tournament_uuid)?
+            .ok_or(EvidenceError::GenerationMismatch)?;
+        if key.generation != expected_generation
+            || current.status.generation != expected_generation
+            || current.status.daemon_instance_uuid == current_daemon_instance_uuid
+        {
+            return Err(EvidenceError::GenerationMismatch);
+        }
+        if current.status.is_terminal()
+            || current.status.phase == SpeculationPhase::RollbackRequired
+        {
+            return Ok(StoredTournamentUpdate {
+                key: key_for(key.slot, &current),
+                record: current,
+            });
+        }
+        if current.restart_prior_phase.is_some() {
+            return Err(EvidenceError::Corrupt);
+        }
+        let mut next = current.clone();
+        next.status.generation = expected_generation
+            .checked_add(1)
+            .ok_or(EvidenceError::GenerationMismatch)?;
+        next.restart_prior_phase = Some(current.status.phase);
+        next.status.phase = SpeculationPhase::RollbackRequired;
+        next.status.rollback_required = true;
+        next.status.selected_index = None;
+        next.status.reason_code = Some(
+            if current.status.phase == SpeculationPhase::DecisionUncertain {
+                SpeculationReasonCode::DecisionUncertainAfterRestart
+            } else {
+                SpeculationReasonCode::ContainmentEvidenceUnavailable
+            },
+        );
+        self.write_restart_normalization(key, expected_generation, current, next)
+    }
+
+    fn write_restart_normalization(
+        &self,
+        key: &TournamentKey,
+        expected_generation: u64,
+        current_snapshot: TournamentRecord,
+        next: TournamentRecord,
+    ) -> EvidenceResult<StoredTournamentUpdate> {
+        next.validate()?;
+        let mut state = self.state.lock().map_err(|_| EvidenceError::Poisoned)?;
+        let slot_state = state
+            .slots
+            .get_mut(key.slot as usize)
+            .ok_or(EvidenceError::GenerationMismatch)?;
+        let SlotState::Valid {
+            record: current,
+            identity,
+        } = slot_state
+        else {
+            return Err(EvidenceError::GenerationMismatch);
+        };
+        if current.as_ref() != &current_snapshot
+            || key.tournament_uuid != current.status.tournament_uuid
+            || key.generation != expected_generation
+            || current.status.generation != expected_generation
+            || next.status.generation
+                != expected_generation
+                    .checked_add(1)
+                    .ok_or(EvidenceError::GenerationMismatch)?
+            || !current.immutable_identity_matches(&next)
+            || next.restart_prior_phase != Some(current.status.phase)
+            || next.status.phase != SpeculationPhase::RollbackRequired
+            || !next.status.rollback_required
+            || next.status.selected_index.is_some()
+            || current.terminal_completed_unix_ms.is_some()
+        {
+            return Err(EvidenceError::GenerationMismatch);
+        }
+        let entry = atomic_replace_json(
+            &self.directory,
+            &slot_leaf(key.slot)?,
+            *identity,
+            &TournamentSlotRecord::occupied(key.slot, next),
+            MAX_SPECULATION_JSON_BYTES,
+        );
+        let entry = match entry {
+            Ok(entry) if entry.value.validate(key.slot).is_ok() => entry,
+            Ok(_) => {
+                *slot_state = SlotState::Corrupt;
+                return Err(EvidenceError::Corrupt);
+            }
+            Err(error) => {
+                *slot_state = SlotState::Corrupt;
+                return Err(error);
+            }
+        };
+        let Some(stored_record) = entry.value.record else {
+            *slot_state = SlotState::Corrupt;
+            return Err(EvidenceError::Corrupt);
+        };
+        let stored = StoredTournamentUpdate {
+            key: key_for(key.slot, &stored_record),
+            record: (*stored_record).clone(),
+        };
+        *slot_state = SlotState::Valid {
+            record: stored_record,
+            identity: entry.identity,
+        };
+        Ok(stored)
     }
 
     pub fn load_by_uuid(&self, id: Uuid) -> EvidenceResult<Option<TournamentRecord>> {
@@ -1253,6 +1504,7 @@ mod tests {
                 payload: None,
             }),
             managed_owners: [None, None],
+            restart_prior_phase: None,
             terminal_completed_unix_ms: Some(100),
             status: SpeculationStatus {
                 schema_version: SpeculationSchemaVersion::V1,
@@ -1333,6 +1585,84 @@ mod tests {
                 .is_some_and(|owner| owner.generation > armed.status.generation)
         );
         armed.validate().unwrap();
+    }
+
+    #[test]
+    fn same_phase_progress_rejects_public_and_owner_regression() {
+        let current = armed_record_with_reused_managed_slot();
+        let mut next = current.clone();
+        next.status.generation += 1;
+        assert!(current.public_evidence_progresses_to(&next));
+
+        next.managed_owners[0] = None;
+        assert!(!current.public_evidence_progresses_to(&next));
+
+        let mut probe = current.clone();
+        probe.managed_owners[0].as_mut().unwrap().role = ManagedOwnerRoleEvidence::Probe;
+        let mut runner = probe.clone();
+        runner.managed_owners[0] = current.managed_owners[0].clone();
+        assert!(probe.public_evidence_progresses_to(&runner));
+        assert!(!runner.public_evidence_progresses_to(&probe));
+
+        let mut ready = current.clone();
+        ready.status.candidates[0].ready = true;
+        ready.status.candidates[0].ready_elapsed_ns = Some(1);
+        assert!(current.public_evidence_progresses_to(&ready));
+        assert!(!ready.public_evidence_progresses_to(&current));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_write_modes_and_restart_normalization_are_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = TournamentStore::open_or_create(&root.path().join("store")).unwrap();
+        let prepared = prepared_record();
+        let key = store.allocate_prepared(prepared.clone(), 1).unwrap();
+
+        let mut same_phase = prepared.clone();
+        same_phase.status.generation += 1;
+        let stored = store
+            .write(
+                &key,
+                key.generation,
+                same_phase.clone(),
+                TournamentWriteKind::SamePhaseEvidence,
+            )
+            .unwrap();
+        assert_eq!(stored.record, same_phase);
+
+        let mut illegal_live = stored.record.clone();
+        illegal_live.status.generation += 1;
+        assert_eq!(
+            store.write(
+                &stored.key,
+                stored.key.generation,
+                illegal_live,
+                TournamentWriteKind::LivePhaseTransition,
+            ),
+            Err(EvidenceError::GenerationMismatch)
+        );
+
+        let current_daemon = Uuid::from_u128(99);
+        let normalized = store
+            .normalize_after_daemon_restart(&stored.key, stored.key.generation, current_daemon)
+            .unwrap();
+        assert_eq!(
+            normalized.record.status.phase,
+            SpeculationPhase::RollbackRequired
+        );
+        assert_eq!(
+            normalized.record.restart_prior_phase,
+            Some(SpeculationPhase::Prepared)
+        );
+        assert_eq!(
+            normalized.record.status.reason_code,
+            Some(SpeculationReasonCode::ContainmentEvidenceUnavailable)
+        );
+        assert_eq!(
+            store.load_by_uuid(key.tournament_uuid).unwrap(),
+            Some(normalized.record)
+        );
     }
 
     #[cfg(target_os = "linux")]
