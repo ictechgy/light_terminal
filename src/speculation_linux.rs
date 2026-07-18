@@ -5,8 +5,8 @@ use crate::launch_registry::{
     ControlCgroupPlacement, MANAGED_SYNC_PIPE_TARGET_FD, ManagedAuxiliary,
     ManagedCgroupDirectoryIdentity, ManagedCgroupMembership, ManagedController,
     ManagedDescendantProof, ManagedExecutablePolicy, ManagedLaunchRequest, ManagedOwnerKind,
-    ManagedOwnerOutcome, ManagedOwnerReceipt, ManagedOwnerRole, ManagedOwnerTag, ManagedPlacement,
-    ManagedWaiter, SyncPipeWrite, launch_managed_process, reconcile_managed_owner,
+    ManagedOwnerOutcome, ManagedOwnerRole, ManagedOwnerTag, ManagedPlacement, ManagedWaiter,
+    SyncPipeWrite, launch_managed_process, reconcile_managed_owner,
 };
 use crate::speculation_fs::{DurableDirectoryIdentity, EvidenceError, ValidatedDirectory};
 #[cfg(target_os = "linux")]
@@ -43,6 +43,8 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -2300,19 +2302,51 @@ impl Drop for PrivateRunnerControl {
 
 #[cfg(target_os = "linux")]
 pub(crate) struct CandidateContainment {
+    control: CandidateControl,
+    observer: CandidateObserver,
+    observation: CandidateObservation,
+}
+
+#[cfg(target_os = "linux")]
+struct CandidateProtocol {
     identity: RunnerIdentity,
     peer: File,
     validator: SequenceValidator,
+    output_limit_observed: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct CandidateControl {
+    identity: RunnerIdentity,
+    protocol: Arc<Mutex<CandidateProtocol>>,
+    payload_proof: Option<ManagedDescendantProof>,
+    _lifetime: Arc<PrivateRunnerControl>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct CandidateObserver {
+    identity: RunnerIdentity,
+    protocol: Arc<Mutex<CandidateProtocol>>,
     controller: ManagedController,
-    owner_receipt: ManagedOwnerReceipt,
     waiter: Option<ManagedWaiter>,
     sync_read: File,
-    control: PrivateRunnerControl,
     payload_membership: ManagedCgroupMembership,
-    payload_proof: Option<ManagedDescendantProof>,
-    output_limit_observed: bool,
     sync_eof_observed: bool,
     managed_reaped_observed: bool,
+    _lifetime: Arc<PrivateRunnerControl>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PayloadPlacementEvidence {
+    identity: RunnerIdentity,
+    proof: ManagedDescendantProof,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct CandidateContainmentParts {
+    pub control: CandidateControl,
+    pub observer: CandidateObserver,
+    pub observation: CandidateObservation,
 }
 
 #[cfg(target_os = "linux")]
@@ -2325,18 +2359,14 @@ pub(crate) struct CandidateObservation {
 #[cfg(target_os = "linux")]
 impl CandidateContainment {
     pub(crate) fn observation(&self) -> CandidateObservation {
-        let owner = self.owner_receipt.owner();
-        CandidateObservation {
-            identity: self.identity,
-            managed_owner: ManagedOwnerEvidence {
-                candidate_index: owner.candidate_index,
-                role: match owner.role {
-                    ManagedOwnerRole::Probe => ManagedOwnerRoleEvidence::Probe,
-                    ManagedOwnerRole::Runner => ManagedOwnerRoleEvidence::Runner,
-                },
-                slot: self.owner_receipt.slot(),
-                generation: self.owner_receipt.generation(),
-            },
+        self.observation.clone()
+    }
+
+    pub(crate) fn split(self) -> CandidateContainmentParts {
+        CandidateContainmentParts {
+            control: self.control,
+            observer: self.observer,
+            observation: self.observation,
         }
     }
 }
@@ -2346,13 +2376,22 @@ impl fmt::Debug for CandidateContainment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CandidateContainment")
-            .field("identity", &self.identity)
+            .field("identity", &self.observation.identity)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) struct CandidateContainment;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct CandidateControl;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct CandidateObserver;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct PayloadPlacementEvidence;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn launch_runner(
@@ -2500,20 +2539,45 @@ fn launch_runner_with_argv(
     ] {
         directory.revalidate().map_err(map_evidence)?;
     }
-    Ok(CandidateContainment {
+    let owner = owner_receipt.owner();
+    let observation = CandidateObservation {
+        identity,
+        managed_owner: ManagedOwnerEvidence {
+            candidate_index: owner.candidate_index,
+            role: match owner.role {
+                ManagedOwnerRole::Probe => ManagedOwnerRoleEvidence::Probe,
+                ManagedOwnerRole::Runner => ManagedOwnerRoleEvidence::Runner,
+            },
+            slot: owner_receipt.slot(),
+            generation: owner_receipt.generation(),
+        },
+    };
+    let protocol = Arc::new(Mutex::new(CandidateProtocol {
         identity,
         peer,
         validator,
-        controller: managed.controller,
-        owner_receipt,
-        waiter: Some(managed.waiter),
-        sync_read,
-        control: private_control,
-        payload_membership,
-        payload_proof: None,
         output_limit_observed: false,
-        sync_eof_observed: false,
-        managed_reaped_observed: false,
+    }));
+    let lifetime = Arc::new(private_control);
+    Ok(CandidateContainment {
+        control: CandidateControl {
+            identity,
+            protocol: Arc::clone(&protocol),
+            payload_proof: None,
+            _lifetime: Arc::clone(&lifetime),
+        },
+        observer: CandidateObserver {
+            identity,
+            protocol,
+            controller: managed.controller,
+            waiter: Some(managed.waiter),
+            sync_read,
+            payload_membership,
+            sync_eof_observed: false,
+            managed_reaped_observed: false,
+            _lifetime: lifetime,
+        },
+        observation,
     })
 }
 
@@ -2531,7 +2595,7 @@ pub(crate) fn run_fixed_probe(
         b"/run/lterm-control/lterm".to_vec(),
         b"--internal-speculation-probe-v1".to_vec(),
     ];
-    let mut containment = launch_runner_with_argv(
+    let containment = launch_runner_with_argv(
         context,
         topology,
         candidate_index,
@@ -2539,16 +2603,22 @@ pub(crate) fn run_fixed_probe(
         ManagedOwnerRole::Probe,
         deadline,
     )?;
-    transfer_payload_fd(&mut containment, topology, deadline)?;
-    send_go(&mut containment, deadline)?;
-    receive_go_receipt(&mut containment, deadline)?;
-    receive_payload_placed(&mut containment, topology, deadline)?;
-    send_payload_release(&mut containment, deadline)?;
-    let leader = receive_leader_exited(&mut containment, deadline)?;
+    let CandidateContainmentParts {
+        mut control,
+        mut observer,
+        ..
+    } = containment.split();
+    transfer_payload_fd(&mut control, topology, deadline)?;
+    receive_payload_fd_ack(&mut observer, deadline)?;
+    send_go(&mut control, deadline)?;
+    receive_go_receipt(&mut observer, deadline)?;
+    let placement = receive_payload_placed(&mut observer, topology, deadline)?;
+    send_payload_release(&mut control, placement, deadline)?;
+    let leader = receive_leader_exited(&mut observer, deadline)?;
     let payload = topology.payload()?;
     write_leaf(payload, c"cgroup.kill", b"1\n")?;
     wait_populated_zero(payload, deadline)?;
-    let drained = receive_output_drained(&mut containment, deadline)?;
+    let drained = receive_output_drained(&mut observer, deadline)?;
     let exited_zero = matches!(
         leader,
         ContainmentEvent::LeaderExited {
@@ -2560,10 +2630,11 @@ pub(crate) fn run_fixed_probe(
         ContainmentEvent::OutputDrained { bytes, .. } => bytes,
         _ => return Err(ContainmentErrorCode::TerminalBoundaryFailure),
     };
-    send_select_or_abort(&mut containment, DecisionKind::Abort, deadline)?;
-    observe_sync_eof(&mut containment, deadline)?;
-    observe_managed_reaped(&mut containment, deadline)?;
-    finish_containment(containment)?;
+    send_select_or_abort(&mut control, DecisionKind::Abort, deadline)?;
+    receive_decision_ack(&mut observer, DecisionKind::Abort, deadline)?;
+    observe_sync_eof(&mut observer, deadline)?;
+    observe_managed_reaped(&mut observer, deadline)?;
+    finish_containment(control, observer)?;
     let parent = topology
         .parent
         .as_ref()
@@ -2602,45 +2673,72 @@ pub(crate) fn launch_runner(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn transfer_payload_fd(
-    containment: &mut CandidateContainment,
+    control: &mut CandidateControl,
     topology: &CandidateTopology,
     deadline: ContainmentDeadline,
-) -> ContainmentResult<ContainmentEvent> {
-    if topology.candidate_index != containment.identity.candidate_index {
+) -> ContainmentResult<()> {
+    if topology.candidate_index != control.identity.candidate_index {
         return Err(ContainmentErrorCode::InvalidIdentity);
     }
     let payload = topology.payload()?;
     let placement_fd = open_cgroup_procs(payload)?;
     failpoint("before_payload_fd_evidence")?;
-    let placement = placement_descriptor_evidence(&placement_fd, payload, containment.identity)?;
+    let placement = placement_descriptor_evidence(&placement_fd, payload, control.identity)?;
     failpoint("after_payload_fd_evidence")?;
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let frame = ControlFrame::new(
-        containment.identity,
-        containment.validator.next_sequence(),
+        control.identity,
+        protocol.validator.next_sequence(),
         ControlMessage::ReadyAck { placement },
     );
-    containment
+    protocol
         .validator
         .accept(&frame)
         .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
     failpoint("before_payload_fd_send")?;
-    wait_fd_until(&containment.peer, libc::POLLOUT, deadline)?;
-    send_frame_with_one_fd(&containment.peer, &frame, &placement_fd)
+    wait_fd_until(&protocol.peer, libc::POLLOUT, deadline)?;
+    send_frame_with_one_fd(&protocol.peer, &frame, &placement_fd)
         .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
     failpoint("after_payload_fd_send")?;
-    let ack = receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn receive_payload_fd_ack(
+    observer: &mut CandidateObserver,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<ContainmentEvent> {
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let ack = receive_validated_frame(peer, validator, deadline)?;
     if !matches!(ack.message, ControlMessage::PayloadFdAck) {
         return Err(ContainmentErrorCode::DescriptorViolation);
     }
     Ok(ContainmentEvent::PayloadFdAck {
-        candidate: containment.identity.candidate_index,
+        candidate: observer.identity.candidate_index,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn transfer_payload_fd(
-    _containment: &mut CandidateContainment,
+    _control: &mut CandidateControl,
     _topology: &CandidateTopology,
+    _deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn receive_payload_fd_ack(
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2648,26 +2746,33 @@ pub(crate) fn transfer_payload_fd(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn send_go(
-    containment: &mut CandidateContainment,
+    control: &mut CandidateControl,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoSendEvidence> {
     let sent_monotonic_ns = monotonic_now_ns()?;
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
     send_validated_frame(
-        &containment.peer,
-        &mut containment.validator,
+        peer,
+        validator,
         ControlMessage::Go,
-        containment.identity,
+        control.identity,
         deadline,
     )?;
     Ok(GoSendEvidence {
-        candidate: containment.identity.candidate_index,
+        candidate: control.identity.candidate_index,
         sent_monotonic_ns,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn send_go(
-    _containment: &mut CandidateContainment,
+    _control: &mut CandidateControl,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoSendEvidence> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2675,11 +2780,17 @@ pub(crate) fn send_go(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_go_receipt(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoReceiptEvidence> {
-    let received =
-        receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let received = receive_validated_frame(peer, validator, deadline)?;
     let ControlMessage::GoReceived { monotonic_ns } = received.message else {
         return Err(ContainmentErrorCode::PeerRejected);
     };
@@ -2687,14 +2798,14 @@ pub(crate) fn receive_go_receipt(
         return Err(ContainmentErrorCode::PeerRejected);
     }
     Ok(GoReceiptEvidence {
-        identity: containment.identity,
+        identity: observer.identity,
         received_monotonic_ns: monotonic_ns,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_go_receipt(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<GoReceiptEvidence> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2702,30 +2813,47 @@ pub(crate) fn receive_go_receipt(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_payload_placed(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     topology: &CandidateTopology,
     deadline: ContainmentDeadline,
-) -> ContainmentResult<ContainmentEvent> {
-    let placed = receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+) -> ContainmentResult<PayloadPlacementEvidence> {
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let placed = receive_validated_frame(peer, validator, deadline)?;
     if !matches!(placed.message, ControlMessage::PayloadPlaced) {
         return Err(ContainmentErrorCode::PlacementUnproven);
     }
+    drop(protocol);
     let payload = topology.payload()?;
     let observed = read_single_cgroup_pid(payload)?;
     failpoint("before_payload_membership_proof")?;
-    let proof = containment
+    let proof = observer
         .controller
-        .prove_descendant_in_cgroup(observed, &containment.payload_membership)
+        .prove_descendant_in_cgroup(observed, &observer.payload_membership)
         .map_err(|_| ContainmentErrorCode::PlacementUnproven)?;
     failpoint("after_payload_membership_proof")?;
-    if proof.membership() != &containment.payload_membership {
+    if proof.membership() != &observer.payload_membership {
         return Err(ContainmentErrorCode::PlacementUnproven);
     }
     prove_namespace_isolation(observed)?;
-    containment.payload_proof = Some(proof);
-    Ok(ContainmentEvent::PayloadPlaced {
-        candidate: containment.identity.candidate_index,
+    Ok(PayloadPlacementEvidence {
+        identity: observer.identity,
+        proof,
     })
+}
+
+#[cfg(target_os = "linux")]
+impl PayloadPlacementEvidence {
+    pub(crate) fn event(&self) -> ContainmentEvent {
+        ContainmentEvent::PayloadPlaced {
+            candidate: self.identity.candidate_index,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2744,27 +2872,39 @@ fn prove_namespace_isolation(observed_host_pid: u32) -> ContainmentResult<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_payload_placed(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _topology: &CandidateTopology,
     _deadline: ContainmentDeadline,
-) -> ContainmentResult<ContainmentEvent> {
+) -> ContainmentResult<PayloadPlacementEvidence> {
     Err(ContainmentErrorCode::Unsupported)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn send_payload_release(
-    containment: &mut CandidateContainment,
+    control: &mut CandidateControl,
+    placement: PayloadPlacementEvidence,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
-    if containment.payload_proof.is_none() {
+    if placement.identity != control.identity
+        || placement.proof.membership().candidate_index() != control.identity.candidate_index
+        || placement.proof.membership().generation() != control.identity.generation
+    {
         return Err(ContainmentErrorCode::PlacementUnproven);
     }
+    control.payload_proof = Some(placement.proof);
     failpoint("before_payload_release")?;
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
     send_validated_frame(
-        &containment.peer,
-        &mut containment.validator,
+        peer,
+        validator,
         ControlMessage::PayloadRelease,
-        containment.identity,
+        control.identity,
         deadline,
     )?;
     failpoint("after_payload_release")
@@ -2772,7 +2912,8 @@ pub(crate) fn send_payload_release(
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn send_payload_release(
-    _containment: &mut CandidateContainment,
+    _control: &mut CandidateControl,
+    _placement: PayloadPlacementEvidence,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2780,17 +2921,17 @@ pub(crate) fn send_payload_release(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_candidate_completion(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<[ContainmentEvent; 2]> {
-    let leader = receive_leader_exited(containment, deadline)?;
-    let drained = receive_output_drained(containment, deadline)?;
+    let leader = receive_leader_exited(observer, deadline)?;
+    let drained = receive_output_drained(observer, deadline)?;
     Ok([leader, drained])
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_candidate_completion(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<[ContainmentEvent; 2]> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2798,10 +2939,10 @@ pub(crate) fn receive_candidate_completion(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_leader_exited(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let event = receive_execution_event(containment, deadline)?;
+    let event = receive_execution_event(observer, deadline)?;
     if !matches!(event, ContainmentEvent::LeaderExited { .. }) {
         return Err(ContainmentErrorCode::OutputLimit);
     }
@@ -2810,26 +2951,33 @@ pub(crate) fn receive_leader_exited(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_execution_event(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let leader = receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let leader = receive_validated_frame(peer, validator, deadline)?;
     match leader.message {
         ControlMessage::LeaderExited {
             category,
             elapsed_ns,
         } if elapsed_ns != 0 => Ok(ContainmentEvent::LeaderExited {
-            candidate: containment.identity.candidate_index,
+            candidate: observer.identity.candidate_index,
             category,
             elapsed_ns,
         }),
         ControlMessage::OutputLimitExceeded { bytes }
             if bytes == crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1
-                && !containment.output_limit_observed =>
+                && !protocol.output_limit_observed =>
         {
-            containment.output_limit_observed = true;
+            protocol.output_limit_observed = true;
             Ok(ContainmentEvent::OutputLimitExceeded {
-                candidate: containment.identity.candidate_index,
+                candidate: observer.identity.candidate_index,
                 bytes,
             })
         }
@@ -2839,7 +2987,7 @@ pub(crate) fn receive_execution_event(
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_leader_exited(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2847,7 +2995,7 @@ pub(crate) fn receive_leader_exited(
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_execution_event(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2855,24 +3003,31 @@ pub(crate) fn receive_execution_event(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn acknowledge_output_cleanup_claimed(
-    containment: &mut CandidateContainment,
+    control: &mut CandidateControl,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
-    if !containment.output_limit_observed {
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if !protocol.output_limit_observed {
         return Err(ContainmentErrorCode::PeerRejected);
     }
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
     send_validated_frame(
-        &containment.peer,
-        &mut containment.validator,
+        peer,
+        validator,
         ControlMessage::OutputCleanupClaimed,
-        containment.identity,
+        control.identity,
         deadline,
     )
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn acknowledge_output_cleanup_claimed(
-    _containment: &mut CandidateContainment,
+    _control: &mut CandidateControl,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<()> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2880,26 +3035,32 @@ pub(crate) fn acknowledge_output_cleanup_claimed(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn receive_output_drained(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    let drained = receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let drained = receive_validated_frame(peer, validator, deadline)?;
     let ControlMessage::OutputDrained { bytes } = drained.message else {
         return Err(ContainmentErrorCode::PeerRejected);
     };
-    if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES && !containment.output_limit_observed
-    {
+    if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES && !protocol.output_limit_observed {
         return Err(ContainmentErrorCode::PeerRejected);
     }
     Ok(ContainmentEvent::OutputDrained {
-        candidate: containment.identity.candidate_index,
+        candidate: observer.identity.candidate_index,
         bytes,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn receive_output_drained(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2907,37 +3068,68 @@ pub(crate) fn receive_output_drained(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn send_select_or_abort(
-    containment: &mut CandidateContainment,
+    control: &mut CandidateControl,
+    decision: DecisionKind,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    let mut protocol = control
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    send_validated_frame(
+        peer,
+        validator,
+        ControlMessage::ResultAccepted,
+        control.identity,
+        deadline,
+    )?;
+    send_validated_frame(
+        peer,
+        validator,
+        ControlMessage::Decision { decision },
+        control.identity,
+        deadline,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn receive_decision_ack(
+    observer: &mut CandidateObserver,
     decision: DecisionKind,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    send_validated_frame(
-        &containment.peer,
-        &mut containment.validator,
-        ControlMessage::ResultAccepted,
-        containment.identity,
-        deadline,
-    )?;
-    send_validated_frame(
-        &containment.peer,
-        &mut containment.validator,
-        ControlMessage::Decision { decision },
-        containment.identity,
-        deadline,
-    )?;
-    let ack = receive_validated_frame(&containment.peer, &mut containment.validator, deadline)?;
+    let mut protocol = observer
+        .protocol
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let CandidateProtocol {
+        peer, validator, ..
+    } = &mut *protocol;
+    let ack = receive_validated_frame(peer, validator, deadline)?;
     if !matches!(ack.message, ControlMessage::Ack { decision: observed } if observed == decision) {
         return Err(ContainmentErrorCode::PeerRejected);
     }
     Ok(ContainmentEvent::DecisionAck {
-        candidate: containment.identity.candidate_index,
+        candidate: observer.identity.candidate_index,
         decision,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn send_select_or_abort(
-    _containment: &mut CandidateContainment,
+    _control: &mut CandidateControl,
+    _decision: DecisionKind,
+    _deadline: ContainmentDeadline,
+) -> ContainmentResult<()> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn receive_decision_ack(
+    _observer: &mut CandidateObserver,
     _decision: DecisionKind,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
@@ -2946,15 +3138,15 @@ pub(crate) fn send_select_or_abort(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn observe_sync_eof(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    if containment.sync_eof_observed {
+    if observer.sync_eof_observed {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    wait_fd_until(&containment.sync_read, libc::POLLIN, deadline)?;
+    wait_fd_until(&observer.sync_read, libc::POLLIN, deadline)?;
     let mut byte = [0_u8; 1];
-    if containment
+    if observer
         .sync_read
         .read(&mut byte)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
@@ -2962,15 +3154,15 @@ pub(crate) fn observe_sync_eof(
     {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    containment.sync_eof_observed = true;
+    observer.sync_eof_observed = true;
     Ok(ContainmentEvent::SyncEof {
-        candidate: containment.identity.candidate_index,
+        candidate: observer.identity.candidate_index,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn observe_sync_eof(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
@@ -2978,13 +3170,13 @@ pub(crate) fn observe_sync_eof(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn observe_managed_reaped(
-    containment: &mut CandidateContainment,
+    observer: &mut CandidateObserver,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
-    if containment.managed_reaped_observed {
+    if observer.managed_reaped_observed {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    let waiter = containment
+    let waiter = observer
         .waiter
         .as_mut()
         .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
@@ -2995,31 +3187,46 @@ pub(crate) fn observe_managed_reaped(
             ContainmentErrorCode::EvidenceUnavailable
         }
     })?;
-    containment.waiter.take();
-    containment.managed_reaped_observed = true;
+    observer.waiter.take();
+    observer.managed_reaped_observed = true;
     Ok(ContainmentEvent::ManagedReaped {
-        candidate: containment.identity.candidate_index,
+        candidate: observer.identity.candidate_index,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn observe_managed_reaped(
-    _containment: &mut CandidateContainment,
+    _observer: &mut CandidateObserver,
     _deadline: ContainmentDeadline,
 ) -> ContainmentResult<ContainmentEvent> {
     Err(ContainmentErrorCode::Unsupported)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn finish_containment(containment: CandidateContainment) -> ContainmentResult<()> {
-    if !containment.sync_eof_observed || !containment.managed_reaped_observed {
+pub(crate) fn finish_containment(
+    control: CandidateControl,
+    observer: CandidateObserver,
+) -> ContainmentResult<()> {
+    if control.identity != observer.identity
+        || !observer.sync_eof_observed
+        || !observer.managed_reaped_observed
+        || !control
+            .protocol
+            .lock()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .validator
+            .is_complete()
+    {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn finish_containment(_containment: CandidateContainment) -> ContainmentResult<()> {
+pub(crate) fn finish_containment(
+    _control: CandidateControl,
+    _observer: CandidateObserver,
+) -> ContainmentResult<()> {
     Err(ContainmentErrorCode::Unsupported)
 }
 
@@ -3117,9 +3324,10 @@ fn accept_authenticated_peer(
     listener: &File,
     controller: &ManagedController,
     membership: &ManagedCgroupMembership,
-    _identity: RunnerIdentity,
+    identity: RunnerIdentity,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<File> {
+    validate_peer_binding(membership, identity)?;
     failpoint("before_control_accept")?;
     wait_fd_until(listener, libc::POLLIN, deadline)?;
     let fd = unsafe {
@@ -3158,6 +3366,19 @@ fn accept_authenticated_peer(
         .prove_descendant_in_cgroup(credentials.pid as u32, membership)
         .map_err(|_| ContainmentErrorCode::PeerRejected)?;
     Ok(peer)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_peer_binding(
+    membership: &ManagedCgroupMembership,
+    identity: RunnerIdentity,
+) -> ContainmentResult<()> {
+    if membership.candidate_index() != identity.candidate_index
+        || membership.generation() != identity.generation
+    {
+        return Err(ContainmentErrorCode::PeerRejected);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3579,7 +3800,7 @@ fn run_real_execution_case(
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         }
     }
-    let mut containments = [
+    let containments = [
         launch_runner(
             &context,
             &tournament,
@@ -3593,30 +3814,40 @@ fn run_real_execution_case(
             ContainmentDeadline::control_action(),
         )?,
     ];
+    let observations = containments
+        .each_ref()
+        .map(CandidateContainment::observation);
     for (candidate, containment) in containments.iter().enumerate() {
         let observation = containment.observation();
         if usize::from(observation.identity.candidate_index) != candidate
             || usize::from(observation.managed_owner.candidate_index) != candidate
             || observation.managed_owner.role != ManagedOwnerRoleEvidence::Runner
-            || containment.control.socket_path.exists()
-            || std::os::unix::net::UnixStream::connect(&containment.control.socket_path).is_ok()
+            || containment.control._lifetime.socket_path.exists()
+            || std::os::unix::net::UnixStream::connect(&containment.control._lifetime.socket_path)
+                .is_ok()
         {
             return Err(ContainmentErrorCode::InvalidIdentity);
         }
     }
-    if containments[0].owner_receipt.slot() == containments[1].owner_receipt.slot() {
+    if observations[0].managed_owner.slot == observations[1].managed_owner.slot {
         return Err(ContainmentErrorCode::InvalidIdentity);
     }
+    let [left, right] = containments;
+    let [left, right] = [left.split(), right.split()];
+    let mut controls = [left.control, right.control];
+    let mut observers = [left.observer, right.observer];
     for candidate in 0_u8..2 {
+        let index = usize::from(candidate);
         transfer_payload_fd(
-            &mut containments[usize::from(candidate)],
+            &mut controls[index],
             tournament.candidate(candidate)?,
             ContainmentDeadline::control_action(),
         )?;
+        receive_payload_fd_ack(&mut observers[index], ContainmentDeadline::control_action())?;
     }
     let sends = [
-        send_go(&mut containments[0], ContainmentDeadline::control_action())?,
-        send_go(&mut containments[1], ContainmentDeadline::control_action())?,
+        send_go(&mut controls[0], ContainmentDeadline::control_action())?,
+        send_go(&mut controls[1], ContainmentDeadline::control_action())?,
     ];
     if sends[0]
         .sent_monotonic_ns
@@ -3626,19 +3857,20 @@ fn run_real_execution_case(
         return Err(ContainmentErrorCode::Timeout);
     }
     let receipts = [
-        receive_go_receipt(&mut containments[0], ContainmentDeadline::control_action())?,
-        receive_go_receipt(&mut containments[1], ContainmentDeadline::control_action())?,
+        receive_go_receipt(&mut observers[0], ContainmentDeadline::control_action())?,
+        receive_go_receipt(&mut observers[1], ContainmentDeadline::control_action())?,
     ];
     go_receipt_skew_ns(receipts)?;
     for candidate in 0_u8..2 {
         let index = usize::from(candidate);
-        receive_payload_placed(
-            &mut containments[index],
+        let placement = receive_payload_placed(
+            &mut observers[index],
             tournament.candidate(candidate)?,
             ContainmentDeadline::control_action(),
         )?;
         send_payload_release(
-            &mut containments[index],
+            &mut controls[index],
+            placement,
             ContainmentDeadline::control_action(),
         )?;
     }
@@ -3653,7 +3885,7 @@ fn run_real_execution_case(
             for candidate in 0_u8..2 {
                 let index = usize::from(candidate);
                 let event = receive_execution_event(
-                    &mut containments[index],
+                    &mut observers[index],
                     ContainmentDeadline::control_action(),
                 )?;
                 let ContainmentEvent::LeaderExited {
@@ -3678,7 +3910,7 @@ fn run_real_execution_case(
             for candidate in 0_u8..2 {
                 let index = usize::from(candidate);
                 let event = receive_execution_event(
-                    &mut containments[index],
+                    &mut observers[index],
                     ContainmentDeadline::control_action(),
                 )?;
                 if event
@@ -3690,7 +3922,7 @@ fn run_real_execution_case(
                     return Err(ContainmentErrorCode::OutputLimit);
                 }
                 acknowledge_output_cleanup_claimed(
-                    &mut containments[index],
+                    &mut controls[index],
                     ContainmentDeadline::control_action(),
                 )?;
                 perform_candidate_cleanup_action(
@@ -3715,7 +3947,7 @@ fn run_real_execution_case(
         for candidate in 0_u8..2 {
             let index = usize::from(candidate);
             let event = receive_execution_event(
-                &mut containments[index],
+                &mut observers[index],
                 ContainmentDeadline::control_action(),
             )?;
             let ContainmentEvent::LeaderExited {
@@ -3734,10 +3966,8 @@ fn run_real_execution_case(
     }
     for candidate in 0_u8..2 {
         let index = usize::from(candidate);
-        let drained = receive_output_drained(
-            &mut containments[index],
-            ContainmentDeadline::control_action(),
-        )?;
+        let drained =
+            receive_output_drained(&mut observers[index], ContainmentDeadline::control_action())?;
         let ContainmentEvent::OutputDrained { bytes, .. } = drained else {
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         };
@@ -3749,15 +3979,20 @@ fn run_real_execution_case(
         }
         evidence[index].output_bytes = bytes;
         send_select_or_abort(
-            &mut containments[index],
+            &mut controls[index],
+            DecisionKind::Abort,
+            ContainmentDeadline::control_action(),
+        )?;
+        receive_decision_ack(
+            &mut observers[index],
             DecisionKind::Abort,
             ContainmentDeadline::control_action(),
         )?;
     }
-    for mut containment in containments {
-        observe_sync_eof(&mut containment, ContainmentDeadline::control_action())?;
-        observe_managed_reaped(&mut containment, ContainmentDeadline::control_action())?;
-        finish_containment(containment)?;
+    for (control, mut observer) in controls.into_iter().zip(observers) {
+        observe_sync_eof(&mut observer, ContainmentDeadline::control_action())?;
+        observe_managed_reaped(&mut observer, ContainmentDeadline::control_action())?;
+        finish_containment(control, observer)?;
     }
     cleanup_real_topology(&mut tournament)?;
     if std::fs::read_dir(&source)
@@ -4018,6 +4253,74 @@ mod tests {
             ),
             Err(ContainmentErrorCode::Timeout)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn step5_actor_can_own_control_while_observer_moves_to_a_waiter() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CandidateControl>();
+        assert_send::<CandidateObserver>();
+
+        let _actor_go: fn(
+            &mut CandidateControl,
+            ContainmentDeadline,
+        ) -> ContainmentResult<GoSendEvidence> = send_go;
+        let _actor_release: fn(
+            &mut CandidateControl,
+            PayloadPlacementEvidence,
+            ContainmentDeadline,
+        ) -> ContainmentResult<()> = send_payload_release;
+        let _actor_decision: fn(
+            &mut CandidateControl,
+            DecisionKind,
+            ContainmentDeadline,
+        ) -> ContainmentResult<()> = send_select_or_abort;
+        let _waiter_event: fn(
+            &mut CandidateObserver,
+            ContainmentDeadline,
+        ) -> ContainmentResult<ContainmentEvent> = receive_execution_event;
+        let _waiter_sync: fn(
+            &mut CandidateObserver,
+            ContainmentDeadline,
+        ) -> ContainmentResult<ContainmentEvent> = observe_sync_eof;
+        let _waiter_reap: fn(
+            &mut CandidateObserver,
+            ContainmentDeadline,
+        ) -> ContainmentResult<ContainmentEvent> = observe_managed_reaped;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_binding_rejects_stale_generation_and_sibling_candidate() {
+        let identity = RunnerIdentity {
+            tournament_uuid: Uuid::from_u128(7),
+            candidate_index: 0,
+            generation: 9,
+        };
+        let membership = |candidate_index, generation| {
+            ManagedCgroupMembership::new(
+                "/delegated/candidate/control".into(),
+                ManagedCgroupDirectoryIdentity {
+                    boot_uuid: Uuid::from_u128(1),
+                    dev: 2,
+                    ino: 3,
+                    statx_mnt_id_unique: 4,
+                },
+                candidate_index,
+                generation,
+            )
+            .unwrap()
+        };
+        assert_eq!(validate_peer_binding(&membership(0, 9), identity), Ok(()));
+        assert_eq!(
+            validate_peer_binding(&membership(0, 10), identity),
+            Err(ContainmentErrorCode::PeerRejected)
+        );
+        assert_eq!(
+            validate_peer_binding(&membership(1, 9), identity),
+            Err(ContainmentErrorCode::PeerRejected)
+        );
     }
 
     #[cfg(target_os = "linux")]
