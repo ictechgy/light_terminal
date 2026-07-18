@@ -35,7 +35,7 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
         .env("LTERM_DATA_DIR", &data)
         .env("LTERM_REQUIRE_REAL_BWRAP", "1")
         .env("LTERM_SPECULATION_CGROUP_ROOT", cgroup_root)
-        .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", &component);
+        .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", component);
     if let Some(failpoint) = failpoint {
         command.env("LTERM_INTERNAL_SPECULATION_FAILPOINT", failpoint);
     }
@@ -86,6 +86,22 @@ fn required_real_failpoint_is_bounded_and_leaves_no_tournament_domain() {
     assert_eq!(
         output.stderr,
         b"error: speculation_containment_evidence_unavailable\n"
+    );
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_runner_ancillary_failpoint_is_bounded_and_cleanup_converges() {
+    let Some((_fixture, output)) =
+        run_required_component(Some("runner_before_payload_fd_validation"))
+    else {
+        return;
+    };
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"error: speculation_control_io\nerror: speculation_containment_peer_rejected\n"
     );
     assert_no_tournament_domains();
 }

@@ -818,7 +818,9 @@ fn run_internal_runner(
     let argv = assembler.finish()?;
     let pty = InternalPty::open()?;
     send_runner_frame(&peer, &mut validator, identity, ControlMessage::Ready)?;
+    runner_failpoint("runner_before_payload_fd_receive")?;
     let (ready_ack, placement) = receive_frame_with_one_fd(&peer)?;
+    runner_failpoint("runner_after_payload_fd_receive")?;
     validator.accept(&ready_ack)?;
     let ControlMessage::ReadyAck {
         placement: expected,
@@ -826,7 +828,9 @@ fn run_internal_runner(
     else {
         return Err(RunnerProtocolError::DescriptorViolation);
     };
+    runner_failpoint("runner_before_payload_fd_validation")?;
     validate_placement_fd(&placement, expected, identity)?;
+    runner_failpoint("runner_after_payload_fd_validation")?;
     send_runner_frame(
         &peer,
         &mut validator,
@@ -846,17 +850,28 @@ fn run_internal_runner(
             monotonic_ns: monotonic_now_ns()?,
         },
     )?;
-    let child = spawn_placement_blocked_child(placement, &pty, &argv)?;
+    runner_failpoint("runner_before_candidate_fork")?;
+    let child = spawn_placement_blocked_child(
+        placement,
+        &pty,
+        &argv,
+        RunnerChildFailpoints::from_environment(),
+    )?;
+    runner_failpoint("runner_after_candidate_fork")?;
     drop(pty.slave);
     drop(pty.dev_null);
     wait_for_placed_ack(&child.placed_read)?;
+    runner_failpoint("runner_before_payload_placed_send")?;
     send_runner_frame(
         &peer,
         &mut validator,
         identity,
         ControlMessage::PayloadPlaced,
     )?;
+    runner_failpoint("runner_after_payload_placed_send")?;
+    runner_failpoint("runner_before_release_receive")?;
     let release = receive_runner_frame(&peer, &mut validator)?;
+    runner_failpoint("runner_after_release_receive")?;
     if !matches!(release.message, ControlMessage::PayloadRelease) {
         return Err(RunnerProtocolError::InvalidSequence);
     }
@@ -1116,6 +1131,45 @@ fn receive_runner_frame(
 }
 
 #[cfg(target_os = "linux")]
+fn runner_failpoint(name: &str) -> RunnerResult<()> {
+    if runner_failpoint_enabled(name) {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+const RUNNER_FAILPOINTS: &[&str] = &[
+    "runner_before_payload_fd_receive",
+    "runner_after_payload_fd_receive",
+    "runner_before_payload_fd_validation",
+    "runner_after_payload_fd_validation",
+    "runner_before_candidate_fork",
+    "runner_after_candidate_fork",
+    "runner_before_child_placement",
+    "runner_after_child_placement",
+    "runner_before_payload_placed_send",
+    "runner_after_payload_placed_send",
+    "runner_before_release_receive",
+    "runner_after_release_receive",
+    "runner_before_child_exec",
+];
+
+#[cfg(target_os = "linux")]
+fn runner_failpoint_enabled(name: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        RUNNER_FAILPOINTS.contains(&name)
+            && std::env::var("LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT").as_deref() == Ok(name)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct InternalPty {
     master: File,
     slave: File,
@@ -1179,10 +1233,30 @@ struct PlacementBlockedChild {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct RunnerChildFailpoints {
+    before_placement: bool,
+    after_placement: bool,
+    before_exec: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl RunnerChildFailpoints {
+    fn from_environment() -> Self {
+        Self {
+            before_placement: runner_failpoint_enabled("runner_before_child_placement"),
+            after_placement: runner_failpoint_enabled("runner_after_child_placement"),
+            before_exec: runner_failpoint_enabled("runner_before_child_exec"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_placement_blocked_child(
     placement: File,
     pty: &InternalPty,
     arguments: &[Vec<u8>],
+    failpoints: RunnerChildFailpoints,
 ) -> RunnerResult<PlacementBlockedChild> {
     let argv = arguments
         .iter()
@@ -1225,10 +1299,16 @@ fn spawn_placement_blocked_child(
                 libc::_exit(125);
             }
             close_child_fds_from(6);
+            if failpoints.before_placement {
+                libc::_exit(124);
+            }
             if libc::write(3, b"0\n".as_ptr().cast(), 2) != 2 {
                 libc::_exit(125);
             }
             libc::close(3);
+            if failpoints.after_placement {
+                libc::_exit(124);
+            }
             if libc::write(4, b"P".as_ptr().cast(), 1) != 1 {
                 libc::_exit(125);
             }
@@ -1238,6 +1318,9 @@ fn spawn_placement_blocked_child(
                 libc::_exit(125);
             }
             libc::close(5);
+            if failpoints.before_exec {
+                libc::_exit(124);
+            }
             libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr());
             libc::_exit(126);
         }
@@ -1543,6 +1626,28 @@ mod tests {
             (limit + 12, Some(limit + 1))
         );
         assert_eq!(account_output_read(limit + 1, 16), (limit + 17, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runner_failpoints_cover_ancillary_fork_placement_release_and_exec_seams() {
+        let names = RUNNER_FAILPOINTS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), RUNNER_FAILPOINTS.len());
+        for seam in [
+            "payload_fd_receive",
+            "payload_fd_validation",
+            "candidate_fork",
+            "child_placement",
+            "payload_placed_send",
+            "release_receive",
+        ] {
+            assert!(names.contains(format!("runner_before_{seam}").as_str()));
+            assert!(names.contains(format!("runner_after_{seam}").as_str()));
+        }
+        assert!(names.contains("runner_before_child_exec"));
     }
 
     #[test]

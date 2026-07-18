@@ -377,6 +377,18 @@ pub(crate) fn build_fixed_bwrap_invocation(
     arguments.push(OsString::from("--ro-bind"));
     arguments.push(control_path.as_os_str().to_owned());
     arguments.push(OsString::from("/run/lterm-control"));
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && let Some(value) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+        && value.as_bytes().starts_with(b"runner_")
+        && value.as_bytes().len() <= 96
+    {
+        arguments.extend([
+            OsString::from("--setenv"),
+            OsString::from("LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT"),
+            value,
+        ]);
+    }
     arguments.extend(
         [
             "--chdir",
@@ -3314,12 +3326,18 @@ fn run_real_execution_case(
     }
     for candidate in 0_u8..2 {
         let candidate_topology = tournament.candidate(candidate)?;
-        let probe = run_fixed_probe(
+        let probe = match run_fixed_probe(
             &context,
             candidate,
             candidate_topology,
             ContainmentDeadline::control_action(),
-        )?;
+        ) {
+            Ok(probe) => probe,
+            Err(error) => {
+                cleanup_real_topology(&mut tournament)?;
+                return Err(error);
+            }
+        };
         if !probe.exited_zero || !probe.parent_populated_zero || probe.output_bytes != 0 {
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         }
@@ -3499,37 +3517,12 @@ fn run_real_execution_case(
             ContainmentDeadline::control_action(),
         )?;
     }
-    for (candidate, mut containment) in containments.into_iter().enumerate() {
+    for mut containment in containments {
         observe_sync_eof(&mut containment, ContainmentDeadline::control_action())?;
         observe_managed_reaped(&mut containment, ContainmentDeadline::control_action())?;
         finish_containment(containment)?;
-        let candidate =
-            u8::try_from(candidate).map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
-        for action in [
-            CandidateCleanupAction::KillParent,
-            CandidateCleanupAction::ProveParentEmpty,
-            CandidateCleanupAction::RemovePayload,
-            CandidateCleanupAction::RemoveControl,
-            CandidateCleanupAction::RemoveParent,
-        ] {
-            perform_candidate_cleanup_action(
-                &mut tournament,
-                candidate,
-                action,
-                ContainmentDeadline::control_action(),
-            )?;
-        }
     }
-    perform_tournament_cleanup_action(
-        &mut tournament,
-        TournamentCleanupAction::ProveEmpty,
-        ContainmentDeadline::control_action(),
-    )?;
-    perform_tournament_cleanup_action(
-        &mut tournament,
-        TournamentCleanupAction::RemoveDomain,
-        ContainmentDeadline::control_action(),
-    )?;
+    cleanup_real_topology(&mut tournament)?;
     if std::fs::read_dir(&source)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
         .next()
@@ -3553,6 +3546,37 @@ fn run_real_execution_case(
         }
     }
     Ok(evidence)
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn cleanup_real_topology(tournament: &mut TournamentTopology) -> ContainmentResult<()> {
+    for candidate in 0_u8..2 {
+        for action in [
+            CandidateCleanupAction::KillParent,
+            CandidateCleanupAction::ProveParentEmpty,
+            CandidateCleanupAction::RemovePayload,
+            CandidateCleanupAction::RemoveControl,
+            CandidateCleanupAction::RemoveParent,
+        ] {
+            perform_candidate_cleanup_action(
+                tournament,
+                candidate,
+                action,
+                ContainmentDeadline::control_action(),
+            )?;
+        }
+    }
+    perform_tournament_cleanup_action(
+        tournament,
+        TournamentCleanupAction::ProveEmpty,
+        ContainmentDeadline::control_action(),
+    )?;
+    perform_tournament_cleanup_action(
+        tournament,
+        TournamentCleanupAction::RemoveDomain,
+        ContainmentDeadline::control_action(),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
