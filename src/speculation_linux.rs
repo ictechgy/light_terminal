@@ -3022,6 +3022,15 @@ fn placement_descriptor_evidence(
     let metadata = file
         .metadata()
         .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
+    let independently_opened = open_cgroup_procs(payload)?;
+    let independently_opened_metadata = independently_opened
+        .metadata()
+        .map_err(|_| ContainmentErrorCode::DescriptorViolation)?;
+    if metadata.dev() != independently_opened_metadata.dev()
+        || metadata.ino() != independently_opened_metadata.ino()
+    {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
     let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
     if unsafe {
         libc::statx(
@@ -3122,7 +3131,7 @@ pub(crate) fn dispatch_internal_containment_test_driver(
     #[cfg(target_os = "linux")]
     {
         run_real_component_driver()?;
-        println!("speculation-real-cases=1");
+        println!("speculation-real-cases=4");
         Ok(true)
     }
 }
@@ -3135,12 +3144,120 @@ fn run_real_component_driver() -> ContainmentResult<()> {
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .map(PathBuf::from)
         .ok_or(ContainmentErrorCode::Unsupported)?;
+    let elapsed = run_real_execution_case(
+        &fixture.join("e"),
+        &cgroup_root,
+        vec![OsString::from("/workspace/run.sh")],
+        Some([
+            b"#!/bin/sh\n/usr/bin/sleep 0.02\n",
+            b"#!/bin/sh\n/usr/bin/sleep 0.18\n",
+        ]),
+        RealExecutionExpectation::Complete { output_bytes: 0 },
+    )?;
+    if elapsed[0].elapsed_ns >= elapsed[1].elapsed_ns
+        || crate::speculation::score_candidates([
+            elapsed[0].candidate_result(0),
+            elapsed[1].candidate_result(1),
+        ]) != crate::speculation::ScoreDecision::Selected(0)
+    {
+        return Err(ContainmentErrorCode::TerminalBoundaryFailure);
+    }
+    run_real_execution_case(
+        &fixture.join("x"),
+        &cgroup_root,
+        vec![
+            OsString::from("/usr/bin/head"),
+            OsString::from("-c"),
+            OsString::from(crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES.to_string()),
+            OsString::from("/dev/zero"),
+        ],
+        None,
+        RealExecutionExpectation::Complete {
+            output_bytes: crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES,
+        },
+    )?;
+    run_real_execution_case(
+        &fixture.join("o"),
+        &cgroup_root,
+        vec![
+            OsString::from("/usr/bin/head"),
+            OsString::from("-c"),
+            OsString::from((crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1).to_string()),
+            OsString::from("/dev/zero"),
+        ],
+        None,
+        RealExecutionExpectation::Overflow,
+    )?;
+    run_real_execution_case(
+        &fixture.join("i"),
+        &cgroup_root,
+        vec![OsString::from("/usr/bin/yes")],
+        None,
+        RealExecutionExpectation::Overflow,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum RealExecutionExpectation {
+    Complete { output_bytes: u64 },
+    Overflow,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct RealExecutionEvidence {
+    elapsed_ns: u64,
+    output_bytes: u64,
+    exited_zero: bool,
+    overflowed: bool,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl RealExecutionEvidence {
+    fn candidate_result(self, input_index: u8) -> crate::speculation::CandidateResult {
+        crate::speculation::CandidateResult {
+            input_index,
+            exit_success: Some(self.exited_zero),
+            elapsed_ns: Some(self.elapsed_ns),
+            output_bytes: Some(self.output_bytes),
+            quiescent: true,
+            output_overflowed: self.overflowed,
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_real_execution_case(
+    fixture: &Path,
+    cgroup_root: &Path,
+    argv: Vec<OsString>,
+    scripts: Option<[&[u8]; 2]>,
+    expectation: RealExecutionExpectation,
+) -> ContainmentResult<[RealExecutionEvidence; 2]> {
+    let has_scripts = scripts.is_some();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let source = fixture.join("source");
     let candidates = [fixture.join("candidate-0"), fixture.join("candidate-1")];
     let ledger = fixture.join("ledger");
     let control = fixture.join("control");
     for path in [&source, &candidates[0], &candidates[1]] {
-        std::fs::create_dir(path).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    if let Some(scripts) = scripts {
+        for (candidate, script) in candidates.iter().zip(scripts) {
+            let path = candidate.join("run.sh");
+            std::fs::write(&path, script).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        }
     }
     for path in [&ledger, &control] {
         std::fs::DirBuilder::new()
@@ -3152,12 +3269,12 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         PrepareInputs {
             tournament_uuid: Uuid::new_v4(),
             generation: 1,
-            source,
-            candidates,
+            source: source.clone(),
+            candidates: candidates.clone(),
             ledger_root: ledger,
-            cgroup_root,
+            cgroup_root: cgroup_root.to_path_buf(),
             control_root: control,
-            argv: vec![OsString::from("/usr/bin/true")],
+            argv,
         },
         ContainmentDeadline::control_action(),
     )?;
@@ -3181,8 +3298,22 @@ fn run_real_component_driver() -> ContainmentResult<()> {
             TopologyAction::ConfigurePayloadLimit { candidate },
         )?;
     }
+    let first = tournament.candidate(0)?;
+    if first.control()?.identity == first.payload()?.identity {
+        return Err(ContainmentErrorCode::TopologyFailure);
+    }
+    let wrong_placement = open_cgroup_procs(first.control()?)?;
+    if placement_descriptor_evidence(
+        &wrong_placement,
+        first.payload()?,
+        context.candidate_identity(0)?,
+    )
+    .is_ok()
+    {
+        return Err(ContainmentErrorCode::DescriptorViolation);
+    }
     for candidate in 0_u8..2 {
-        let candidate_topology = &tournament.candidates[usize::from(candidate)];
+        let candidate_topology = tournament.candidate(candidate)?;
         let probe = run_fixed_probe(
             &context,
             candidate,
@@ -3211,14 +3342,20 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         let observation = containment.observation();
         if usize::from(observation.identity.candidate_index) != candidate
             || usize::from(observation.managed_owner.candidate_index) != candidate
+            || observation.managed_owner.role != ManagedOwnerRoleEvidence::Runner
+            || containment.control.socket_path.exists()
+            || std::os::unix::net::UnixStream::connect(&containment.control.socket_path).is_ok()
         {
             return Err(ContainmentErrorCode::InvalidIdentity);
         }
     }
+    if containments[0].owner_receipt.slot() == containments[1].owner_receipt.slot() {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
     for candidate in 0_u8..2 {
         transfer_payload_fd(
             &mut containments[usize::from(candidate)],
-            &tournament.candidates[usize::from(candidate)],
+            tournament.candidate(candidate)?,
             ContainmentDeadline::control_action(),
         )?;
     }
@@ -3242,7 +3379,7 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         let index = usize::from(candidate);
         receive_payload_placed(
             &mut containments[index],
-            &tournament.candidates[index],
+            tournament.candidate(candidate)?,
             ContainmentDeadline::control_action(),
         )?;
         send_payload_release(
@@ -3250,28 +3387,112 @@ fn run_real_component_driver() -> ContainmentResult<()> {
             ContainmentDeadline::control_action(),
         )?;
     }
+    let mut evidence = [RealExecutionEvidence {
+        elapsed_ns: 0,
+        output_bytes: 0,
+        exited_zero: false,
+        overflowed: false,
+    }; 2];
+    match expectation {
+        RealExecutionExpectation::Complete { .. } => {
+            for candidate in 0_u8..2 {
+                let index = usize::from(candidate);
+                let event = receive_execution_event(
+                    &mut containments[index],
+                    ContainmentDeadline::control_action(),
+                )?;
+                let ContainmentEvent::LeaderExited {
+                    category,
+                    elapsed_ns,
+                    ..
+                } = event
+                else {
+                    return Err(ContainmentErrorCode::OutputLimit);
+                };
+                evidence[index].elapsed_ns = elapsed_ns;
+                evidence[index].exited_zero = category == RunnerExitCategory::ExitedZero;
+                perform_candidate_cleanup_action(
+                    &mut tournament,
+                    candidate,
+                    CandidateCleanupAction::KillPayload,
+                    ContainmentDeadline::control_action(),
+                )?;
+            }
+        }
+        RealExecutionExpectation::Overflow => {
+            for candidate in 0_u8..2 {
+                let index = usize::from(candidate);
+                let event = receive_execution_event(
+                    &mut containments[index],
+                    ContainmentDeadline::control_action(),
+                )?;
+                if event
+                    != (ContainmentEvent::OutputLimitExceeded {
+                        candidate,
+                        bytes: crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1,
+                    })
+                {
+                    return Err(ContainmentErrorCode::OutputLimit);
+                }
+                acknowledge_output_cleanup_claimed(
+                    &mut containments[index],
+                    ContainmentDeadline::control_action(),
+                )?;
+                perform_candidate_cleanup_action(
+                    &mut tournament,
+                    candidate,
+                    CandidateCleanupAction::KillPayload,
+                    ContainmentDeadline::control_action(),
+                )?;
+                evidence[index].overflowed = true;
+            }
+        }
+    }
     for candidate in 0_u8..2 {
-        let index = usize::from(candidate);
-        receive_leader_exited(
-            &mut containments[index],
-            ContainmentDeadline::control_action(),
-        )?;
-        perform_candidate_cleanup_action(
-            &mut tournament,
-            candidate,
-            CandidateCleanupAction::KillPayload,
-            ContainmentDeadline::control_action(),
-        )?;
         perform_candidate_cleanup_action(
             &mut tournament,
             candidate,
             CandidateCleanupAction::ProvePayloadEmpty,
             ContainmentDeadline::control_action(),
         )?;
-        receive_output_drained(
+    }
+    if matches!(expectation, RealExecutionExpectation::Overflow) {
+        for candidate in 0_u8..2 {
+            let index = usize::from(candidate);
+            let event = receive_execution_event(
+                &mut containments[index],
+                ContainmentDeadline::control_action(),
+            )?;
+            let ContainmentEvent::LeaderExited {
+                category,
+                elapsed_ns,
+                ..
+            } = event
+            else {
+                return Err(ContainmentErrorCode::OutputLimit);
+            };
+            if category != RunnerExitCategory::OutputLimitExceeded {
+                return Err(ContainmentErrorCode::OutputLimit);
+            }
+            evidence[index].elapsed_ns = elapsed_ns;
+        }
+    }
+    for candidate in 0_u8..2 {
+        let index = usize::from(candidate);
+        let drained = receive_output_drained(
             &mut containments[index],
             ContainmentDeadline::control_action(),
         )?;
+        let ContainmentEvent::OutputDrained { bytes, .. } = drained else {
+            return Err(ContainmentErrorCode::TerminalBoundaryFailure);
+        };
+        match expectation {
+            RealExecutionExpectation::Complete { output_bytes } if bytes == output_bytes => {}
+            RealExecutionExpectation::Overflow
+                if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES => {}
+            _ => return Err(ContainmentErrorCode::OutputLimit),
+        }
+        evidence[index].output_bytes = bytes;
         send_select_or_abort(
             &mut containments[index],
             DecisionKind::Abort,
@@ -3309,7 +3530,29 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         TournamentCleanupAction::RemoveDomain,
         ContainmentDeadline::control_action(),
     )?;
-    Ok(())
+    if std::fs::read_dir(&source)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        .next()
+        .is_some()
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    for candidate in candidates {
+        let names = std::fs::read_dir(candidate)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
+            })
+            .collect::<ContainmentResult<Vec<_>>>()?;
+        if (!has_scripts && !names.is_empty())
+            || (has_scripts && (names.len() != 1 || names[0] != std::ffi::OsStr::new("run.sh")))
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+    }
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -3415,6 +3658,37 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deliberate_monotonic_receipt_skew_over_fifty_ms_is_rejected() {
+        let tournament_uuid = Uuid::from_u128(7);
+        let first = monotonic_now_ns().unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let second = monotonic_now_ns().unwrap();
+        assert!(second.abs_diff(first) > MAX_GO_RECEIPT_SKEW_NS);
+        assert_eq!(
+            go_receipt_skew_ns([
+                GoReceiptEvidence {
+                    identity: RunnerIdentity {
+                        tournament_uuid,
+                        candidate_index: 0,
+                        generation: 9,
+                    },
+                    received_monotonic_ns: first,
+                },
+                GoReceiptEvidence {
+                    identity: RunnerIdentity {
+                        tournament_uuid,
+                        candidate_index: 1,
+                        generation: 9,
+                    },
+                    received_monotonic_ns: second,
+                },
+            ]),
+            Err(ContainmentErrorCode::Timeout)
+        );
+    }
+
     #[test]
     fn action_deadlines_are_explicit_and_never_exceed_the_control_bound() {
         assert!(ContainmentDeadline::from_now(Duration::from_millis(1)).is_ok());
@@ -3483,6 +3757,47 @@ mod tests {
             ),
             Err(ContainmentErrorCode::Timeout)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_scan_rejects_symlink_hardlink_fifo_socket_and_setid_residue() {
+        fn workspace() -> (tempfile::TempDir, ValidatedDirectory) {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let directory = open_existing_workspace_dir(root.path()).unwrap();
+            (root, directory)
+        }
+        let assert_rejected = |directory: &ValidatedDirectory| {
+            assert_eq!(
+                scan_workspace(directory, ContainmentDeadline::control_action()),
+                Err(ContainmentErrorCode::InvalidIdentity)
+            );
+        };
+
+        let (root, directory) = workspace();
+        std::os::unix::fs::symlink("missing", root.path().join("symlink")).unwrap();
+        assert_rejected(&directory);
+
+        let (root, directory) = workspace();
+        std::fs::write(root.path().join("first"), b"fixed").unwrap();
+        std::fs::hard_link(root.path().join("first"), root.path().join("second")).unwrap();
+        assert_rejected(&directory);
+
+        let (root, directory) = workspace();
+        let fifo = CString::new(root.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_rejected(&directory);
+
+        let (root, directory) = workspace();
+        let _listener = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
+        assert_rejected(&directory);
+
+        let (root, directory) = workspace();
+        let setid = root.path().join("setid");
+        std::fs::write(&setid, b"fixed").unwrap();
+        std::fs::set_permissions(&setid, std::fs::Permissions::from_mode(0o4500)).unwrap();
+        assert_rejected(&directory);
     }
 
     #[cfg(target_os = "linux")]
