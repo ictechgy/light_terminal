@@ -214,10 +214,77 @@ pub(crate) struct ManagedReconcileReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedOwnerCorrelation {
+    Absent,
+    Matched {
+        key: ManagedKey,
+        outcome: ReconcileOutcome,
+    },
+    Unresolved,
+}
+
+impl ManagedReconcileReport {
+    pub(crate) fn correlate_owner(&self, owner: &ManagedOwnerTag) -> ManagedOwnerCorrelation {
+        if owner.validate().is_err() {
+            return ManagedOwnerCorrelation::Unresolved;
+        }
+        let mut matched = None;
+        for entry in &self.entries {
+            let Some(entry_owner) = &entry.owner else {
+                return ManagedOwnerCorrelation::Unresolved;
+            };
+            if entry_owner != owner {
+                continue;
+            }
+            let Some(key) = entry.key else {
+                return ManagedOwnerCorrelation::Unresolved;
+            };
+            if matched.is_some() {
+                return ManagedOwnerCorrelation::Unresolved;
+            }
+            matched = Some(ManagedOwnerCorrelation::Matched {
+                key,
+                outcome: entry.outcome.clone(),
+            });
+        }
+        matched.unwrap_or(ManagedOwnerCorrelation::Absent)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedOwnerOutcome {
     Absent,
     ResolvedTombstone(ManagedKey),
     UnknownOrphanRisk(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedOwnerReceipt {
+    owner: ManagedOwnerTag,
+    key: ManagedKey,
+}
+
+impl ManagedOwnerReceipt {
+    pub(crate) fn new(owner: ManagedOwnerTag, key: ManagedKey) -> Result<Self> {
+        owner.validate()?;
+        ensure!(
+            key.generation != 0,
+            "managed owner receipt generation is zero"
+        );
+        Ok(Self { owner, key })
+    }
+
+    pub(crate) fn owner(&self) -> &ManagedOwnerTag {
+        &self.owner
+    }
+
+    pub(crate) fn slot(&self) -> u16 {
+        self.key.slot
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.key.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,6 +490,7 @@ pub(crate) struct ManagedWaiter {
 pub(crate) struct ManagedLaunch {
     pub controller: ManagedController,
     pub waiter: ManagedWaiter,
+    pub owner_receipt: Option<ManagedOwnerReceipt>,
 }
 
 impl ManagedController {
@@ -510,6 +578,33 @@ impl ManagedKey {
 
 impl ManagedWaiter {
     #[cfg(target_os = "linux")]
+    pub(crate) fn wait_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<std::process::ExitStatus> {
+        let status = loop {
+            let child = self
+                .child
+                .as_mut()
+                .context("managed root-process handle was already consumed")?;
+            if let Some(status) = child.try_wait().context("poll managed root process")? {
+                break status;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "managed root-process wait deadline expired"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        self.child.take();
+        ensure!(
+            self.controller.terminate()? == ReconcileOutcome::ResolvedTombstone,
+            "managed root process exited without a durable tombstone"
+        );
+        Ok(status)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn wait(mut self) -> Result<std::process::ExitStatus> {
         let status = self
             .child
@@ -553,6 +648,7 @@ impl Drop for ManagedWaiter {
         #[cfg(target_os = "linux")]
         if let Some(mut child) = self.child.take() {
             let controller = self.controller.clone();
+            let _ = controller.terminate();
             let _ = std::thread::Builder::new()
                 .name("lterm-managed-root-reaper".into())
                 .spawn(move || {
@@ -1682,12 +1778,19 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
 
     match launch_result {
         Ok(identity) => {
+            let key = ManagedKey {
+                slot: intent.record.slot,
+                generation: intent.record.generation,
+            };
+            let owner_receipt = intent
+                .record
+                .owner
+                .clone()
+                .map(|owner| ManagedOwnerReceipt::new(owner, key))
+                .transpose()?;
             let controller = ManagedController {
                 inner: Arc::new(ManagedControllerInner {
-                    key: ManagedKey {
-                        slot: intent.record.slot,
-                        generation: intent.record.generation,
-                    },
+                    key,
                     identity,
                     owner: intent.record.owner.clone(),
                     registry,
@@ -1699,6 +1802,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
                     controller: controller.clone(),
                 },
                 controller,
+                owner_receipt,
             })
         }
         Err(err) => {
@@ -2827,6 +2931,42 @@ mod tests {
             candidate_index,
             role,
         }
+    }
+
+    #[test]
+    fn managed_owner_receipt_and_full_report_correlation_are_identity_bound() {
+        let tag = owner(1, ManagedOwnerRole::Runner);
+        let key = ManagedKey {
+            slot: 7,
+            generation: 11,
+        };
+        let receipt = ManagedOwnerReceipt::new(tag.clone(), key).unwrap();
+        assert_eq!(receipt.owner(), &tag);
+        assert_eq!(receipt.slot(), 7);
+        assert_eq!(receipt.generation(), 11);
+
+        let report = ManagedReconcileReport {
+            entries: vec![ManagedReconcileEntry {
+                key: Some(key),
+                owner: Some(tag.clone()),
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            }],
+        };
+        assert_eq!(
+            report.correlate_owner(&tag),
+            ManagedOwnerCorrelation::Matched {
+                key,
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            }
+        );
+
+        let duplicate = ManagedReconcileReport {
+            entries: vec![report.entries[0].clone(), report.entries[0].clone()],
+        };
+        assert_eq!(
+            duplicate.correlate_owner(&tag),
+            ManagedOwnerCorrelation::Unresolved
+        );
     }
 
     #[test]
