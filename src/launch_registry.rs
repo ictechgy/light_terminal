@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -31,6 +33,12 @@ const INTERNAL_TEST_RECONCILE_ARG: &str = "__lterm-internal-managed-reconcile-te
 const GATE_CONTROL_FD: RawFd = 3;
 #[cfg(target_os = "linux")]
 const GATE_GUARD_FD: RawFd = 4;
+#[cfg(target_os = "linux")]
+const GATE_PLACEMENT_FD: RawFd = 5;
+#[cfg(target_os = "linux")]
+pub(crate) const MANAGED_SYNC_PIPE_TARGET_FD: RawFd = 10;
+#[cfg(target_os = "linux")]
+const MAX_COMMIT_FDS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "evidence", content = "value")]
@@ -46,6 +54,46 @@ pub(crate) struct ProcessIdentity {
     pub pid_namespace_inode: u64,
     pub pid: u32,
     pub start_ticks: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedOwnerKind {
+    Speculation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedOwnerRole {
+    Probe,
+    Runner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedOwnerTag {
+    pub kind: ManagedOwnerKind,
+    pub tournament_uuid: Uuid,
+    pub candidate_index: u8,
+    pub role: ManagedOwnerRole,
+}
+
+impl ManagedOwnerTag {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.kind == ManagedOwnerKind::Speculation,
+            "unsupported managed owner kind"
+        );
+        ensure!(
+            !self.tournament_uuid.is_nil(),
+            "managed owner tournament UUID must not be nil"
+        );
+        ensure!(
+            self.candidate_index < 2,
+            "managed owner candidate index must be 0 or 1"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +126,8 @@ struct SlotRecord {
     schema_version: u32,
     slot: u16,
     generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<ManagedOwnerTag>,
     #[serde(flatten)]
     state: SlotState,
 }
@@ -106,12 +156,28 @@ struct GateHello {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GateCommit {
     protocol: String,
     slot: u16,
     generation: u64,
     nonce: Uuid,
     identity: ProcessIdentity,
+    descriptors: Vec<CommitDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommitDescriptorRole {
+    TargetExecutable,
+    SyncPipeWrite,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitDescriptor {
+    role: CommitDescriptorRole,
+    target_fd: Option<RawFd>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,24 +195,168 @@ pub(crate) enum ReconcileOutcome {
     ResolvedTombstone,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedKey {
+    slot: u16,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedReconcileEntry {
+    pub key: Option<ManagedKey>,
+    pub owner: Option<ManagedOwnerTag>,
+    pub outcome: ReconcileOutcome,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManagedReconcileReport {
+    pub entries: Vec<ManagedReconcileEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedOwnerOutcome {
+    Absent,
+    ResolvedTombstone(ManagedKey),
+    UnknownOrphanRisk(String),
+}
+
+#[derive(Debug)]
+pub(crate) struct ControlCgroupPlacement {
+    cgroup_procs: File,
+    expected_membership: String,
+}
+
+impl ControlCgroupPlacement {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new(cgroup_procs: File, expected_membership: String) -> Result<Self> {
+        validate_cgroup_membership(&expected_membership)?;
+        validate_cgroup_procs_fd(&cgroup_procs)?;
+        Ok(Self {
+            cgroup_procs,
+            expected_membership,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum ManagedPlacement {
+    #[default]
+    None,
+    CgroupV2(ControlCgroupPlacement),
+}
+
+#[derive(Debug)]
+pub(crate) struct SyncPipeWrite {
+    file: File,
+    target_fd: RawFd,
+}
+
+impl SyncPipeWrite {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new(file: File, target_fd: RawFd) -> Result<Self> {
+        ensure!(
+            target_fd == MANAGED_SYNC_PIPE_TARGET_FD,
+            "sync pipe target FD must be the fixed managed sync FD"
+        );
+        validate_sync_pipe_write_fd(&file)?;
+        Ok(Self { file, target_fd })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum ManagedAuxiliary {
+    #[default]
+    None,
+    SyncPipeWrite(SyncPipeWrite),
+}
+
+#[derive(Debug)]
 pub(crate) struct ManagedLaunchRequest {
+    pub owner: Option<ManagedOwnerTag>,
+    pub placement: ManagedPlacement,
+    pub auxiliary: ManagedAuxiliary,
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub environment: Vec<(OsString, OsString)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedController {
+    inner: Arc<ManagedControllerInner>,
+}
+
 #[derive(Debug)]
-pub(crate) struct ManagedProcess {
-    pub slot: u16,
-    pub generation: u64,
-    pub identity: ProcessIdentity,
-    child: Option<std::process::Child>,
+struct ManagedControllerInner {
+    key: ManagedKey,
+    identity: ProcessIdentity,
+    owner: Option<ManagedOwnerTag>,
     registry: Registry,
 }
 
-impl ManagedProcess {
+#[derive(Debug)]
+pub(crate) struct ManagedWaiter {
+    child: Option<std::process::Child>,
+    controller: ManagedController,
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedLaunch {
+    pub controller: ManagedController,
+    pub waiter: ManagedWaiter,
+}
+
+impl ManagedController {
+    pub(crate) fn key(&self) -> ManagedKey {
+        self.inner.key
+    }
+
+    pub(crate) fn owner(&self) -> Option<&ManagedOwnerTag> {
+        self.inner.owner.as_ref()
+    }
+
+    pub(crate) fn identity(&self) -> &ProcessIdentity {
+        &self.inner.identity
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn status(&self) -> ReconcileOutcome {
+        match verify_exact_process(&self.inner.identity) {
+            Evidence::Present(_) => ReconcileOutcome::Live,
+            Evidence::Absent => ReconcileOutcome::Absent,
+            Evidence::Unavailable(reason) => ReconcileOutcome::UnknownOrphanRisk(reason),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn terminate(&self) -> Result<ReconcileOutcome> {
+        self.inner
+            .registry
+            .cleanup(self.inner.key.slot, self.inner.key.generation)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_owner(&self) -> Result<ManagedOwnerOutcome> {
+        let owner = self
+            .inner
+            .owner
+            .as_ref()
+            .context("managed launch has no typed owner")?;
+        self.inner.registry.reconcile_owner(owner)
+    }
+}
+
+impl ManagedKey {
+    pub(crate) fn slot(self) -> u16 {
+        self.slot
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+impl ManagedWaiter {
     #[cfg(target_os = "linux")]
     pub(crate) fn wait(mut self) -> Result<std::process::ExitStatus> {
         let status = self
@@ -156,8 +366,7 @@ impl ManagedProcess {
             .wait()
             .context("wait for managed root process")?;
         ensure!(
-            self.registry.cleanup(self.slot, self.generation)?
-                == ReconcileOutcome::ResolvedTombstone,
+            self.controller.terminate()? == ReconcileOutcome::ResolvedTombstone,
             "managed root process exited without a durable tombstone"
         );
         Ok(status)
@@ -165,7 +374,7 @@ impl ManagedProcess {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn terminate_and_wait(mut self) -> Result<std::process::ExitStatus> {
-        let first = self.registry.cleanup(self.slot, self.generation)?;
+        let first = self.controller.terminate()?;
         ensure!(
             matches!(
                 first,
@@ -180,26 +389,23 @@ impl ManagedProcess {
             .wait()
             .context("reap managed root process after cleanup")?;
         ensure!(
-            self.registry.cleanup(self.slot, self.generation)?
-                == ReconcileOutcome::ResolvedTombstone,
+            self.controller.terminate()? == ReconcileOutcome::ResolvedTombstone,
             "managed cleanup did not reach a durable tombstone after reap"
         );
         Ok(status)
     }
 }
 
-impl Drop for ManagedProcess {
+impl Drop for ManagedWaiter {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(mut child) = self.child.take() {
-            let registry = self.registry.clone();
-            let slot = self.slot;
-            let generation = self.generation;
+            let controller = self.controller.clone();
             let _ = std::thread::Builder::new()
                 .name("lterm-managed-root-reaper".into())
                 .spawn(move || {
                     let _ = child.wait();
-                    let _ = registry.cleanup(slot, generation);
+                    let _ = controller.terminate();
                 });
         }
     }
@@ -283,6 +489,7 @@ impl Registry {
                 schema_version: SCHEMA_VERSION,
                 slot,
                 generation: 0,
+                owner: None,
                 state: SlotState::Vacant,
             };
             create_exact_json_file(&slots.join(slot_name(slot)), &record)?;
@@ -327,7 +534,14 @@ impl Registry {
     }
 
     #[cfg(target_os = "linux")]
-    fn allocate_intent(&self, now_unix_secs: u64) -> Result<LaunchIntent> {
+    fn allocate_intent(
+        &self,
+        now_unix_secs: u64,
+        owner: Option<ManagedOwnerTag>,
+    ) -> Result<LaunchIntent> {
+        if let Some(owner) = &owner {
+            owner.validate()?;
+        }
         let _registry_lock = OfdLock::try_acquire(&self.root.join("registry.lock"))
             .context("managed launch registry is busy")?;
         let mut selected = None;
@@ -336,29 +550,36 @@ impl Registry {
         for slot in 0..self.slot_count {
             let slot = u16::try_from(slot).context("slot index overflow")?;
             match self.read_slot(slot) {
-                SlotRead::Valid(record) => match &record.state {
-                    SlotState::Vacant => {
-                        selected.get_or_insert(record);
-                    }
-                    SlotState::ResolvedTombstone {
-                        resolved_unix_secs, ..
-                    } => {
-                        if now_unix_secs
-                            .checked_sub(*resolved_unix_secs)
-                            .is_some_and(|age| age >= TOMBSTONE_RETENTION.as_secs())
-                        {
-                            let vacant = SlotRecord {
-                                state: SlotState::Vacant,
-                                ..record.clone()
-                            };
-                            self.replace_slot(&record, &vacant)?;
-                            selected.get_or_insert(vacant);
-                        } else {
-                            unknown += 1;
+                SlotRead::Valid(record) => {
+                    ensure!(
+                        owner.is_none() || record.owner.as_ref() != owner.as_ref(),
+                        "managed owner already has a durable registry record"
+                    );
+                    match &record.state {
+                        SlotState::Vacant => {
+                            selected.get_or_insert(record);
                         }
+                        SlotState::ResolvedTombstone {
+                            resolved_unix_secs, ..
+                        } => {
+                            if now_unix_secs
+                                .checked_sub(*resolved_unix_secs)
+                                .is_some_and(|age| age >= TOMBSTONE_RETENTION.as_secs())
+                            {
+                                let vacant = SlotRecord {
+                                    owner: None,
+                                    state: SlotState::Vacant,
+                                    ..record.clone()
+                                };
+                                self.replace_slot(&record, &vacant)?;
+                                selected.get_or_insert(vacant);
+                            } else {
+                                unknown += 1;
+                            }
+                        }
+                        _ => unknown += 1,
                     }
-                    _ => unknown += 1,
-                },
+                }
                 SlotRead::Unknown(_) => unknown += 1,
             }
         }
@@ -388,6 +609,7 @@ impl Registry {
             schema_version: SCHEMA_VERSION,
             slot: vacant.slot,
             generation,
+            owner,
             state: SlotState::IntentDurable {
                 nonce,
                 created_unix_secs: now_unix_secs,
@@ -478,6 +700,7 @@ impl Registry {
             schema_version: SCHEMA_VERSION,
             slot: intent.slot,
             generation: intent.generation,
+            owner: intent.owner.clone(),
             state: SlotState::IdentityDurable {
                 nonce,
                 identity: registration.identity.clone(),
@@ -612,40 +835,121 @@ impl Registry {
     }
 
     #[cfg(target_os = "linux")]
-    fn reconcile_all(&self) -> Vec<(u16, ReconcileOutcome)> {
-        (0..self.slot_count)
+    fn reconcile_all(&self) -> ManagedReconcileReport {
+        let entries = (0..self.slot_count)
             .map(|slot| u16::try_from(slot).expect("validated registry slot count"))
             .filter_map(|slot| match self.read_slot(slot) {
                 SlotRead::Valid(SlotRecord {
-                    state: SlotState::Vacant | SlotState::ResolvedTombstone { .. },
+                    state: SlotState::Vacant,
                     ..
                 }) => None,
-                SlotRead::Valid(record) => Some((
-                    slot,
-                    self.cleanup(slot, record.generation).unwrap_or_else(|err| {
+                SlotRead::Valid(
+                    record @ SlotRecord {
+                        state: SlotState::ResolvedTombstone { .. },
+                        ..
+                    },
+                ) => record.owner.map(|owner| ManagedReconcileEntry {
+                    key: Some(ManagedKey {
+                        slot,
+                        generation: record.generation,
+                    }),
+                    owner: Some(owner),
+                    outcome: ReconcileOutcome::ResolvedTombstone,
+                }),
+                SlotRead::Valid(record) => Some(ManagedReconcileEntry {
+                    key: Some(ManagedKey {
+                        slot,
+                        generation: record.generation,
+                    }),
+                    owner: record.owner.clone(),
+                    outcome: self.cleanup(slot, record.generation).unwrap_or_else(|err| {
                         ReconcileOutcome::UnknownOrphanRisk(format!(
                             "slot {slot} reconciliation failed: {err:#}"
                         ))
                     }),
-                )),
-                SlotRead::Unknown(reason) => {
-                    Some((slot, ReconcileOutcome::UnknownOrphanRisk(reason)))
-                }
+                }),
+                SlotRead::Unknown(reason) => Some(ManagedReconcileEntry {
+                    key: None,
+                    owner: None,
+                    outcome: ReconcileOutcome::UnknownOrphanRisk(reason),
+                }),
             })
-            .collect()
+            .collect();
+        ManagedReconcileReport { entries }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_owner(&self, owner: &ManagedOwnerTag) -> Result<ManagedOwnerOutcome> {
+        owner.validate()?;
+        let mut matched = None;
+        for slot in 0..self.slot_count {
+            let slot = u16::try_from(slot).expect("validated registry slot count");
+            let record = match self.read_slot(slot) {
+                SlotRead::Valid(record) => record,
+                SlotRead::Unknown(reason) => {
+                    return Ok(ManagedOwnerOutcome::UnknownOrphanRisk(format!(
+                        "managed owner lookup encountered unknown slot {slot}: {reason}"
+                    )));
+                }
+            };
+            if record.owner.as_ref() == Some(owner) {
+                if matched.is_some() {
+                    return Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
+                        "duplicate managed owner records".into(),
+                    ));
+                }
+                matched = Some(record);
+            }
+        }
+        let Some(record) = matched else {
+            return Ok(ManagedOwnerOutcome::Absent);
+        };
+        let key = ManagedKey {
+            slot: record.slot,
+            generation: record.generation,
+        };
+        match record.state {
+            SlotState::ResolvedTombstone { .. } => Ok(ManagedOwnerOutcome::ResolvedTombstone(key)),
+            SlotState::Vacant => Ok(ManagedOwnerOutcome::Absent),
+            _ => match self.cleanup(record.slot, record.generation) {
+                Err(err) => Ok(ManagedOwnerOutcome::UnknownOrphanRisk(format!(
+                    "managed owner reconciliation failed: {err:#}"
+                ))),
+                Ok(outcome) => match outcome {
+                    ReconcileOutcome::ResolvedTombstone => {
+                        Ok(ManagedOwnerOutcome::ResolvedTombstone(key))
+                    }
+                    ReconcileOutcome::Absent => Ok(ManagedOwnerOutcome::Absent),
+                    ReconcileOutcome::Live => Ok(ManagedOwnerOutcome::UnknownOrphanRisk(
+                        "managed owner remained live after reconciliation".into(),
+                    )),
+                    ReconcileOutcome::UnknownOrphanRisk(reason) => {
+                        Ok(ManagedOwnerOutcome::UnknownOrphanRisk(reason))
+                    }
+                },
+            },
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn reconcile_managed_processes() -> Result<Vec<(u16, ReconcileOutcome)>> {
+pub(crate) fn reconcile_managed_processes() -> Result<ManagedReconcileReport> {
     Ok(Registry::open_default()?.reconcile_all())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reconcile_managed_owner(owner: &ManagedOwnerTag) -> Result<ManagedOwnerOutcome> {
+    Registry::open_default()?.reconcile_owner(owner)
 }
 
 fn validate_slot_record(record: &SlotRecord, expected_slot: u16) -> Result<()> {
     ensure!(record.schema_version == SCHEMA_VERSION);
     ensure!(record.slot == expected_slot);
+    if let Some(owner) = &record.owner {
+        owner.validate()?;
+    }
     match &record.state {
-        SlotState::Vacant => {}
+        SlotState::Vacant => ensure!(record.owner.is_none(), "vacant slot retained an owner"),
         SlotState::IntentDurable { nonce, .. }
         | SlotState::IdentityDurable { nonce, .. }
         | SlotState::CleanupPending { nonce, .. }
@@ -680,12 +984,23 @@ fn validate_transition(current: &SlotRecord, next: &SlotRecord) -> Result<()> {
             SlotState::ResolvedTombstone { nonce: b, .. },
         ) => current.generation == next.generation && a == b,
         (SlotState::ResolvedTombstone { .. }, SlotState::Vacant) => {
-            current.generation == next.generation
+            current.generation == next.generation && next.owner.is_none()
         }
         // Idempotent durable readback/rewrite is permitted only for the same
         // full record, never as a state shortcut.
         _ => current == next,
     };
+    let owner_stable = match (&current.state, &next.state) {
+        (SlotState::Vacant, SlotState::IntentDurable { .. }) => {
+            if let Some(owner) = &next.owner {
+                owner.validate()?;
+            }
+            true
+        }
+        (SlotState::ResolvedTombstone { .. }, SlotState::Vacant) => next.owner.is_none(),
+        _ => current.owner == next.owner,
+    };
+    ensure!(owner_stable, "managed owner changed across slot transition");
     ensure!(legal, "illegal managed registry state transition");
     Ok(())
 }
@@ -1078,13 +1393,16 @@ fn open_verified_pidfd(expected: &ProcessIdentity) -> Evidence<PidFd> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<ManagedProcess> {
+pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<ManagedLaunch> {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
+    if let Some(owner) = &request.owner {
+        owner.validate()?;
+    }
     let registry = Registry::open_default()?;
     managed_test_failpoint("parent_before_intent");
-    let intent = registry.allocate_intent(now_unix_secs()?)?;
+    let intent = registry.allocate_intent(now_unix_secs()?, request.owner.clone())?;
     managed_test_failpoint("parent_after_intent");
     let SlotState::IntentDurable { nonce, .. } = &intent.record.state else {
         unreachable!("allocator returns intent")
@@ -1100,6 +1418,13 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
     };
     let guard_fd = intent.guard.file.as_raw_fd();
     let control_fd = child_control.as_raw_fd();
+    let placement = match request.placement {
+        ManagedPlacement::None => None,
+        ManagedPlacement::CgroupV2(placement) => Some(placement),
+    };
+    let placement_fd = placement
+        .as_ref()
+        .map(|placement| placement.cgroup_procs.as_raw_fd());
 
     let mut command = Command::new("/proc/self/exe");
     command
@@ -1108,6 +1433,11 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         .arg(intent.record.slot.to_string())
         .arg(intent.record.generation.to_string())
         .arg(nonce.to_string())
+        .arg(if placement.is_some() {
+            "cgroup_v2"
+        } else {
+            "none"
+        })
         .arg(request.executable.as_os_str())
         .args(&request.arguments)
         .env_clear()
@@ -1116,7 +1446,7 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         command.current_dir(current_dir);
     }
     unsafe {
-        command.pre_exec(move || remap_gate_fds(control_fd, guard_fd));
+        command.pre_exec(move || remap_gate_fds(control_fd, guard_fd, placement_fd));
     }
     let mut child = match command.spawn().context("spawn trusted managed launch gate") {
         Ok(child) => child,
@@ -1132,6 +1462,12 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         ensure!(hello.registration.generation == intent.record.generation);
         ensure!(hello.registration.nonce == nonce);
         ensure!(hello.registration.identity.pid == child.id());
+        if let Some(placement) = &placement {
+            verify_process_cgroup_membership(
+                hello.registration.identity.pid,
+                &placement.expected_membership,
+            )?;
+        }
         managed_test_failpoint("parent_after_hello");
         let verified = match open_verified_pidfd(&hello.registration.identity) {
             Evidence::Present(pidfd) => pidfd,
@@ -1150,22 +1486,55 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
             generation: intent.record.generation,
             nonce,
             identity: identity.clone(),
+            descriptors: match &request.auxiliary {
+                ManagedAuxiliary::None => vec![CommitDescriptor {
+                    role: CommitDescriptorRole::TargetExecutable,
+                    target_fd: None,
+                }],
+                ManagedAuxiliary::SyncPipeWrite(sync) => vec![
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::TargetExecutable,
+                        target_fd: None,
+                    },
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::SyncPipeWrite,
+                        target_fd: Some(sync.target_fd),
+                    },
+                ],
+            },
         };
         managed_test_failpoint("parent_before_commit");
-        send_commit_with_fd(parent_control.as_raw_fd(), &commit, target.as_raw_fd())?;
+        let mut commit_fds = vec![target.as_raw_fd()];
+        if let ManagedAuxiliary::SyncPipeWrite(sync) = &request.auxiliary {
+            commit_fds.push(sync.file.as_raw_fd());
+        }
+        send_commit_with_fds(parent_control.as_raw_fd(), &commit, &commit_fds)?;
         managed_test_failpoint("parent_after_commit");
         wait_for_gate_exec(parent_control.as_raw_fd())?;
         Ok(identity.clone())
     })();
 
     match launch_result {
-        Ok(identity) => Ok(ManagedProcess {
-            slot: intent.record.slot,
-            generation: intent.record.generation,
-            identity,
-            child: Some(child),
-            registry,
-        }),
+        Ok(identity) => {
+            let controller = ManagedController {
+                inner: Arc::new(ManagedControllerInner {
+                    key: ManagedKey {
+                        slot: intent.record.slot,
+                        generation: intent.record.generation,
+                    },
+                    identity,
+                    owner: intent.record.owner.clone(),
+                    registry,
+                }),
+            };
+            Ok(ManagedLaunch {
+                waiter: ManagedWaiter {
+                    child: Some(child),
+                    controller: controller.clone(),
+                },
+                controller,
+            })
+        }
         Err(err) => {
             drop(parent_control);
             settle_failed_launch(
@@ -1270,7 +1639,7 @@ fn managed_test_failpoint(_name: &str) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn launch_managed_process(_request: ManagedLaunchRequest) -> Result<ManagedProcess> {
+pub(crate) fn launch_managed_process(_request: ManagedLaunchRequest) -> Result<ManagedLaunch> {
     bail!("durable managed-process launch is supported only on Linux")
 }
 
@@ -1309,8 +1678,8 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
     bail!("internal managed-launch test driver is supported only on Linux");
     #[cfg(target_os = "linux")]
     if action.as_deref() == Some(std::ffi::OsStr::new(INTERNAL_TEST_RECONCILE_ARG)) {
-        for (slot, outcome) in reconcile_managed_processes()? {
-            println!("managed-reconcile slot={slot} outcome={outcome:?}");
+        for entry in reconcile_managed_processes()?.entries {
+            println!("managed-reconcile entry={entry:?}");
         }
         return Ok(true);
     }
@@ -1320,18 +1689,74 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
             .next()
             .map(PathBuf::from)
             .context("internal managed-launch test driver requires an executable")?;
+        let owner = std::env::var("LTERM_INTERNAL_MANAGED_OWNER_UUID")
+            .ok()
+            .map(|tournament_uuid| -> Result<ManagedOwnerTag> {
+                let role = match std::env::var("LTERM_INTERNAL_MANAGED_OWNER_ROLE")?.as_str() {
+                    "probe" => ManagedOwnerRole::Probe,
+                    "runner" => ManagedOwnerRole::Runner,
+                    _ => bail!("invalid internal managed owner role"),
+                };
+                let owner = ManagedOwnerTag {
+                    kind: ManagedOwnerKind::Speculation,
+                    tournament_uuid: Uuid::parse_str(&tournament_uuid)?,
+                    candidate_index: std::env::var("LTERM_INTERNAL_MANAGED_OWNER_CANDIDATE")?
+                        .parse()?,
+                    role,
+                };
+                owner.validate()?;
+                Ok(owner)
+            })
+            .transpose()?;
+        let placement = match (
+            std::env::var_os("LTERM_INTERNAL_MANAGED_CONTROL_CGROUP_PROCS"),
+            std::env::var("LTERM_INTERNAL_MANAGED_CONTROL_CGROUP_MEMBERSHIP").ok(),
+        ) {
+            (None, None) => ManagedPlacement::None,
+            (Some(path), Some(membership)) => {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                    .open(path)
+                    .context("open internal test control cgroup.procs")?;
+                ManagedPlacement::CgroupV2(ControlCgroupPlacement::new(file, membership)?)
+            }
+            _ => bail!("internal managed placement requires path and membership together"),
+        };
+        let (auxiliary, mut sync_read) = if std::env::var_os("LTERM_INTERNAL_MANAGED_SYNC_PIPE")
+            .as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            let mut fds = [-1; 2];
+            ensure!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0);
+            let read = unsafe { File::from_raw_fd(fds[0]) };
+            let write = unsafe { File::from_raw_fd(fds[1]) };
+            (
+                ManagedAuxiliary::SyncPipeWrite(SyncPipeWrite::new(
+                    write,
+                    MANAGED_SYNC_PIPE_TARGET_FD,
+                )?),
+                Some(read),
+            )
+        } else {
+            (ManagedAuxiliary::None, None)
+        };
         let process = launch_managed_process(ManagedLaunchRequest {
+            owner,
+            placement,
+            auxiliary,
             executable,
             arguments: arguments.collect(),
             current_dir: None,
             environment: std::env::vars_os().collect(),
         })?;
-        let slot = process.slot;
-        let generation = process.generation;
-        let pid = process.identity.pid;
+        let key = process.controller.key();
+        let pid = process.controller.identity().pid;
         println!(
             "managed-launch slot={} generation={} pid={}",
-            slot, generation, pid
+            key.slot(),
+            key.generation(),
+            pid
         );
         if std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_NO_WAIT").as_deref()
             == Some(std::ffi::OsStr::new("1"))
@@ -1342,9 +1767,9 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
         let terminate = std::env::var_os("LTERM_INTERNAL_MANAGED_LAUNCH_TERMINATE").as_deref()
             == Some(std::ffi::OsStr::new("1"));
         let status = if terminate {
-            process.terminate_and_wait()?
+            process.waiter.terminate_and_wait()?
         } else {
-            process.wait()?
+            process.waiter.wait()?
         };
         if !terminate {
             ensure!(
@@ -1352,12 +1777,26 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
                 "managed root process exited with {status}"
             );
         }
+        if let Some(sync_read) = &mut sync_read {
+            let mut unexpected = Vec::new();
+            sync_read
+                .read_to_end(&mut unexpected)
+                .context("wait for managed sync pipe EOF")?;
+            ensure!(
+                unexpected.is_empty(),
+                "managed sync pipe carried unexpected bytes"
+            );
+        }
         Ok(true)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn remap_gate_fds(control_fd: RawFd, guard_fd: RawFd) -> std::io::Result<()> {
+fn remap_gate_fds(
+    control_fd: RawFd,
+    guard_fd: RawFd,
+    placement_fd: Option<RawFd>,
+) -> std::io::Result<()> {
     let control_copy = duplicate_for_gate_remap(control_fd)?;
     let guard_copy = match duplicate_for_gate_remap(guard_fd) {
         Ok(fd) => fd,
@@ -1366,23 +1805,40 @@ fn remap_gate_fds(control_fd: RawFd, guard_fd: RawFd) -> std::io::Result<()> {
             return Err(err);
         }
     };
+    let placement_copy = match placement_fd.map(duplicate_for_gate_remap).transpose() {
+        Ok(fd) => fd,
+        Err(err) => {
+            unsafe {
+                libc::close(control_copy);
+                libc::close(guard_copy);
+            }
+            return Err(err);
+        }
+    };
     let result = if unsafe { libc::dup2(control_copy, GATE_CONTROL_FD) } < 0
         || unsafe { libc::dup2(guard_copy, GATE_GUARD_FD) } < 0
+        || placement_copy.is_some_and(|fd| unsafe { libc::dup2(fd, GATE_PLACEMENT_FD) } < 0)
     {
         Err(std::io::Error::last_os_error())
     } else {
+        if placement_copy.is_none() {
+            unsafe { libc::close(GATE_PLACEMENT_FD) };
+        }
         Ok(())
     };
     unsafe {
         libc::close(control_copy);
         libc::close(guard_copy);
+        if let Some(fd) = placement_copy {
+            libc::close(fd);
+        }
     }
     result
 }
 
 #[cfg(target_os = "linux")]
 fn duplicate_for_gate_remap(fd: RawFd) -> std::io::Result<RawFd> {
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, GATE_GUARD_FD + 1) };
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, GATE_PLACEMENT_FD + 1) };
     if duplicate < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -1394,18 +1850,25 @@ fn duplicate_for_gate_remap(fd: RawFd) -> std::io::Result<RawFd> {
 fn run_gate(arguments: Vec<OsString>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
-    ensure!(arguments.len() >= 5, "malformed internal gate invocation");
+    ensure!(arguments.len() >= 6, "malformed internal gate invocation");
     let registry_root = PathBuf::from(&arguments[0]);
     ensure!(registry_root.is_absolute());
     let slot: u16 = arguments[1].to_string_lossy().parse()?;
     let generation: u64 = arguments[2].to_string_lossy().parse()?;
     let nonce = Uuid::parse_str(&arguments[3].to_string_lossy())?;
-    let target_argv = &arguments[4..];
+    let placement_kind = arguments[4].to_string_lossy();
+    ensure!(placement_kind == "none" || placement_kind == "cgroup_v2");
+    let target_argv = &arguments[5..];
     ensure!(!target_argv.is_empty());
 
     let control = unsafe { File::from_raw_fd(GATE_CONTROL_FD) };
     let guard = unsafe { File::from_raw_fd(GATE_GUARD_FD) };
+    unsafe { libc::close(MANAGED_SYNC_PIPE_TARGET_FD) };
     validate_seqpacket(control.as_raw_fd())?;
+    if placement_kind == "cgroup_v2" {
+        let placement = unsafe { File::from_raw_fd(GATE_PLACEMENT_FD) };
+        place_gate_in_control_cgroup(placement)?;
+    }
     let registry = Registry::open_at(registry_root, SLOT_COUNT)?;
     validate_inherited_guard(&registry, slot, &guard)?;
     let intent = registry.read_valid_slot(slot)?;
@@ -1450,7 +1913,7 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
     managed_test_failpoint("gate_after_hello");
 
     set_socket_timeout(control.as_raw_fd(), Duration::from_secs(30))?;
-    let (commit, target) = recv_commit_with_fd(control.as_raw_fd())?;
+    let (commit, target, sync_pipe) = recv_commit_with_fds(control.as_raw_fd())?;
     managed_test_failpoint("gate_after_commit");
     ensure!(commit.protocol == "lterm-managed-commit-v1");
     ensure!(commit.slot == slot && commit.generation == generation && commit.nonce == nonce);
@@ -1468,8 +1931,12 @@ fn run_gate(arguments: Vec<OsString>) -> Result<()> {
         observe_identity(std::process::id()),
         Evidence::Present(ref actual) if actual == &identity
     ));
+    let target = move_file_away_from_fd(target, MANAGED_SYNC_PIPE_TARGET_FD)?;
     validate_pinned_executable(&target)?;
     prepare_target_fd_for_exec(&target)?;
+    if let Some(sync_pipe) = sync_pipe {
+        install_sync_pipe(sync_pipe, MANAGED_SYNC_PIPE_TARGET_FD)?;
+    }
     set_cloexec(control.as_raw_fd())?;
     set_cloexec(guard.as_raw_fd())?;
     managed_test_failpoint("gate_before_exec");
@@ -1619,6 +2086,107 @@ fn validate_seqpacket(fd: RawFd) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn validate_cgroup_membership(value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty() && value.len() <= 1_024,
+        "control cgroup membership is empty or oversized"
+    );
+    ensure!(
+        value.starts_with('/'),
+        "control cgroup membership is not absolute"
+    );
+    ensure!(
+        !value.as_bytes().contains(&0) && !value.contains('\n'),
+        "control cgroup membership contains a forbidden byte"
+    );
+    for component in Path::new(value).components() {
+        ensure!(
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            ),
+            "control cgroup membership is not normalized"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cgroup_procs_fd(file: &File) -> Result<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    ensure!(flags >= 0, "cgroup.procs FD flags unavailable");
+    ensure!(
+        flags & libc::O_ACCMODE == libc::O_WRONLY || flags & libc::O_ACCMODE == libc::O_RDWR,
+        "cgroup.procs FD is not writable"
+    );
+    let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::fstatfs(file.as_raw_fd(), &mut statfs) } == 0,
+        "cgroup.procs filesystem identity unavailable"
+    );
+    ensure!(
+        statfs.f_type as u64 == libc::CGROUP2_SUPER_MAGIC as u64,
+        "placement FD is not on cgroup v2"
+    );
+    let link = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .context("resolve placement FD")?;
+    ensure!(
+        link.file_name().is_some_and(|name| name == "cgroup.procs"),
+        "placement FD is not cgroup.procs"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn place_gate_in_control_cgroup(file: File) -> Result<()> {
+    validate_cgroup_procs_fd(&file)?;
+    let bytes = b"0\n";
+    let written = unsafe { libc::write(file.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+    ensure!(
+        written == bytes.len() as isize,
+        "control cgroup placement write failed"
+    );
+    drop(file);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_process_cgroup_membership(pid: u32, expected: &str) -> Result<()> {
+    validate_cgroup_membership(expected)?;
+    let bytes = fs::read(format!("/proc/{pid}/cgroup")).context("read managed gate cgroup")?;
+    ensure!(
+        bytes.len() <= 4 * 1_024,
+        "managed gate cgroup report is oversized"
+    );
+    let actual = std::str::from_utf8(&bytes).context("managed gate cgroup report is not UTF-8")?;
+    ensure!(
+        actual == format!("0::{expected}\n"),
+        "managed gate is not in the exact control cgroup"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sync_pipe_write_fd(file: &File) -> Result<()> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } == 0,
+        "sync pipe FD metadata unavailable"
+    );
+    ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFIFO,
+        "sync auxiliary FD is not a pipe"
+    );
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    ensure!(flags >= 0, "sync pipe FD flags unavailable");
+    ensure!(
+        flags & libc::O_ACCMODE == libc::O_WRONLY || flags & libc::O_ACCMODE == libc::O_RDWR,
+        "sync auxiliary FD is not writable"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn set_socket_timeout(fd: RawFd, timeout: Duration) -> Result<()> {
     let value = libc::timeval {
         tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
@@ -1666,14 +2234,20 @@ fn recv_packet<T: for<'de> Deserialize<'de>>(fd: RawFd) -> Result<T> {
 }
 
 #[cfg(target_os = "linux")]
-fn send_commit_with_fd(fd: RawFd, commit: &GateCommit, target_fd: RawFd) -> Result<()> {
+fn send_commit_with_fds(fd: RawFd, commit: &GateCommit, rights: &[RawFd]) -> Result<()> {
     let bytes = serde_json::to_vec(commit)?;
     ensure!(bytes.len() <= MAX_RECORD_BYTES);
+    ensure!(!rights.is_empty() && rights.len() <= MAX_COMMIT_FDS);
+    ensure!(commit.descriptors.len() == rights.len());
     let mut iovec = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
-    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let rights_bytes = rights
+        .len()
+        .checked_mul(std::mem::size_of::<RawFd>())
+        .context("COMMIT descriptor byte count overflow")?;
+    let control_len = unsafe { libc::CMSG_SPACE(rights_bytes as u32) } as usize;
     let mut control = vec![0u8; control_len];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iovec;
@@ -1685,8 +2259,12 @@ fn send_commit_with_fd(fd: RawFd, commit: &GateCommit, target_fd: RawFd) -> Resu
         ensure!(!header.is_null());
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
-        std::ptr::write(libc::CMSG_DATA(header).cast::<RawFd>(), target_fd);
+        (*header).cmsg_len = libc::CMSG_LEN(rights_bytes as u32) as usize;
+        std::ptr::copy_nonoverlapping(
+            rights.as_ptr(),
+            libc::CMSG_DATA(header).cast::<RawFd>(),
+            rights.len(),
+        );
         message.msg_controllen = (*header).cmsg_len;
     }
     let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) };
@@ -1695,14 +2273,15 @@ fn send_commit_with_fd(fd: RawFd, commit: &GateCommit, target_fd: RawFd) -> Resu
 }
 
 #[cfg(target_os = "linux")]
-fn recv_commit_with_fd(fd: RawFd) -> Result<(GateCommit, File)> {
+fn recv_commit_with_fds(fd: RawFd) -> Result<(GateCommit, File, Option<File>)> {
     use std::os::fd::FromRawFd;
     let mut bytes = [0u8; MAX_RECORD_BYTES + 1];
     let mut iovec = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
     };
-    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let rights_bytes = MAX_COMMIT_FDS * std::mem::size_of::<RawFd>();
+    let control_len = unsafe { libc::CMSG_SPACE(rights_bytes as u32) } as usize;
     let mut control = vec![0u8; control_len];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iovec;
@@ -1712,22 +2291,111 @@ fn recv_commit_with_fd(fd: RawFd) -> Result<(GateCommit, File)> {
     let received =
         unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC | libc::MSG_TRUNC) };
     ensure!(received > 0, "COMMIT EOF or receive failure");
-    ensure!(received as usize <= MAX_RECORD_BYTES, "oversized COMMIT");
-    ensure!(message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) == 0);
-    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-    ensure!(!header.is_null(), "COMMIT has no target executable FD");
-    unsafe {
-        ensure!((*header).cmsg_level == libc::SOL_SOCKET);
-        ensure!((*header).cmsg_type == libc::SCM_RIGHTS);
-        ensure!((*header).cmsg_len == libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize);
+    let mut received_files = Vec::new();
+    let mut ancillary_shape_valid = true;
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let minimum = unsafe { libc::CMSG_LEN(0) } as usize;
+        let header_len = unsafe { (*header).cmsg_len };
+        if header_len < minimum {
+            ancillary_shape_valid = false;
+            break;
+        }
+        let is_rights = unsafe {
+            (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
+        };
+        if !is_rights {
+            ancillary_shape_valid = false;
+        } else {
+            let payload_len = header_len - minimum;
+            if payload_len % std::mem::size_of::<RawFd>() != 0 {
+                ancillary_shape_valid = false;
+            } else {
+                let count = payload_len / std::mem::size_of::<RawFd>();
+                for index in 0..count {
+                    let received_fd = unsafe {
+                        std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>().add(index))
+                    };
+                    if received_fd < 0 {
+                        ancillary_shape_valid = false;
+                    } else {
+                        // Own every delivered descriptor immediately. All later
+                        // validation and JSON failures therefore close it.
+                        received_files.push(unsafe { File::from_raw_fd(received_fd) });
+                    }
+                }
+            }
+        }
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
     }
-    let target_fd = unsafe { std::ptr::read(libc::CMSG_DATA(header).cast::<RawFd>()) };
-    ensure!(target_fd >= 0);
-    // SAFETY: SCM_RIGHTS transferred a new descriptor owned by this process.
-    // Wrap it before parsing so every subsequent error path closes it.
-    let target = unsafe { File::from_raw_fd(target_fd) };
-    let commit = serde_json::from_slice(&bytes[..received as usize]).context("malformed COMMIT")?;
-    Ok((commit, target))
+    ensure!(received as usize <= MAX_RECORD_BYTES, "oversized COMMIT");
+    ensure!(
+        message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) == 0,
+        "truncated COMMIT packet or ancillary data"
+    );
+    ensure!(ancillary_shape_valid, "malformed COMMIT ancillary data");
+    let commit: GateCommit =
+        serde_json::from_slice(&bytes[..received as usize]).context("malformed COMMIT")?;
+    ensure!(
+        commit.descriptors.len() == received_files.len(),
+        "COMMIT descriptor metadata/rights count mismatch"
+    );
+    ensure!(
+        matches!(
+            commit.descriptors.as_slice(),
+            [CommitDescriptor {
+                role: CommitDescriptorRole::TargetExecutable,
+                target_fd: None,
+            }] | [
+                CommitDescriptor {
+                    role: CommitDescriptorRole::TargetExecutable,
+                    target_fd: None,
+                },
+                CommitDescriptor {
+                    role: CommitDescriptorRole::SyncPipeWrite,
+                    target_fd: Some(MANAGED_SYNC_PIPE_TARGET_FD),
+                }
+            ]
+        ),
+        "COMMIT descriptor roles or target mapping are invalid"
+    );
+    let mut received_files = received_files.into_iter();
+    let target = received_files
+        .next()
+        .context("COMMIT has no target executable FD")?;
+    let sync_pipe = received_files.next();
+    ensure!(received_files.next().is_none());
+    Ok((commit, target, sync_pipe))
+}
+
+#[cfg(target_os = "linux")]
+fn move_file_away_from_fd(file: File, prohibited: RawFd) -> Result<File> {
+    if file.as_raw_fd() != prohibited {
+        return Ok(file);
+    }
+    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, prohibited + 1) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("move pinned executable away from fixed auxiliary FD");
+    }
+    Ok(unsafe { File::from_raw_fd(duplicate) })
+}
+
+#[cfg(target_os = "linux")]
+fn install_sync_pipe(file: File, target_fd: RawFd) -> Result<()> {
+    validate_sync_pipe_write_fd(&file)?;
+    if file.as_raw_fd() != target_fd {
+        let result = unsafe { libc::dup3(file.as_raw_fd(), target_fd, 0) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error()).context("install fixed sync pipe FD");
+        }
+    } else {
+        clear_cloexec(target_fd)?;
+        let _ = file.into_raw_fd();
+        return Ok(());
+    }
+    drop(file);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1771,6 +2439,15 @@ mod tests {
         }
     }
 
+    fn owner(candidate_index: u8, role: ManagedOwnerRole) -> ManagedOwnerTag {
+        ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::from_u128(0x1234),
+            candidate_index,
+            role,
+        }
+    }
+
     #[test]
     fn genesis_creates_fixed_exact_layout_and_reopens() {
         let (_temp, registry) = registry(4);
@@ -1801,6 +2478,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 slot: 0,
                 generation: 0,
+                owner: None,
                 state: SlotState::Vacant,
             },
         )
@@ -1830,6 +2508,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             slot: 0,
             generation: 4,
+            owner: None,
             state: SlotState::Vacant,
         };
         let intent = SlotRecord {
@@ -1860,6 +2539,59 @@ mod tests {
             ..exhausted.clone()
         };
         assert!(validate_transition(&exhausted, &wrapped).is_err());
+    }
+
+    #[test]
+    fn owner_tag_is_bounded_stable_and_old_records_remain_compatible() {
+        let old = br#"{"schema_version":1,"slot":0,"generation":0,"state":"vacant"}"#;
+        let old_record: SlotRecord = serde_json::from_slice(old).unwrap();
+        assert_eq!(old_record.owner, None);
+        assert!(
+            !String::from_utf8(serde_json::to_vec(&old_record).unwrap())
+                .unwrap()
+                .contains("owner")
+        );
+
+        let nil = ManagedOwnerTag {
+            tournament_uuid: Uuid::nil(),
+            ..owner(0, ManagedOwnerRole::Probe)
+        };
+        assert!(nil.validate().is_err());
+        assert!(owner(2, ManagedOwnerRole::Runner).validate().is_err());
+
+        let tagged = owner(1, ManagedOwnerRole::Runner);
+        let vacant = SlotRecord {
+            schema_version: SCHEMA_VERSION,
+            slot: 0,
+            generation: 0,
+            owner: None,
+            state: SlotState::Vacant,
+        };
+        let intent = SlotRecord {
+            generation: 1,
+            owner: Some(tagged.clone()),
+            state: SlotState::IntentDurable {
+                nonce: Uuid::from_u128(1),
+                created_unix_secs: 1,
+            },
+            ..vacant.clone()
+        };
+        assert!(validate_transition(&vacant, &intent).is_ok());
+        let changed = SlotRecord {
+            owner: Some(owner(0, ManagedOwnerRole::Probe)),
+            state: SlotState::IdentityDurable {
+                nonce: Uuid::from_u128(1),
+                identity: identity(42),
+                release_may_have_occurred: true,
+            },
+            ..intent.clone()
+        };
+        assert!(validate_transition(&intent, &changed).is_err());
+        let stable = SlotRecord {
+            owner: Some(tagged),
+            ..changed
+        };
+        assert!(validate_transition(&intent, &stable).is_ok());
     }
 
     #[test]
@@ -1903,6 +2635,9 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             let result = launch_managed_process(ManagedLaunchRequest {
+                owner: None,
+                placement: ManagedPlacement::None,
+                auxiliary: ManagedAuxiliary::None,
                 executable: PathBuf::from("/bin/echo"),
                 arguments: Vec::new(),
                 current_dir: None,
@@ -1996,7 +2731,7 @@ mod tests {
             malformed.len() as isize
         );
 
-        let error = recv_commit_with_fd(receiver.as_raw_fd()).unwrap_err();
+        let error = recv_commit_with_fds(receiver.as_raw_fd()).unwrap_err();
         assert!(error.to_string().contains("malformed COMMIT"), "{error:#}");
         assert_eq!(
             count_target_fds(),
@@ -2006,12 +2741,252 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn test_commit(descriptors: Vec<CommitDescriptor>) -> GateCommit {
+        GateCommit {
+            protocol: "lterm-managed-commit-v1".into(),
+            slot: 0,
+            generation: 1,
+            nonce: Uuid::from_u128(1),
+            identity: identity(42),
+            descriptors,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_raw_commit(fd: RawFd, bytes: &[u8], rights: &[RawFd]) {
+        if rights.is_empty() {
+            assert_eq!(
+                unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) },
+                bytes.len() as isize
+            );
+            return;
+        }
+        let mut iovec = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let rights_bytes = std::mem::size_of_val(rights);
+        let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(rights_bytes as u32) } as usize];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            assert!(!header.is_null());
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(rights_bytes as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                rights.as_ptr(),
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                rights.len(),
+            );
+            message.msg_controllen = (*header).cmsg_len;
+        }
+        assert_eq!(
+            unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_descriptor_shapes_fail_closed_and_close_every_received_fd() {
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let target_metadata = target.as_file().metadata().unwrap();
+        let count_target_fds = || {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.dev() == target_metadata.dev()
+                        && metadata.ino() == target_metadata.ino()
+                })
+                .count()
+        };
+        let source = target.as_file().as_raw_fd();
+        let cases = [
+            (
+                test_commit(vec![CommitDescriptor {
+                    role: CommitDescriptorRole::TargetExecutable,
+                    target_fd: None,
+                }]),
+                vec![],
+            ),
+            (
+                test_commit(vec![CommitDescriptor {
+                    role: CommitDescriptorRole::TargetExecutable,
+                    target_fd: None,
+                }]),
+                vec![source, source],
+            ),
+            (
+                test_commit(vec![
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::TargetExecutable,
+                        target_fd: None,
+                    },
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::TargetExecutable,
+                        target_fd: None,
+                    },
+                ]),
+                vec![source, source],
+            ),
+            (
+                test_commit(vec![CommitDescriptor {
+                    role: CommitDescriptorRole::SyncPipeWrite,
+                    target_fd: Some(MANAGED_SYNC_PIPE_TARGET_FD),
+                }]),
+                vec![source],
+            ),
+            (
+                test_commit(vec![
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::TargetExecutable,
+                        target_fd: None,
+                    },
+                    CommitDescriptor {
+                        role: CommitDescriptorRole::SyncPipeWrite,
+                        target_fd: Some(MANAGED_SYNC_PIPE_TARGET_FD + 1),
+                    },
+                ]),
+                vec![source, source],
+            ),
+        ];
+
+        for (commit, rights) in cases {
+            let (sender, receiver) = seqpacket_pair().unwrap();
+            let before = count_target_fds();
+            send_raw_commit(
+                sender.as_raw_fd(),
+                &serde_json::to_vec(&commit).unwrap(),
+                &rights,
+            );
+            assert!(recv_commit_with_fds(receiver.as_raw_fd()).is_err());
+            assert_eq!(
+                count_target_fds(),
+                before,
+                "malformed COMMIT leaked a received descriptor"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn truncated_ancillary_closes_all_kernel_delivered_fds() {
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let target_metadata = target.as_file().metadata().unwrap();
+        let count_target_fds = || {
+            fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.dev() == target_metadata.dev()
+                        && metadata.ino() == target_metadata.ino()
+                })
+                .count()
+        };
+        let before = count_target_fds();
+        let rights = vec![target.as_file().as_raw_fd(); MAX_COMMIT_FDS + 1];
+        let descriptors = vec![
+            CommitDescriptor {
+                role: CommitDescriptorRole::TargetExecutable,
+                target_fd: None,
+            };
+            rights.len()
+        ];
+        send_raw_commit(
+            sender.as_raw_fd(),
+            &serde_json::to_vec(&test_commit(descriptors)).unwrap(),
+            &rights,
+        );
+        assert!(recv_commit_with_fds(receiver.as_raw_fd()).is_err());
+        assert_eq!(count_target_fds(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_pipe_mapping_accepts_only_writable_pipe_and_fixed_target() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        assert!(SyncPipeWrite::new(write, MANAGED_SYNC_PIPE_TARGET_FD).is_ok());
+        assert!(SyncPipeWrite::new(read, MANAGED_SYNC_PIPE_TARGET_FD).is_err());
+
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let _read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        assert!(SyncPipeWrite::new(write, MANAGED_SYNC_PIPE_TARGET_FD + 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_target_and_sync_commit_returns_two_typed_owned_descriptors() {
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let _sync_read = unsafe { File::from_raw_fd(pipe_fds[0]) };
+        let sync_write = unsafe { File::from_raw_fd(pipe_fds[1]) };
+        let commit = test_commit(vec![
+            CommitDescriptor {
+                role: CommitDescriptorRole::TargetExecutable,
+                target_fd: None,
+            },
+            CommitDescriptor {
+                role: CommitDescriptorRole::SyncPipeWrite,
+                target_fd: Some(MANAGED_SYNC_PIPE_TARGET_FD),
+            },
+        ]);
+        send_commit_with_fds(
+            sender.as_raw_fd(),
+            &commit,
+            &[target.as_file().as_raw_fd(), sync_write.as_raw_fd()],
+        )
+        .unwrap();
+        let (received, received_target, received_sync) =
+            recv_commit_with_fds(receiver.as_raw_fd()).unwrap();
+        assert_eq!(received, commit);
+        let target_metadata = target.as_file().metadata().unwrap();
+        let received_metadata = received_target.metadata().unwrap();
+        assert_eq!(
+            (received_metadata.dev(), received_metadata.ino()),
+            (target_metadata.dev(), target_metadata.ino())
+        );
+        validate_sync_pipe_write_fd(&received_sync.unwrap()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn placement_rejects_non_cgroup_fd_and_unbounded_or_non_normal_membership() {
+        let ordinary = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            ControlCgroupPlacement::new(ordinary.reopen().unwrap(), "/speculation/control".into())
+                .is_err()
+        );
+        assert!(validate_cgroup_membership("relative/control").is_err());
+        assert!(validate_cgroup_membership("/speculation/../control").is_err());
+        assert!(validate_cgroup_membership(&format!("/{}", "x".repeat(1_025))).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn fixed_capacity_fails_before_reusing_unresolved_records() {
         let (_temp, registry) = registry(2);
-        let first = registry.allocate_intent(1).unwrap();
-        let second = registry.allocate_intent(1).unwrap();
-        assert!(registry.allocate_intent(1).is_err());
+        let first = registry.allocate_intent(1, None).unwrap();
+        let second = registry.allocate_intent(1, None).unwrap();
+        assert!(registry.allocate_intent(1, None).is_err());
         drop((first, second));
     }
 
@@ -2036,7 +3011,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let error = registry.allocate_intent(2).unwrap_err().to_string();
+        let error = registry.allocate_intent(2, None).unwrap_err().to_string();
         assert!(error.contains("1024/1024 unresolved"), "{error}");
     }
 
@@ -2044,7 +3019,7 @@ mod tests {
     #[test]
     fn unlocked_intent_is_durably_tombstoned() {
         let (_temp, registry) = registry(1);
-        let intent = registry.allocate_intent(1).unwrap();
+        let intent = registry.allocate_intent(1, None).unwrap();
         let slot = intent.record.slot;
         let generation = intent.record.generation;
         let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
@@ -2070,7 +3045,7 @@ mod tests {
     #[test]
     fn busy_intent_with_absent_registered_identity_stays_unknown() {
         let (_temp, registry) = registry(1);
-        let intent = registry.allocate_intent(1).unwrap();
+        let intent = registry.allocate_intent(1, None).unwrap();
         let SlotState::IntentDurable { nonce, .. } = intent.record.state else {
             unreachable!()
         };
@@ -2103,6 +3078,75 @@ mod tests {
             registry.read_valid_slot(intent.record.slot).unwrap().state,
             SlotState::IntentDurable { .. }
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_is_durable_before_spawn_retained_through_tombstone_and_reconciled_typed() {
+        let (_temp, registry) = registry(2);
+        let owner = owner(0, ManagedOwnerRole::Runner);
+        let intent = registry.allocate_intent(1, Some(owner.clone())).unwrap();
+        assert_eq!(
+            registry.read_valid_slot(intent.record.slot).unwrap().owner,
+            Some(owner.clone())
+        );
+        assert!(
+            registry
+                .allocate_intent(2, Some(owner.clone()))
+                .unwrap_err()
+                .to_string()
+                .contains("already has a durable registry record")
+        );
+        let key = ManagedKey {
+            slot: intent.record.slot,
+            generation: intent.record.generation,
+        };
+        drop(intent);
+
+        assert_eq!(
+            registry.reconcile_owner(&owner).unwrap(),
+            ManagedOwnerOutcome::ResolvedTombstone(key)
+        );
+        let tombstone = registry.read_valid_slot(key.slot).unwrap();
+        assert_eq!(tombstone.owner, Some(owner.clone()));
+        assert!(matches!(
+            tombstone.state,
+            SlotState::ResolvedTombstone { .. }
+        ));
+        assert_eq!(
+            registry.reconcile_owner(&owner).unwrap(),
+            ManagedOwnerOutcome::ResolvedTombstone(key)
+        );
+        let report = registry.reconcile_all();
+        assert!(report.entries.iter().any(|entry| {
+            entry.key == Some(key)
+                && entry.owner.as_ref() == Some(&owner)
+                && entry.outcome == ReconcileOutcome::ResolvedTombstone
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controller_is_cloneable_without_cloning_waiter_ownership() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<ManagedController>();
+
+        let (_temp, registry) = registry(1);
+        let controller = ManagedController {
+            inner: Arc::new(ManagedControllerInner {
+                key: ManagedKey {
+                    slot: 0,
+                    generation: 0,
+                },
+                identity: identity(u32::MAX),
+                owner: None,
+                registry,
+            }),
+        };
+        let clone = controller.clone();
+        assert_eq!(clone.key(), controller.key());
+        assert_eq!(clone.owner(), None);
+        assert_eq!(clone.status(), ReconcileOutcome::Absent);
     }
 
     #[cfg(target_os = "linux")]

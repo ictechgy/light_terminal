@@ -35,6 +35,10 @@ fn slot_state(path: &std::path::Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn slot_json(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read managed slot")).expect("parse managed slot")
+}
+
 fn wait_for_slot_state(path: &std::path::Path, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while slot_state(path).as_deref() != Some(expected) && Instant::now() < deadline {
@@ -231,6 +235,104 @@ fn restart_reconciliation_cleans_detached_root() {
     wait_for_slot_state(&slot, "identity_durable");
 
     reconcile_until_tombstone(&temp);
+}
+
+#[test]
+fn managed_owner_is_present_in_the_terminal_tombstone() {
+    let temp = private_temp();
+    let tournament = "00000000-0000-4000-8000-000000000123";
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg("exit 0")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_MANAGED_OWNER_UUID", tournament)
+        .env("LTERM_INTERNAL_MANAGED_OWNER_CANDIDATE", "1")
+        .env("LTERM_INTERNAL_MANAGED_OWNER_ROLE", "runner")
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run owner-tagged managed launch");
+    assert!(
+        output.status.success(),
+        "owner-tagged launch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let slot = slot_json(&slot_path(&temp));
+    assert_eq!(slot["state"], "resolved_tombstone");
+    assert_eq!(slot["owner"]["kind"], "speculation");
+    assert_eq!(slot["owner"]["tournament_uuid"], tournament);
+    assert_eq!(slot["owner"]["candidate_index"], 1);
+    assert_eq!(slot["owner"]["role"], "runner");
+}
+
+#[test]
+fn fixed_sync_pipe_fd_stays_open_until_the_last_descendant_exits() {
+    let temp = private_temp();
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg("test -p /proc/self/fd/10 || exit 1; (sleep 1) &")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_MANAGED_SYNC_PIPE", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run sync-FD managed launch");
+    assert!(
+        output.status.success(),
+        "sync-FD launch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(750),
+        "driver observed sync EOF before the descendant exited"
+    );
+    assert_eq!(
+        slot_state(&slot_path(&temp)).as_deref(),
+        Some("resolved_tombstone")
+    );
+}
+
+#[test]
+#[ignore = "requires an explicit writable delegated cgroup-v2 control leaf"]
+fn managed_gate_joins_exact_control_cgroup_before_target_release() {
+    let cgroup_procs = std::env::var_os("LTERM_TEST_CONTROL_CGROUP_PROCS")
+        .expect("LTERM_TEST_CONTROL_CGROUP_PROCS is required");
+    let membership = std::env::var("LTERM_TEST_CONTROL_CGROUP_MEMBERSHIP")
+        .expect("LTERM_TEST_CONTROL_CGROUP_MEMBERSHIP is required");
+    let temp = private_temp();
+    let marker = temp.path().join("placed-target-ran");
+    let script = format!(
+        "test \"$(cat /proc/self/cgroup)\" = '0::{}' && printf placed > '{}'",
+        membership,
+        marker.display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg(script)
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_MANAGED_CONTROL_CGROUP_PROCS", cgroup_procs)
+        .env(
+            "LTERM_INTERNAL_MANAGED_CONTROL_CGROUP_MEMBERSHIP",
+            &membership,
+        )
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run control-cgroup managed launch");
+    assert!(
+        output.status.success(),
+        "control-cgroup launch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "placed");
+    assert_eq!(
+        slot_state(&slot_path(&temp)).as_deref(),
+        Some("resolved_tombstone")
+    );
 }
 
 #[test]
