@@ -11,7 +11,11 @@ mod speculation_fs;
 #[allow(dead_code)]
 mod speculation_ledger;
 #[allow(dead_code)]
+mod speculation_linux;
+#[allow(dead_code)]
 mod speculation_registry;
+#[allow(dead_code)]
+mod speculation_runner;
 mod tmux_compat;
 
 #[cfg(test)]
