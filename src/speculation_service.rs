@@ -484,6 +484,7 @@ impl SpeculationService {
         &self,
         request: SpeculationStatusRequest,
     ) -> Result<SpeculationStatusResponse, ServiceError> {
+        self.require_ready()?;
         let status = self.cached_status(request.tournament_uuid)?;
         validate_status_identity(
             &status,
@@ -499,6 +500,7 @@ impl SpeculationService {
         &self,
         request: SpeculationFinalizeRequest,
     ) -> Result<SpeculationFinalizeResponse, ServiceError> {
+        self.require_ready()?;
         if let Some(terminal) = self.cached_terminal(request.tournament_uuid)? {
             validate_status_identity(
                 &terminal,
@@ -520,6 +522,7 @@ impl SpeculationService {
         &self,
         request: SpeculationRollbackRequest,
     ) -> Result<SpeculationRollbackResponse, ServiceError> {
+        self.require_ready()?;
         if let Some(terminal) = self.cached_terminal(request.tournament_uuid)? {
             validate_status_identity(
                 &terminal,

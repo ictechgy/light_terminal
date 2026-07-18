@@ -8,11 +8,13 @@ use crate::protocol::{
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_METADATA_JOURNAL_ENTRIES,
     MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
     MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
-    MetadataValue, PROTOCOL_VERSION, Request, Response, SPECULATION_UNSUPPORTED_ERROR_CODE,
+    MetadataValue, PROTOCOL_VERSION, Request, Response, SPECULATION_PROTOCOL_VERSION,
     SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
-    StatusTheme, WaitContainsResult, WaitExitResult,
+    SpeculationRequest, SpeculationRequestEnvelope, StatusTheme, WaitContainsResult,
+    WaitExitResult,
 };
 use crate::sanitize;
+use crate::speculation_service::SpeculationService;
 use anyhow::{Context, Result, anyhow, bail};
 use libc::{c_int, mode_t};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -165,6 +167,7 @@ struct State {
     // 보내 client가 uptime을 omit하게 한다.
     started_at_unix_secs: Option<u64>,
     lifecycle_journal: Option<Arc<session_lifecycle::LifecycleJournal>>,
+    speculation: SpeculationService,
 }
 
 #[derive(Default)]
@@ -191,9 +194,16 @@ impl State {
                 err
             })
             .ok();
+        let speculation = SpeculationService::production().unwrap_or_else(|_| {
+            let service = SpeculationService::new_reconciling(Uuid::new_v4())
+                .expect("fresh daemon UUID is nonnil");
+            service.mark_unresolved();
+            service
+        });
         Self {
             started_at_unix_secs,
             lifecycle_journal,
+            speculation,
             ..Self::default()
         }
     }
@@ -1792,7 +1802,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                 started_at_unix_secs: state.started_at_unix_secs,
             }))
         }
-        Request::Speculation(_) => Ok(Response::err(SPECULATION_UNSUPPORTED_ERROR_CODE)),
+        Request::Speculation(envelope) => Ok(handle_speculation_request(state, envelope)),
         Request::New {
             name,
             command,
@@ -2029,6 +2039,12 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             Ok(Response::empty())
         }
         Request::Shutdown => {
+            if let Err(error) = state
+                .speculation
+                .claim_shutdown(crate::speculation::CONTROL_ACK_TIMEOUT)
+            {
+                return Ok(Response::err(error.public_code()));
+            }
             state.shutting_down.store(true, Ordering::SeqCst);
             let sessions: Vec<_> = lock(&state.sessions).by_pane.values().cloned().collect();
             for session in sessions {
@@ -2044,6 +2060,29 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
             unreachable!("handled by handle_connection above")
         }
     }
+}
+
+fn handle_speculation_request(
+    state: &Arc<State>,
+    envelope: SpeculationRequestEnvelope,
+) -> Response {
+    if envelope.protocol_version() != SPECULATION_PROTOCOL_VERSION {
+        return Response::err("speculation_protocol_mismatch");
+    }
+    let result = match envelope.into_request() {
+        SpeculationRequest::Prepare(request) => {
+            state.speculation.prepare(request).map(Response::ok)
+        }
+        SpeculationRequest::Arm(request) => state.speculation.arm(request).map(Response::ok),
+        SpeculationRequest::Status(request) => state.speculation.status(request).map(Response::ok),
+        SpeculationRequest::Finalize(request) => {
+            state.speculation.finalize(request).map(Response::ok)
+        }
+        SpeculationRequest::Rollback(request) => {
+            state.speculation.rollback(request).map(Response::ok)
+        }
+    };
+    result.unwrap_or_else(|error| Response::err(error.public_code()))
 }
 
 struct ParentSession {
@@ -4609,7 +4648,9 @@ mod tests {
         CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
         MAX_METADATA_JOURNAL_ENTRIES, MAX_RECENT_EXITS_LIMIT, MetadataStepDirection, Request,
         SPECULATION_UNSUPPORTED_ERROR_CODE, SessionExitTrigger, SessionLifecycleState,
-        SpeculationRequest, SpeculationRequestEnvelope, SpeculationStatusRequest, StatusTheme,
+        SpeculationArgv, SpeculationArmRequest, SpeculationFinalizeRequest,
+        SpeculationPrepareRequest, SpeculationRequest, SpeculationRequestEnvelope,
+        SpeculationRollbackRequest, SpeculationStatusRequest, SpeculationUnixPath, StatusTheme,
     };
     use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
     use std::collections::{HashMap, VecDeque};
@@ -6767,26 +6808,60 @@ mod tests {
     }
 
     #[test]
-    fn speculation_rpc_placeholder_is_bounded_and_has_no_session_side_effects() {
+    fn all_speculation_v9_arms_are_bounded_and_have_no_session_side_effects() {
         let state = Arc::new(State::default());
-        let response = super::handle_request(
-            &state,
-            Request::Speculation(SpeculationRequestEnvelope::new(SpeculationRequest::Status(
-                SpeculationStatusRequest {
-                    tournament_uuid: Uuid::nil(),
-                    daemon_instance_uuid: Uuid::nil(),
-                    generation: 0,
-                },
-            ))),
-        )
-        .expect("unsupported speculation request should receive a bounded response");
-
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.as_deref(),
-            Some(SPECULATION_UNSUPPORTED_ERROR_CODE)
-        );
-        assert!(response.result.is_none());
+        let identity = |generation| SpeculationStatusRequest {
+            tournament_uuid: Uuid::from_u128(1),
+            daemon_instance_uuid: Uuid::from_u128(2),
+            generation,
+        };
+        let requests = vec![
+            SpeculationRequest::Prepare(
+                SpeculationPrepareRequest::new(
+                    SpeculationUnixPath::from_path(std::path::Path::new("/source")).unwrap(),
+                    [
+                        SpeculationUnixPath::from_path(std::path::Path::new("/candidate-0"))
+                            .unwrap(),
+                        SpeculationUnixPath::from_path(std::path::Path::new("/candidate-1"))
+                            .unwrap(),
+                    ],
+                    SpeculationUnixPath::from_path(std::path::Path::new("/ledger")).unwrap(),
+                    SpeculationUnixPath::from_path(std::path::Path::new("/cgroup")).unwrap(),
+                    1_000,
+                    SpeculationArgv::from_os_strings(vec!["true".into()]).unwrap(),
+                )
+                .unwrap(),
+            ),
+            SpeculationRequest::Arm(SpeculationArmRequest {
+                tournament_uuid: Uuid::from_u128(1),
+                daemon_instance_uuid: Uuid::from_u128(2),
+                generation: 1,
+            }),
+            SpeculationRequest::Status(identity(1)),
+            SpeculationRequest::Finalize(SpeculationFinalizeRequest {
+                tournament_uuid: Uuid::from_u128(1),
+                daemon_instance_uuid: Uuid::from_u128(2),
+                generation: 1,
+            }),
+            SpeculationRequest::Rollback(SpeculationRollbackRequest {
+                tournament_uuid: Uuid::from_u128(1),
+                daemon_instance_uuid: Uuid::from_u128(2),
+                generation: 1,
+            }),
+        ];
+        for request in requests {
+            let response = super::handle_request(
+                &state,
+                Request::Speculation(SpeculationRequestEnvelope::new(request)),
+            )
+            .expect("unsupported speculation request should receive a bounded response");
+            assert!(!response.ok);
+            assert_eq!(
+                response.error.as_deref(),
+                Some(SPECULATION_UNSUPPORTED_ERROR_CODE)
+            );
+            assert!(response.result.is_none());
+        }
         assert!(super::lock(&state.sessions).by_pane.is_empty());
     }
 
