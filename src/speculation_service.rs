@@ -18,16 +18,18 @@ use crate::speculation_ledger::{
 };
 #[cfg(target_os = "linux")]
 use crate::speculation_linux::{
-    CandidateCleanupAction, CandidateControl, CandidateObserver, ContainmentEvent,
-    GoReceiptEvidence, OldBootRecoveryAction, OldBootRecoveryEvidence, PayloadPlacementEvidence,
-    RecoveryAction, RecoveryEvidence, TopologyAction, TopologyEvidence, TournamentCleanupAction,
-    TournamentTopology, acknowledge_output_cleanup_claimed, begin_topology, create_topology,
-    finish_containment, go_receipt_skew_ns, launch_fixed_probe, launch_runner,
-    observe_managed_reaped, observe_sync_eof, perform_candidate_cleanup_action,
-    perform_tournament_cleanup_action, receive_decision_ack, receive_execution_event,
-    receive_go_receipt, receive_output_drained, receive_payload_fd_ack,
-    receive_payload_placed_owned, reconcile_different_boot, reconcile_from_record, send_go,
-    send_payload_release, send_select_or_abort, transfer_payload_fd_owned,
+    CandidateCleanupAction, CandidateControl, CandidateEmptyProof, CandidateObserver,
+    ContainmentEvent, GoReceiptEvidence, OldBootRecoveryAction, OldBootRecoveryEvidence,
+    PayloadPlacementEvidence, RecoveryAction, RecoveryEvidence, TopologyAction, TopologyEvidence,
+    TournamentCleanupAction, TournamentEmptyProof, TournamentTopology,
+    acknowledge_output_cleanup_claimed, begin_topology, create_topology, finish_containment,
+    go_receipt_skew_ns, launch_fixed_probe, launch_runner, observe_managed_reaped,
+    observe_sync_eof, perform_candidate_cleanup_action, perform_tournament_cleanup_action,
+    prepare_candidate_empty_proof, prepare_tournament_empty_proof, prove_candidate_empty,
+    prove_tournament_empty, receive_decision_ack, receive_execution_event, receive_go_receipt,
+    receive_output_drained, receive_payload_fd_ack, receive_payload_placed_owned,
+    reconcile_different_boot, reconcile_from_record, send_go, send_payload_release,
+    send_select_or_abort, transfer_payload_fd_owned,
 };
 use crate::speculation_linux::{
     ContainmentDeadline, ContainmentErrorCode, LiveTournamentContext, PrepareInputs,
@@ -146,6 +148,8 @@ enum ActorEvent {
     },
     #[cfg(target_os = "linux")]
     Observed(Box<ObserverCompletion>),
+    #[cfg(target_os = "linux")]
+    Proof(Box<ProofCompletion>),
 }
 
 #[cfg(target_os = "linux")]
@@ -174,6 +178,24 @@ struct ObserverCompletion {
     candidate: u8,
     observer: CandidateObserver,
     result: Result<ObserverEvidence, ContainmentErrorCode>,
+}
+
+#[cfg(target_os = "linux")]
+enum ProofEvidence {
+    Candidate(crate::speculation_linux::CandidateCleanupEvidence),
+    Tournament(crate::speculation_linux::TournamentCleanupEvidence),
+}
+
+#[cfg(target_os = "linux")]
+enum ProofOperation {
+    Candidate(CandidateEmptyProof),
+    Tournament(TournamentEmptyProof),
+}
+
+#[cfg(target_os = "linux")]
+struct ProofCompletion {
+    authorization_generation: u64,
+    result: Result<ProofEvidence, ContainmentErrorCode>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1190,6 +1212,10 @@ fn actor_loop(mut actor: ActorState) {
             ActorEvent::Observed(_) => {
                 actor.fail_closed_pipeline();
             }
+            #[cfg(target_os = "linux")]
+            ActorEvent::Proof(_) => {
+                actor.fail_closed_pipeline();
+            }
         }
         if actor.record.status.is_terminal() {
             #[cfg(target_os = "linux")]
@@ -1452,6 +1478,47 @@ impl ActorState {
         }
     }
 
+    fn wait_proof(&mut self, operation: ProofOperation) -> Result<ProofEvidence, ServiceError> {
+        let authorization_generation = self.pipeline.as_ref().map_or_else(
+            || self.context.identity().generation,
+            |pipeline| pipeline.authorization_generation,
+        );
+        let sender = self.sender.clone();
+        thread::Builder::new()
+            .name("lterm-speculation-proof".into())
+            .spawn(move || {
+                let deadline = ContainmentDeadline::control_action();
+                let result = match operation {
+                    ProofOperation::Candidate(proof) => {
+                        prove_candidate_empty(proof, deadline).map(ProofEvidence::Candidate)
+                    }
+                    ProofOperation::Tournament(proof) => {
+                        prove_tournament_empty(proof, deadline).map(ProofEvidence::Tournament)
+                    }
+                };
+                let _ = sender.send(ActorEvent::Proof(Box::new(ProofCompletion {
+                    authorization_generation,
+                    result,
+                })));
+            })
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        loop {
+            match self
+                .receiver
+                .recv()
+                .map_err(|_| ServiceError::EvidenceUnavailable)?
+            {
+                ActorEvent::Proof(completion)
+                    if completion.authorization_generation == authorization_generation =>
+                {
+                    return completion.result.map_err(ServiceError::from);
+                }
+                ActorEvent::Proof(_) | ActorEvent::Observed(_) => {}
+                event => self.handle_pipeline_event(event)?,
+            }
+        }
+    }
+
     fn handle_pipeline_event(&mut self, event: ActorEvent) -> Result<(), ServiceError> {
         match event {
             ActorEvent::Rollback {
@@ -1503,6 +1570,7 @@ impl ActorState {
                 let _ = reply.send(Err(ServiceError::InvalidTransition));
             }
             ActorEvent::Observed(_) => {}
+            ActorEvent::Proof(_) => {}
         }
         Ok(())
     }
@@ -1510,7 +1578,9 @@ impl ActorState {
     fn drain_pipeline_events(&mut self) -> Result<(), ServiceError> {
         loop {
             match self.receiver.try_recv() {
-                Ok(ActorEvent::Observed(_)) => return Err(ServiceError::EvidenceUnavailable),
+                Ok(ActorEvent::Observed(_) | ActorEvent::Proof(_)) => {
+                    return Err(ServiceError::EvidenceUnavailable);
+                }
                 Ok(event) => self.handle_pipeline_event(event)?,
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => return Err(ServiceError::EvidenceUnavailable),
@@ -1768,6 +1838,49 @@ impl ActorState {
             .map_err(ServiceError::from)
     }
 
+    fn prove_candidate_empty_async(
+        &mut self,
+        candidate: u8,
+        payload: bool,
+    ) -> Result<(), ServiceError> {
+        let proof = {
+            let pipeline = self
+                .pipeline
+                .as_ref()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            prepare_candidate_empty_proof(&pipeline.topology, candidate, payload)?
+        };
+        match self.wait_proof(ProofOperation::Candidate(proof))? {
+            ProofEvidence::Candidate(
+                crate::speculation_linux::CandidateCleanupEvidence::PayloadEmpty {
+                    candidate: observed,
+                },
+            ) if payload && observed == candidate => Ok(()),
+            ProofEvidence::Candidate(
+                crate::speculation_linux::CandidateCleanupEvidence::ParentEmpty {
+                    candidate: observed,
+                },
+            ) if !payload && observed == candidate => Ok(()),
+            _ => Err(ServiceError::EvidenceUnavailable),
+        }
+    }
+
+    fn prove_tournament_empty_async(&mut self) -> Result<(), ServiceError> {
+        let proof = {
+            let pipeline = self
+                .pipeline
+                .as_ref()
+                .ok_or(ServiceError::EvidenceUnavailable)?;
+            prepare_tournament_empty_proof(&pipeline.topology)?
+        };
+        match self.wait_proof(ProofOperation::Tournament(proof))? {
+            ProofEvidence::Tournament(
+                crate::speculation_linux::TournamentCleanupEvidence::Empty,
+            ) => Ok(()),
+            _ => Err(ServiceError::EvidenceUnavailable),
+        }
+    }
+
     fn run_probe(&mut self, candidate: u8) -> Result<(), ServiceError> {
         let index = usize::from(candidate);
         self.persist_same(|record| {
@@ -1861,11 +1974,7 @@ impl ActorState {
             ContainmentDeadline::control_action(),
         )?;
         self.persist_same(|_| {})?;
-        self.candidate_action(
-            candidate,
-            CandidateCleanupAction::ProvePayloadEmpty,
-            ContainmentDeadline::control_action(),
-        )?;
+        self.prove_candidate_empty_async(candidate, true)?;
         let evidence = self.observe_event(candidate, ObserverOperation::OutputDrained)?;
         if !matches!(evidence, ContainmentEvent::OutputDrained { bytes: 0, .. }) {
             return Err(ServiceError::ContainmentUnavailable);
@@ -1896,11 +2005,7 @@ impl ActorState {
             self.wait_observer(candidate, observer, ObserverOperation::ManagedReaped)?;
         finish_containment(live.control, observer)?;
         self.persist_same(|_| {})?;
-        self.candidate_action(
-            candidate,
-            CandidateCleanupAction::ProveParentEmpty,
-            ContainmentDeadline::control_action(),
-        )?;
+        self.prove_candidate_empty_async(candidate, false)?;
         self.persist_same(|record| {
             record.cgroups[index].lifecycle =
                 CgroupLifecycleState::Forward(CgroupForwardState::ProbeEmpty);
@@ -2077,18 +2182,7 @@ impl ActorState {
             )?;
         }
         self.persist_same(|_| {})?;
-        {
-            let pipeline = self
-                .pipeline
-                .as_mut()
-                .ok_or(ServiceError::EvidenceUnavailable)?;
-            perform_candidate_cleanup_action(
-                &mut pipeline.topology,
-                candidate,
-                CandidateCleanupAction::ProvePayloadEmpty,
-                ContainmentDeadline::control_action(),
-            )?;
-        }
+        self.prove_candidate_empty_async(candidate, true)?;
         self.persist_same(|record| {
             record.cgroups[index].lifecycle =
                 CgroupLifecycleState::Forward(CgroupForwardState::PayloadEmpty);
@@ -2259,18 +2353,7 @@ impl ActorState {
             )?;
         }
         self.persist_same(|_| {})?;
-        {
-            let pipeline = self
-                .pipeline
-                .as_mut()
-                .ok_or(ServiceError::EvidenceUnavailable)?;
-            perform_candidate_cleanup_action(
-                &mut pipeline.topology,
-                candidate,
-                CandidateCleanupAction::ProveParentEmpty,
-                ContainmentDeadline::control_action(),
-            )?;
-        }
+        self.prove_candidate_empty_async(candidate, false)?;
         self.persist_same(|record| {
             record.cgroups[index].lifecycle = CgroupLifecycleState::ParentEmpty { from };
             record.status.candidates[index].cleanup.cgroup_empty = true;
@@ -2342,17 +2425,7 @@ impl ActorState {
         self.persist_same(|record| {
             record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::RemovePending;
         })?;
-        {
-            let pipeline = self
-                .pipeline
-                .as_mut()
-                .ok_or(ServiceError::EvidenceUnavailable)?;
-            perform_tournament_cleanup_action(
-                &mut pipeline.topology,
-                TournamentCleanupAction::ProveEmpty,
-                ContainmentDeadline::control_action(),
-            )?;
-        }
+        self.prove_tournament_empty_async()?;
         self.persist_same(|_| {})?;
         {
             let pipeline = self

@@ -1518,6 +1518,134 @@ pub(crate) enum TournamentCleanupEvidence {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct CandidateEmptyProof {
+    candidate: u8,
+    payload: bool,
+    node: RetainedCgroupNode,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct TournamentEmptyProof {
+    node: RetainedCgroupNode,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct CandidateEmptyProof;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct TournamentEmptyProof;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_candidate_empty_proof(
+    tournament: &TournamentTopology,
+    candidate: u8,
+    payload: bool,
+) -> ContainmentResult<CandidateEmptyProof> {
+    let topology = tournament
+        .candidates
+        .get(usize::from(candidate))
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let node = if payload {
+        topology.payload()?
+    } else {
+        topology
+            .parent
+            .as_ref()
+            .ok_or(ContainmentErrorCode::TopologyFailure)?
+    };
+    Ok(CandidateEmptyProof {
+        candidate,
+        payload,
+        node: clone_cgroup_node(node)?,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_candidate_empty_proof(
+    _tournament: &TournamentTopology,
+    _candidate: u8,
+    _payload: bool,
+) -> ContainmentResult<CandidateEmptyProof> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prove_candidate_empty(
+    proof: CandidateEmptyProof,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<CandidateCleanupEvidence> {
+    revalidate_cgroup_node(&proof.node)?;
+    failpoint(if proof.payload {
+        "before_payload_empty_proof"
+    } else {
+        "before_parent_empty_proof"
+    })?;
+    wait_populated_zero(&proof.node, deadline)?;
+    failpoint(if proof.payload {
+        "after_payload_empty_proof"
+    } else {
+        "after_parent_empty_proof"
+    })?;
+    Ok(if proof.payload {
+        CandidateCleanupEvidence::PayloadEmpty {
+            candidate: proof.candidate,
+        }
+    } else {
+        CandidateCleanupEvidence::ParentEmpty {
+            candidate: proof.candidate,
+        }
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prove_candidate_empty(
+    _proof: CandidateEmptyProof,
+    _deadline: ContainmentDeadline,
+) -> ContainmentResult<CandidateCleanupEvidence> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_tournament_empty_proof(
+    tournament: &TournamentTopology,
+) -> ContainmentResult<TournamentEmptyProof> {
+    let domain = tournament
+        .domain
+        .as_ref()
+        .ok_or(ContainmentErrorCode::TopologyFailure)?;
+    Ok(TournamentEmptyProof {
+        node: clone_cgroup_node(domain)?,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_tournament_empty_proof(
+    _tournament: &TournamentTopology,
+) -> ContainmentResult<TournamentEmptyProof> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prove_tournament_empty(
+    proof: TournamentEmptyProof,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<TournamentCleanupEvidence> {
+    revalidate_cgroup_node(&proof.node)?;
+    failpoint("before_tournament_empty_proof")?;
+    wait_populated_zero(&proof.node, deadline)?;
+    failpoint("after_tournament_empty_proof")?;
+    Ok(TournamentCleanupEvidence::Empty)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prove_tournament_empty(
+    _proof: TournamentEmptyProof,
+    _deadline: ContainmentDeadline,
+) -> ContainmentResult<TournamentCleanupEvidence> {
+    Err(ContainmentErrorCode::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn perform_candidate_cleanup_action(
     tournament: &mut TournamentTopology,
     candidate_index: u8,
