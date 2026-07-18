@@ -6,6 +6,12 @@ mod protocol;
 mod sanitize;
 mod server;
 mod speculation;
+#[allow(dead_code)]
+mod speculation_fs;
+#[allow(dead_code)]
+mod speculation_ledger;
+#[allow(dead_code)]
+mod speculation_registry;
 mod tmux_compat;
 
 #[cfg(test)]
