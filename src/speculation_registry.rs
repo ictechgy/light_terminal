@@ -628,9 +628,10 @@ impl TournamentRecord {
             && self.status.candidates[1].candidate_uuid == next.status.candidates[1].candidate_uuid
     }
 
-    fn public_evidence_progresses_to(&self, next: &Self) -> bool {
+    fn public_evidence_progresses_to(&self, next: &Self, retain_reason: bool) -> bool {
         self.status.lease_deadline_unix_ms <= next.status.lease_deadline_unix_ms
-            && option_is_retained(self.status.reason_code, next.status.reason_code)
+            && (!retain_reason
+                || option_is_retained(self.status.reason_code, next.status.reason_code))
             && option_is_retained(self.status.selected_index, next.status.selected_index)
             && slice_is_prefix(
                 self.status.error_codes.as_slice(),
@@ -1132,7 +1133,10 @@ impl TournamentStore {
                         && current.restart_prior_phase == next.restart_prior_phase
                 }
             }
-            || !current.public_evidence_progresses_to(&next)
+            || !current.public_evidence_progresses_to(
+                &next,
+                kind == TournamentWriteKind::SamePhaseEvidence,
+            )
             || !current
                 .tournament_cgroup
                 .lifecycle
@@ -1592,23 +1596,23 @@ mod tests {
         let current = armed_record_with_reused_managed_slot();
         let mut next = current.clone();
         next.status.generation += 1;
-        assert!(current.public_evidence_progresses_to(&next));
+        assert!(current.public_evidence_progresses_to(&next, true));
 
         next.managed_owners[0] = None;
-        assert!(!current.public_evidence_progresses_to(&next));
+        assert!(!current.public_evidence_progresses_to(&next, true));
 
         let mut probe = current.clone();
         probe.managed_owners[0].as_mut().unwrap().role = ManagedOwnerRoleEvidence::Probe;
         let mut runner = probe.clone();
         runner.managed_owners[0] = current.managed_owners[0].clone();
-        assert!(probe.public_evidence_progresses_to(&runner));
-        assert!(!runner.public_evidence_progresses_to(&probe));
+        assert!(probe.public_evidence_progresses_to(&runner, true));
+        assert!(!runner.public_evidence_progresses_to(&probe, true));
 
         let mut ready = current.clone();
         ready.status.candidates[0].ready = true;
         ready.status.candidates[0].ready_elapsed_ns = Some(1);
-        assert!(current.public_evidence_progresses_to(&ready));
-        assert!(!ready.public_evidence_progresses_to(&current));
+        assert!(current.public_evidence_progresses_to(&ready, true));
+        assert!(!ready.public_evidence_progresses_to(&current, true));
     }
 
     #[cfg(target_os = "linux")]

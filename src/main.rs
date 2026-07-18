@@ -16,6 +16,8 @@ mod speculation_linux;
 mod speculation_registry;
 #[allow(dead_code)]
 mod speculation_runner;
+#[allow(dead_code)]
+mod speculation_service;
 mod tmux_compat;
 
 #[cfg(test)]
