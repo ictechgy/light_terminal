@@ -1,4 +1,8 @@
-use crate::protocol::{SpeculationPhase, SpeculationStatus, SpeculationUnixPath};
+use crate::protocol::{
+    MAX_SPECULATION_ERROR_CODES, SPECULATION_SCORE_ORDER, SpeculationCandidateStatus,
+    SpeculationExitCategory, SpeculationPhase, SpeculationSchemaVersion, SpeculationStatus,
+    SpeculationUnixPath,
+};
 use crate::speculation_fs::{
     DirectoryIdentity, EvidenceError, EvidenceResult, FileIdentity, MAX_SPECULATION_JSON_BYTES,
     ValidatedDirectory, atomic_create_json, atomic_replace_json, open_or_create_private_dir,
@@ -14,6 +18,58 @@ use uuid::Uuid;
 pub const MAX_TOURNAMENT_RECORDS: usize = 1024;
 pub const MAX_LIVE_TOURNAMENTS: usize = 8;
 pub const TERMINAL_RETENTION_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+const STORE_MANIFEST_LEAF: &CStr = c"store-manifest.json";
+const STORE_MATERIALIZATION_WORDS: usize = MAX_TOURNAMENT_RECORDS / u64::BITS as usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TournamentStoreManifestSchema {
+    #[serde(rename = "lterm.speculation.tournament-store-manifest.v1")]
+    V1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TournamentStoreManifest {
+    schema_version: TournamentStoreManifestSchema,
+    slot_count: u16,
+    materialized_slots: [u64; STORE_MATERIALIZATION_WORDS],
+}
+
+impl TournamentStoreManifest {
+    fn fixed() -> Self {
+        Self {
+            schema_version: TournamentStoreManifestSchema::V1,
+            slot_count: MAX_TOURNAMENT_RECORDS as u16,
+            materialized_slots: [0; STORE_MATERIALIZATION_WORDS],
+        }
+    }
+
+    fn validate(&self) -> EvidenceResult<()> {
+        if self.schema_version != TournamentStoreManifestSchema::V1
+            || self.slot_count as usize != MAX_TOURNAMENT_RECORDS
+        {
+            return Err(EvidenceError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn is_materialized(&self, slot: u16) -> bool {
+        let slot = slot as usize;
+        let word = slot / u64::BITS as usize;
+        let bit = slot % u64::BITS as usize;
+        self.materialized_slots[word] & (1_u64 << bit) != 0
+    }
+
+    fn merge_materialized(&mut self, present: &[u64; STORE_MATERIALIZATION_WORDS]) -> bool {
+        let mut changed = false;
+        for (current, present) in self.materialized_slots.iter_mut().zip(present) {
+            let merged = *current | *present;
+            changed |= merged != *current;
+            *current = merged;
+        }
+        changed
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TournamentRecordSchema {
@@ -322,12 +378,19 @@ pub struct CandidateCgroupEvidence {
 impl CandidateCgroupEvidence {
     fn validate(&self, expected_index: u8, boot_uuid: Uuid) -> EvidenceResult<()> {
         if self.candidate_index != expected_index
+            || self.deterministic_name_uuid.is_nil()
             || self
                 .parent
                 .iter()
                 .chain(self.control.iter())
                 .chain(self.payload.iter())
                 .any(|identity| identity.boot_uuid != boot_uuid)
+            || self
+                .parent
+                .iter()
+                .chain(self.control.iter())
+                .chain(self.payload.iter())
+                .any(|identity| !valid_directory_identity(identity))
         {
             return Err(EvidenceError::Corrupt);
         }
@@ -363,11 +426,16 @@ impl CandidateCgroupEvidence {
             (true, true, true) => 3,
             _ => return Err(EvidenceError::Corrupt),
         };
-        if !matches!(
-            self.lifecycle,
-            CgroupLifecycleState::Removed | CgroupLifecycleState::RollbackRequired
-        ) && present_floor != creation_floor
-        {
+        let expected_present_floor = match self.lifecycle {
+            CgroupLifecycleState::PayloadRemoved { .. }
+            | CgroupLifecycleState::ControlRemovePending { .. } => creation_floor.min(2),
+            CgroupLifecycleState::ControlRemoved { .. }
+            | CgroupLifecycleState::ParentRemovePending { .. } => creation_floor.min(1),
+            CgroupLifecycleState::Removed => 0,
+            CgroupLifecycleState::RollbackRequired => present_floor,
+            _ => creation_floor,
+        };
+        if present_floor != expected_present_floor {
             return Err(EvidenceError::Corrupt);
         }
         Ok(())
@@ -389,7 +457,24 @@ pub struct TournamentRecord {
 
 impl TournamentRecord {
     pub fn validate(&self) -> EvidenceResult<()> {
+        self.validate_core()?;
+        if self.terminal_completed_unix_ms.is_some() != self.is_positive_terminal() {
+            return Err(EvidenceError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn validate_core(&self) -> EvidenceResult<()> {
         if self.schema_version != TournamentRecordSchema::V1
+            || self.boot_uuid.is_nil()
+            || !valid_directory_identity(&self.roots.source)
+            || !valid_directory_identity(&self.roots.ledger_root)
+            || !valid_directory_identity(&self.roots.cgroup_root)
+            || self
+                .roots
+                .candidates
+                .iter()
+                .any(|identity| !valid_directory_identity(identity))
             || self.boot_uuid != self.roots.source.boot_uuid
             || self.boot_uuid != self.roots.ledger_root.boot_uuid
             || self.boot_uuid != self.roots.cgroup_root.boot_uuid
@@ -401,28 +486,29 @@ impl TournamentRecord {
             || self.cgroup_root_locator.identity != self.roots.cgroup_root
             || self.cgroups[0].validate(0, self.boot_uuid).is_err()
             || self.cgroups[1].validate(1, self.boot_uuid).is_err()
-            || self.status.candidates[0].index != 0
-            || self.status.candidates[1].index != 1
+            || self.cgroups[0].deterministic_name_uuid != self.status.candidates[0].candidate_uuid
+            || self.cgroups[1].deterministic_name_uuid != self.status.candidates[1].candidate_uuid
+            || validate_status_semantics(&self.status).is_err()
             || self
                 .managed_owners
                 .iter()
                 .enumerate()
                 .any(|(index, owner)| {
-                    owner
-                        .as_ref()
-                        .is_some_and(|owner| owner.candidate_index != index as u8)
+                    owner.as_ref().is_some_and(|owner| {
+                        owner.candidate_index != index as u8
+                            || owner.generation == 0
+                            || owner.generation > self.status.generation
+                    })
                 })
         {
-            return Err(EvidenceError::Corrupt);
-        }
-        if self.terminal_completed_unix_ms.is_some() != self.is_positive_terminal() {
             return Err(EvidenceError::Corrupt);
         }
         Ok(())
     }
 
     pub fn is_positive_terminal(&self) -> bool {
-        self.status.is_terminal()
+        self.validate_core().is_ok()
+            && self.status.is_terminal()
             && !self.status.rollback_required
             && self
                 .cgroups
@@ -446,6 +532,131 @@ impl TournamentRecord {
             && self.status.daemon_instance_uuid == next.status.daemon_instance_uuid
             && self.status.candidates[0].candidate_uuid == next.status.candidates[0].candidate_uuid
             && self.status.candidates[1].candidate_uuid == next.status.candidates[1].candidate_uuid
+    }
+}
+
+fn valid_directory_identity(identity: &DirectoryIdentity) -> bool {
+    !identity.boot_uuid.is_nil()
+        && identity.dev != 0
+        && identity.ino != 0
+        && identity.statx_mnt_id != 0
+}
+
+fn validate_status_semantics(status: &SpeculationStatus) -> EvidenceResult<()> {
+    if status.schema_version != SpeculationSchemaVersion::V1
+        || status.tournament_uuid.is_nil()
+        || status.daemon_instance_uuid.is_nil()
+        || status.generation == 0
+        || status.fixed_score_order != SPECULATION_SCORE_ORDER
+        || status.candidates[0].index != 0
+        || status.candidates[1].index != 1
+        || status.candidates[0].candidate_uuid.is_nil()
+        || status.candidates[1].candidate_uuid.is_nil()
+        || status.candidates[0].candidate_uuid == status.candidates[1].candidate_uuid
+        || status.error_codes.as_slice().len() > MAX_SPECULATION_ERROR_CODES
+        || status
+            .candidates
+            .iter()
+            .any(|candidate| validate_candidate_status(candidate).is_err())
+    {
+        return Err(EvidenceError::Corrupt);
+    }
+
+    let rollback_phase = matches!(
+        status.phase,
+        SpeculationPhase::RollbackRequired
+            | SpeculationPhase::DecisionUncertain
+            | SpeculationPhase::RollbackPending
+    );
+    if status.rollback_required != rollback_phase {
+        return Err(EvidenceError::Corrupt);
+    }
+
+    match status.phase {
+        SpeculationPhase::Selected => {
+            let selected = status.selected_index.ok_or(EvidenceError::Corrupt)?;
+            if selected > 1 || score_selected_index(&status.candidates) != Some(selected) {
+                return Err(EvidenceError::Corrupt);
+            }
+        }
+        SpeculationPhase::RolledBack
+        | SpeculationPhase::RollbackRequired
+        | SpeculationPhase::DecisionUncertain
+        | SpeculationPhase::RollbackPending => {
+            if status.selected_index.is_some() {
+                return Err(EvidenceError::Corrupt);
+            }
+        }
+        _ => {
+            if status.selected_index.is_some_and(|selected| {
+                selected > 1 || score_selected_index(&status.candidates) != Some(selected)
+            }) {
+                return Err(EvidenceError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_candidate_status(candidate: &SpeculationCandidateStatus) -> EvidenceResult<()> {
+    if candidate.ready != candidate.ready_elapsed_ns.is_some()
+        || candidate.go_received != candidate.go_received_elapsed_ns.is_some()
+        || (candidate.go_received && !candidate.ready)
+    {
+        return Err(EvidenceError::Corrupt);
+    }
+    let complete_result = candidate.exit_success.is_some()
+        && candidate.exit_category.is_some()
+        && candidate.elapsed_ns.is_some()
+        && candidate.output_bytes.is_some();
+    let empty_result = candidate.exit_success.is_none()
+        && candidate.exit_category.is_none()
+        && candidate.elapsed_ns.is_none()
+        && candidate.output_bytes.is_none();
+    if if candidate.result_accepted {
+        !complete_result
+    } else {
+        !empty_result || candidate.eligible
+    } {
+        return Err(EvidenceError::Corrupt);
+    }
+    if let (Some(success), Some(category)) = (candidate.exit_success, candidate.exit_category) {
+        if success != matches!(category, SpeculationExitCategory::ExitedZero) {
+            return Err(EvidenceError::Corrupt);
+        }
+        if candidate.eligible
+            && (matches!(
+                category,
+                SpeculationExitCategory::SpawnFailed
+                    | SpeculationExitCategory::OutputLimitExceeded
+                    | SpeculationExitCategory::EvidenceIncomplete
+            ) || candidate
+                .output_bytes
+                .is_none_or(|bytes| bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES))
+        {
+            return Err(EvidenceError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn score_selected_index(candidates: &[SpeculationCandidateStatus; 2]) -> Option<u8> {
+    if !candidates.iter().any(|candidate| candidate.eligible) {
+        return None;
+    }
+    let score = |candidate: &SpeculationCandidateStatus| {
+        (
+            candidate.eligible,
+            candidate.exit_success,
+            std::cmp::Reverse(candidate.elapsed_ns),
+            std::cmp::Reverse(candidate.output_bytes),
+            std::cmp::Reverse(candidate.index),
+        )
+    };
+    if score(&candidates[0]) >= score(&candidates[1]) {
+        Some(candidates[0].index)
+    } else {
+        Some(candidates[1].index)
     }
 }
 
@@ -483,7 +694,7 @@ pub enum TournamentRecoveryRecord {
 
 enum SlotState {
     Vacant {
-        identity: FileIdentity,
+        identity: Option<FileIdentity>,
     },
     Valid {
         record: Box<TournamentRecord>,
@@ -518,16 +729,46 @@ impl TournamentStore {
 
     pub fn open(directory: ValidatedDirectory) -> EvidenceResult<Self> {
         let mut leaves = directory.list_leaf_names()?;
-        if leaves.is_empty() {
-            initialize_vacant_slots(&directory)?;
+        if !leaves
+            .iter()
+            .any(|leaf| leaf.as_c_str() == STORE_MANIFEST_LEAF)
+        {
+            if !leaves.is_empty() {
+                return Err(EvidenceError::Corrupt);
+            }
+            match atomic_create_json(
+                &directory,
+                STORE_MANIFEST_LEAF,
+                &TournamentStoreManifest::fixed(),
+                MAX_SPECULATION_JSON_BYTES,
+            ) {
+                Ok(_) | Err(EvidenceError::AlreadyExists) => {}
+                Err(error) => return Err(error),
+            }
             leaves = directory.list_leaf_names()?;
         }
+        let mut present_slots = [0_u64; STORE_MATERIALIZATION_WORDS];
+        for leaf in &leaves {
+            if let Some(slot) = parse_slot_leaf(leaf) {
+                mark_materialized_word(&mut present_slots, slot);
+            }
+        }
+        let manifest = persist_materialized_slots(&directory, &present_slots)?;
         let mut slots = (0..MAX_TOURNAMENT_RECORDS)
-            .map(|_| SlotState::Corrupt)
+            .map(|slot| {
+                if manifest.is_materialized(slot as u16) {
+                    SlotState::Corrupt
+                } else {
+                    SlotState::Vacant { identity: None }
+                }
+            })
             .collect::<Vec<_>>();
         let mut seen = vec![false; MAX_TOURNAMENT_RECORDS];
         let mut unknown_corrupt_records = 0_usize;
         for leaf in leaves {
+            if leaf.as_c_str() == STORE_MANIFEST_LEAF {
+                continue;
+            }
             let Some(slot) = parse_slot_leaf(&leaf) else {
                 unknown_corrupt_records = unknown_corrupt_records.saturating_add(1);
                 continue;
@@ -548,7 +789,7 @@ impl TournamentStore {
                         identity: entry.identity,
                     },
                     None => SlotState::Vacant {
-                        identity: entry.identity,
+                        identity: Some(entry.identity),
                     },
                 },
                 _ => SlotState::Corrupt,
@@ -587,10 +828,18 @@ impl TournamentStore {
         let leaf = slot_leaf(slot)?;
         let envelope = TournamentSlotRecord::occupied(slot, record.clone());
         let entry = match &state.slots[slot as usize] {
-            SlotState::Vacant { identity } => atomic_replace_json(
+            SlotState::Vacant {
+                identity: Some(identity),
+            } => atomic_replace_json(
                 &self.directory,
                 &leaf,
                 *identity,
+                &envelope,
+                MAX_SPECULATION_JSON_BYTES,
+            ),
+            SlotState::Vacant { identity: None } => atomic_create_json(
+                &self.directory,
+                &leaf,
                 &envelope,
                 MAX_SPECULATION_JSON_BYTES,
             ),
@@ -603,6 +852,10 @@ impl TournamentStore {
             ),
             SlotState::Corrupt => return Err(EvidenceError::Capacity),
         };
+        let newly_materialized = matches!(
+            &state.slots[slot as usize],
+            SlotState::Vacant { identity: None }
+        );
         let entry = match entry {
             Ok(entry) if entry.value.validate(slot).is_ok() => entry,
             Ok(_) => {
@@ -618,6 +871,14 @@ impl TournamentStore {
             state.slots[slot as usize] = SlotState::Corrupt;
             return Err(EvidenceError::Corrupt);
         };
+        if newly_materialized {
+            let mut present = [0_u64; STORE_MATERIALIZATION_WORDS];
+            mark_materialized_word(&mut present, slot);
+            if let Err(error) = persist_materialized_slots(&self.directory, &present) {
+                state.slots[slot as usize] = SlotState::Corrupt;
+                return Err(error);
+            }
+        }
         let key = key_for(slot, &record);
         state.slots[slot as usize] = SlotState::Valid {
             record: stored_record,
@@ -747,6 +1008,41 @@ impl TournamentStore {
     }
 }
 
+fn mark_materialized_word(words: &mut [u64; STORE_MATERIALIZATION_WORDS], slot: u16) {
+    let slot = slot as usize;
+    words[slot / u64::BITS as usize] |= 1_u64 << (slot % u64::BITS as usize);
+}
+
+fn persist_materialized_slots(
+    directory: &ValidatedDirectory,
+    present: &[u64; STORE_MATERIALIZATION_WORDS],
+) -> EvidenceResult<TournamentStoreManifest> {
+    for _ in 0..64 {
+        let current = read_json::<TournamentStoreManifest>(
+            directory,
+            STORE_MANIFEST_LEAF,
+            MAX_SPECULATION_JSON_BYTES,
+        )?;
+        current.value.validate()?;
+        let mut next = current.value;
+        if !next.merge_materialized(present) {
+            return Ok(next);
+        }
+        match atomic_replace_json(
+            directory,
+            STORE_MANIFEST_LEAF,
+            current.identity,
+            &next,
+            MAX_SPECULATION_JSON_BYTES,
+        ) {
+            Ok(stored) => return Ok(stored.value),
+            Err(EvidenceError::Stale) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(EvidenceError::Stale)
+}
+
 fn key_for(slot: u16, record: &TournamentRecord) -> TournamentKey {
     TournamentKey {
         slot,
@@ -788,19 +1084,6 @@ fn select_allocation_slot(state: &StoreState, now_unix_ms: u64) -> Option<u16> {
         .and_then(|slot| u16::try_from(slot).ok())
 }
 
-fn initialize_vacant_slots(directory: &ValidatedDirectory) -> EvidenceResult<()> {
-    for slot in 0..MAX_TOURNAMENT_RECORDS {
-        let slot = u16::try_from(slot).map_err(|_| EvidenceError::Capacity)?;
-        atomic_create_json(
-            directory,
-            &slot_leaf(slot)?,
-            &TournamentSlotRecord::vacant(slot),
-            MAX_SPECULATION_JSON_BYTES,
-        )?;
-    }
-    Ok(())
-}
-
 fn slot_leaf(slot: u16) -> EvidenceResult<CString> {
     if slot as usize >= MAX_TOURNAMENT_RECORDS {
         return Err(EvidenceError::InvalidLeaf);
@@ -822,6 +1105,75 @@ fn parse_slot_leaf(leaf: &CStr) -> Option<u16> {
 mod tests {
     use super::*;
 
+    fn terminal_record() -> TournamentRecord {
+        let identity = DirectoryIdentity::test_value();
+        let candidate_uuids = [Uuid::from_u128(2), Uuid::from_u128(3)];
+        let cleanup = crate::protocol::SpeculationCleanupStatus {
+            runner_ack: true,
+            bwrap_reaped: true,
+            sync_eof: true,
+            cgroup_empty: true,
+            managed_tombstone: true,
+        };
+        let candidate = |index: u8, success: bool, elapsed_ns: u64| SpeculationCandidateStatus {
+            candidate_uuid: candidate_uuids[index as usize],
+            index,
+            ready: true,
+            ready_elapsed_ns: Some(1),
+            go_received: true,
+            go_received_elapsed_ns: Some(2),
+            result_accepted: true,
+            exit_success: Some(success),
+            exit_category: Some(if success {
+                SpeculationExitCategory::ExitedZero
+            } else {
+                SpeculationExitCategory::ExitedNonzero
+            }),
+            elapsed_ns: Some(elapsed_ns),
+            output_bytes: Some(8),
+            eligible: true,
+            cleanup,
+        };
+        TournamentRecord {
+            schema_version: TournamentRecordSchema::V1,
+            boot_uuid: identity.boot_uuid,
+            roots: PrivateRootIdentities {
+                source: identity,
+                candidates: [identity, identity],
+                ledger_root: identity,
+                cgroup_root: identity,
+            },
+            cgroup_root_locator: PrivateCgroupRootLocator {
+                canonical_path: SpeculationUnixPath::from_path(Path::new("/cgroup")).unwrap(),
+                identity,
+            },
+            cgroups: std::array::from_fn(|index| CandidateCgroupEvidence {
+                candidate_index: index as u8,
+                deterministic_name_uuid: candidate_uuids[index],
+                lifecycle: CgroupLifecycleState::Removed,
+                parent: None,
+                control: None,
+                payload: None,
+            }),
+            managed_owners: [None, None],
+            terminal_completed_unix_ms: Some(100),
+            status: SpeculationStatus {
+                schema_version: SpeculationSchemaVersion::V1,
+                tournament_uuid: Uuid::from_u128(4),
+                daemon_instance_uuid: Uuid::from_u128(5),
+                phase: SpeculationPhase::Selected,
+                generation: 9,
+                lease_deadline_unix_ms: 42,
+                reason_code: None,
+                candidates: [candidate(0, true, 10), candidate(1, false, 9)],
+                fixed_score_order: SPECULATION_SCORE_ORDER,
+                selected_index: Some(0),
+                rollback_required: false,
+                error_codes: Default::default(),
+            },
+        }
+    }
+
     #[test]
     fn registry_caps_retention_and_slot_names_are_fixed() {
         assert_eq!(MAX_TOURNAMENT_RECORDS, 1024);
@@ -835,7 +1187,7 @@ mod tests {
     fn corrupt_and_unresolved_slots_consume_live_capacity_and_never_reclaim() {
         let mut slots = (0..MAX_TOURNAMENT_RECORDS)
             .map(|_| SlotState::Vacant {
-                identity: FileIdentity { dev: 1, ino: 1 },
+                identity: Some(FileIdentity { dev: 1, ino: 1 }),
             })
             .collect::<Vec<_>>();
         for slot in slots.iter_mut().take(MAX_LIVE_TOURNAMENTS - 1) {
@@ -847,6 +1199,137 @@ mod tests {
         };
         assert_eq!(occupied_live_count(&state), MAX_LIVE_TOURNAMENTS);
         assert!(select_allocation_slot(&state, u64::MAX).is_some());
+    }
+
+    #[test]
+    fn malformed_terminal_evidence_is_never_a_reclaimable_tombstone() {
+        let valid = terminal_record();
+        valid.validate().unwrap();
+        assert!(valid.is_positive_terminal());
+
+        let mut malformed = Vec::new();
+        let mut missing_selection = valid.clone();
+        missing_selection.status.selected_index = None;
+        malformed.push(missing_selection);
+        let mut wrong_selection = valid.clone();
+        wrong_selection.status.selected_index = Some(1);
+        malformed.push(wrong_selection);
+        let mut wrong_score_order = valid.clone();
+        wrong_score_order.status.fixed_score_order.swap(0, 1);
+        malformed.push(wrong_score_order);
+        let mut duplicate_score_order = valid.clone();
+        duplicate_score_order.status.fixed_score_order[0] =
+            duplicate_score_order.status.fixed_score_order[1];
+        malformed.push(duplicate_score_order);
+        let mut partial_result = valid.clone();
+        partial_result.status.candidates[0].result_accepted = false;
+        malformed.push(partial_result);
+        let mut wrong_candidate_uuid = valid.clone();
+        wrong_candidate_uuid.cgroups[0].deterministic_name_uuid = Uuid::from_u128(99);
+        malformed.push(wrong_candidate_uuid);
+        let mut zero_root = valid;
+        zero_root.roots.source.dev = 0;
+        malformed.push(zero_root);
+
+        for record in malformed {
+            assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
+            assert!(!record.is_positive_terminal());
+            let state = StoreState {
+                slots: std::iter::once(SlotState::Corrupt)
+                    .chain(
+                        (1..MAX_TOURNAMENT_RECORDS).map(|_| SlotState::Vacant { identity: None }),
+                    )
+                    .collect(),
+                unknown_corrupt_records: 0,
+            };
+            assert_eq!(occupied_live_count(&state), 1);
+            assert!(matches!(state.slots[0], SlotState::Corrupt));
+        }
+    }
+
+    #[test]
+    fn fixed_store_manifest_commits_exactly_1024_virtual_slots() {
+        let manifest = TournamentStoreManifest::fixed();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.slot_count as usize, MAX_TOURNAMENT_RECORDS);
+        assert!(manifest.materialized_slots.iter().all(|word| *word == 0));
+        let slots = (0..manifest.slot_count)
+            .map(|_| SlotState::Vacant { identity: None })
+            .collect::<Vec<_>>();
+        assert_eq!(slots.len(), 1024);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifest_genesis_is_restart_atomic_and_partial_pre_genesis_fails_closed() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("store");
+        let store = TournamentStore::open_or_create(&path).unwrap();
+        {
+            let state = store.state.lock().unwrap();
+            assert_eq!(state.slots.len(), MAX_TOURNAMENT_RECORDS);
+            assert!(
+                state
+                    .slots
+                    .iter()
+                    .all(|slot| matches!(slot, SlotState::Vacant { identity: None }))
+            );
+        }
+        drop(store);
+        let reopened = TournamentStore::open_or_create(&path).unwrap();
+        assert_eq!(reopened.state.lock().unwrap().slots.len(), 1024);
+        drop(reopened);
+
+        let directory = crate::speculation_fs::open_existing_private_dir(&path).unwrap();
+        atomic_create_json(
+            &directory,
+            &slot_leaf(7).unwrap(),
+            &TournamentSlotRecord::vacant(7),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        drop(directory);
+        let repaired = TournamentStore::open_or_create(&path).unwrap();
+        assert!(matches!(
+            repaired.state.lock().unwrap().slots[7],
+            SlotState::Vacant { identity: Some(_) }
+        ));
+        drop(repaired);
+        let directory = crate::speculation_fs::open_existing_private_dir(&path).unwrap();
+        let manifest = read_json::<TournamentStoreManifest>(
+            &directory,
+            STORE_MANIFEST_LEAF,
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert!(manifest.value.is_materialized(7));
+        std::fs::remove_file(path.join("slot-0007.json")).unwrap();
+        drop(directory);
+        let missing = TournamentStore::open_or_create(&path).unwrap();
+        assert!(matches!(
+            missing.state.lock().unwrap().slots[7],
+            SlotState::Corrupt
+        ));
+
+        let partial = root.path().join("partial");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&partial)
+            .unwrap();
+        let bytes = serde_json::to_vec(&TournamentSlotRecord::vacant(0)).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        std::io::Write::write_all(
+            &mut options.open(partial.join("slot-0000.json")).unwrap(),
+            &bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            TournamentStore::open_or_create(&partial),
+            Err(EvidenceError::Corrupt)
+        ));
     }
 
     #[test]

@@ -8,13 +8,14 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 pub const MAX_SPECULATION_JSON_BYTES: usize = 32 * 1024;
 const MAX_DIRECTORY_PATH_BYTES: usize = 4096;
 const MAX_LEAF_BYTES: usize = 255;
-static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+const TRANSACTION_TEMP_PREFIX: &str = ".lterm-speculation-txn-v1-";
+const TRANSACTION_TEMP_SUFFIX: &str = ".tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceError {
@@ -73,7 +74,7 @@ pub struct DirectoryIdentity {
 impl DirectoryIdentity {
     pub fn test_value() -> Self {
         Self {
-            boot_uuid: Uuid::nil(),
+            boot_uuid: Uuid::from_u128(1),
             dev: 2,
             ino: 3,
             statx_mnt_id: 4,
@@ -91,6 +92,7 @@ pub struct ValidatedDirectory {
     file: File,
     identity: DirectoryIdentity,
     canonical_locator: PathBuf,
+    mutation_lock: Mutex<()>,
 }
 
 impl fmt::Debug for ValidatedDirectory {
@@ -129,14 +131,50 @@ impl ValidatedDirectory {
     }
 
     pub(crate) fn list_leaf_names(&self) -> EvidenceResult<Vec<CString>> {
+        let _guard = self.lock_mutations()?;
         self.revalidate()?;
-        let entries = std::fs::read_dir(&self.canonical_locator).map_err(|_| EvidenceError::Io)?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let name = entry.map_err(|_| EvidenceError::Io)?.file_name();
-            names.push(CString::new(name.as_bytes()).map_err(|_| EvidenceError::InvalidLeaf)?);
+        let mut names = enumerate_leaf_names_from_fd(&self.file, self.identity)?;
+        let mut removed_transaction_temp = false;
+        names.retain(|name| {
+            if !is_transaction_temp_leaf(name) {
+                return true;
+            }
+            if validate_temp_leaf_for_recovery(self.file.as_raw_fd(), name).is_ok()
+                && unlinkat_checked(self.file.as_raw_fd(), name).is_ok()
+            {
+                removed_transaction_temp = true;
+                return false;
+            }
+            true
+        });
+        if removed_transaction_temp {
+            self.file.sync_all().map_err(|_| EvidenceError::Io)?;
         }
+        self.revalidate()?;
         Ok(names)
+    }
+
+    fn lock_mutations(&self) -> EvidenceResult<DirectoryMutationGuard<'_>> {
+        let local = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| EvidenceError::Poisoned)?;
+        lock_directory(self.file.as_raw_fd())?;
+        Ok(DirectoryMutationGuard {
+            directory: self,
+            _local: local,
+        })
+    }
+}
+
+struct DirectoryMutationGuard<'a> {
+    directory: &'a ValidatedDirectory,
+    _local: MutexGuard<'a, ()>,
+}
+
+impl Drop for DirectoryMutationGuard<'_> {
+    fn drop(&mut self) {
+        unlock_directory(self.directory.file.as_raw_fd());
     }
 }
 
@@ -167,6 +205,7 @@ fn open_private_dir(path: &Path, create: bool) -> EvidenceResult<ValidatedDirect
         file: canonical,
         identity,
         canonical_locator: canonical_path,
+        mutation_lock: Mutex::new(()),
     })
 }
 
@@ -224,19 +263,23 @@ pub fn atomic_create_json<T>(
 where
     T: Serialize + DeserializeOwned,
 {
-    directory.revalidate()?;
     validate_leaf(leaf)?;
     let bytes = serialize_bounded(value, cap)?;
-    let mut file = openat_file(
-        directory.file.as_raw_fd(),
-        leaf,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        0o600,
-    )?;
+    let _guard = directory.lock_mutations()?;
+    directory.revalidate()?;
+    let mut file = create_unnamed_temp(directory.file.as_raw_fd())?;
     write_and_sync(&mut file, &bytes)?;
-    validate_record_file(&file)?;
+    let unlinked_identity = validate_temporary_record_file(&file)?;
+    publish_unnamed_no_replace(&file, directory.file.as_raw_fd(), leaf)?;
+    let published_identity = validate_record_file(&file)?;
+    if published_identity != unlinked_identity {
+        unlinkat(directory.file.as_raw_fd(), leaf);
+        return Err(EvidenceError::Stale);
+    }
     directory.file.sync_all().map_err(|_| EvidenceError::Io)?;
-    read_json(directory, leaf, cap)
+    let stored = read_exact_written_json(directory, leaf, published_identity, &bytes, cap)?;
+    directory.revalidate()?;
+    Ok(stored)
 }
 
 pub fn atomic_replace_json<T>(
@@ -249,8 +292,10 @@ pub fn atomic_replace_json<T>(
 where
     T: Serialize + DeserializeOwned,
 {
-    directory.revalidate()?;
     validate_leaf(leaf)?;
+    let bytes = serialize_bounded(value, cap)?;
+    let _guard = directory.lock_mutations()?;
+    directory.revalidate()?;
     let current = openat_file(
         directory.file.as_raw_fd(),
         leaf,
@@ -261,25 +306,51 @@ where
         return Err(EvidenceError::Stale);
     }
 
-    let bytes = serialize_bounded(value, cap)?;
-    let temp = temp_leaf()?;
+    let mut file = create_unnamed_temp(directory.file.as_raw_fd())?;
+    write_and_sync(&mut file, &bytes)?;
+    let unlinked_identity = validate_temporary_record_file(&file)?;
+    let temp = transaction_temp_leaf();
     let result = (|| {
-        let mut file = openat_file(
-            directory.file.as_raw_fd(),
-            &temp,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )?;
-        write_and_sync(&mut file, &bytes)?;
-        validate_record_file(&file)?;
+        publish_unnamed_no_replace(&file, directory.file.as_raw_fd(), &temp)?;
+        let published_identity = validate_record_file(&file)?;
+        if published_identity != unlinked_identity {
+            return Err(EvidenceError::Stale);
+        }
         renameat(directory.file.as_raw_fd(), &temp, leaf)?;
         directory.file.sync_all().map_err(|_| EvidenceError::Io)?;
-        read_json(directory, leaf, cap)
+        let stored = read_exact_written_json(directory, leaf, published_identity, &bytes, cap)?;
+        directory.revalidate()?;
+        Ok(stored)
     })();
     if result.is_err() {
         unlinkat(directory.file.as_raw_fd(), &temp);
     }
     result
+}
+
+fn read_exact_written_json<T: DeserializeOwned>(
+    directory: &ValidatedDirectory,
+    leaf: &CStr,
+    expected_identity: FileIdentity,
+    expected_bytes: &[u8],
+    cap: usize,
+) -> EvidenceResult<StoredJson<T>> {
+    let mut file = openat_file(
+        directory.file.as_raw_fd(),
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let identity = validate_record_file(&file)?;
+    if identity != expected_identity {
+        return Err(EvidenceError::Stale);
+    }
+    let bytes = read_bounded(&mut file, cap)?;
+    if bytes != expected_bytes {
+        return Err(EvidenceError::Corrupt);
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|_| EvidenceError::Corrupt)?;
+    Ok(StoredJson { value, identity })
 }
 
 fn serialize_bounded<T: Serialize>(value: &T, cap: usize) -> EvidenceResult<Vec<u8>> {
@@ -309,6 +380,14 @@ fn write_and_sync(file: &mut File, bytes: &[u8]) -> EvidenceResult<()> {
 }
 
 fn validate_record_file(file: &File) -> EvidenceResult<FileIdentity> {
+    validate_regular_file(file, 1)
+}
+
+fn validate_temporary_record_file(file: &File) -> EvidenceResult<FileIdentity> {
+    validate_regular_file(file, 0)
+}
+
+fn validate_regular_file(file: &File, expected_links: u64) -> EvidenceResult<FileIdentity> {
     let metadata = file.metadata().map_err(|_| EvidenceError::Io)?;
     let file_type = metadata.file_type();
     if !file_type.is_file()
@@ -319,7 +398,7 @@ fn validate_record_file(file: &File) -> EvidenceResult<FileIdentity> {
         || file_type.is_char_device()
         || metadata.uid() != current_euid()
         || metadata.mode() & 0o7777 != 0o600
-        || metadata.nlink() != 1
+        || metadata.nlink() != expected_links
     {
         return Err(EvidenceError::InvalidIdentity);
     }
@@ -334,7 +413,6 @@ fn validate_private_directory_metadata(file: &File) -> EvidenceResult<()> {
     if !metadata.file_type().is_dir()
         || metadata.uid() != current_euid()
         || metadata.mode() & 0o7777 != 0o700
-        || metadata.nlink() != 2
     {
         return Err(EvidenceError::InvalidDirectory);
     }
@@ -366,13 +444,25 @@ fn validate_leaf(leaf: &CStr) -> EvidenceResult<()> {
     Ok(())
 }
 
-fn temp_leaf() -> EvidenceResult<CString> {
-    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+fn transaction_temp_leaf() -> CString {
     CString::new(format!(
-        ".lterm-speculation-{}-{id}.tmp",
-        std::process::id()
+        "{TRANSACTION_TEMP_PREFIX}{}{TRANSACTION_TEMP_SUFFIX}",
+        Uuid::new_v4()
     ))
-    .map_err(|_| EvidenceError::InvalidLeaf)
+    .expect("transaction temp leaf is NUL-free")
+}
+
+fn is_transaction_temp_leaf(leaf: &CStr) -> bool {
+    let Ok(value) = std::str::from_utf8(leaf.to_bytes()) else {
+        return false;
+    };
+    let Some(uuid) = value
+        .strip_prefix(TRANSACTION_TEMP_PREFIX)
+        .and_then(|value| value.strip_suffix(TRANSACTION_TEMP_SUFFIX))
+    else {
+        return false;
+    };
+    Uuid::parse_str(uuid).is_ok()
 }
 
 fn openat_file(dirfd: RawFd, leaf: &CStr, flags: i32, mode: u32) -> EvidenceResult<File> {
@@ -390,10 +480,95 @@ fn renameat(dirfd: RawFd, from: &CStr, to: &CStr) -> EvidenceResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn create_unnamed_temp(dirfd: RawFd) -> EvidenceResult<File> {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c".".as_ptr(),
+            libc::O_WRONLY | libc::O_TMPFILE | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS) => Err(EvidenceError::Unsupported),
+            _ => Err(EvidenceError::Io),
+        };
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_unnamed_temp(_dirfd: RawFd) -> EvidenceResult<File> {
+    Err(EvidenceError::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_unnamed_no_replace(file: &File, dirfd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
+    let mut result = unsafe {
+        libc::linkat(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            dirfd,
+            leaf.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        let proc_fd = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| EvidenceError::InvalidLeaf)?;
+        result = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                proc_fd.as_ptr(),
+                dirfd,
+                leaf.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+    }
+    if result != 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EEXIST) => Err(EvidenceError::AlreadyExists),
+            Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS | libc::EPERM) => {
+                Err(EvidenceError::Unsupported)
+            }
+            _ => Err(EvidenceError::Io),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_unnamed_no_replace(_file: &File, _dirfd: RawFd, _leaf: &CStr) -> EvidenceResult<()> {
+    Err(EvidenceError::Unsupported)
+}
+
+fn validate_temp_leaf_for_recovery(dirfd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
+    if !is_transaction_temp_leaf(leaf) {
+        return Err(EvidenceError::InvalidLeaf);
+    }
+    let file = openat_file(
+        dirfd,
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    validate_record_file(&file).map(|_| ())
+}
+
 fn unlinkat(dirfd: RawFd, leaf: &CStr) {
     unsafe {
         libc::unlinkat(dirfd, leaf.as_ptr(), 0);
     }
+}
+
+fn unlinkat_checked(dirfd: RawFd, leaf: &CStr) -> EvidenceResult<()> {
+    if unsafe { libc::unlinkat(dirfd, leaf.as_ptr(), 0) } != 0 {
+        return Err(map_io_error());
+    }
+    Ok(())
 }
 
 fn map_io_error() -> EvidenceError {
@@ -409,6 +584,84 @@ fn current_euid() -> u32 {
 }
 
 #[cfg(target_os = "linux")]
+fn lock_directory(fd: RawFd) -> EvidenceResult<()> {
+    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+        return Err(EvidenceError::Io);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_directory(_fd: RawFd) -> EvidenceResult<()> {
+    Err(EvidenceError::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
+fn unlock_directory(fd: RawFd) {
+    unsafe {
+        libc::flock(fd, libc::LOCK_UN);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unlock_directory(_fd: RawFd) {}
+
+#[cfg(target_os = "linux")]
+fn enumerate_leaf_names_from_fd(
+    directory: &File,
+    expected_identity: DirectoryIdentity,
+) -> EvidenceResult<Vec<CString>> {
+    if directory_identity(directory)? != expected_identity {
+        return Err(EvidenceError::Stale);
+    }
+    validate_private_directory_metadata(directory)?;
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(EvidenceError::Io);
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(EvidenceError::Io);
+    }
+    let mut names = Vec::new();
+    loop {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let errno = unsafe { *libc::__errno_location() };
+            unsafe {
+                libc::closedir(stream);
+            }
+            if errno != 0 {
+                return Err(EvidenceError::Io);
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(CString::new(name.to_bytes()).map_err(|_| EvidenceError::InvalidLeaf)?);
+        }
+    }
+    if directory_identity(directory)? != expected_identity {
+        return Err(EvidenceError::Stale);
+    }
+    Ok(names)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enumerate_leaf_names_from_fd(
+    _directory: &File,
+    _expected_identity: DirectoryIdentity,
+) -> EvidenceResult<Vec<CString>> {
+    Err(EvidenceError::Unsupported)
+}
+
+#[cfg(target_os = "linux")]
 fn create_and_open_components(path: &Path) -> EvidenceResult<File> {
     open_components(path, true)
 }
@@ -417,7 +670,7 @@ fn create_and_open_components(path: &Path) -> EvidenceResult<File> {
 fn open_components(path: &Path, create: bool) -> EvidenceResult<File> {
     let root_fd = unsafe {
         libc::open(
-            b"/\0".as_ptr().cast(),
+            c"/".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
@@ -460,7 +713,7 @@ fn directory_identity(file: &File) -> EvidenceResult<DirectoryIdentity> {
     let result = unsafe {
         libc::statx(
             file.as_raw_fd(),
-            b"\0".as_ptr().cast(),
+            c"".as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
             libc::STATX_BASIC_STATS | STATX_MNT_ID_UNIQUE,
             statx.as_mut_ptr(),
@@ -566,5 +819,174 @@ mod tests {
             .to_string(),
             "speculation_record_stale"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_create_never_publishes_the_unwritten_temporary_inode() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+        let leaf = c"record.json";
+        let bytes = br#"{"generation":1}"#;
+        let mut partial = create_unnamed_temp(directory.file.as_raw_fd()).unwrap();
+        partial.write_all(br#"{"generation":"#).unwrap();
+        partial.sync_all().unwrap();
+        drop(partial);
+        assert_eq!(
+            read_json::<serde_json::Value>(&directory, leaf, MAX_SPECULATION_JSON_BYTES)
+                .unwrap_err(),
+            EvidenceError::Missing
+        );
+
+        let mut temporary = create_unnamed_temp(directory.file.as_raw_fd()).unwrap();
+        temporary.write_all(bytes).unwrap();
+        temporary.sync_all().unwrap();
+        validate_temporary_record_file(&temporary).unwrap();
+        assert_eq!(
+            read_json::<serde_json::Value>(&directory, leaf, MAX_SPECULATION_JSON_BYTES)
+                .unwrap_err(),
+            EvidenceError::Missing
+        );
+        publish_unnamed_no_replace(&temporary, directory.file.as_raw_fd(), leaf).unwrap();
+        directory.file.sync_all().unwrap();
+        let stored =
+            read_json::<serde_json::Value>(&directory, leaf, MAX_SPECULATION_JSON_BYTES).unwrap();
+        assert_eq!(stored.value["generation"], 1);
+        assert_eq!(
+            read_exact_written_json::<serde_json::Value>(
+                &directory,
+                leaf,
+                stored.identity,
+                br#"{"generation":2}"#,
+                MAX_SPECULATION_JSON_BYTES,
+            )
+            .unwrap_err(),
+            EvidenceError::Corrupt
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_compare_and_swap_has_exactly_one_winner() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::{Arc, Barrier};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let first_directory = open_existing_private_dir(&path).unwrap();
+        let leaf = c"record.json";
+        let initial = atomic_create_json(
+            &first_directory,
+            leaf,
+            &serde_json::json!({"generation": 1}),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        let second_directory = open_existing_private_dir(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let spawn_writer =
+            |directory: ValidatedDirectory, generation: u64, barrier: Arc<Barrier>| {
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    atomic_replace_json(
+                        &directory,
+                        leaf,
+                        initial.identity,
+                        &serde_json::json!({"generation": generation}),
+                        MAX_SPECULATION_JSON_BYTES,
+                    )
+                })
+            };
+        let left = spawn_writer(first_directory, 2, Arc::clone(&barrier));
+        let right = spawn_writer(second_directory, 3, Arc::clone(&barrier));
+        barrier.wait();
+        let results = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(EvidenceError::Stale)))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_private_trees_revalidate_and_enumeration_stays_on_retained_fd() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+        let child = path.join("src");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory.revalidate().unwrap();
+
+        std::fs::write(path.join("retained"), b"old").unwrap();
+        let moved = root.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        std::fs::write(path.join("replacement"), b"new").unwrap();
+        let names = enumerate_leaf_names_from_fd(&directory.file, directory.identity()).unwrap();
+        assert!(names.iter().any(|name| name.to_bytes() == b"retained"));
+        assert!(!names.iter().any(|name| name.to_bytes() == b"replacement"));
+        assert_eq!(directory.list_leaf_names(), Err(EvidenceError::Stale));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validated_transaction_temp_is_reaped_without_poisoning_enumeration() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+        let temp = transaction_temp_leaf();
+        let mut file = create_unnamed_temp(directory.file.as_raw_fd()).unwrap();
+        file.write_all(br#"{"complete":true}"#).unwrap();
+        file.sync_all().unwrap();
+        publish_unnamed_no_replace(&file, directory.file.as_raw_fd(), &temp).unwrap();
+        assert!(directory.list_leaf_names().unwrap().is_empty());
+        assert_eq!(
+            read_json::<serde_json::Value>(&directory, &temp, MAX_SPECULATION_JSON_BYTES)
+                .unwrap_err(),
+            EvidenceError::Missing
+        );
+
+        let corrupt_temp = transaction_temp_leaf();
+        let corrupt_path = path.join(std::ffi::OsStr::from_bytes(corrupt_temp.to_bytes()));
+        std::fs::write(&corrupt_path, b"incomplete").unwrap();
+        assert!(
+            directory
+                .list_leaf_names()
+                .unwrap()
+                .iter()
+                .any(|leaf| leaf == &corrupt_temp)
+        );
+        assert!(corrupt_path.exists());
     }
 }
