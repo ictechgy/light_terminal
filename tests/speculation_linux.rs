@@ -47,6 +47,38 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
     Some((fixture, output))
 }
 
+fn run_required_actor_service() -> Option<(tempfile::TempDir, Output)> {
+    if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
+        .expect("required actor run needs LTERM_SPECULATION_CGROUP_ROOT");
+    let fixture = tempfile::TempDir::new().expect("private actor fixture");
+    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700))
+        .expect("private actor fixture mode");
+    let data = fixture.path().join("data");
+    fs::create_dir(&data).expect("private actor managed-launch data");
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).expect("private actor data mode");
+    let self_exe = fixture.path().join("lterm-test-bin");
+    fs::copy(env!("CARGO_BIN_EXE_lterm"), &self_exe).expect("copy retained actor executable");
+    fs::set_permissions(&self_exe, fs::Permissions::from_mode(0o500))
+        .expect("retained actor executable mode");
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg("--internal-speculation-containment-test-v1")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_SPECULATION_ACTOR_SERVICE", "1")
+        .env("LTERM_INTERNAL_SPECULATION_SELF_EXE", &self_exe)
+        .env("LTERM_DATA_DIR", &data)
+        .env("LTERM_REQUIRE_REAL_BWRAP", "1")
+        .env("LTERM_SPECULATION_CGROUP_ROOT", cgroup_root)
+        .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", fixture.path())
+        .output()
+        .expect("run real actor service driver");
+    Some((fixture, output))
+}
+
 fn assert_no_tournament_domains() {
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .expect("required real run needs LTERM_SPECULATION_CGROUP_ROOT");
@@ -235,6 +267,25 @@ fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
     assert!(
         output.stderr.is_empty(),
         "positive component emitted stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_actor_service_progresses_and_finalizes_loser_first() {
+    let Some((_fixture, output)) = run_required_actor_service() else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "actor service driver failed with bounded stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"speculation-actor-service=1\n");
+    assert!(
+        output.stderr.is_empty(),
+        "actor service emitted stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_no_tournament_domains();
