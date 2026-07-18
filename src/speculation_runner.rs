@@ -993,7 +993,15 @@ fn run_internal_probe() -> RunnerResult<()> {
             return Err(RunnerProtocolError::InvalidFrame);
         }
     }
-    if std::env::vars_os().count() != expected.len() {
+    #[cfg(debug_assertions)]
+    let probe_failpoint = std::env::var("LTERM_INTERNAL_SPECULATION_PROBE_FAILPOINT").ok();
+    #[cfg(not(debug_assertions))]
+    let probe_failpoint: Option<String> = None;
+    if probe_failpoint
+        .as_deref()
+        .is_some_and(|value| value != "probe_after_workspace_canary_write")
+        || std::env::vars_os().count() != expected.len() + usize::from(probe_failpoint.is_some())
+    {
         return Err(RunnerProtocolError::InvalidFrame);
     }
     let status = std::fs::read("/proc/self/status").map_err(|_| RunnerProtocolError::Io)?;
@@ -1042,9 +1050,52 @@ fn run_internal_probe() -> RunnerResult<()> {
     }
     prove_no_external_ip_connectivity()?;
     audit_probe_descriptors()?;
-    let canary = std::path::Path::new("/workspace/.lterm-speculation-probe-v1");
-    std::fs::write(canary, b"probe").map_err(|_| RunnerProtocolError::Io)?;
-    std::fs::remove_file(canary).map_err(|_| RunnerProtocolError::Io)?;
+    // An O_TMPFILE inode proves that the sandbox can write the host-backed
+    // workspace without ever creating a directory entry.  This is the only
+    // cleanup shape that remains deterministic if the probe is killed at any
+    // instruction: the kernel reclaims the link-count-zero inode when its file
+    // descriptor closes, so abrupt rollback cannot leave a workspace marker.
+    let canary_fd = unsafe {
+        libc::open(
+            c"/workspace".as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if canary_fd < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    let canary = unsafe { File::from_raw_fd(canary_fd) };
+    let before = canary.metadata().map_err(|_| RunnerProtocolError::Io)?;
+    if before.mode() & libc::S_IFMT != libc::S_IFREG || before.nlink() != 0 || before.len() != 0 {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    if unsafe { libc::write(canary.as_raw_fd(), b"probe".as_ptr().cast(), 5) } != 5
+        || unsafe { libc::fsync(canary.as_raw_fd()) } != 0
+    {
+        return Err(RunnerProtocolError::Io);
+    }
+    #[cfg(debug_assertions)]
+    if probe_failpoint.as_deref() == Some("probe_after_workspace_canary_write") {
+        unsafe { libc::_exit(86) };
+    }
+    let after = canary.metadata().map_err(|_| RunnerProtocolError::Io)?;
+    let mut bytes = [0_u8; 5];
+    if after.mode() & libc::S_IFMT != libc::S_IFREG
+        || after.nlink() != 0
+        || after.len() != bytes.len() as u64
+        || unsafe {
+            libc::pread(
+                canary.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        } != bytes.len() as isize
+        || bytes != *b"probe"
+    {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
     Ok(())
 }
 
@@ -1193,6 +1244,7 @@ const RUNNER_FAILPOINTS: &[&str] = &[
     "runner_before_release_receive",
     "runner_after_release_receive",
     "runner_before_child_exec",
+    "probe_after_workspace_canary_write",
 ];
 
 #[cfg(target_os = "linux")]
@@ -1278,6 +1330,7 @@ struct RunnerChildFailpoints {
     before_placement: bool,
     after_placement: bool,
     before_exec: bool,
+    after_probe_canary_write: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1287,6 +1340,9 @@ impl RunnerChildFailpoints {
             before_placement: runner_failpoint_enabled("runner_before_child_placement"),
             after_placement: runner_failpoint_enabled("runner_after_child_placement"),
             before_exec: runner_failpoint_enabled("runner_before_child_exec"),
+            after_probe_canary_write: runner_failpoint_enabled(
+                "probe_after_workspace_canary_write",
+            ),
         }
     }
 }
@@ -1303,14 +1359,27 @@ fn spawn_placement_blocked_child(
         .map(|argument| std::ffi::CString::new(argument.as_slice()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RunnerProtocolError::InvalidArgv)?;
-    let env = [
-        c"PATH=/usr/bin:/bin",
-        c"HOME=/home/lterm",
-        c"TMPDIR=/tmp",
-        c"LANG=C.UTF-8",
-        c"LC_ALL=C.UTF-8",
-        c"TERM=xterm-256color",
+    let mut env = vec![
+        std::ffi::CString::from(c"PATH=/usr/bin:/bin"),
+        std::ffi::CString::from(c"HOME=/home/lterm"),
+        std::ffi::CString::from(c"TMPDIR=/tmp"),
+        std::ffi::CString::from(c"LANG=C.UTF-8"),
+        std::ffi::CString::from(c"LC_ALL=C.UTF-8"),
+        std::ffi::CString::from(c"TERM=xterm-256color"),
     ];
+    let is_fixed_probe = arguments
+        == [
+            b"/run/lterm-control/lterm".as_slice(),
+            b"--internal-speculation-probe-v1".as_slice(),
+        ];
+    if failpoints.after_probe_canary_write && is_fixed_probe {
+        env.push(
+            std::ffi::CString::new(
+                "LTERM_INTERNAL_SPECULATION_PROBE_FAILPOINT=probe_after_workspace_canary_write",
+            )
+            .map_err(|_| RunnerProtocolError::InvalidFrame)?,
+        );
+    }
     let mut argv_ptrs = argv
         .iter()
         .map(|argument| argument.as_ptr())

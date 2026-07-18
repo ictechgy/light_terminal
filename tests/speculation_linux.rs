@@ -95,6 +95,23 @@ fn assert_candidate_workspaces_empty(fixture: &tempfile::TempDir, seam: &str) {
     }
 }
 
+fn assert_scripted_execution_workspaces_unchanged(fixture: &tempfile::TempDir, seam: &str) {
+    for candidate in ["candidate-0", "candidate-1"] {
+        let path = fixture.path().join("e").join(candidate);
+        if path.exists() {
+            let names = fs::read_dir(path)
+                .expect("inspect candidate after failpoint")
+                .map(|entry| entry.expect("candidate entry").file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                [std::ffi::OsString::from("run.sh")],
+                "{seam} unexpectedly mutated the candidate workspace"
+            );
+        }
+    }
+}
+
 fn tournament_domain(tournament_uuid: Uuid) -> std::path::PathBuf {
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .expect("required restart run needs LTERM_SPECULATION_CGROUP_ROOT");
@@ -234,6 +251,17 @@ fn required_real_failpoint_is_bounded_and_leaves_no_tournament_domain() {
         output.stderr,
         b"error: speculation_containment_evidence_unavailable\n"
     );
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_probe_canary_abrupt_exit_leaves_no_workspace_mutation() {
+    let seam = "probe_after_workspace_canary_write";
+    let Some((fixture, output)) = run_required_component(Some(seam)) else {
+        return;
+    };
+    assert_bounded_raw_free_failure(&output, &fixture, seam);
+    assert_scripted_execution_workspaces_unchanged(&fixture, seam);
     assert_no_tournament_domains();
 }
 
@@ -874,20 +902,7 @@ fn required_real_placement_ack_release_and_pre_exec_failpoints_cleanup() {
             return;
         };
         assert_bounded_raw_free_failure(&output, &fixture, seam);
-        for candidate in ["candidate-0", "candidate-1"] {
-            let path = fixture.path().join("e").join(candidate);
-            if path.exists() {
-                let names = fs::read_dir(path)
-                    .expect("inspect candidate after failpoint")
-                    .map(|entry| entry.expect("candidate entry").file_name())
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    names,
-                    [std::ffi::OsString::from("run.sh")],
-                    "{seam} unexpectedly mutated the candidate workspace"
-                );
-            }
-        }
+        assert_scripted_execution_workspaces_unchanged(&fixture, seam);
         assert_no_tournament_domains();
     }
 }

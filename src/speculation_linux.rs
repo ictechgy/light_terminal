@@ -382,7 +382,8 @@ pub(crate) fn build_fixed_bwrap_invocation(
     #[cfg(all(debug_assertions, target_os = "linux"))]
     if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1")) {
         if let Some(value) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT")
-            && value.as_bytes().starts_with(b"runner_")
+            && (value.as_bytes().starts_with(b"runner_")
+                || value.as_bytes() == b"probe_after_workspace_canary_write")
             && value.as_bytes().len() <= 96
         {
             arguments.extend([
