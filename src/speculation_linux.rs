@@ -5230,9 +5230,10 @@ fn run_real_component_driver() -> ContainmentResult<()> {
         Some([migration, migration]),
         RealExecutionExpectation::Complete { output_bytes: 0 },
     )?;
-    // Exceed the fixed pids.max=256 boundary without making the real gate
-    // spend another full action deadline on hundreds of guaranteed failures.
-    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 300 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
+    // The runner and 255 children fill the fixed pids.max=256 boundary. A few
+    // additional attempts prove the kernel rejection without spending the
+    // action deadline on failures that cannot add evidence.
+    let pids_exhaustion = b"#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 260 ]; do\n    /usr/bin/sleep 30 2>/dev/null &\n    i=$((i + 1))\ndone 2>/dev/null\nexit 0\n";
     run_real_execution_case(
         &fixture.join("q"),
         &cgroup_root,
@@ -6135,6 +6136,7 @@ fn prove_pids_limit_hit(payload: &RetainedCgroupNode) -> ContainmentResult<()> {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 fn cleanup_real_topology(tournament: &mut TournamentTopology) -> ContainmentResult<()> {
+    let mut first_error = None;
     for candidate in 0_u8..2 {
         for action in [
             CandidateCleanupAction::KillParent,
@@ -6143,25 +6145,31 @@ fn cleanup_real_topology(tournament: &mut TournamentTopology) -> ContainmentResu
             CandidateCleanupAction::RemoveControl,
             CandidateCleanupAction::RemoveParent,
         ] {
-            perform_candidate_cleanup_action(
+            if let Err(error) = perform_candidate_cleanup_action(
                 tournament,
                 candidate,
                 action,
                 ContainmentDeadline::control_action(),
-            )?;
+            ) {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    perform_tournament_cleanup_action(
+    if let Err(error) = perform_tournament_cleanup_action(
         tournament,
         TournamentCleanupAction::ProveEmpty,
         ContainmentDeadline::control_action(),
-    )?;
-    perform_tournament_cleanup_action(
+    ) {
+        first_error.get_or_insert(error);
+    }
+    if let Err(error) = perform_tournament_cleanup_action(
         tournament,
         TournamentCleanupAction::RemoveDomain,
         ContainmentDeadline::control_action(),
-    )?;
-    Ok(())
+    ) {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
