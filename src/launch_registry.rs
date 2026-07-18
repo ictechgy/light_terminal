@@ -231,6 +231,7 @@ impl ControlCgroupPlacement {
     pub(crate) fn new(cgroup_procs: File, expected_membership: String) -> Result<Self> {
         validate_cgroup_membership(&expected_membership)?;
         validate_cgroup_procs_fd(&cgroup_procs)?;
+        set_cloexec(cgroup_procs.as_raw_fd())?;
         Ok(Self {
             cgroup_procs,
             expected_membership,
@@ -259,6 +260,7 @@ impl SyncPipeWrite {
             "sync pipe target FD must be the fixed managed sync FD"
         );
         validate_sync_pipe_write_fd(&file)?;
+        set_cloexec(file.as_raw_fd())?;
         Ok(Self { file, target_fd })
     }
 }
@@ -546,6 +548,7 @@ impl Registry {
             .context("managed launch registry is busy")?;
         let mut selected = None;
         let mut unknown = 0usize;
+        let mut unreadable = 0usize;
 
         for slot in 0..self.slot_count {
             let slot = u16::try_from(slot).context("slot index overflow")?;
@@ -580,9 +583,18 @@ impl Registry {
                         _ => unknown += 1,
                     }
                 }
-                SlotRead::Unknown(_) => unknown += 1,
+                SlotRead::Unknown(_) => {
+                    unknown += 1;
+                    unreadable += 1;
+                }
             }
         }
+
+        ensure!(
+            owner.is_none() || unreadable == 0,
+            "unknown_orphan_risk: managed owner uniqueness is uncertain ({unreadable}/{} unreadable)",
+            self.slot_count
+        );
 
         let vacant = selected.with_context(|| {
             format!(
@@ -1661,6 +1673,21 @@ pub(crate) fn dispatch_internal_gate() -> Result<bool> {
 }
 
 #[cfg(debug_assertions)]
+#[cfg(target_os = "linux")]
+fn relocate_internal_test_fd_without_cloexec(file: File, minimum: RawFd) -> Result<File> {
+    let relocated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, minimum) };
+    ensure!(
+        relocated >= minimum,
+        "relocate internal test descriptor without CLOEXEC"
+    );
+    drop(file);
+    let relocated = unsafe { File::from_raw_fd(relocated) };
+    let flags = unsafe { libc::fcntl(relocated.as_raw_fd(), libc::F_GETFD) };
+    ensure!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
+    Ok(relocated)
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
@@ -1685,6 +1712,10 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
     }
     #[cfg(target_os = "linux")]
     {
+        let non_cloexec_inputs = std::env::var_os("LTERM_INTERNAL_MANAGED_NON_CLOEXEC_INPUTS")
+            .as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        let mut launch_environment = std::env::vars_os().collect::<Vec<_>>();
         let executable = arguments
             .next()
             .map(PathBuf::from)
@@ -1714,11 +1745,18 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
         ) {
             (None, None) => ManagedPlacement::None,
             (Some(path), Some(membership)) => {
-                let file = OpenOptions::new()
+                let mut file = OpenOptions::new()
                     .write(true)
                     .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
                     .open(path)
                     .context("open internal test control cgroup.procs")?;
+                if non_cloexec_inputs {
+                    file = relocate_internal_test_fd_without_cloexec(file, 64)?;
+                    launch_environment.push((
+                        OsString::from("LTERM_INTERNAL_MANAGED_PLACEMENT_SOURCE_FD"),
+                        OsString::from(file.as_raw_fd().to_string()),
+                    ));
+                }
                 ManagedPlacement::CgroupV2(ControlCgroupPlacement::new(file, membership)?)
             }
             _ => bail!("internal managed placement requires path and membership together"),
@@ -1728,9 +1766,21 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
             == Some(std::ffi::OsStr::new("1"))
         {
             let mut fds = [-1; 2];
-            ensure!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0);
+            let flags = if non_cloexec_inputs {
+                0
+            } else {
+                libc::O_CLOEXEC
+            };
+            ensure!(unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } == 0);
             let read = unsafe { File::from_raw_fd(fds[0]) };
-            let write = unsafe { File::from_raw_fd(fds[1]) };
+            let mut write = unsafe { File::from_raw_fd(fds[1]) };
+            if non_cloexec_inputs {
+                write = relocate_internal_test_fd_without_cloexec(write, 80)?;
+                launch_environment.push((
+                    OsString::from("LTERM_INTERNAL_MANAGED_SYNC_SOURCE_FD"),
+                    OsString::from(write.as_raw_fd().to_string()),
+                ));
+            }
             (
                 ManagedAuxiliary::SyncPipeWrite(SyncPipeWrite::new(
                     write,
@@ -1748,7 +1798,7 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
             executable,
             arguments: arguments.collect(),
             current_dir: None,
-            environment: std::env::vars_os().collect(),
+            environment: launch_environment,
         })?;
         let key = process.controller.key();
         let pid = process.controller.identity().pid;
@@ -2401,9 +2451,14 @@ fn install_sync_pipe(file: File, target_fd: RawFd) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn set_cloexec(fd: RawFd) -> Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    ensure!(flags >= 0);
+    ensure!(flags >= 0, "descriptor flags unavailable before CLOEXEC");
     let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    ensure!(result == 0);
+    ensure!(result == 0, "failed to set descriptor CLOEXEC");
+    let verified = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    ensure!(
+        verified >= 0 && verified & libc::FD_CLOEXEC != 0,
+        "descriptor CLOEXEC verification failed"
+    );
     Ok(())
 }
 
@@ -2929,6 +2984,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sync_pipe_constructor_establishes_cloexec_on_non_cloexec_input() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), 0) }, 0);
+        let _read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        assert_eq!(
+            unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        let sync = SyncPipeWrite::new(write, MANAGED_SYNC_PIPE_TARGET_FD).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(sync.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn exact_target_and_sync_commit_returns_two_typed_owned_descriptors() {
         let (sender, receiver) = seqpacket_pair().unwrap();
         let target = tempfile::NamedTempFile::new().unwrap();
@@ -3123,6 +3197,29 @@ mod tests {
                 && entry.owner.as_ref() == Some(&owner)
                 && entry.outcome == ReconcileOutcome::ResolvedTombstone
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_slot_blocks_typed_owner_allocation_before_another_intent() {
+        for replacement in [b"{".to_vec(), vec![b'x'; MAX_RECORD_BYTES + 1]] {
+            let (_temp, registry) = registry(2);
+            let owner = owner(0, ManagedOwnerRole::Runner);
+            let prior = registry.allocate_intent(1, Some(owner.clone())).unwrap();
+            let prior_slot = prior.record.slot;
+            drop(prior);
+            fs::write(registry.slots.join(slot_name(prior_slot)), replacement).unwrap();
+
+            let error = registry
+                .allocate_intent(2, Some(owner.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("owner uniqueness is uncertain"), "{error}");
+            assert!(matches!(
+                registry.read_valid_slot(1).unwrap().state,
+                SlotState::Vacant
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]

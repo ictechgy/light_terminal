@@ -22,8 +22,13 @@ fn shell_executable() -> std::path::PathBuf {
 }
 
 fn slot_path(temp: &TempDir) -> std::path::PathBuf {
-    temp.path()
-        .join("speculation/process-registry-v1/slots/slot-0000.json")
+    slot_path_at(temp, 0)
+}
+
+fn slot_path_at(temp: &TempDir, slot: u16) -> std::path::PathBuf {
+    temp.path().join(format!(
+        "speculation/process-registry-v1/slots/slot-{slot:04}.json"
+    ))
 }
 
 fn slot_state(path: &std::path::Path) -> Option<String> {
@@ -267,6 +272,51 @@ fn managed_owner_is_present_in_the_terminal_tombstone() {
 }
 
 #[test]
+fn corrupt_prior_owner_slot_blocks_spawn_and_second_intent() {
+    let temp = private_temp();
+    let tournament = "00000000-0000-4000-8000-000000000124";
+    let owner_env = |command: &mut Command| {
+        command
+            .env("LTERM_INTERNAL_TEST_MODE", "1")
+            .env("LTERM_INTERNAL_MANAGED_OWNER_UUID", tournament)
+            .env("LTERM_INTERNAL_MANAGED_OWNER_CANDIDATE", "0")
+            .env("LTERM_INTERNAL_MANAGED_OWNER_ROLE", "runner")
+            .env("LTERM_DATA_DIR", temp.path());
+    };
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    first
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg("exit 0");
+    owner_env(&mut first);
+    assert!(
+        first
+            .status()
+            .expect("create prior owner tombstone")
+            .success()
+    );
+
+    fs::write(slot_path(&temp), b"{").expect("corrupt prior owner slot");
+    let marker = temp.path().join("duplicate-owner-target-ran");
+    let mut second = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    second
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg(format!("printf executed > '{}'", marker.display()));
+    owner_env(&mut second);
+    let output = second.output().expect("attempt duplicate owner launch");
+    assert!(!output.status.success());
+    assert!(!marker.exists(), "target spawned past unknown owner slot");
+    assert_eq!(
+        slot_state(&slot_path_at(&temp, 1)).as_deref(),
+        Some("vacant")
+    );
+}
+
+#[test]
 fn fixed_sync_pipe_fd_stays_open_until_the_last_descendant_exits() {
     let temp = private_temp();
     let started = Instant::now();
@@ -296,6 +346,34 @@ fn fixed_sync_pipe_fd_stays_open_until_the_last_descendant_exits() {
 }
 
 #[test]
+fn non_cloexec_sync_source_does_not_survive_beside_fixed_fd() {
+    let temp = private_temp();
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .arg(shell_executable())
+        .arg("-c")
+        .arg(
+            "test -p /proc/self/fd/10 && \
+             test ! -e /proc/self/fd/$LTERM_INTERNAL_MANAGED_SYNC_SOURCE_FD",
+        )
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_INTERNAL_MANAGED_SYNC_PIPE", "1")
+        .env("LTERM_INTERNAL_MANAGED_NON_CLOEXEC_INPUTS", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .output()
+        .expect("run non-CLOEXEC sync-FD managed launch");
+    assert!(
+        output.status.success(),
+        "non-CLOEXEC sync-FD launch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        slot_state(&slot_path(&temp)).as_deref(),
+        Some("resolved_tombstone")
+    );
+}
+
+#[test]
 #[ignore = "requires an explicit writable delegated cgroup-v2 control leaf"]
 fn managed_gate_joins_exact_control_cgroup_before_target_release() {
     let cgroup_procs = std::env::var_os("LTERM_TEST_CONTROL_CGROUP_PROCS")
@@ -305,7 +383,11 @@ fn managed_gate_joins_exact_control_cgroup_before_target_release() {
     let temp = private_temp();
     let marker = temp.path().join("placed-target-ran");
     let script = format!(
-        "test \"$(cat /proc/self/cgroup)\" = '0::{}' && printf placed > '{}'",
+        "test \"$(cat /proc/self/cgroup)\" = '0::{}' && \
+         test -p /proc/self/fd/10 && \
+         test ! -e /proc/self/fd/$LTERM_INTERNAL_MANAGED_PLACEMENT_SOURCE_FD && \
+         test ! -e /proc/self/fd/$LTERM_INTERNAL_MANAGED_SYNC_SOURCE_FD && \
+         printf placed > '{}'",
         membership,
         marker.display()
     );
@@ -320,6 +402,8 @@ fn managed_gate_joins_exact_control_cgroup_before_target_release() {
             "LTERM_INTERNAL_MANAGED_CONTROL_CGROUP_MEMBERSHIP",
             &membership,
         )
+        .env("LTERM_INTERNAL_MANAGED_SYNC_PIPE", "1")
+        .env("LTERM_INTERNAL_MANAGED_NON_CLOEXEC_INPUTS", "1")
         .env("LTERM_DATA_DIR", temp.path())
         .output()
         .expect("run control-cgroup managed launch");
