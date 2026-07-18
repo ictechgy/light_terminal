@@ -12926,6 +12926,70 @@ fn agent_alias_force_status_repaints_after_alt_screen_startup_clear() -> TestRes
 
 #[test]
 #[cfg(unix)]
+fn zero_size_pty_plain_launch_reaches_the_session_command() -> TestResult {
+    let env = TestEnv::new()?;
+    let path = std::env::var_os("PATH").ok_or("PATH should be set for the test")?;
+
+    let output = run_cli_on_pty_until_exit_at_size(
+        &env,
+        &path,
+        &[
+            "start",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'PLAIN_ZERO_SIZE_READY\\n'",
+        ],
+        "plain launch on a zero-size PTY",
+        0,
+        0,
+    )?;
+    assert!(
+        contains_subsequence(&output, b"PLAIN_ZERO_SIZE_READY"),
+        "plain session command should start despite an initial zero-size PTY: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn zero_size_pty_omc_madmax_launches_and_preserves_forwarded_argument() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omc"),
+        "#!/bin/sh\nprintf 'OMC_ARGS:%s\\n' \"$*\"\nprintf 'OMC_ZERO_SIZE_READY\\n'\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = run_cli_on_pty_until_exit_at_size(
+        &env,
+        &path,
+        &["omc", "--madmax"],
+        "omc --madmax on a zero-size PTY",
+        0,
+        0,
+    )?;
+    assert!(
+        contains_subsequence(&output, b"OMC_ARGS:--madmax"),
+        "--madmax should be forwarded unchanged to omc: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_subsequence(&output, b"OMC_ZERO_SIZE_READY"),
+        "omc should start despite an initial zero-size PTY: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn agent_launch_controls_set_name_cwd_and_detach() -> TestResult {
     let env = TestEnv::new()?;
     let fake_bin = env.temp.path().join("fake-bin");
@@ -14554,8 +14618,20 @@ fn run_agent_alias_on_pty_until_exit(
     args: &[&str],
     label: &str,
 ) -> TestResult<Vec<u8>> {
+    run_cli_on_pty_until_exit_at_size(env, path, args, label, 24, 80)
+}
+
+#[cfg(unix)]
+fn run_cli_on_pty_until_exit_at_size(
+    env: &TestEnv,
+    path: &OsString,
+    args: &[&str],
+    label: &str,
+    rows: u16,
+    cols: u16,
+) -> TestResult<Vec<u8>> {
     let (mut master, slave) = open_pty_pair()?;
-    set_pty_window_size(&slave, 24, 80)?;
+    set_pty_window_size(&slave, rows, cols)?;
     let stdin = Stdio::from(slave.try_clone()?);
     let stdout = Stdio::from(slave.try_clone()?);
     let stderr = Stdio::from(slave.try_clone()?);
