@@ -573,9 +573,7 @@ impl TournamentRecord {
                 .enumerate()
                 .any(|(index, owner)| {
                     owner.as_ref().is_some_and(|owner| {
-                        owner.candidate_index != index as u8
-                            || owner.generation == 0
-                            || owner.generation > self.status.generation
+                        owner.candidate_index != index as u8 || owner.generation == 0
                     })
                 })
         {
@@ -1273,6 +1271,37 @@ mod tests {
         }
     }
 
+    fn prepared_record() -> TournamentRecord {
+        let mut record = terminal_record();
+        record.terminal_completed_unix_ms = None;
+        record.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Planned;
+        for (index, cgroup) in record.cgroups.iter_mut().enumerate() {
+            cgroup.lifecycle = CgroupLifecycleState::Forward(CgroupForwardState::Planned);
+            cgroup.parent = None;
+            cgroup.control = None;
+            cgroup.payload = None;
+            record.status.candidates[index] = SpeculationCandidateStatus {
+                candidate_uuid: cgroup.deterministic_name_uuid,
+                index: index as u8,
+                ready: false,
+                ready_elapsed_ns: None,
+                go_received: false,
+                go_received_elapsed_ns: None,
+                result_accepted: false,
+                exit_success: None,
+                exit_category: None,
+                elapsed_ns: None,
+                output_bytes: None,
+                eligible: false,
+                cleanup: Default::default(),
+            };
+        }
+        record.status.phase = SpeculationPhase::Prepared;
+        record.status.selected_index = None;
+        record.status.rollback_required = false;
+        record
+    }
+
     #[test]
     fn registry_caps_retention_and_slot_names_are_fixed() {
         assert_eq!(MAX_TOURNAMENT_RECORDS, 1024);
@@ -1280,6 +1309,55 @@ mod tests {
         assert_eq!(TERMINAL_RETENTION_MILLIS, 7 * 24 * 60 * 60 * 1000);
         assert_eq!(parse_slot_leaf(&slot_leaf(1023).unwrap()), Some(1023));
         assert!(slot_leaf(1024).is_err());
+    }
+
+    fn armed_record_with_reused_managed_slot() -> TournamentRecord {
+        let mut armed = prepared_record();
+        armed.status.phase = SpeculationPhase::Armed;
+        armed.status.generation += 1;
+        armed.managed_owners[0] = Some(ManagedOwnerEvidence {
+            candidate_index: 0,
+            role: ManagedOwnerRoleEvidence::Runner,
+            slot: 7,
+            generation: armed.status.generation + 1,
+        });
+        armed
+    }
+
+    #[test]
+    fn managed_slot_generation_is_independent_from_tournament_generation() {
+        let armed = armed_record_with_reused_managed_slot();
+        assert!(
+            armed.managed_owners[0]
+                .as_ref()
+                .is_some_and(|owner| owner.generation > armed.status.generation)
+        );
+        armed.validate().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reused_managed_slot_receipt_survives_cas_reload_and_recovery_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let store = TournamentStore::open_or_create(&root.path().join("store")).unwrap();
+        let record = prepared_record();
+        let key = store.allocate_prepared(record, 1).unwrap();
+        let armed = armed_record_with_reused_managed_slot();
+
+        let key = store
+            .compare_and_swap(&key, key.generation, armed.clone())
+            .unwrap();
+        assert_eq!(
+            store.load_by_uuid(key.tournament_uuid).unwrap(),
+            Some(armed.clone())
+        );
+        assert!(store.scan_recovery().unwrap().into_iter().any(|entry| {
+            matches!(
+                entry,
+                TournamentRecoveryRecord::Valid { record, .. }
+                    if *record == armed
+            )
+        }));
     }
 
     #[test]
