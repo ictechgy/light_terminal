@@ -14,12 +14,12 @@ use crate::speculation_fs::{
     durable_identity_from_fd, open_existing_delegated_cgroup_root, open_existing_private_dir,
     open_existing_workspace_dir, validate_no_overlap,
 };
-use crate::speculation_registry::ManagedOwnerRoleEvidence;
 #[cfg(target_os = "linux")]
 use crate::speculation_registry::{
-    AbsenceDisposition, CgroupComponent, CgroupLifecycleState, ManagedOwnerEvidence,
+    AbsenceDisposition, CgroupForwardState, CgroupLifecycleState, ManagedOwnerEvidence,
     TournamentCgroupLifecycleState, TournamentRecord, TournamentRecoveryRecord,
 };
+use crate::speculation_registry::{CgroupComponent, ManagedOwnerRoleEvidence};
 #[cfg(target_os = "linux")]
 use crate::speculation_runner::{
     ControlFrame, ControlMessage, PlacementDescriptorEvidence, PlacementDescriptorKind,
@@ -1005,8 +1005,10 @@ pub(crate) fn create_topology(
 ) -> ContainmentResult<TopologyEvidence> {
     match action {
         TopologyAction::CreateTournamentDomain => {
-            if topology.domain.is_some() {
-                return Err(ContainmentErrorCode::TopologyFailure);
+            if let Some(domain) = topology.domain.as_ref() {
+                revalidate_cgroup_node(domain)?;
+                enable_pids(domain)?;
+                return Ok(TopologyEvidence::TournamentDomain(domain.identity));
             }
             failpoint("before_tournament_create")?;
             prove_domain_task_free(&topology.root)?;
@@ -1014,16 +1016,29 @@ pub(crate) fn create_topology(
             let name = cgroup_name(&format!("lterm-g003-{}", topology.tournament_uuid))?;
             let membership = join_membership(&topology.root.membership, name.to_bytes())?;
             let domain = create_cgroup_child(&topology.root, &name, membership)?;
-            enable_pids(&domain)?;
-            failpoint("after_tournament_create")?;
             let identity = domain.identity;
             topology.domain = Some(domain);
+            failpoint("after_tournament_create")?;
+            enable_pids(
+                topology
+                    .domain
+                    .as_ref()
+                    .ok_or(ContainmentErrorCode::TopologyFailure)?,
+            )?;
             Ok(TopologyEvidence::TournamentDomain(identity))
         }
         TopologyAction::CreateCandidateParent { candidate } => {
             let index = usize::from(candidate);
-            if index >= topology.candidates.len() || topology.candidates[index].parent.is_some() {
+            if index >= topology.candidates.len() {
                 return Err(ContainmentErrorCode::TopologyFailure);
+            }
+            if let Some(parent) = topology.candidates[index].parent.as_ref() {
+                revalidate_cgroup_node(parent)?;
+                enable_pids(parent)?;
+                return Ok(TopologyEvidence::CandidateParent {
+                    candidate,
+                    identity: parent.identity,
+                });
             }
             let domain = topology
                 .domain
@@ -1033,10 +1048,15 @@ pub(crate) fn create_topology(
             let membership = join_membership(&domain.membership, name.to_bytes())?;
             failpoint("before_candidate_parent_create")?;
             let parent = create_cgroup_child(domain, &name, membership)?;
-            enable_pids(&parent)?;
-            failpoint("after_candidate_parent_create")?;
             let identity = parent.identity;
             topology.candidates[index].parent = Some(parent);
+            failpoint("after_candidate_parent_create")?;
+            enable_pids(
+                topology.candidates[index]
+                    .parent
+                    .as_ref()
+                    .ok_or(ContainmentErrorCode::TopologyFailure)?,
+            )?;
             Ok(TopologyEvidence::CandidateParent {
                 candidate,
                 identity,
@@ -1048,15 +1068,19 @@ pub(crate) fn create_topology(
                 .parent
                 .as_ref()
                 .ok_or(ContainmentErrorCode::TopologyFailure)?;
-            if candidate_topology.control.is_some() {
-                return Err(ContainmentErrorCode::TopologyFailure);
+            if let Some(control) = candidate_topology.control.as_ref() {
+                revalidate_cgroup_node(control)?;
+                return Ok(TopologyEvidence::ControlLeaf {
+                    candidate,
+                    identity: control.identity,
+                });
             }
             let membership = join_membership(&parent.membership, b"control")?;
             failpoint("before_control_create")?;
             let control = create_cgroup_child(parent, c"control", membership)?;
-            failpoint("after_control_create")?;
             let identity = control.identity;
             candidate_topology.control = Some(control);
+            failpoint("after_control_create")?;
             Ok(TopologyEvidence::ControlLeaf {
                 candidate,
                 identity,
@@ -1068,15 +1092,22 @@ pub(crate) fn create_topology(
                 .parent
                 .as_ref()
                 .ok_or(ContainmentErrorCode::TopologyFailure)?;
-            if candidate_topology.control.is_none() || candidate_topology.payload.is_some() {
+            if candidate_topology.control.is_none() {
                 return Err(ContainmentErrorCode::TopologyFailure);
+            }
+            if let Some(payload) = candidate_topology.payload.as_ref() {
+                revalidate_cgroup_node(payload)?;
+                return Ok(TopologyEvidence::PayloadLeaf {
+                    candidate,
+                    identity: payload.identity,
+                });
             }
             let membership = join_membership(&parent.membership, b"payload")?;
             failpoint("before_payload_create")?;
             let payload = create_cgroup_child(parent, c"payload", membership)?;
-            failpoint("after_payload_create")?;
             let identity = payload.identity;
             candidate_topology.payload = Some(payload);
+            failpoint("after_payload_create")?;
             Ok(TopologyEvidence::PayloadLeaf {
                 candidate,
                 identity,
@@ -1307,6 +1338,11 @@ fn failpoint(_name: &str) -> ContainmentResult<()> {
     if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
         && std::env::var("LTERM_INTERNAL_SPECULATION_FAILPOINT").as_deref() == Ok(_name)
     {
+        if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
+            == Some(std::ffi::OsStr::new("exit"))
+        {
+            unsafe { libc::_exit(86) };
+        }
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
     Ok(())
@@ -1355,6 +1391,10 @@ const DURABLE_EDGE_FAILPOINTS: &[(&str, &str)] = &[
     (
         "before_recovery_parent_empty_proof",
         "after_recovery_parent_empty_proof",
+    ),
+    (
+        "before_recovery_tournament_empty_proof",
+        "after_recovery_tournament_empty_proof",
     ),
 ];
 
@@ -1587,6 +1627,11 @@ pub(crate) fn perform_tournament_cleanup_action(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryAction {
+    ReconcileTournamentCreate,
+    ReconcileCandidateCreate {
+        candidate: u8,
+        component: CgroupComponent,
+    },
     ReconcileManagedOwner {
         candidate: u8,
         role: ManagedOwnerRoleEvidence,
@@ -1612,6 +1657,16 @@ pub(crate) enum RecoveryAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryEvidence {
+    TournamentCreateReconciled {
+        identity: DurableDirectoryIdentity,
+        adopted: bool,
+    },
+    CandidateCreateReconciled {
+        candidate: u8,
+        component: CgroupComponent,
+        identity: DurableDirectoryIdentity,
+        adopted: bool,
+    },
     ManagedOwnerReconciled {
         candidate: u8,
         role: ManagedOwnerRoleEvidence,
@@ -1637,10 +1692,24 @@ pub(crate) fn reconcile_from_record(
     let TournamentRecoveryRecord::Valid { record, .. } = recovery else {
         return Ok(RecoveryEvidence::RollbackRequired);
     };
+    reconcile_valid_record(record, action, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_valid_record(
+    record: &TournamentRecord,
+    action: RecoveryAction,
+    deadline: ContainmentDeadline,
+) -> ContainmentResult<RecoveryEvidence> {
     if record.validate().is_err() {
         return Ok(RecoveryEvidence::RollbackRequired);
     }
     match action {
+        RecoveryAction::ReconcileTournamentCreate => recover_pending_tournament_create(record),
+        RecoveryAction::ReconcileCandidateCreate {
+            candidate,
+            component,
+        } => recover_pending_candidate_create(record, candidate, component),
         RecoveryAction::ReconcileManagedOwner { candidate, role } => {
             reconcile_record_owner(record, candidate, role)
         }
@@ -1655,6 +1724,138 @@ pub(crate) fn reconcile_from_record(
             recover_tournament_action(record, action, deadline)
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_tournament_create(
+    record: &TournamentRecord,
+) -> ContainmentResult<RecoveryEvidence> {
+    if record.tournament_cgroup.lifecycle != TournamentCgroupLifecycleState::CreatePending
+        || record.tournament_cgroup.domain.is_some()
+        || record.cgroups.iter().any(|candidate| {
+            candidate.lifecycle != CgroupLifecycleState::Forward(CgroupForwardState::Planned)
+        })
+    {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    }
+    let root = reopen_recovery_root(record)?;
+    enable_pids(&root)?;
+    let name = cgroup_name(&format!("lterm-g003-{}", record.status.tournament_uuid))?;
+    let membership = join_membership(&root.membership, name.to_bytes())?;
+    let (domain, adopted) = create_or_adopt_cgroup_child(&root, &name, membership)?;
+    for candidate in 0_u8..2 {
+        let candidate_name = cgroup_name(&format!("candidate-{candidate}"))?;
+        if open_observed_cgroup_child(
+            &domain,
+            &candidate_name,
+            join_membership(&domain.membership, candidate_name.to_bytes())?,
+        )?
+        .is_some()
+        {
+            return Ok(RecoveryEvidence::RollbackRequired);
+        }
+    }
+    enable_pids(&domain)?;
+    Ok(RecoveryEvidence::TournamentCreateReconciled {
+        identity: domain.identity,
+        adopted,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_candidate_create(
+    record: &TournamentRecord,
+    candidate: u8,
+    component: CgroupComponent,
+) -> ContainmentResult<RecoveryEvidence> {
+    let evidence = record
+        .cgroups
+        .get(usize::from(candidate))
+        .filter(|evidence| evidence.candidate_index == candidate)
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let expected_state = match component {
+        CgroupComponent::Parent => CgroupForwardState::ParentCreatePending,
+        CgroupComponent::Control => CgroupForwardState::ControlCreatePending,
+        CgroupComponent::Payload => CgroupForwardState::PayloadCreatePending,
+    };
+    if evidence.lifecycle != CgroupLifecycleState::Forward(expected_state)
+        || evidence.lifecycle.same_boot_absence(component) != AbsenceDisposition::RetryCreate
+    {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    }
+    let Some((_, _, domain)) = reopen_recovery_domain(record)? else {
+        return Ok(RecoveryEvidence::RollbackRequired);
+    };
+    let parent_name = cgroup_name(&format!("candidate-{candidate}"))?;
+    let parent_membership = join_membership(&domain.membership, parent_name.to_bytes())?;
+
+    let (node, adopted) = match component {
+        CgroupComponent::Parent => {
+            let result = create_or_adopt_cgroup_child(&domain, &parent_name, parent_membership)?;
+            for leaf in [c"control", c"payload"] {
+                if open_observed_cgroup_child(
+                    &result.0,
+                    leaf,
+                    join_membership(&result.0.membership, leaf.to_bytes())?,
+                )?
+                .is_some()
+                {
+                    return Ok(RecoveryEvidence::RollbackRequired);
+                }
+            }
+            enable_pids(&result.0)?;
+            result
+        }
+        CgroupComponent::Control => {
+            let Some(parent) =
+                reopen_cgroup_child(&domain, &parent_name, parent_membership, evidence.parent)?
+            else {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            };
+            if open_observed_cgroup_child(
+                &parent,
+                c"payload",
+                join_membership(&parent.membership, b"payload")?,
+            )?
+            .is_some()
+            {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            }
+            create_or_adopt_cgroup_child(
+                &parent,
+                c"control",
+                join_membership(&parent.membership, b"control")?,
+            )?
+        }
+        CgroupComponent::Payload => {
+            let Some(parent) =
+                reopen_cgroup_child(&domain, &parent_name, parent_membership, evidence.parent)?
+            else {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            };
+            if reopen_cgroup_child(
+                &parent,
+                c"control",
+                join_membership(&parent.membership, b"control")?,
+                evidence.control,
+            )?
+            .is_none()
+            {
+                return Ok(RecoveryEvidence::RollbackRequired);
+            }
+            create_or_adopt_cgroup_child(
+                &parent,
+                c"payload",
+                join_membership(&parent.membership, b"payload")?,
+            )?
+        }
+    };
+    Ok(RecoveryEvidence::CandidateCreateReconciled {
+        candidate,
+        component,
+        identity: node.identity,
+        adopted,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1884,7 +2085,9 @@ fn recover_tournament_action(
     };
     match action {
         RecoveryAction::ProveTournamentEmpty => {
+            failpoint("before_recovery_tournament_empty_proof")?;
             wait_populated_zero(&domain, deadline)?;
+            failpoint("after_recovery_tournament_empty_proof")?;
         }
         RecoveryAction::RemoveTournamentDomain => {
             if !record
@@ -1908,17 +2111,7 @@ fn recover_tournament_action(
 fn reopen_recovery_domain(
     record: &TournamentRecord,
 ) -> ContainmentResult<Option<(RetainedCgroupNode, CString, RetainedCgroupNode)>> {
-    let root = record
-        .cgroup_root_locator
-        .reopen_and_verify()
-        .map_err(map_evidence)?;
-    let root_node = RetainedCgroupNode {
-        file: root.try_clone_retained_fd().map_err(map_evidence)?,
-        identity: root.identity(),
-        membership: membership_for_cgroup_path(Path::new(std::ffi::OsStr::from_bytes(
-            root.canonical_locator_bytes(),
-        )))?,
-    };
+    let root_node = reopen_recovery_root(record)?;
     let tournament_name = cgroup_name(&format!("lterm-g003-{}", record.status.tournament_uuid))?;
     let membership = join_membership(&root_node.membership, tournament_name.to_bytes())?;
     let domain = reopen_cgroup_child(
@@ -1931,11 +2124,57 @@ fn reopen_recovery_domain(
 }
 
 #[cfg(target_os = "linux")]
+fn reopen_recovery_root(record: &TournamentRecord) -> ContainmentResult<RetainedCgroupNode> {
+    let root = record
+        .cgroup_root_locator
+        .reopen_and_verify()
+        .map_err(map_evidence)?;
+    let node = RetainedCgroupNode {
+        file: root.try_clone_retained_fd().map_err(map_evidence)?,
+        identity: root.identity(),
+        membership: membership_for_cgroup_path(Path::new(std::ffi::OsStr::from_bytes(
+            root.canonical_locator_bytes(),
+        )))?,
+    };
+    prove_domain_task_free(&node)?;
+    Ok(node)
+}
+
+#[cfg(target_os = "linux")]
 fn reopen_cgroup_child(
     parent: &RetainedCgroupNode,
     name: &CStr,
     membership: String,
     expected: Option<DurableDirectoryIdentity>,
+) -> ContainmentResult<Option<RetainedCgroupNode>> {
+    let observed = open_observed_cgroup_child(parent, name, membership)?;
+    let Some(observed) = observed else {
+        return Ok(None);
+    };
+    if expected != Some(observed.identity) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(Some(observed))
+}
+
+#[cfg(target_os = "linux")]
+fn create_or_adopt_cgroup_child(
+    parent: &RetainedCgroupNode,
+    name: &CStr,
+    membership: String,
+) -> ContainmentResult<(RetainedCgroupNode, bool)> {
+    if let Some(observed) = open_observed_cgroup_child(parent, name, membership.clone())? {
+        prove_domain_task_free(&observed)?;
+        return Ok((observed, true));
+    }
+    create_cgroup_child(parent, name, membership).map(|created| (created, false))
+}
+
+#[cfg(target_os = "linux")]
+fn open_observed_cgroup_child(
+    parent: &RetainedCgroupNode,
+    name: &CStr,
+    membership: String,
 ) -> ContainmentResult<Option<RetainedCgroupNode>> {
     revalidate_cgroup_node(parent)?;
     let fd = unsafe {
@@ -1954,15 +2193,13 @@ fn reopen_cgroup_child(
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let observed = durable_identity_from_fd(&file).map_err(map_evidence)?;
-    if expected != Some(observed) {
-        return Err(ContainmentErrorCode::InvalidIdentity);
-    }
-    revalidate_cgroup_node(parent)?;
-    Ok(Some(RetainedCgroupNode {
+    let node = RetainedCgroupNode {
         file,
         identity: observed,
         membership,
-    }))
+    };
+    revalidate_cgroup_node(parent)?;
+    Ok(Some(node))
 }
 
 #[cfg(target_os = "linux")]
