@@ -101,20 +101,36 @@ pub(crate) enum RunnerExitCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlacementDescriptorKind {
+    PayloadCgroupProcs,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlacementDescriptorEvidence {
-    pub dev: u64,
-    pub ino: u64,
-    pub statx_mnt_id_unique: u64,
+    pub kind: PlacementDescriptorKind,
+    pub file_dev: u64,
+    pub file_ino: u64,
+    pub file_statx_mnt_id_unique: u64,
+    pub payload_dev: u64,
+    pub payload_ino: u64,
+    pub payload_statx_mnt_id_unique: u64,
     pub candidate_index: u8,
     pub generation: u64,
 }
 
 impl PlacementDescriptorEvidence {
     pub(crate) fn validate(self, identity: RunnerIdentity) -> RunnerResult<()> {
-        if self.dev == 0
-            || self.ino == 0
-            || self.statx_mnt_id_unique == 0
+        if self.kind != PlacementDescriptorKind::PayloadCgroupProcs
+            || self.file_dev == 0
+            || self.file_ino == 0
+            || self.file_statx_mnt_id_unique == 0
+            || self.payload_dev == 0
+            || self.payload_ino == 0
+            || self.payload_statx_mnt_id_unique == 0
+            || self.file_statx_mnt_id_unique != self.payload_statx_mnt_id_unique
             || self.candidate_index != identity.candidate_index
             || self.generation != identity.generation
         {
@@ -147,12 +163,17 @@ pub(crate) enum ControlMessage {
     PayloadFdAck,
     Go,
     GoReceived {
-        elapsed_ns: u64,
+        monotonic_ns: u64,
     },
     PayloadPlaced,
     PayloadRelease,
+    OutputLimitExceeded {
+        bytes: u64,
+    },
+    OutputCleanupClaimed,
     LeaderExited {
         category: RunnerExitCategory,
+        elapsed_ns: u64,
     },
     OutputDrained {
         bytes: u64,
@@ -199,6 +220,8 @@ enum SequenceState {
     GoReceived,
     PayloadPlaced,
     PayloadRelease,
+    ExecutionEvent,
+    OutputCleanupClaim,
     LeaderExited,
     OutputDrained,
     ResultAccepted,
@@ -262,9 +285,16 @@ impl SequenceValidator {
                 SequenceState::PayloadRelease
             }
             (SequenceState::PayloadRelease, ControlMessage::PayloadRelease) => {
+                SequenceState::ExecutionEvent
+            }
+            (SequenceState::ExecutionEvent, ControlMessage::OutputLimitExceeded { .. }) => {
+                SequenceState::OutputCleanupClaim
+            }
+            (SequenceState::OutputCleanupClaim, ControlMessage::OutputCleanupClaimed) => {
                 SequenceState::LeaderExited
             }
-            (SequenceState::LeaderExited, ControlMessage::LeaderExited { .. }) => {
+            (SequenceState::ExecutionEvent, ControlMessage::LeaderExited { .. })
+            | (SequenceState::LeaderExited, ControlMessage::LeaderExited { .. }) => {
                 SequenceState::OutputDrained
             }
             (SequenceState::OutputDrained, ControlMessage::OutputDrained { .. }) => {
@@ -757,7 +787,6 @@ fn run_internal_runner(
     }
     unsafe { libc::close(10) };
     let peer = connect_seqpacket(control_path)?;
-    let started = Instant::now();
     let mut validator = SequenceValidator::new(identity)?;
     send_runner_frame(&peer, &mut validator, identity, ControlMessage::Hello)?;
     let hello_ack = receive_runner_frame(&peer, &mut validator)?;
@@ -808,13 +837,13 @@ fn run_internal_runner(
     if !matches!(go.message, ControlMessage::Go) {
         return Err(RunnerProtocolError::InvalidSequence);
     }
-    let go_elapsed = started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+    let go_started = Instant::now();
     send_runner_frame(
         &peer,
         &mut validator,
         identity,
         ControlMessage::GoReceived {
-            elapsed_ns: go_elapsed,
+            monotonic_ns: monotonic_now_ns()?,
         },
     )?;
     let child = spawn_placement_blocked_child(placement, &pty, &argv)?;
@@ -832,13 +861,45 @@ fn run_internal_runner(
         return Err(RunnerProtocolError::InvalidSequence);
     }
     release_child(&child.release_write)?;
-    let completion = drain_and_wait(child.pid, &pty.master, started)?;
+    let mut bytes = 0;
+    let mut overflow_reported = false;
+    let completion = loop {
+        match drain_until_execution_event(
+            child.pid,
+            &pty.master,
+            go_started,
+            bytes,
+            overflow_reported,
+        )? {
+            ExecutionProgress::OutputLimit {
+                total_bytes,
+                reported_bytes,
+            } => {
+                bytes = total_bytes;
+                overflow_reported = true;
+                send_runner_frame(
+                    &peer,
+                    &mut validator,
+                    identity,
+                    ControlMessage::OutputLimitExceeded {
+                        bytes: reported_bytes,
+                    },
+                )?;
+                let cleanup = receive_runner_frame(&peer, &mut validator)?;
+                if !matches!(cleanup.message, ControlMessage::OutputCleanupClaimed) {
+                    return Err(RunnerProtocolError::InvalidSequence);
+                }
+            }
+            ExecutionProgress::LeaderExited(completion) => break completion,
+        }
+    };
     send_runner_frame(
         &peer,
         &mut validator,
         identity,
         ControlMessage::LeaderExited {
             category: completion.category,
+            elapsed_ns: completion.elapsed_ns,
         },
     )?;
     // The daemon receives LEADER_EXITED before this read reaches EOF and may
@@ -930,10 +991,42 @@ fn run_internal_probe() -> RunnerResult<()> {
             return Err(RunnerProtocolError::InvalidFrame);
         }
     }
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    prove_no_external_ip_connectivity()?;
     audit_probe_descriptors()?;
     let canary = std::path::Path::new("/workspace/.lterm-speculation-probe-v1");
     std::fs::write(canary, b"probe").map_err(|_| RunnerProtocolError::Io)?;
     std::fs::remove_file(canary).map_err(|_| RunnerProtocolError::Io)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prove_no_external_ip_connectivity() -> RunnerResult<()> {
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: u16::to_be(9),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes([198, 51, 100, 1]).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let connected = unsafe {
+        libc::connect(
+            socket,
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    } == 0;
+    unsafe { libc::close(socket) };
+    if connected {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
     Ok(())
 }
 
@@ -1044,8 +1137,11 @@ impl InternalPty {
             return Err(RunnerProtocolError::Io);
         }
         let master = unsafe { File::from_raw_fd(master_fd) };
-        let mut name = [0_i8; 256];
+        let mut name = [0 as libc::c_char; 256];
         if unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) } != 0 {
+            return Err(RunnerProtocolError::Io);
+        }
+        if !name.contains(&0) {
             return Err(RunnerProtocolError::Io);
         }
         let slave_fd = unsafe {
@@ -1205,33 +1301,56 @@ fn release_child(file: &File) -> RunnerResult<()> {
 struct LeaderCompletion {
     category: RunnerExitCategory,
     bytes: u64,
+    elapsed_ns: u64,
 }
 
 #[cfg(target_os = "linux")]
-fn drain_and_wait(
+enum ExecutionProgress {
+    OutputLimit {
+        total_bytes: u64,
+        reported_bytes: u64,
+    },
+    LeaderExited(LeaderCompletion),
+}
+
+#[cfg(target_os = "linux")]
+fn drain_until_execution_event(
     pid: libc::pid_t,
     master: &File,
-    _started: Instant,
-) -> RunnerResult<LeaderCompletion> {
+    started: Instant,
+    mut bytes: u64,
+    overflow_reported: bool,
+) -> RunnerResult<ExecutionProgress> {
     set_nonblocking(master)?;
-    let mut bytes = 0_u64;
     loop {
-        bytes = drain_available(master, bytes)?;
+        let (next, _, overflow) = drain_available_with_eof(master, bytes)?;
+        bytes = next;
+        if !overflow_reported && let Some(reported_bytes) = overflow {
+            return Ok(ExecutionProgress::OutputLimit {
+                total_bytes: bytes,
+                reported_bytes,
+            });
+        }
         let mut status = 0_i32;
         let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if waited == pid {
-            let category = if bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES {
-                RunnerExitCategory::OutputLimitExceeded
-            } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                RunnerExitCategory::ExitedZero
-            } else if libc::WIFEXITED(status) {
-                RunnerExitCategory::ExitedNonzero
-            } else if libc::WIFSIGNALED(status) {
-                RunnerExitCategory::Signaled
-            } else {
-                RunnerExitCategory::EvidenceIncomplete
-            };
-            return Ok(LeaderCompletion { category, bytes });
+            let category =
+                if overflow_reported || bytes > crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES {
+                    RunnerExitCategory::OutputLimitExceeded
+                } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    RunnerExitCategory::ExitedZero
+                } else if libc::WIFEXITED(status) {
+                    RunnerExitCategory::ExitedNonzero
+                } else if libc::WIFSIGNALED(status) {
+                    RunnerExitCategory::Signaled
+                } else {
+                    RunnerExitCategory::EvidenceIncomplete
+                };
+            return Ok(ExecutionProgress::LeaderExited(LeaderCompletion {
+                category,
+                bytes,
+                elapsed_ns: started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+            }));
         }
         if waited < 0 {
             return Err(RunnerProtocolError::Io);
@@ -1249,8 +1368,8 @@ fn drain_and_wait(
 fn drain_to_eof(master: &File, mut bytes: u64) -> RunnerResult<u64> {
     loop {
         match drain_available_with_eof(master, bytes)? {
-            (next, true) => return Ok(next),
-            (next, false) => bytes = next,
+            (next, true, _) => return Ok(next),
+            (next, false, _) => bytes = next,
         }
         let mut pollfd = libc::pollfd {
             fd: master.as_raw_fd(),
@@ -1264,32 +1383,58 @@ fn drain_to_eof(master: &File, mut bytes: u64) -> RunnerResult<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn drain_available(master: &File, bytes: u64) -> RunnerResult<u64> {
-    drain_available_with_eof(master, bytes).map(|(bytes, _)| bytes)
-}
-
-#[cfg(target_os = "linux")]
-fn drain_available_with_eof(master: &File, mut bytes: u64) -> RunnerResult<(u64, bool)> {
+fn drain_available_with_eof(
+    master: &File,
+    mut bytes: u64,
+) -> RunnerResult<(u64, bool, Option<u64>)> {
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let read =
             unsafe { libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
         if read > 0 {
-            bytes = bytes.saturating_add(read as u64);
+            let (next, overflow) = account_output_read(bytes, read as u64);
+            bytes = next;
+            if overflow.is_some() {
+                return Ok((bytes, false, overflow));
+            }
             continue;
         }
         if read == 0 {
-            return Ok((bytes, true));
+            return Ok((bytes, true, None));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok((bytes, false));
+            return Ok((bytes, false, None));
         }
         if error.raw_os_error() == Some(libc::EIO) {
-            return Ok((bytes, true));
+            return Ok((bytes, true, None));
         }
         return Err(RunnerProtocolError::Io);
     }
+}
+
+fn account_output_read(current: u64, read: u64) -> (u64, Option<u64>) {
+    let next = current.saturating_add(read);
+    let limit = crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES;
+    let first_excess = (current <= limit && next > limit).then_some(limit + 1);
+    (next, first_excess)
+}
+
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> RunnerResult<u64> {
+    let mut now = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    let now = unsafe { now.assume_init() };
+    if now.tv_sec < 0 || now.tv_nsec < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    u64::try_from(now.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|seconds| seconds.checked_add(now.tv_nsec as u64))
+        .ok_or(RunnerProtocolError::Io)
 }
 
 #[cfg(target_os = "linux")]
@@ -1320,8 +1465,8 @@ fn validate_placement_fd(
     let mut statfs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0
         || unsafe { statfs.assume_init() }.f_type as u64 != libc::CGROUP2_SUPER_MAGIC as u64
-        || metadata.dev() != expected.dev
-        || metadata.ino() != expected.ino
+        || metadata.dev() != expected.file_dev
+        || metadata.ino() != expected.file_ino
     {
         return Err(RunnerProtocolError::DescriptorViolation);
     }
@@ -1336,7 +1481,26 @@ fn validate_placement_fd(
             statx.as_mut_ptr(),
         )
     } != 0
-        || unsafe { statx.assume_init() }.stx_mnt_id != expected.statx_mnt_id_unique
+    {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    }
+    let statx = unsafe { statx.assume_init() };
+    if statx.stx_mask & STATX_MNT_ID_UNIQUE == 0
+        || statx.stx_mnt_id != expected.file_statx_mnt_id_unique
+    {
+        return Err(RunnerProtocolError::DescriptorViolation);
+    }
+    validate_placement_fd_name(file)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_placement_fd_name(file: &File) -> RunnerResult<()> {
+    let target = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| RunnerProtocolError::DescriptorViolation)?;
+    if target.file_name() != Some(std::ffi::OsStr::new("cgroup.procs"))
+        || target.parent().and_then(std::path::Path::file_name)
+            != Some(std::ffi::OsStr::new("payload"))
     {
         return Err(RunnerProtocolError::DescriptorViolation);
     }
@@ -1357,12 +1521,47 @@ mod tests {
 
     fn placement() -> PlacementDescriptorEvidence {
         PlacementDescriptorEvidence {
-            dev: 1,
-            ino: 2,
-            statx_mnt_id_unique: 3,
+            kind: PlacementDescriptorKind::PayloadCgroupProcs,
+            file_dev: 4,
+            file_ino: 2,
+            file_statx_mnt_id_unique: 6,
+            payload_dev: 4,
+            payload_ino: 5,
+            payload_statx_mnt_id_unique: 6,
             candidate_index: 1,
             generation: 9,
         }
+    }
+
+    #[test]
+    fn output_limit_boundary_reports_the_first_excess_byte_immediately() {
+        let limit = crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES;
+        assert_eq!(account_output_read(limit - 1, 1), (limit, None));
+        assert_eq!(account_output_read(limit, 1), (limit + 1, Some(limit + 1)));
+        assert_eq!(
+            account_output_read(limit - 4, 16),
+            (limit + 12, Some(limit + 1))
+        );
+        assert_eq!(account_output_read(limit + 1, 16), (limit + 17, None));
+    }
+
+    #[test]
+    fn placement_receipt_requires_exact_payload_and_cgroup_procs_binding() {
+        placement().validate(identity()).unwrap();
+
+        let mut missing_payload = placement();
+        missing_payload.payload_ino = 0;
+        assert_eq!(
+            missing_payload.validate(identity()),
+            Err(RunnerProtocolError::DescriptorViolation)
+        );
+
+        let mut wrong_kind = placement();
+        wrong_kind.kind = PlacementDescriptorKind::Other;
+        assert_eq!(
+            wrong_kind.validate(identity()),
+            Err(RunnerProtocolError::DescriptorViolation)
+        );
     }
 
     #[test]
@@ -1387,11 +1586,12 @@ mod tests {
             },
             ControlMessage::PayloadFdAck,
             ControlMessage::Go,
-            ControlMessage::GoReceived { elapsed_ns: 1 },
+            ControlMessage::GoReceived { monotonic_ns: 1 },
             ControlMessage::PayloadPlaced,
             ControlMessage::PayloadRelease,
             ControlMessage::LeaderExited {
                 category: RunnerExitCategory::ExitedZero,
+                elapsed_ns: 2,
             },
             ControlMessage::OutputDrained { bytes: 4 },
             ControlMessage::ResultAccepted,
@@ -1407,6 +1607,59 @@ mod tests {
             let frame = ControlFrame::new(identity(), sequence as u32, message);
             validator
                 .accept(&decode_frame(&encode_frame(&frame).unwrap()).unwrap())
+                .unwrap();
+        }
+        assert!(validator.is_complete());
+    }
+
+    #[test]
+    fn output_overflow_requires_cleanup_claim_before_leader_completion() {
+        let messages = vec![
+            ControlMessage::Hello,
+            ControlMessage::HelloAck,
+            ControlMessage::ArgvBegin {
+                argument_count: 1,
+                total_bytes: 3,
+            },
+            ControlMessage::ArgvChunk {
+                argument_index: 0,
+                offset: 0,
+                total: 3,
+                data: encode_base64(b"cmd"),
+            },
+            ControlMessage::ArgvEnd,
+            ControlMessage::Ready,
+            ControlMessage::ReadyAck {
+                placement: placement(),
+            },
+            ControlMessage::PayloadFdAck,
+            ControlMessage::Go,
+            ControlMessage::GoReceived { monotonic_ns: 1 },
+            ControlMessage::PayloadPlaced,
+            ControlMessage::PayloadRelease,
+            ControlMessage::OutputLimitExceeded {
+                bytes: crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1,
+            },
+            ControlMessage::OutputCleanupClaimed,
+            ControlMessage::LeaderExited {
+                category: RunnerExitCategory::OutputLimitExceeded,
+                elapsed_ns: 2,
+            },
+            ControlMessage::OutputDrained {
+                bytes: crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES + 1,
+            },
+            ControlMessage::ResultAccepted,
+            ControlMessage::Decision {
+                decision: DecisionKind::Abort,
+            },
+            ControlMessage::Ack {
+                decision: DecisionKind::Abort,
+            },
+        ];
+        let mut validator = SequenceValidator::new(identity()).unwrap();
+        for (sequence, message) in messages.into_iter().enumerate() {
+            validator
+                .accept(&ControlFrame::new(identity(), sequence as u32, message))
                 .unwrap();
         }
         assert!(validator.is_complete());
