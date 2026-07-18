@@ -141,6 +141,62 @@ pub enum SpeculationErrorCode {
     EvidenceUnavailable,
 }
 
+/// Error-code collection that cannot exceed the public status wire bound.
+///
+/// The inner vector is private so every value constructible outside this
+/// module is valid by construction and therefore serializes infallibly through
+/// [`Response::ok`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SpeculationErrorCodes(Vec<SpeculationErrorCode>);
+
+#[allow(dead_code)]
+impl SpeculationErrorCodes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_slice(&self) -> &[SpeculationErrorCode] {
+        &self.0
+    }
+
+    pub fn push(&mut self, code: SpeculationErrorCode) -> Result<(), SpeculationWireError> {
+        if self.0.len() >= MAX_SPECULATION_ERROR_CODES {
+            return Err(SpeculationWireError("too many speculation error codes"));
+        }
+        self.0.push(code);
+        Ok(())
+    }
+}
+
+impl From<SpeculationErrorCode> for SpeculationErrorCodes {
+    fn from(code: SpeculationErrorCode) -> Self {
+        Self(vec![code])
+    }
+}
+
+impl TryFrom<Vec<SpeculationErrorCode>> for SpeculationErrorCodes {
+    type Error = SpeculationWireError;
+
+    fn try_from(codes: Vec<SpeculationErrorCode>) -> Result<Self, Self::Error> {
+        if codes.len() > MAX_SPECULATION_ERROR_CODES {
+            return Err(SpeculationWireError("too many speculation error codes"));
+        }
+        Ok(Self(codes))
+    }
+}
+
+impl<'de> Deserialize<'de> for SpeculationErrorCodes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::try_from(Vec::<SpeculationErrorCode>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Raw-free validation failures for the private speculation wire DTOs.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,8 +674,7 @@ pub struct SpeculationStatus {
     pub fixed_score_order: [SpeculationScoreField; 5],
     pub selected_index: Option<u8>,
     pub rollback_required: bool,
-    #[serde(with = "speculation_error_codes_serde")]
-    pub error_codes: Vec<SpeculationErrorCode>,
+    pub error_codes: SpeculationErrorCodes,
 }
 
 #[allow(dead_code)]
@@ -649,33 +704,6 @@ speculation_status_response!(SpeculationArmResponse);
 speculation_status_response!(SpeculationStatusResponse);
 speculation_status_response!(SpeculationFinalizeResponse);
 speculation_status_response!(SpeculationRollbackResponse);
-
-mod speculation_error_codes_serde {
-    use super::{MAX_SPECULATION_ERROR_CODES, SpeculationErrorCode};
-    use serde::ser::Error as _;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(codes: &[SpeculationErrorCode], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if codes.len() > MAX_SPECULATION_ERROR_CODES {
-            return Err(S::Error::custom("too many speculation error codes"));
-        }
-        codes.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<SpeculationErrorCode>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let codes = Vec::<SpeculationErrorCode>::deserialize(deserializer)?;
-        if codes.len() > MAX_SPECULATION_ERROR_CODES {
-            return Err(serde::de::Error::custom("too many speculation error codes"));
-        }
-        Ok(codes)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1591,12 +1619,13 @@ mod tests {
         SPECULATION_PROTOCOL_VERSION, SPECULATION_SCORE_ORDER, SensitiveCapabilityRequest,
         SessionExitTrigger, SessionInfo, SessionLifecycleState, SpeculationArgv,
         SpeculationArmRequest, SpeculationArmResponse, SpeculationCandidateStatus,
-        SpeculationCleanupStatus, SpeculationErrorCode, SpeculationExitCategory,
-        SpeculationFinalizeRequest, SpeculationFinalizeResponse, SpeculationPhase,
-        SpeculationPrepareRequest, SpeculationPrepareResponse, SpeculationReasonCode,
-        SpeculationRequest, SpeculationRequestEnvelope, SpeculationRollbackRequest,
-        SpeculationRollbackResponse, SpeculationSchemaVersion, SpeculationStatus,
-        SpeculationStatusRequest, SpeculationStatusResponse, SpeculationUnixPath, StatusTheme,
+        SpeculationCleanupStatus, SpeculationErrorCode, SpeculationErrorCodes,
+        SpeculationExitCategory, SpeculationFinalizeRequest, SpeculationFinalizeResponse,
+        SpeculationPhase, SpeculationPrepareRequest, SpeculationPrepareResponse,
+        SpeculationReasonCode, SpeculationRequest, SpeculationRequestEnvelope,
+        SpeculationRollbackRequest, SpeculationRollbackResponse, SpeculationSchemaVersion,
+        SpeculationStatus, SpeculationStatusRequest, SpeculationStatusResponse,
+        SpeculationUnixPath, StatusTheme,
     };
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
@@ -1646,7 +1675,7 @@ mod tests {
             fixed_score_order: SPECULATION_SCORE_ORDER,
             selected_index: Some(0),
             rollback_required: false,
-            error_codes: vec![SpeculationErrorCode::Unsupported],
+            error_codes: SpeculationErrorCode::Unsupported.into(),
         }
     }
 
@@ -2008,7 +2037,44 @@ mod tests {
 
     #[test]
     fn speculation_wire_responses_are_strict_and_status_errors_are_bounded() {
-        let status = sample_speculation_status();
+        let mut status = sample_speculation_status();
+        status.error_codes = SpeculationErrorCodes::try_from(vec![
+            SpeculationErrorCode::Unsupported;
+            MAX_SPECULATION_ERROR_CODES
+        ])
+        .expect("the exact error-code cap is valid");
+        assert!(
+            status
+                .error_codes
+                .push(SpeculationErrorCode::InvalidRequest)
+                .is_err(),
+            "the public collection cannot be mutated past its wire cap"
+        );
+        assert_eq!(
+            status.error_codes.as_slice().len(),
+            MAX_SPECULATION_ERROR_CODES
+        );
+
+        let response_boundary = super::Response::ok(SpeculationStatusResponse {
+            status: status.clone(),
+        });
+        assert!(response_boundary.ok);
+        assert_eq!(
+            response_boundary.result.as_ref().expect("response result")["status"]["error_codes"]
+                .as_array()
+                .expect("error codes array")
+                .len(),
+            MAX_SPECULATION_ERROR_CODES
+        );
+        assert!(
+            SpeculationErrorCodes::try_from(vec![
+                SpeculationErrorCode::Unsupported;
+                MAX_SPECULATION_ERROR_CODES + 1
+            ])
+            .is_err(),
+            "an oversized in-memory collection must not be constructible"
+        );
+
         let responses = [
             serde_json::to_value(SpeculationPrepareResponse {
                 status: status.clone(),

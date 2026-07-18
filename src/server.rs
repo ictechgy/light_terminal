@@ -16,6 +16,7 @@ use crate::sanitize;
 use anyhow::{Context, Result, anyhow, bail};
 use libc::{c_int, mode_t};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -141,7 +142,7 @@ pub fn serve_forever() -> Result<()> {
                 thread::spawn(move || {
                     let _connection_guard = connection_guard;
                     if let Err(err) = handle_connection(state, stream) {
-                        eprintln!("connection error: {err:#}");
+                        eprintln!("{}", connection_error_message(&err));
                     }
                 });
             }
@@ -1533,10 +1534,74 @@ fn parse_request_line(line: &str) -> Result<Request> {
 }
 
 fn is_speculation_request_value(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| value.get("type")?.as_str().map(str::to_owned))
-        .is_some_and(|request_type| request_type == "speculation")
+    has_canonical_speculation_type_prefix(line)
+        || serde_json::from_str::<RequestTypeProbe<'_>>(line)
+            .ok()
+            .and_then(|probe| probe.request_type)
+            .is_some_and(|request_type| request_type == "speculation")
+}
+
+#[derive(Deserialize)]
+struct RequestTypeProbe<'a> {
+    #[serde(borrow, rename = "type")]
+    request_type: Option<&'a str>,
+}
+
+/// Recognizes the canonical internally-tagged speculation prefix without
+/// parsing or allocating from attacker-controlled request contents.
+///
+/// Serde emits `type` as the first member for `Request::Speculation`. Once that
+/// exact top-level tag has arrived, any later truncation or syntax error must
+/// use the raw-free speculation diagnostic rather than the legacy preview.
+fn has_canonical_speculation_type_prefix(line: &str) -> bool {
+    const CLASSIFIER_BYTES: usize = 64;
+    let bytes = &line.as_bytes()[..line.len().min(CLASSIFIER_BYTES)];
+    let mut cursor = 0;
+
+    skip_json_whitespace(bytes, &mut cursor);
+    if !consume_prefix(bytes, &mut cursor, b"{") {
+        return false;
+    }
+    skip_json_whitespace(bytes, &mut cursor);
+    if !consume_prefix(bytes, &mut cursor, br#""type""#) {
+        return false;
+    }
+    skip_json_whitespace(bytes, &mut cursor);
+    if !consume_prefix(bytes, &mut cursor, b":") {
+        return false;
+    }
+    skip_json_whitespace(bytes, &mut cursor);
+    if !consume_prefix(bytes, &mut cursor, br#""speculation""#) {
+        return false;
+    }
+
+    bytes
+        .get(cursor)
+        .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}'))
+}
+
+fn skip_json_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        *cursor += 1;
+    }
+}
+
+fn consume_prefix(bytes: &[u8], cursor: &mut usize, expected: &[u8]) -> bool {
+    let Some(end) = cursor.checked_add(expected.len()) else {
+        return false;
+    };
+    if bytes.get(*cursor..end) != Some(expected) {
+        return false;
+    }
+    *cursor = end;
+    true
+}
+
+fn connection_error_message(error: &anyhow::Error) -> String {
+    format!("connection error: {error:#}")
 }
 
 fn handle_capability_channel(
@@ -6748,11 +6813,44 @@ mod tests {
         assert_eq!(error.to_string(), "speculation_invalid_request");
         assert!(!error.to_string().contains(marker));
 
+        let raw_marker = "G007_TRUNCATED_RAW_MARKER";
+        let base64_marker = "RzAwN19UUlVOQ0FURURfUkFXX01BUktFUg==";
+        let truncated = format!(
+            concat!(
+                r#"{{"type":"speculation","protocol_version":9,"request":{{"action":"prepare","body":{{"source":"{}","argv":["{}""#
+            ),
+            base64_marker, raw_marker
+        );
+        let (server_stream, mut client_stream) =
+            UnixStream::pair().expect("speculation request stream pair");
+        client_stream
+            .write_all(format!("{truncated}\n").as_bytes())
+            .expect("write truncated speculation request");
+        let truncated_error =
+            super::handle_connection(Arc::new(super::State::default()), server_stream)
+                .expect_err("truncated speculation request should fail closed");
+        assert_eq!(truncated_error.to_string(), "speculation_invalid_request");
+        assert!(!truncated_error.to_string().contains(raw_marker));
+        assert!(!truncated_error.to_string().contains(base64_marker));
+
+        let logged = super::connection_error_message(&truncated_error);
+        assert_eq!(logged, "connection error: speculation_invalid_request");
+        assert!(!logged.contains(raw_marker));
+        assert!(!logged.contains(base64_marker));
+
         let legacy_marker = "legacy-preview-marker";
         let legacy = format!(r#"{{"type":"send","target":"{legacy_marker}"}}"#);
         let legacy_error = super::parse_request_line(&legacy)
             .expect_err("legacy malformed request should retain the v8 diagnostic path");
         assert!(legacy_error.to_string().contains(legacy_marker));
+
+        let nested_marker = "ordinary-nested-speculation-marker";
+        let nested = format!(
+            r#"{{"type":"send","target":{{"type":"speculation","marker":"{nested_marker}"}}}}"#
+        );
+        let nested_error = super::parse_request_line(&nested)
+            .expect_err("a nested speculation string is still an ordinary malformed request");
+        assert!(nested_error.to_string().contains(nested_marker));
     }
 
     #[test]
