@@ -151,6 +151,26 @@ pub fn ensure_server() -> Result<()> {
         return Ok(());
     }
 
+    spawn_server_daemon()?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match rpc::<serde_json::Value>(&Request::Ping) {
+            Ok(_) => {
+                warn_daemon_version_mismatch();
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready. Run `lterm doctor` to inspect daemon state or `lterm shutdown && lterm list` to retry a clean start.")))
+}
+
+fn spawn_server_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let log = paths::log_path()?;
     rotate_log_if_large(&log)?;
@@ -176,22 +196,7 @@ pub fn ensure_server() -> Result<()> {
         });
     }
     daemon.spawn().context("spawn lterm daemon")?;
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        match rpc::<serde_json::Value>(&Request::Ping) {
-            Ok(_) => {
-                warn_daemon_version_mismatch();
-                return Ok(());
-            }
-            Err(err) => {
-                last_err = Some(err);
-                thread::sleep(Duration::from_millis(80));
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready. Run `lterm doctor` to inspect daemon state or `lterm shutdown && lterm list` to retry a clean start.")))
+    Ok(())
 }
 
 pub fn daemon_status() -> Result<DaemonStatus> {
@@ -436,7 +441,15 @@ fn strict_rpc_at<T: DeserializeOwned>(
     socket: &Path,
     request: &Request,
 ) -> SpeculationClientResult<T> {
-    let mut stream = UnixStream::connect(socket).map_err(|_| SpeculationClientError::Transport)?;
+    let stream = UnixStream::connect(socket).map_err(|_| SpeculationClientError::Transport)?;
+    strict_rpc_on_stream(stream, request)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn strict_rpc_on_stream<T: DeserializeOwned>(
+    mut stream: UnixStream,
+    request: &Request,
+) -> SpeculationClientResult<T> {
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|_| SpeculationClientError::Transport)?;
@@ -596,10 +609,40 @@ fn validate_prepare_status(status: &SpeculationStatus) -> SpeculationClientResul
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn ensure_speculation_server_at(
+    socket: &Path,
+    start: impl FnOnce() -> SpeculationClientResult<()>,
+) -> SpeculationClientResult<()> {
+    match UnixStream::connect(socket) {
+        Ok(stream) => {
+            return strict_rpc_on_stream::<serde_json::Value>(stream, &Request::Ping).map(|_| ());
+        }
+        Err(_) => start()?,
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(stream) => match strict_rpc_on_stream::<serde_json::Value>(stream, &Request::Ping) {
+                Ok(_) => return Ok(()),
+                Err(SpeculationClientError::Transport) if Instant::now() < deadline => {}
+                Err(error) => return Err(error),
+            },
+            Err(_) if Instant::now() < deadline => {}
+            Err(_) => return Err(SpeculationClientError::Transport),
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn production_speculation_socket() -> SpeculationClientResult<PathBuf> {
-    ensure_server().map_err(|_| SpeculationClientError::Transport)?;
-    paths::socket_path().map_err(|_| SpeculationClientError::Transport)
+    let socket = paths::socket_path().map_err(|_| SpeculationClientError::Transport)?;
+    ensure_speculation_server_at(&socket, || {
+        spawn_server_daemon().map_err(|_| SpeculationClientError::Transport)
+    })?;
+    Ok(socket)
 }
 
 #[cfg(target_os = "linux")]
@@ -8489,6 +8532,15 @@ mod tests {
         (directory, socket, server)
     }
 
+    fn daemon_ping_response() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "error": null,
+            "result": "pong"
+        }))
+        .unwrap()
+    }
+
     fn daemon_status_response(protocol_version: u32) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "ok": true,
@@ -8511,6 +8563,109 @@ mod tests {
             "result": {"status": status}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn speculation_startup_reuses_ready_daemon_without_warning_or_start() {
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_ping_response()]);
+        let starts = std::cell::Cell::new(0_u8);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || {
+                starts.set(starts.get() + 1);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(starts.get(), 0);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+    }
+
+    #[test]
+    fn speculation_startup_starts_once_and_uses_strict_ping_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("startup.sock");
+        let server = std::sync::Mutex::new(None);
+        let starts = std::cell::Cell::new(0_u8);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || {
+                starts.set(starts.get() + 1);
+                let listener = UnixListener::bind(&socket).unwrap();
+                let response = daemon_ping_response();
+                let handle = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    stream.read_to_end(&mut request).unwrap();
+                    stream.write_all(&response).unwrap();
+                    request
+                });
+                *server.lock().unwrap() = Some(handle);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(starts.get(), 1);
+        let request = server.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&request),
+            Ok(Request::Ping)
+        ));
+    }
+
+    #[test]
+    fn speculation_startup_rejects_connected_malformed_response_without_start_or_preview() {
+        let marker = "daemon-controlled-startup-preview-marker";
+        let (_directory, socket, server) =
+            fake_speculation_socket(vec![format!("not-json-{marker}").into_bytes()]);
+        let starts = std::cell::Cell::new(0_u8);
+
+        let error = super::ensure_speculation_server_at(&socket, || {
+            starts.set(starts.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, SpeculationClientError::ResponseInvalid);
+        assert_eq!(starts.get(), 0);
+        assert!(!error.to_string().contains(marker));
+        assert!(!format!("{error:?}").contains(marker));
+        assert!(!serde_json::to_string(&error).unwrap().contains(marker));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+    }
+
+    #[test]
+    fn speculation_startup_and_protocol_guard_emit_exact_ping_status_frames() {
+        let (_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_ping_response(),
+            daemon_status_response(crate::protocol::SPECULATION_PROTOCOL_VERSION),
+        ]);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || panic!("ready daemon was restarted")),
+            Ok(())
+        );
+        assert_eq!(require_speculation_protocol_at(&socket), Ok(()));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[1]),
+            Ok(Request::Status)
+        ));
     }
 
     #[test]
