@@ -20,10 +20,12 @@ use crate::protocol::{
     SpeculationStatusRequest, SpeculationStatusResponse, SpeculationUnixPath,
 };
 use crate::sanitize;
+#[cfg(any(target_os = "linux", test))]
+use crate::speculation_ledger::LedgerAction;
 #[cfg(target_os = "linux")]
 use crate::speculation_ledger::{
     ClientLedger, ClientLedgerAuthority, ClientLedgerEntry, ClientLedgerRecord, ClientLedgerSchema,
-    ClientRootIdentities, LedgerAction,
+    ClientRootIdentities,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{
@@ -676,14 +678,23 @@ fn write_requested_action(
     readback_ledger(ledger, stored)
 }
 
-#[cfg(target_os = "linux")]
-fn action_is_pending(action: LedgerAction) -> bool {
-    matches!(
-        action,
-        LedgerAction::ArmRequested
-            | LedgerAction::FinalizeRequested
-            | LedgerAction::RollbackRequested
-    )
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedActionPlan {
+    Start,
+    RecoverStatusOnly,
+    Reject,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn requested_action_plan(current: LedgerAction, desired: LedgerAction) -> RequestedActionPlan {
+    if !current.is_requested() {
+        RequestedActionPlan::Start
+    } else if current == desired {
+        RequestedActionPlan::RecoverStatusOnly
+    } else {
+        RequestedActionPlan::Reject
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -699,7 +710,6 @@ fn observe_and_mirror_newer_status(
         current.value.generation,
     )?;
     if status.generation == current.value.generation {
-        let _retains_pending_intent = action_is_pending(current.value.action);
         return Ok(current);
     }
     let stored = ledger
@@ -1144,16 +1154,17 @@ fn speculate_finalize_at(
         }
         FinalizePhaseAction::Start => {}
     }
-    if current.value.action == LedgerAction::FinalizeRequested
-        && current.value.generation == observed.generation
-    {
-        let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
-            status.is_terminal() || status.phase.is_rollback_only()
-        })?;
-        return Ok(status);
-    }
-    if action_is_pending(current.value.action) && current.value.generation == observed.generation {
-        return Err(SpeculationClientError::EvidenceUnavailable);
+    match requested_action_plan(current.value.action, LedgerAction::FinalizeRequested) {
+        RequestedActionPlan::RecoverStatusOnly => {
+            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
+                status.is_terminal() || status.phase.is_rollback_only()
+            })?;
+            return Ok(status);
+        }
+        RequestedActionPlan::Reject => {
+            return Err(SpeculationClientError::EvidenceUnavailable);
+        }
+        RequestedActionPlan::Start => {}
     }
     current = write_requested_action(&ledger, &current, LedgerAction::FinalizeRequested)?;
     let request = SpeculationFinalizeRequest {
@@ -1234,24 +1245,28 @@ fn speculate_rollback_at(
         }
         RollbackPhaseAction::Start => {}
     }
-    if current.value.action == LedgerAction::RollbackRequested
-        && current.value.generation == observed.generation
-    {
-        let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
-            status.is_terminal() || status.phase == SpeculationPhase::RollbackPending
-        })?;
-        if status.phase == SpeculationPhase::RollbackPending {
-            let (terminal, _) = poll_journaled_status_until(
-                socket,
-                &ledger,
-                ledger
-                    .read_verified(status.tournament_uuid, status.daemon_instance_uuid)
-                    .map_err(map_speculation_evidence)?,
-                SpeculationStatus::is_terminal,
-            )?;
-            return Ok(terminal);
+    match requested_action_plan(current.value.action, LedgerAction::RollbackRequested) {
+        RequestedActionPlan::RecoverStatusOnly => {
+            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
+                status.is_terminal() || status.phase == SpeculationPhase::RollbackPending
+            })?;
+            if status.phase == SpeculationPhase::RollbackPending {
+                let (terminal, _) = poll_journaled_status_until(
+                    socket,
+                    &ledger,
+                    ledger
+                        .read_verified(status.tournament_uuid, status.daemon_instance_uuid)
+                        .map_err(map_speculation_evidence)?,
+                    SpeculationStatus::is_terminal,
+                )?;
+                return Ok(terminal);
+            }
+            return Ok(status);
         }
-        return Ok(status);
+        RequestedActionPlan::Reject => {
+            return Err(SpeculationClientError::EvidenceUnavailable);
+        }
+        RequestedActionPlan::Start => {}
     }
     current = write_requested_action(&ledger, &current, LedgerAction::RollbackRequested)?;
     let request = SpeculationRollbackRequest {
@@ -8867,6 +8882,29 @@ mod tests {
         assert_eq!(rollback, [10, 4, 2]);
     }
 
+    #[test]
+    fn requested_action_plan_is_start_recover_or_reject() {
+        use crate::speculation_ledger::LedgerAction;
+
+        assert_eq!(
+            super::requested_action_plan(LedgerAction::Prepared, LedgerAction::RollbackRequested),
+            super::RequestedActionPlan::Start
+        );
+        assert_eq!(
+            super::requested_action_plan(
+                LedgerAction::RollbackRequested,
+                LedgerAction::RollbackRequested,
+            ),
+            super::RequestedActionPlan::RecoverStatusOnly
+        );
+        for current in [LedgerAction::ArmRequested, LedgerAction::FinalizeRequested] {
+            assert_eq!(
+                super::requested_action_plan(current, LedgerAction::RollbackRequested),
+                super::RequestedActionPlan::Reject
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn linux_client_ledger() -> (
         tempfile::TempDir,
@@ -8899,6 +8937,65 @@ mod tests {
             })
             .unwrap();
         (directory, ledger_path, ledger, created)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rollback_never_overwrites_or_sends_after_different_same_generation_request() {
+        use crate::speculation_ledger::LedgerAction;
+
+        for (phase, action) in [
+            (SpeculationPhase::Prepared, LedgerAction::ArmRequested),
+            (
+                SpeculationPhase::PendingFinalize,
+                LedgerAction::FinalizeRequested,
+            ),
+        ] {
+            let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+            let current = if phase == SpeculationPhase::Prepared {
+                prepared
+            } else {
+                let pending = speculation_status(phase, 2);
+                super::observe_and_mirror_newer_status(&ledger, prepared, &pending).unwrap()
+            };
+            let requested = super::write_requested_action(&ledger, &current, action).unwrap();
+            let observed = requested.value.status.clone();
+            let tournament = ledger
+                .read_tournament(requested.value.tournament_uuid)
+                .unwrap();
+            let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+                daemon_status_response(9),
+                speculation_response(&observed),
+            ]);
+
+            assert_eq!(
+                super::speculate_rollback_at(&socket, ledger, tournament),
+                Err(SpeculationClientError::EvidenceUnavailable)
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[0]),
+                Ok(Request::Status)
+            ));
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[1]),
+                Ok(Request::Speculation(envelope))
+                    if matches!(envelope.request(), SpeculationRequest::Status(_))
+            ));
+
+            let reopened = crate::speculation_ledger::ClientLedger::new(
+                crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+            );
+            let exact = reopened
+                .read_verified(
+                    requested.value.tournament_uuid,
+                    requested.value.daemon_instance_uuid,
+                )
+                .unwrap();
+            assert_eq!(exact.identity, requested.identity);
+            assert_eq!(exact.value, requested.value);
+        }
     }
 
     #[test]

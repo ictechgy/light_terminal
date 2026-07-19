@@ -23,6 +23,15 @@ pub enum LedgerAction {
     RollbackRequested,
 }
 
+impl LedgerAction {
+    pub(crate) const fn is_requested(self) -> bool {
+        matches!(
+            self,
+            Self::ArmRequested | Self::FinalizeRequested | Self::RollbackRequested
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientRootIdentities {
@@ -137,6 +146,7 @@ impl ClientLedger {
             || next.action != action
             || next.generation != generation
             || current.value.generation != generation
+            || current.value.action.is_requested()
             || action == LedgerAction::Prepared
             || action == LedgerAction::StatusMirrored
         {
@@ -161,6 +171,8 @@ impl ClientLedger {
         if status.tournament_uuid != current.value.tournament_uuid
             || status.daemon_instance_uuid != current.value.daemon_instance_uuid
             || status.generation < current.value.generation
+            || (current.value.action.is_requested()
+                && status.generation == current.value.generation)
         {
             return Err(EvidenceError::GenerationMismatch);
         }
@@ -478,6 +490,69 @@ mod tests {
             ledger.read_tournament(wrong_leaf),
             Err(EvidenceError::Stale)
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn requested_action_is_immutable_until_new_generation_is_mirrored() {
+        let (_directory, ledger) = private_ledger();
+        let tournament = Uuid::from_u128(15);
+        let identity = ledger.root.identity();
+        let current_roots = ClientRootIdentities {
+            source: identity,
+            candidates: [identity, identity],
+            ledger_root: identity,
+            cgroup_root: identity,
+        };
+        let prepared = ledger
+            .create_prepared(&test_record(tournament, current_roots))
+            .unwrap();
+        let mut arm_record = prepared.value.clone();
+        arm_record.action = LedgerAction::ArmRequested;
+        let arm = ledger
+            .write_before_action(
+                &prepared,
+                &arm_record,
+                LedgerAction::ArmRequested,
+                prepared.value.generation,
+            )
+            .unwrap();
+
+        for next_action in [
+            LedgerAction::ArmRequested,
+            LedgerAction::FinalizeRequested,
+            LedgerAction::RollbackRequested,
+        ] {
+            let mut next = arm.value.clone();
+            next.action = next_action;
+            assert!(matches!(
+                ledger.write_before_action(&arm, &next, next_action, arm.value.generation),
+                Err(EvidenceError::GenerationMismatch)
+            ));
+        }
+        assert!(matches!(
+            ledger.mirror_status(&arm, &arm.value.status),
+            Err(EvidenceError::GenerationMismatch)
+        ));
+
+        let mut newer_status = arm.value.status.clone();
+        newer_status.generation += 1;
+        newer_status.phase = SpeculationPhase::Armed;
+        let mirrored = ledger.mirror_status(&arm, &newer_status).unwrap();
+        assert_eq!(mirrored.value.action, LedgerAction::StatusMirrored);
+        assert_eq!(mirrored.value.generation, 2);
+
+        let mut rollback_record = mirrored.value.clone();
+        rollback_record.action = LedgerAction::RollbackRequested;
+        let rollback = ledger
+            .write_before_action(
+                &mirrored,
+                &rollback_record,
+                LedgerAction::RollbackRequested,
+                mirrored.value.generation,
+            )
+            .unwrap();
+        assert_eq!(rollback.value.action, LedgerAction::RollbackRequested);
     }
 
     #[test]
