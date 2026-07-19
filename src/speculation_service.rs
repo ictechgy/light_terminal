@@ -542,7 +542,6 @@ impl SpeculationService {
             .ok_or(ServiceError::Unavailable)?;
         let tournament_uuid = Uuid::new_v4();
         let generation = 1;
-        let run_timeout = prepare_run_timeout(&request);
         let context = validate_prepare(
             PrepareInputs {
                 tournament_uuid,
@@ -636,21 +635,24 @@ impl SpeculationService {
         prepare_failpoint("after_prepared_index_insert")?;
         let core = Arc::clone(&self.core);
         let actor_store = Arc::clone(&store);
+        let transition = ActorTransitionState::from_prepare(
+            Arc::clone(&core),
+            actor_store,
+            key,
+            exact,
+            Arc::clone(&snapshot),
+            &request,
+        );
         thread::Builder::new()
             .name("lterm-speculation-actor".into())
             .spawn(move || {
                 actor_loop(ActorState {
-                    core,
-                    store: actor_store,
-                    key,
-                    record: exact,
+                    transition,
                     context,
-                    snapshot,
                     sender: sender.clone(),
                     receiver,
                     #[cfg(target_os = "linux")]
                     pipeline: None,
-                    run_timeout,
                     interrupt_requested: false,
                 });
             })
@@ -1484,10 +1486,6 @@ fn increment(generation: u64) -> Result<u64, ServiceError> {
         .ok_or(ServiceError::GenerationExhausted)
 }
 
-fn prepare_run_timeout(request: &SpeculationPrepareRequest) -> Duration {
-    Duration::from_millis(request.timeout_ms())
-}
-
 fn checked_lease_deadline_unix_ms(now_unix_ms: u64, lease: Duration) -> Result<u64, ServiceError> {
     let lease_ms =
         u64::try_from(lease.as_millis()).map_err(|_| ServiceError::GenerationExhausted)?;
@@ -1508,19 +1506,143 @@ fn lease_duration_for_phase(phase: SpeculationPhase, run_timeout: Duration) -> O
     }
 }
 
-struct ActorState {
+struct ActorTransitionState {
     core: Arc<ServiceCore>,
     store: Arc<TournamentStore>,
     key: TournamentKey,
     record: TournamentRecord,
-    context: LiveTournamentContext,
     snapshot: Arc<Mutex<SpeculationStatus>>,
+    run_timeout: Duration,
+}
+
+impl ActorTransitionState {
+    fn from_prepare(
+        core: Arc<ServiceCore>,
+        store: Arc<TournamentStore>,
+        key: TournamentKey,
+        record: TournamentRecord,
+        snapshot: Arc<Mutex<SpeculationStatus>>,
+        request: &SpeculationPrepareRequest,
+    ) -> Self {
+        Self {
+            core,
+            store,
+            key,
+            record,
+            snapshot,
+            run_timeout: Duration::from_millis(request.timeout_ms()),
+        }
+    }
+
+    fn map_store_error(&self, error: crate::speculation_fs::EvidenceError) -> ServiceError {
+        map_store_error_for_core(&self.core, error)
+    }
+
+    fn claim(
+        &mut self,
+        tournament_uuid: Uuid,
+        daemon_instance_uuid: Uuid,
+        generation: u64,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.claim_at(
+            tournament_uuid,
+            daemon_instance_uuid,
+            generation,
+            phase,
+            reason,
+            unix_time_ms()?,
+        )
+    }
+
+    fn claim_at(
+        &mut self,
+        tournament_uuid: Uuid,
+        daemon_instance_uuid: Uuid,
+        generation: u64,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+        now_unix_ms: u64,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        validate_status_identity(
+            &self.record.status,
+            tournament_uuid,
+            daemon_instance_uuid,
+            generation,
+            true,
+        )?;
+        if self.record.status.phase == phase && phase.is_terminal() {
+            return Ok(self.record.status.clone());
+        }
+        if !crate::speculation::is_legal_transition(self.record.status.phase, phase) {
+            return Err(ServiceError::InvalidTransition);
+        }
+        let mut next = self.record.clone();
+        next.status.generation = generation
+            .checked_add(1)
+            .ok_or(ServiceError::GenerationExhausted)?;
+        next.status.phase = phase;
+        if let Some(reason) = reason {
+            next.status.reason_code = Some(reason);
+        }
+        let lease = lease_duration_for_phase(phase, self.run_timeout);
+        if let Some(lease) = lease {
+            next.status.lease_deadline_unix_ms =
+                checked_lease_deadline_unix_ms(now_unix_ms, lease)?;
+        }
+        next.status.rollback_required = phase.is_rollback_only();
+        if phase.is_rollback_only() {
+            next.status.selected_index = None;
+            let _ = next.status.error_codes.push(match phase {
+                SpeculationPhase::DecisionUncertain => SpeculationErrorCode::DecisionUncertain,
+                _ => SpeculationErrorCode::RollbackRequired,
+            });
+        }
+        let stored = self
+            .store
+            .write(
+                &self.key,
+                generation,
+                next,
+                TournamentWriteKind::LivePhaseTransition,
+            )
+            .map_err(|error| self.map_store_error(error))?;
+        self.key = stored.key;
+        self.record = stored.record;
+        let status = self.record.status.clone();
+        *self.snapshot.lock().map_err(|_| {
+            self.core
+                .availability
+                .store(Availability::Unresolved as u8, Ordering::Release);
+            ServiceError::EvidenceUnavailable
+        })? = status.clone();
+        Ok(status)
+    }
+}
+
+struct ActorState {
+    transition: ActorTransitionState,
+    context: LiveTournamentContext,
     sender: SyncSender<ActorEvent>,
     receiver: Receiver<ActorEvent>,
     #[cfg(target_os = "linux")]
     pipeline: Option<LivePipeline>,
-    run_timeout: Duration,
     interrupt_requested: bool,
+}
+
+impl std::ops::Deref for ActorState {
+    type Target = ActorTransitionState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transition
+    }
+}
+
+impl std::ops::DerefMut for ActorState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transition
+    }
 }
 
 fn actor_loop(mut actor: ActorState) {
@@ -1619,8 +1741,21 @@ fn actor_loop(mut actor: ActorState) {
 }
 
 impl ActorState {
-    fn map_store_error(&self, error: crate::speculation_fs::EvidenceError) -> ServiceError {
-        map_store_error_for_core(&self.core, error)
+    fn claim(
+        &mut self,
+        tournament_uuid: Uuid,
+        daemon_instance_uuid: Uuid,
+        generation: u64,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.transition.claim(
+            tournament_uuid,
+            daemon_instance_uuid,
+            generation,
+            phase,
+            reason,
+        )
     }
 
     fn arm(&mut self, request: SpeculationArmRequest) -> Result<SpeculationStatus, ServiceError> {
@@ -1663,69 +1798,6 @@ impl ActorState {
                     .store(Availability::Unresolved as u8, Ordering::Release);
                 ServiceError::EvidenceUnavailable
             })?;
-        Ok(status)
-    }
-
-    fn claim(
-        &mut self,
-        tournament_uuid: Uuid,
-        daemon_instance_uuid: Uuid,
-        generation: u64,
-        phase: SpeculationPhase,
-        reason: Option<SpeculationReasonCode>,
-    ) -> Result<SpeculationStatus, ServiceError> {
-        validate_status_identity(
-            &self.record.status,
-            tournament_uuid,
-            daemon_instance_uuid,
-            generation,
-            true,
-        )?;
-        if self.record.status.phase == phase && phase.is_terminal() {
-            return Ok(self.record.status.clone());
-        }
-        if !crate::speculation::is_legal_transition(self.record.status.phase, phase) {
-            return Err(ServiceError::InvalidTransition);
-        }
-        let mut next = self.record.clone();
-        next.status.generation = generation
-            .checked_add(1)
-            .ok_or(ServiceError::GenerationExhausted)?;
-        next.status.phase = phase;
-        if let Some(reason) = reason {
-            next.status.reason_code = Some(reason);
-        }
-        let lease = lease_duration_for_phase(phase, self.run_timeout);
-        if let Some(lease) = lease {
-            next.status.lease_deadline_unix_ms =
-                checked_lease_deadline_unix_ms(unix_time_ms()?, lease)?;
-        }
-        next.status.rollback_required = phase.is_rollback_only();
-        if phase.is_rollback_only() {
-            next.status.selected_index = None;
-            let _ = next.status.error_codes.push(match phase {
-                SpeculationPhase::DecisionUncertain => SpeculationErrorCode::DecisionUncertain,
-                _ => SpeculationErrorCode::RollbackRequired,
-            });
-        }
-        let stored = self
-            .store
-            .write(
-                &self.key,
-                generation,
-                next,
-                TournamentWriteKind::LivePhaseTransition,
-            )
-            .map_err(|error| self.map_store_error(error))?;
-        self.key = stored.key;
-        self.record = stored.record;
-        let status = self.record.status.clone();
-        *self.snapshot.lock().map_err(|_| {
-            self.core
-                .availability
-                .store(Availability::Unresolved as u8, Ordering::Release);
-            ServiceError::EvidenceUnavailable
-        })? = status.clone();
         Ok(status)
     }
 }
@@ -3544,6 +3616,7 @@ mod tests {
         service
     }
 
+    #[cfg(target_os = "linux")]
     fn prepare_request_with_timeout(timeout_ms: u64) -> SpeculationPrepareRequest {
         use crate::protocol::{SpeculationArgv, SpeculationUnixPath};
 
@@ -3561,33 +3634,104 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    fn transition_state_for_prepare(
+        request: &SpeculationPrepareRequest,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TournamentStore>,
+        ActorTransitionState,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(TournamentStore::open_or_create(&root.path().join("store")).unwrap());
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        service
+            .install_ready(Arc::clone(&store), root.path().join("control"))
+            .unwrap();
+        let tournament_uuid = Uuid::new_v4();
+        let record = test_prepared_record(tournament_uuid, service.core.daemon_instance_uuid);
+        let key = store.allocate_prepared(record, 1).unwrap();
+        let record = store.load_by_uuid(tournament_uuid).unwrap().unwrap();
+        let snapshot = Arc::new(Mutex::new(record.status.clone()));
+        let state = ActorTransitionState::from_prepare(
+            Arc::clone(&service.core),
+            Arc::clone(&store),
+            key,
+            record,
+            snapshot,
+            request,
+        );
+        (root, store, state)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn claim_test_phase(
+        state: &mut ActorTransitionState,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+        now_unix_ms: u64,
+    ) -> SpeculationStatus {
+        let current = state.record.status.clone();
+        state
+            .claim_at(
+                current.tournament_uuid,
+                current.daemon_instance_uuid,
+                current.generation,
+                phase,
+                reason,
+                now_unix_ms,
+            )
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn validated_prepare_timeouts_drive_running_and_result_pending_leases() {
-        let now_unix_ms = 42_000;
-        let shorter = prepare_run_timeout(&prepare_request_with_timeout(1_250));
-        let longer = prepare_run_timeout(&prepare_request_with_timeout(17_500));
+    fn public_prepare_timeouts_flow_through_actor_claims_and_persisted_leases() {
+        for timeout_ms in [45_000, 75_000] {
+            let request = prepare_request_with_timeout(timeout_ms);
+            assert_eq!(request.timeout_ms(), timeout_ms);
+            let (_root, store, mut state) = transition_state_for_prepare(&request);
 
-        for phase in [SpeculationPhase::Running, SpeculationPhase::ResultPending] {
-            let shorter_lease = lease_duration_for_phase(phase, shorter).unwrap();
-            let longer_lease = lease_duration_for_phase(phase, longer).unwrap();
-            let shorter_deadline =
-                checked_lease_deadline_unix_ms(now_unix_ms, shorter_lease).unwrap();
-            let longer_deadline =
-                checked_lease_deadline_unix_ms(now_unix_ms, longer_lease).unwrap();
+            claim_test_phase(&mut state, SpeculationPhase::Armed, None, 1_000);
+            claim_test_phase(&mut state, SpeculationPhase::Starting, None, 2_000);
+            claim_test_phase(
+                &mut state,
+                SpeculationPhase::Ready,
+                Some(SpeculationReasonCode::ReadyLease),
+                3_000,
+            );
+            claim_test_phase(&mut state, SpeculationPhase::GoPending, None, 4_000);
 
-            assert_eq!(shorter_deadline, 43_250);
-            assert_eq!(longer_deadline, 59_500);
-            assert_eq!(longer_deadline - shorter_deadline, 16_250);
+            let running = claim_test_phase(
+                &mut state,
+                SpeculationPhase::Running,
+                Some(SpeculationReasonCode::RunningLease),
+                5_000,
+            );
+            assert_eq!(running.lease_deadline_unix_ms, 5_000 + timeout_ms);
+            assert_eq!(
+                store
+                    .load_by_uuid(running.tournament_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                running
+            );
+            assert_eq!(*state.snapshot.lock().unwrap(), running);
+
+            let result_pending =
+                claim_test_phase(&mut state, SpeculationPhase::ResultPending, None, 6_000);
+            assert_eq!(result_pending.lease_deadline_unix_ms, 6_000 + timeout_ms);
+            assert_eq!(
+                store
+                    .load_by_uuid(result_pending.tournament_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                result_pending
+            );
+            assert_eq!(*state.snapshot.lock().unwrap(), result_pending);
         }
-
-        assert_eq!(
-            lease_duration_for_phase(SpeculationPhase::Ready, shorter),
-            Some(READY_LEASE)
-        );
-        assert_eq!(
-            lease_duration_for_phase(SpeculationPhase::PendingFinalize, longer),
-            Some(PENDING_FINALIZE_LEASE)
-        );
     }
 
     #[cfg(target_os = "linux")]
