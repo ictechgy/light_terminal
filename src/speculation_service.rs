@@ -10,9 +10,7 @@ use crate::protocol::{
 };
 #[cfg(target_os = "linux")]
 use crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES;
-use crate::speculation::{
-    DEFAULT_RUN_TIMEOUT, PENDING_FINALIZE_LEASE, PREPARED_LEASE, READY_LEASE,
-};
+use crate::speculation::{PENDING_FINALIZE_LEASE, PREPARED_LEASE, READY_LEASE};
 #[cfg(all(debug_assertions, target_os = "linux"))]
 use crate::speculation_ledger::{ClientLedgerRecord, ClientLedgerSchema};
 use crate::speculation_ledger::{ClientRootIdentities, LedgerAction};
@@ -544,6 +542,7 @@ impl SpeculationService {
             .ok_or(ServiceError::Unavailable)?;
         let tournament_uuid = Uuid::new_v4();
         let generation = 1;
+        let run_timeout = prepare_run_timeout(&request);
         let context = validate_prepare(
             PrepareInputs {
                 tournament_uuid,
@@ -651,6 +650,7 @@ impl SpeculationService {
                     receiver,
                     #[cfg(target_os = "linux")]
                     pipeline: None,
+                    run_timeout,
                     interrupt_requested: false,
                 });
             })
@@ -1484,6 +1484,30 @@ fn increment(generation: u64) -> Result<u64, ServiceError> {
         .ok_or(ServiceError::GenerationExhausted)
 }
 
+fn prepare_run_timeout(request: &SpeculationPrepareRequest) -> Duration {
+    Duration::from_millis(request.timeout_ms())
+}
+
+fn checked_lease_deadline_unix_ms(now_unix_ms: u64, lease: Duration) -> Result<u64, ServiceError> {
+    let lease_ms =
+        u64::try_from(lease.as_millis()).map_err(|_| ServiceError::GenerationExhausted)?;
+    now_unix_ms
+        .checked_add(lease_ms)
+        .ok_or(ServiceError::GenerationExhausted)
+}
+
+fn lease_duration_for_phase(phase: SpeculationPhase, run_timeout: Duration) -> Option<Duration> {
+    match phase {
+        SpeculationPhase::Ready | SpeculationPhase::GoPending => Some(READY_LEASE),
+        SpeculationPhase::Running | SpeculationPhase::ResultPending => Some(run_timeout),
+        SpeculationPhase::PendingFinalize
+        | SpeculationPhase::FinalizingLoser
+        | SpeculationPhase::WinnerSelectionPending
+        | SpeculationPhase::FinalizingWinner => Some(PENDING_FINALIZE_LEASE),
+        _ => None,
+    }
+}
+
 struct ActorState {
     core: Arc<ServiceCore>,
     store: Arc<TournamentStore>,
@@ -1495,6 +1519,7 @@ struct ActorState {
     receiver: Receiver<ActorEvent>,
     #[cfg(target_os = "linux")]
     pipeline: Option<LivePipeline>,
+    run_timeout: Duration,
     interrupt_requested: bool,
 }
 
@@ -1670,21 +1695,10 @@ impl ActorState {
         if let Some(reason) = reason {
             next.status.reason_code = Some(reason);
         }
-        let lease = match phase {
-            SpeculationPhase::Ready | SpeculationPhase::GoPending => Some(READY_LEASE),
-            SpeculationPhase::Running | SpeculationPhase::ResultPending => {
-                Some(DEFAULT_RUN_TIMEOUT)
-            }
-            SpeculationPhase::PendingFinalize
-            | SpeculationPhase::FinalizingLoser
-            | SpeculationPhase::WinnerSelectionPending
-            | SpeculationPhase::FinalizingWinner => Some(PENDING_FINALIZE_LEASE),
-            _ => None,
-        };
+        let lease = lease_duration_for_phase(phase, self.run_timeout);
         if let Some(lease) = lease {
-            next.status.lease_deadline_unix_ms = unix_time_ms()?
-                .checked_add(lease.as_millis() as u64)
-                .ok_or(ServiceError::GenerationExhausted)?;
+            next.status.lease_deadline_unix_ms =
+                checked_lease_deadline_unix_ms(unix_time_ms()?, lease)?;
         }
         next.status.rollback_required = phase.is_rollback_only();
         if phase.is_rollback_only() {
@@ -3528,6 +3542,52 @@ mod tests {
             .availability
             .store(Availability::Ready as u8, Ordering::Release);
         service
+    }
+
+    fn prepare_request_with_timeout(timeout_ms: u64) -> SpeculationPrepareRequest {
+        use crate::protocol::{SpeculationArgv, SpeculationUnixPath};
+
+        SpeculationPrepareRequest::new(
+            SpeculationUnixPath::from_path(std::path::Path::new("/source")).unwrap(),
+            [
+                SpeculationUnixPath::from_path(std::path::Path::new("/candidate-0")).unwrap(),
+                SpeculationUnixPath::from_path(std::path::Path::new("/candidate-1")).unwrap(),
+            ],
+            SpeculationUnixPath::from_path(std::path::Path::new("/ledger")).unwrap(),
+            SpeculationUnixPath::from_path(std::path::Path::new("/cgroup")).unwrap(),
+            timeout_ms,
+            SpeculationArgv::from_os_strings(vec![std::ffi::OsString::from("/bin/true")]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validated_prepare_timeouts_drive_running_and_result_pending_leases() {
+        let now_unix_ms = 42_000;
+        let shorter = prepare_run_timeout(&prepare_request_with_timeout(1_250));
+        let longer = prepare_run_timeout(&prepare_request_with_timeout(17_500));
+
+        for phase in [SpeculationPhase::Running, SpeculationPhase::ResultPending] {
+            let shorter_lease = lease_duration_for_phase(phase, shorter).unwrap();
+            let longer_lease = lease_duration_for_phase(phase, longer).unwrap();
+            let shorter_deadline =
+                checked_lease_deadline_unix_ms(now_unix_ms, shorter_lease).unwrap();
+            let longer_deadline =
+                checked_lease_deadline_unix_ms(now_unix_ms, longer_lease).unwrap();
+
+            assert_eq!(shorter_deadline, 43_250);
+            assert_eq!(longer_deadline, 59_500);
+            assert_eq!(longer_deadline - shorter_deadline, 16_250);
+        }
+
+        assert_eq!(
+            lease_duration_for_phase(SpeculationPhase::Ready, shorter),
+            Some(READY_LEASE)
+        );
+        assert_eq!(
+            lease_duration_for_phase(SpeculationPhase::PendingFinalize, longer),
+            Some(PENDING_FINALIZE_LEASE)
+        );
     }
 
     #[cfg(target_os = "linux")]
