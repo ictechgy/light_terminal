@@ -304,6 +304,14 @@ impl ServiceIndex {
     }
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct ActorLeaseObservation {
+    phase: SpeculationPhase,
+    now_unix_ms: u64,
+    lease_deadline_unix_ms: u64,
+}
+
 struct ServiceCore {
     availability: AtomicU8,
     admission: Mutex<()>,
@@ -312,6 +320,8 @@ struct ServiceCore {
     control_root: OnceLock<PathBuf>,
     daemon_instance_uuid: Uuid,
     watchdog_stop: AtomicBool,
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    lease_observer: Mutex<Option<SyncSender<ActorLeaseObservation>>>,
 }
 
 #[derive(Clone)]
@@ -364,6 +374,8 @@ impl Default for SpeculationService {
                 control_root: OnceLock::new(),
                 daemon_instance_uuid: Uuid::nil(),
                 watchdog_stop: AtomicBool::new(true),
+                #[cfg(all(debug_assertions, target_os = "linux"))]
+                lease_observer: Mutex::new(None),
             }),
         }
     }
@@ -399,6 +411,8 @@ impl SpeculationService {
                 control_root: OnceLock::new(),
                 daemon_instance_uuid,
                 watchdog_stop: AtomicBool::new(false),
+                #[cfg(all(debug_assertions, target_os = "linux"))]
+                lease_observer: Mutex::new(None),
             }),
         })
     }
@@ -1513,6 +1527,8 @@ struct ActorTransitionState {
     record: TournamentRecord,
     snapshot: Arc<Mutex<SpeculationStatus>>,
     run_timeout: Duration,
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    lease_observer: Option<SyncSender<ActorLeaseObservation>>,
 }
 
 impl ActorTransitionState {
@@ -1524,6 +1540,12 @@ impl ActorTransitionState {
         snapshot: Arc<Mutex<SpeculationStatus>>,
         request: &SpeculationPrepareRequest,
     ) -> Self {
+        #[cfg(all(debug_assertions, target_os = "linux"))]
+        let lease_observer = core
+            .lease_observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone());
         Self {
             core,
             store,
@@ -1531,6 +1553,8 @@ impl ActorTransitionState {
             record,
             snapshot,
             run_timeout: Duration::from_millis(request.timeout_ms()),
+            #[cfg(all(debug_assertions, target_os = "linux"))]
+            lease_observer,
         }
     }
 
@@ -1546,13 +1570,13 @@ impl ActorTransitionState {
         phase: SpeculationPhase,
         reason: Option<SpeculationReasonCode>,
     ) -> Result<SpeculationStatus, ServiceError> {
-        self.claim_at(
+        self.claim_with_clock(
             tournament_uuid,
             daemon_instance_uuid,
             generation,
             phase,
             reason,
-            unix_time_ms()?,
+            unix_time_ms,
         )
     }
 
@@ -1564,6 +1588,25 @@ impl ActorTransitionState {
         phase: SpeculationPhase,
         reason: Option<SpeculationReasonCode>,
         now_unix_ms: u64,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.claim_with_clock(
+            tournament_uuid,
+            daemon_instance_uuid,
+            generation,
+            phase,
+            reason,
+            || Ok(now_unix_ms),
+        )
+    }
+
+    fn claim_with_clock(
+        &mut self,
+        tournament_uuid: Uuid,
+        daemon_instance_uuid: Uuid,
+        generation: u64,
+        phase: SpeculationPhase,
+        reason: Option<SpeculationReasonCode>,
+        now: impl FnOnce() -> Result<u64, ServiceError>,
     ) -> Result<SpeculationStatus, ServiceError> {
         validate_status_identity(
             &self.record.status,
@@ -1586,10 +1629,24 @@ impl ActorTransitionState {
         if let Some(reason) = reason {
             next.status.reason_code = Some(reason);
         }
+        #[cfg(all(debug_assertions, target_os = "linux"))]
+        let mut lease_observation = None;
         let lease = lease_duration_for_phase(phase, self.run_timeout);
         if let Some(lease) = lease {
-            next.status.lease_deadline_unix_ms =
-                checked_lease_deadline_unix_ms(now_unix_ms, lease)?;
+            let now_unix_ms = now()?;
+            let lease_deadline_unix_ms = checked_lease_deadline_unix_ms(now_unix_ms, lease)?;
+            next.status.lease_deadline_unix_ms = lease_deadline_unix_ms;
+            #[cfg(all(debug_assertions, target_os = "linux"))]
+            if matches!(
+                phase,
+                SpeculationPhase::Running | SpeculationPhase::ResultPending
+            ) {
+                lease_observation = Some(ActorLeaseObservation {
+                    phase,
+                    now_unix_ms,
+                    lease_deadline_unix_ms,
+                });
+            }
         }
         next.status.rollback_required = phase.is_rollback_only();
         if phase.is_rollback_only() {
@@ -1617,6 +1674,10 @@ impl ActorTransitionState {
                 .store(Availability::Unresolved as u8, Ordering::Release);
             ServiceError::EvidenceUnavailable
         })? = status.clone();
+        #[cfg(all(debug_assertions, target_os = "linux"))]
+        if let (Some(observer), Some(observation)) = (&self.lease_observer, lease_observation) {
+            let _ = observer.try_send(observation);
+        }
         Ok(status)
     }
 }
@@ -3249,6 +3310,26 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     service
         .install_ready(Arc::clone(&store), control)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let observed_run_timeout_ms = std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_LEASE_MS")
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ContainmentErrorCode::InvalidIdentity)
+        })
+        .transpose()?;
+    let lease_receiver = if observed_run_timeout_ms.is_some() {
+        let (observer, receiver) = sync_channel(2);
+        *service
+            .core
+            .lease_observer
+            .lock()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)? = Some(observer);
+        Some(receiver)
+    } else {
+        None
+    };
+    let run_timeout_ms = observed_run_timeout_ms.unwrap_or(60_000);
     let request = SpeculationPrepareRequest::new(
         SpeculationUnixPath::from_path(&source)
             .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
@@ -3262,7 +3343,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
             .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
         SpeculationUnixPath::from_path(&cgroup_root)
             .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
-        60_000,
+        run_timeout_ms,
         SpeculationArgv::from_os_strings(vec![
             OsString::from("/bin/sh"),
             OsString::from("/workspace/run.sh"),
@@ -3475,6 +3556,21 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
         })
     {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    if let Some(receiver) = lease_receiver {
+        for expected_phase in [SpeculationPhase::Running, SpeculationPhase::ResultPending] {
+            let observation = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| ContainmentErrorCode::Timeout)?;
+            if observation.phase != expected_phase
+                || observation
+                    .lease_deadline_unix_ms
+                    .checked_sub(observation.now_unix_ms)
+                    != Some(run_timeout_ms)
+            {
+                return Err(ContainmentErrorCode::EvidenceUnavailable);
+            }
+        }
     }
     let terminal_phase = match std::env::var_os("LTERM_INTERNAL_SPECULATION_ACTOR_TERMINAL")
         .as_deref()
@@ -3732,6 +3828,54 @@ mod tests {
             );
             assert_eq!(*state.snapshot.lock().unwrap(), result_pending);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actor_claim_reads_clock_only_after_validation_and_for_lease_phases() {
+        let request = prepare_request_with_timeout(45_000);
+        let (_root, _store, mut state) = transition_state_for_prepare(&request);
+        let current = state.record.status.clone();
+
+        assert_eq!(
+            state.claim_with_clock(
+                Uuid::nil(),
+                current.daemon_instance_uuid,
+                current.generation,
+                SpeculationPhase::Armed,
+                None,
+                || panic!("invalid identity read the clock"),
+            ),
+            Err(ServiceError::InvalidRequest)
+        );
+
+        let armed = state
+            .claim_with_clock(
+                current.tournament_uuid,
+                current.daemon_instance_uuid,
+                current.generation,
+                SpeculationPhase::Armed,
+                None,
+                || panic!("no-lease transition read the clock"),
+            )
+            .unwrap();
+        assert_eq!(armed.phase, SpeculationPhase::Armed);
+
+        state.record.status.phase = SpeculationPhase::RolledBack;
+        let terminal = state.record.status.clone();
+        assert_eq!(
+            state
+                .claim_with_clock(
+                    terminal.tournament_uuid,
+                    terminal.daemon_instance_uuid,
+                    terminal.generation,
+                    SpeculationPhase::RolledBack,
+                    None,
+                    || panic!("idempotent terminal claim read the clock"),
+                )
+                .unwrap(),
+            terminal
+        );
     }
 
     #[cfg(target_os = "linux")]

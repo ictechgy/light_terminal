@@ -48,12 +48,20 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
 }
 
 fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Output)> {
-    run_required_actor_service_case(terminal, None)
+    run_required_actor_service_case_with_lease(terminal, None, None)
 }
 
 fn run_required_actor_service_case(
     terminal: &str,
     prepare_failpoint: Option<&str>,
+) -> Option<(tempfile::TempDir, Output)> {
+    run_required_actor_service_case_with_lease(terminal, prepare_failpoint, None)
+}
+
+fn run_required_actor_service_case_with_lease(
+    terminal: &str,
+    prepare_failpoint: Option<&str>,
+    observed_run_timeout_ms: Option<u64>,
 ) -> Option<(tempfile::TempDir, Output)> {
     if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
@@ -85,6 +93,12 @@ fn run_required_actor_service_case(
         .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", fixture.path());
     if let Some(failpoint) = prepare_failpoint {
         command.env("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT", failpoint);
+    }
+    if let Some(timeout_ms) = observed_run_timeout_ms {
+        command.env(
+            "LTERM_INTERNAL_SPECULATION_OBSERVE_LEASE_MS",
+            timeout_ms.to_string(),
+        );
     }
     let output = command.output().expect("run real actor service driver");
     Some((fixture, output))
@@ -300,6 +314,29 @@ fn required_real_actor_service_progresses_and_finalizes_loser_first() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_actor_service_observes_requested_running_and_result_pending_leases() {
+    for timeout_ms in [45_000, 75_000] {
+        let Some((_fixture, output)) =
+            run_required_actor_service_case_with_lease("finalize", None, Some(timeout_ms))
+        else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "actor service timeout {timeout_ms} failed with bounded stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"speculation-actor-service=1\n");
+        assert!(
+            output.stderr.is_empty(),
+            "actor service timeout {timeout_ms} emitted stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_no_tournament_domains();
+    }
 }
 
 #[test]
