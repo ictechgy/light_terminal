@@ -13,9 +13,9 @@ use crate::speculation::MAX_CANDIDATE_OUTPUT_BYTES;
 use crate::speculation::{
     DEFAULT_RUN_TIMEOUT, PENDING_FINALIZE_LEASE, PREPARED_LEASE, READY_LEASE,
 };
-use crate::speculation_ledger::{
-    ClientLedgerEntry, ClientLedgerRecord, ClientRootIdentities, LedgerAction,
-};
+#[cfg(all(debug_assertions, target_os = "linux"))]
+use crate::speculation_ledger::{ClientLedgerRecord, ClientLedgerSchema};
+use crate::speculation_ledger::{ClientRootIdentities, LedgerAction};
 #[cfg(target_os = "linux")]
 use crate::speculation_linux::{
     CandidateCleanupAction, CandidateControl, CandidateEmptyProof, CandidateObserver,
@@ -573,23 +573,6 @@ impl SpeculationService {
             generation,
             lease_deadline_unix_ms,
         );
-        let ledger = context.verified_ledger()?;
-        let ledger_entry = ledger
-            .create_prepared(&ClientLedgerRecord {
-                schema_version: crate::speculation_ledger::ClientLedgerSchema::V1,
-                tournament_uuid,
-                daemon_instance_uuid: self.core.daemon_instance_uuid,
-                generation,
-                action: LedgerAction::Prepared,
-                roots: ClientRootIdentities {
-                    source: roots.source,
-                    candidates: roots.candidates,
-                    ledger_root: roots.ledger_root,
-                    cgroup_root: roots.cgroup_root,
-                },
-                status: status.clone(),
-            })
-            .map_err(|_| ServiceError::EvidenceUnavailable)?;
         let record = TournamentRecord {
             schema_version: TournamentRecordSchema::V1,
             boot_uuid: roots.source.boot_uuid,
@@ -663,7 +646,6 @@ impl SpeculationService {
                     key,
                     record: exact,
                     context,
-                    ledger_entry,
                     snapshot,
                     sender: sender.clone(),
                     receiver,
@@ -1508,7 +1490,6 @@ struct ActorState {
     key: TournamentKey,
     record: TournamentRecord,
     context: LiveTournamentContext,
-    ledger_entry: ClientLedgerEntry,
     snapshot: Arc<Mutex<SpeculationStatus>>,
     sender: SyncSender<ActorEvent>,
     receiver: Receiver<ActorEvent>,
@@ -1629,12 +1610,19 @@ impl ActorState {
         let exact = ledger
             .read_verified(request.tournament_uuid, request.daemon_instance_uuid)
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let (roots, _) = self.context.durable_record_evidence()?;
+        let expected_roots = ClientRootIdentities {
+            source: roots.source,
+            candidates: roots.candidates,
+            ledger_root: roots.ledger_root,
+            cgroup_root: roots.cgroup_root,
+        };
         if exact.value.action != LedgerAction::ArmRequested
             || exact.value.generation != request.generation
+            || exact.value.roots != expected_roots
         {
             return Err(ServiceError::EvidenceUnavailable);
         }
-        self.ledger_entry = exact;
         let status = self.claim(
             request.tournament_uuid,
             request.daemon_instance_uuid,
@@ -3222,16 +3210,104 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     let prepared = service
         .prepare(request)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if std::fs::read_dir(&ledger_path)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        .next()
+        .is_some()
+    {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_CLIENT_DIES_BEFORE_LEDGER").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        let prepared_record = service
+            .load_store_record(&store, prepared.status.tournament_uuid)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
+        if prepared_record.status.phase != SpeculationPhase::Prepared
+            || prepared_record.tournament_cgroup.lifecycle
+                != TournamentCgroupLifecycleState::Planned
+            || prepared_record.managed_owners.iter().any(Option::is_some)
+            || prepared_record.cgroups.iter().any(|candidate| {
+                candidate.lifecycle != CgroupLifecycleState::Forward(CgroupForwardState::Planned)
+                    || candidate.parent.is_some()
+                    || candidate.control.is_some()
+                    || candidate.payload.is_some()
+            })
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        service
+            .enqueue_watchdog_tick(prepared.status.lease_deadline_unix_ms.saturating_add(1))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let closed = service
+                .cached_status(prepared.status.tournament_uuid)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if closed.phase == SpeculationPhase::RolledBack {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ContainmentErrorCode::Timeout);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if std::fs::read_dir(&ledger_path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .next()
+            .is_some()
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        service
+            .claim_shutdown(Duration::from_millis(250))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        return Ok(());
+    }
     let ledger = crate::speculation_ledger::ClientLedger::new(
         crate::speculation_fs::open_existing_private_dir(&ledger_path)
             .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
     );
+    let prepared_record = service
+        .load_store_record(&store, prepared.status.tournament_uuid)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
+    let roots = ClientRootIdentities {
+        source: prepared_record.roots.source,
+        candidates: prepared_record.roots.candidates,
+        ledger_root: prepared_record.roots.ledger_root,
+        cgroup_root: prepared_record.roots.cgroup_root,
+    };
+    let mut roots = roots;
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_ARM_ROOT_MISMATCH").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        roots.source.dev = roots.source.dev.saturating_add(1);
+    }
+    let created = ledger
+        .create_prepared(&ClientLedgerRecord {
+            schema_version: ClientLedgerSchema::V1,
+            tournament_uuid: prepared.status.tournament_uuid,
+            daemon_instance_uuid: prepared.status.daemon_instance_uuid,
+            generation: prepared.status.generation,
+            action: LedgerAction::Prepared,
+            roots,
+            status: prepared.status.clone(),
+        })
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let current = ledger
         .read_verified(
             prepared.status.tournament_uuid,
             prepared.status.daemon_instance_uuid,
         )
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if current.identity != created.identity
+        || current.value != created.value
+        || current.value.action != LedgerAction::Prepared
+    {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
     let mut arm_record = current.value.clone();
     arm_record.action = LedgerAction::ArmRequested;
     ledger
@@ -3242,6 +3318,40 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
             prepared.status.generation,
         )
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_ARM_ROOT_MISMATCH").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        if service
+            .arm(SpeculationArmRequest {
+                tournament_uuid: prepared.status.tournament_uuid,
+                daemon_instance_uuid: prepared.status.daemon_instance_uuid,
+                generation: prepared.status.generation,
+            })
+            .is_ok()
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        service
+            .enqueue_watchdog_tick(prepared.status.lease_deadline_unix_ms.saturating_add(1))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let closed = service
+                .cached_status(prepared.status.tournament_uuid)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if closed.phase == SpeculationPhase::RolledBack {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ContainmentErrorCode::Timeout);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        service
+            .claim_shutdown(Duration::from_millis(250))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        return Ok(());
+    }
     let armed = service
         .arm(SpeculationArmRequest {
             tournament_uuid: prepared.status.tournament_uuid,
