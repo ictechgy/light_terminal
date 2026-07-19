@@ -4,9 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir, Output)> {
+fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir, Output, bool)> {
     if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
     }
@@ -44,17 +45,18 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
     let output = command
         .output()
         .expect("run real speculation component driver");
-    Some((fixture, output))
+    let leaked_before_cleanup = cleanup_tournament_domains_before_assertions();
+    Some((fixture, output, leaked_before_cleanup))
 }
 
-fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Output)> {
+fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Output, bool)> {
     run_required_actor_service_case_with_lease(terminal, None, None)
 }
 
 fn run_required_actor_service_case(
     terminal: &str,
     prepare_failpoint: Option<&str>,
-) -> Option<(tempfile::TempDir, Output)> {
+) -> Option<(tempfile::TempDir, Output, bool)> {
     run_required_actor_service_case_with_lease(terminal, prepare_failpoint, None)
 }
 
@@ -62,7 +64,7 @@ fn run_required_actor_service_case_with_lease(
     terminal: &str,
     prepare_failpoint: Option<&str>,
     observed_run_timeout_ms: Option<u64>,
-) -> Option<(tempfile::TempDir, Output)> {
+) -> Option<(tempfile::TempDir, Output, bool)> {
     if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
     }
@@ -101,7 +103,8 @@ fn run_required_actor_service_case_with_lease(
         );
     }
     let output = command.output().expect("run real actor service driver");
-    Some((fixture, output))
+    let leaked_before_cleanup = cleanup_tournament_domains_before_assertions();
+    Some((fixture, output, leaked_before_cleanup))
 }
 
 fn assert_no_tournament_domains() {
@@ -118,6 +121,55 @@ fn assert_no_tournament_domains() {
                 .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
         });
     assert!(!leaked, "speculation component leaked a tournament domain");
+}
+
+fn cleanup_tournament_domains_before_assertions() -> bool {
+    let Some(cgroup_root) = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT") else {
+        return false;
+    };
+    let root = std::path::PathBuf::from(cgroup_root);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return false;
+    };
+    let domains = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let suffix = name.to_str()?.strip_prefix("lterm-g003-")?;
+            Uuid::parse_str(suffix).ok()?;
+            Some(entry.path())
+        })
+        .collect::<Vec<_>>();
+    for domain in &domains {
+        let _ = fs::write(domain.join("cgroup.kill"), b"1\n");
+        for _ in 0..500 {
+            let populated = fs::read_to_string(domain.join("cgroup.events"))
+                .ok()
+                .and_then(|events| {
+                    events.lines().find_map(|line| {
+                        line.strip_prefix("populated ")
+                            .and_then(|value| value.parse::<u8>().ok())
+                    })
+                })
+                .unwrap_or(0);
+            if populated == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for relative in [
+            "candidate-0/control",
+            "candidate-0/payload",
+            "candidate-1/control",
+            "candidate-1/payload",
+            "candidate-0",
+            "candidate-1",
+        ] {
+            let _ = fs::remove_dir(domain.join(relative));
+        }
+        let _ = fs::remove_dir(domain);
+    }
+    !domains.is_empty()
 }
 
 fn assert_bounded_raw_free_failure(output: &Output, fixture: &tempfile::TempDir, seam: &str) {
@@ -225,6 +277,18 @@ fn run_restart_component(
     failpoint: Option<&str>,
     candidate: u8,
 ) -> Output {
+    restart_component_command(fixture, mode, tournament_uuid, failpoint, candidate)
+        .output()
+        .expect("run restart component driver")
+}
+
+fn restart_component_command(
+    fixture: &tempfile::TempDir,
+    mode: &str,
+    tournament_uuid: Uuid,
+    failpoint: Option<&str>,
+    candidate: u8,
+) -> Command {
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .expect("required restart run needs LTERM_SPECULATION_CGROUP_ROOT");
     let mut command = Command::new(env!("CARGO_BIN_EXE_lterm"));
@@ -255,7 +319,65 @@ fn run_restart_component(
             .env("LTERM_INTERNAL_SPECULATION_FAILPOINT", failpoint)
             .env("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION", "exit");
     }
-    command.output().expect("run restart component driver")
+    command
+}
+
+fn run_delayed_runner_deadline_case(
+    fixture: &tempfile::TempDir,
+    tournament_uuid: Uuid,
+    force_pending_reap: bool,
+    force_reaper_spawn_failure: bool,
+) -> Output {
+    let mut command = restart_component_command(
+        fixture,
+        "crash-runtime",
+        tournament_uuid,
+        Some("before_control_unlink"),
+        0,
+    );
+    command
+        .env_remove("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION")
+        .env("LTERM_INTERNAL_SPECULATION_DELAY_RUNNER_EXEC_SECONDS", "6")
+        .env(
+            "LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME",
+            "1",
+        )
+        .env("LTERM_INTERNAL_MANAGED_FIRST_CLEANUP_UNKNOWN", "1");
+    if force_pending_reap {
+        command.env("LTERM_INTERNAL_MANAGED_FORCE_PENDING_REAP", "1");
+    }
+    if force_reaper_spawn_failure {
+        assert!(
+            force_pending_reap,
+            "reaper spawn-failure seam requires forced Pending"
+        );
+        command.env("LTERM_INTERNAL_SPECULATION_FORCE_REAPER_SPAWN_FAILURE", "1");
+    }
+    command
+        .output()
+        .expect("run delayed runner deadline component driver")
+}
+
+fn assert_delayed_runner_output_is_closed(failed: &Output, failed_elapsed: Duration) {
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(
+        failed_elapsed < Duration::from_secs(15),
+        "failed runner cleanup exceeded its bound: {failed_elapsed:?}"
+    );
+    assert!(failed.stdout.is_empty());
+    assert_eq!(failed.stderr, b"error: speculation_containment_timeout\n");
+    assert!(
+        !failed
+            .stdout
+            .windows(b"lterm-managed-stdout-marker".len())
+            .any(|window| window == b"lterm-managed-stdout-marker")
+    );
+    assert!(
+        !failed
+            .stderr
+            .windows(b"lterm-managed-stderr-marker".len())
+            .any(|window| window == b"lterm-managed-stderr-marker")
+    );
 }
 
 fn required_component_stage(fixture: &tempfile::TempDir) -> &'static str {
@@ -279,7 +401,7 @@ fn required_component_stage(fixture: &tempfile::TempDir) -> &'static str {
 
 #[test]
 fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
-    let Some((fixture, output)) = run_required_component(None) else {
+    let Some((fixture, output, leaked_before_cleanup)) = run_required_component(None) else {
         return;
     };
     assert!(
@@ -294,12 +416,151 @@ fn required_real_bwrap_cgroup_component_path_executes_positive_case() {
         "positive component emitted stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        !leaked_before_cleanup,
+        "positive component leaked a tournament domain before test cleanup"
+    );
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_delayed_runner_deadline_reaps_synchronously_before_private_control_unlink() {
+    let Some(fixture) = required_restart_fixture() else {
+        return;
+    };
+    let tournament_uuid = Uuid::new_v4();
+    let started = Instant::now();
+    let failed = run_delayed_runner_deadline_case(&fixture, tournament_uuid, false, false);
+    let failed_elapsed = started.elapsed();
+    let lifetime_marker = fs::read(
+        fixture
+            .path()
+            .join("control/failed-runner-reaped-before-private-control-drop"),
+    );
+    let first_cleanup_unknown = fs::read(
+        fixture
+            .path()
+            .join("control/managed-first-cleanup-unknown-orphan-risk"),
+    );
+    let recovered = run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+
+    assert_delayed_runner_output_is_closed(&failed, failed_elapsed);
+    assert_eq!(
+        lifetime_marker.expect("synchronous failed-runner lifetime evidence"),
+        b"1\n"
+    );
+    assert_eq!(
+        first_cleanup_unknown.expect("first cleanup UnknownOrphanRisk evidence"),
+        b"1\n"
+    );
+    assert!(
+        recovered.status.success(),
+        "delayed runner recovery failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(recovered.stdout, b"speculation-runtime-recovered=1\n");
+    assert!(recovered.stderr.is_empty());
+    assert_candidate_workspaces_empty(&fixture, "delayed-runner-deadline");
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_forced_pending_runner_handoff_reaps_before_private_control_unlink() {
+    let Some(fixture) = required_restart_fixture() else {
+        return;
+    };
+    let tournament_uuid = Uuid::new_v4();
+    let started = Instant::now();
+    let failed = run_delayed_runner_deadline_case(&fixture, tournament_uuid, true, false);
+    let failed_elapsed = started.elapsed();
+    let lifetime_marker = fs::read(
+        fixture
+            .path()
+            .join("control/failed-runner-reaped-before-private-control-drop"),
+    );
+    let first_cleanup_unknown = fs::read(
+        fixture
+            .path()
+            .join("control/managed-first-cleanup-unknown-orphan-risk"),
+    );
+    let pending_handoff = fs::read(
+        fixture
+            .path()
+            .join("control/failed-runner-pending-reaper-retained-private-control"),
+    );
+    let recovered = run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+
+    assert_delayed_runner_output_is_closed(&failed, failed_elapsed);
+    assert_eq!(
+        lifetime_marker.expect("synchronous failed-runner lifetime evidence"),
+        b"1\n"
+    );
+    assert_eq!(
+        first_cleanup_unknown.expect("first cleanup UnknownOrphanRisk evidence"),
+        b"1\n"
+    );
+    assert_eq!(
+        pending_handoff.expect("forced-Pending reaper handoff evidence"),
+        b"1\n"
+    );
+    assert!(
+        recovered.status.success(),
+        "delayed runner recovery failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(recovered.stdout, b"speculation-runtime-recovered=1\n");
+    assert!(recovered.stderr.is_empty());
+    assert_candidate_workspaces_empty(&fixture, "forced-pending-runner-deadline");
+    assert_no_tournament_domains();
+}
+
+#[test]
+fn required_real_forced_pending_spawn_failure_retains_control_until_recovery() {
+    let Some(fixture) = required_restart_fixture() else {
+        return;
+    };
+    let tournament_uuid = Uuid::new_v4();
+    let started = Instant::now();
+    let failed = run_delayed_runner_deadline_case(&fixture, tournament_uuid, true, true);
+    let failed_elapsed = started.elapsed();
+    let pending_handoff = fs::read(
+        fixture
+            .path()
+            .join("control/failed-runner-pending-reaper-retained-private-control"),
+    );
+    let retained_control = fixture
+        .path()
+        .join("control")
+        .join(format!("lterm-g003-{tournament_uuid}-candidate-0"));
+    let retained_executable = retained_control.join("lterm").is_file();
+    let retained_socket = retained_control.join("control.sock").exists();
+    let recovered = run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+
+    assert_delayed_runner_output_is_closed(&failed, failed_elapsed);
+    assert_eq!(
+        pending_handoff.expect("spawn-failure handoff retained-control evidence"),
+        b"1\n"
+    );
+    assert!(
+        retained_executable,
+        "spawn failure unlinked the runner early"
+    );
+    assert!(retained_socket, "spawn failure unlinked the socket early");
+    assert!(
+        recovered.status.success(),
+        "spawn-failure recovery failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(recovered.stdout, b"speculation-runtime-recovered=1\n");
+    assert!(recovered.stderr.is_empty());
+    assert_candidate_workspaces_empty(&fixture, "forced-reaper-spawn-failure");
     assert_no_tournament_domains();
 }
 
 #[test]
 fn required_real_actor_service_progresses_and_finalizes_loser_first() {
-    let Some((_fixture, output)) = run_required_actor_service("finalize") else {
+    let Some((_fixture, output, leaked_before_cleanup)) = run_required_actor_service("finalize")
+    else {
         return;
     };
     assert!(
@@ -313,13 +574,17 @@ fn required_real_actor_service_progresses_and_finalizes_loser_first() {
         "actor service emitted stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        !leaked_before_cleanup,
+        "actor service leaked a tournament domain before test cleanup"
+    );
     assert_no_tournament_domains();
 }
 
 #[test]
 fn required_real_actor_service_observes_requested_running_and_result_pending_leases() {
     for timeout_ms in [45_000, 75_000] {
-        let Some((_fixture, output)) =
+        let Some((_fixture, output, leaked_before_cleanup)) =
             run_required_actor_service_case_with_lease("finalize", None, Some(timeout_ms))
         else {
             return;
@@ -335,6 +600,10 @@ fn required_real_actor_service_observes_requested_running_and_result_pending_lea
             "actor service timeout {timeout_ms} emitted stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            !leaked_before_cleanup,
+            "actor service timeout {timeout_ms} leaked a tournament domain before test cleanup"
+        );
         assert_no_tournament_domains();
     }
 }
@@ -342,7 +611,8 @@ fn required_real_actor_service_observes_requested_running_and_result_pending_lea
 #[test]
 fn required_real_actor_service_rollback_expiry_and_shutdown_converge() {
     for terminal in ["rollback", "expiry", "shutdown"] {
-        let Some((_fixture, output)) = run_required_actor_service(terminal) else {
+        let Some((_fixture, output, leaked_before_cleanup)) = run_required_actor_service(terminal)
+        else {
             return;
         };
         assert!(
@@ -356,6 +626,10 @@ fn required_real_actor_service_rollback_expiry_and_shutdown_converge() {
             "actor service {terminal} emitted stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            !leaked_before_cleanup,
+            "actor service {terminal} leaked a tournament domain before test cleanup"
+        );
         assert_no_tournament_domains();
     }
 }
@@ -367,7 +641,8 @@ fn required_real_prepare_post_allocation_failpoints_close_positive_terminal() {
         "after_prepared_readback",
         "after_prepared_index_insert",
     ] {
-        let Some((_fixture, output)) = run_required_actor_service_case("finalize", Some(failpoint))
+        let Some((_fixture, output, leaked_before_cleanup)) =
+            run_required_actor_service_case("finalize", Some(failpoint))
         else {
             return;
         };
@@ -378,13 +653,19 @@ fn required_real_prepare_post_allocation_failpoints_close_positive_terminal() {
         );
         assert_eq!(output.stdout, b"speculation-actor-service=1\n");
         assert!(output.stderr.is_empty());
+        assert!(
+            !leaked_before_cleanup,
+            "prepare failpoint {failpoint} leaked a tournament domain before test cleanup"
+        );
         assert_no_tournament_domains();
     }
 }
 
 #[test]
 fn required_real_failpoint_is_bounded_and_leaves_no_tournament_domain() {
-    let Some((_fixture, output)) = run_required_component(Some("before_tournament_create")) else {
+    let Some((_fixture, output, leaked_before_cleanup)) =
+        run_required_component(Some("before_tournament_create"))
+    else {
         return;
     };
     assert!(!output.status.success());
@@ -393,23 +674,31 @@ fn required_real_failpoint_is_bounded_and_leaves_no_tournament_domain() {
         output.stderr,
         b"error: speculation_containment_evidence_unavailable\n"
     );
+    assert!(
+        !leaked_before_cleanup,
+        "pre-create failpoint leaked a tournament domain before test cleanup"
+    );
     assert_no_tournament_domains();
 }
 
 #[test]
 fn required_real_probe_canary_abrupt_exit_leaves_no_workspace_mutation() {
     let seam = "probe_after_workspace_canary_write";
-    let Some((fixture, output)) = run_required_component(Some(seam)) else {
+    let Some((fixture, output, leaked_before_cleanup)) = run_required_component(Some(seam)) else {
         return;
     };
     assert_bounded_raw_free_failure(&output, &fixture, seam);
     assert_scripted_execution_workspaces_unchanged(&fixture, seam);
+    assert!(
+        !leaked_before_cleanup,
+        "{seam} leaked a tournament domain before test cleanup"
+    );
     assert_no_tournament_domains();
 }
 
 #[test]
 fn required_real_runner_ancillary_failpoint_is_bounded_and_cleanup_converges() {
-    let Some((_fixture, output)) =
+    let Some((_fixture, output, leaked_before_cleanup)) =
         run_required_component(Some("runner_before_payload_fd_validation"))
     else {
         return;
@@ -418,7 +707,11 @@ fn required_real_runner_ancillary_failpoint_is_bounded_and_cleanup_converges() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         output.stderr,
-        b"error: speculation_control_io\nerror: speculation_containment_peer_rejected\n"
+        b"error: speculation_containment_peer_rejected\n"
+    );
+    assert!(
+        !leaked_before_cleanup,
+        "ancillary runner failure leaked a tournament domain before test cleanup"
     );
     assert_no_tournament_domains();
 }
@@ -453,6 +746,8 @@ fn required_real_create_edges_recover_before_and_after_abrupt_restart() {
             Some(failpoint),
             candidate,
         );
+        let recovered =
+            run_restart_component(&fixture, "recover-create", tournament_uuid, None, candidate);
         assert_eq!(
             crashed.status.code(),
             Some(86),
@@ -460,9 +755,6 @@ fn required_real_create_edges_recover_before_and_after_abrupt_restart() {
         );
         assert!(crashed.stdout.is_empty(), "{failpoint} emitted stdout");
         assert!(crashed.stderr.is_empty(), "{failpoint} emitted stderr");
-
-        let recovered =
-            run_restart_component(&fixture, "recover-create", tournament_uuid, None, candidate);
         assert!(
             recovered.status.success(),
             "{failpoint} candidate {candidate} recovery failed with bounded stderr: {}",
@@ -745,13 +1037,6 @@ fn required_real_cleanup_edges_recover_before_and_after_abrupt_restart() {
                     Some(&failpoint),
                     candidate,
                 );
-                assert_eq!(
-                    crashed.status.code(),
-                    Some(86),
-                    "{failpoint} candidate {candidate} did not stop abruptly"
-                );
-                assert!(crashed.stdout.is_empty());
-                assert!(crashed.stderr.is_empty());
                 let recovered = run_restart_component(
                     &fixture,
                     "recover-cleanup",
@@ -759,6 +1044,13 @@ fn required_real_cleanup_edges_recover_before_and_after_abrupt_restart() {
                     None,
                     candidate,
                 );
+                assert_eq!(
+                    crashed.status.code(),
+                    Some(86),
+                    "{failpoint} candidate {candidate} did not stop abruptly"
+                );
+                assert!(crashed.stdout.is_empty());
+                assert!(crashed.stderr.is_empty());
                 assert!(
                     recovered.status.success(),
                     "{failpoint} candidate {candidate} recovery failed with bounded stderr: {}",
@@ -785,11 +1077,11 @@ fn required_real_cleanup_edges_recover_before_and_after_abrupt_restart() {
                 Some(&failpoint),
                 0,
             );
+            let recovered =
+                run_restart_component(&fixture, "recover-cleanup", tournament_uuid, None, 0);
             assert_eq!(crashed.status.code(), Some(86), "{failpoint}");
             assert!(crashed.stdout.is_empty());
             assert!(crashed.stderr.is_empty());
-            let recovered =
-                run_restart_component(&fixture, "recover-cleanup", tournament_uuid, None, 0);
             assert!(
                 recovered.status.success(),
                 "{failpoint} recovery failed with bounded stderr: {}",
@@ -817,12 +1109,6 @@ fn required_real_live_tournament_empty_proof_edges_recover_without_foreign_delet
             Some(&failpoint),
             0,
         );
-        assert_eq!(
-            crashed.status.code(),
-            Some(86),
-            "{failpoint} did not abruptly stop the live cleanup driver"
-        );
-        assert_bounded_raw_free_failure(&crashed, &fixture, &failpoint);
         let live_pid = fs::read_to_string(fixture.path().join("live-topology-populated"))
             .expect("live cleanup observed populated topology")
             .trim()
@@ -855,6 +1141,13 @@ fn required_real_live_tournament_empty_proof_edges_recover_without_foreign_delet
         let foreign_topology_survived = foreign_cgroup.is_dir();
         reap_attack_process(&mut foreign);
         fs::remove_dir(&foreign_cgroup).expect("remove surviving foreign sibling cgroup");
+
+        assert_eq!(
+            crashed.status.code(),
+            Some(86),
+            "{failpoint} did not abruptly stop the live cleanup driver"
+        );
+        assert_bounded_raw_free_failure(&crashed, &fixture, &failpoint);
 
         assert!(
             recovered.status.success(),
@@ -896,11 +1189,11 @@ fn required_real_missing_daemon_edges_die_abruptly_and_recover_separately() {
                 Some(&failpoint),
                 0,
             );
+            let recovered =
+                run_restart_component(&fixture, "recover-create", tournament_uuid, None, 0);
             assert_eq!(crashed.status.code(), Some(86), "{failpoint}");
             assert!(crashed.stdout.is_empty(), "{failpoint} emitted stdout");
             assert!(crashed.stderr.is_empty(), "{failpoint} emitted stderr");
-            let recovered =
-                run_restart_component(&fixture, "recover-create", tournament_uuid, None, 0);
             assert!(
                 recovered.status.success(),
                 "{failpoint} recovery failed: {}",
@@ -946,6 +1239,8 @@ fn required_real_missing_daemon_edges_die_abruptly_and_recover_separately() {
                 Some(&failpoint),
                 0,
             );
+            let recovered =
+                run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
             assert_eq!(
                 crashed.status.code(),
                 Some(86),
@@ -954,8 +1249,6 @@ fn required_real_missing_daemon_edges_die_abruptly_and_recover_separately() {
                 String::from_utf8_lossy(&crashed.stderr)
             );
             assert_bounded_raw_free_failure(&crashed, &fixture, &failpoint);
-            let recovered =
-                run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
             assert!(
                 recovered.status.success(),
                 "{failpoint} recovery failed: {}",
@@ -998,9 +1291,9 @@ fn required_real_runner_abrupt_matrix_recovers_without_candidate_execution() {
         let tournament_uuid = Uuid::new_v4();
         let crashed =
             run_restart_component(&fixture, "crash-runtime", tournament_uuid, Some(seam), 0);
-        assert_bounded_raw_free_failure(&crashed, &fixture, seam);
         let recovered =
             run_restart_component(&fixture, "recover-runtime", tournament_uuid, None, 0);
+        assert_bounded_raw_free_failure(&crashed, &fixture, seam);
         assert!(
             recovered.status.success(),
             "{seam} recovery failed: {}",
@@ -1040,11 +1333,16 @@ fn required_real_placement_ack_release_and_pre_exec_failpoints_cleanup() {
         "after_payload_release",
     ];
     for seam in seams {
-        let Some((fixture, output)) = run_required_component(Some(seam)) else {
+        let Some((fixture, output, leaked_before_cleanup)) = run_required_component(Some(seam))
+        else {
             return;
         };
         assert_bounded_raw_free_failure(&output, &fixture, seam);
         assert_scripted_execution_workspaces_unchanged(&fixture, seam);
+        assert!(
+            !leaked_before_cleanup,
+            "{seam} leaked a tournament domain before test cleanup"
+        );
         assert_no_tournament_domains();
     }
 }

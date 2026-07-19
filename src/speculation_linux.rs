@@ -2,11 +2,11 @@
 
 #[cfg(target_os = "linux")]
 use crate::launch_registry::{
-    ControlCgroupPlacement, MANAGED_SYNC_PIPE_TARGET_FD, ManagedAuxiliary,
+    ControlCgroupPlacement, MANAGED_SYNC_PIPE_TARGET_FD, ManagedAuxiliary, ManagedBoundedReap,
     ManagedCgroupDirectoryIdentity, ManagedCgroupMembership, ManagedController,
     ManagedDescendantProof, ManagedExecutablePolicy, ManagedLaunchRequest, ManagedOwnerKind,
-    ManagedOwnerOutcome, ManagedOwnerRole, ManagedOwnerTag, ManagedPlacement, ManagedWaiter,
-    SyncPipeWrite, launch_managed_process, reconcile_managed_owner,
+    ManagedOwnerOutcome, ManagedOwnerRole, ManagedOwnerTag, ManagedPlacement, ManagedStdioPolicy,
+    ManagedWaiter, SyncPipeWrite, launch_managed_process, reconcile_managed_owner,
 };
 use crate::speculation_fs::{DurableDirectoryIdentity, EvidenceError, ValidatedDirectory};
 #[cfg(target_os = "linux")]
@@ -449,24 +449,50 @@ pub(crate) fn build_fixed_bwrap_invocation(
             ]);
         }
     }
-    arguments.extend(
-        [
-            "--chdir",
-            "/workspace",
-            "/run/lterm-control/lterm",
-            "--internal-speculation-runner-v1",
-            "--tournament",
-        ]
-        .into_iter()
-        .map(OsString::from),
-    );
-    arguments.push(OsString::from(identity.tournament_uuid.to_string()));
-    arguments.push(OsString::from("--candidate-index"));
-    arguments.push(OsString::from(identity.candidate_index.to_string()));
-    arguments.push(OsString::from("--generation"));
-    arguments.push(OsString::from(identity.generation.to_string()));
-    arguments.push(OsString::from("--control"));
-    arguments.push(OsString::from("/run/lterm-control/control.sock"));
+    let mut runner_arguments = vec![
+        OsString::from("--internal-speculation-runner-v1"),
+        OsString::from("--tournament"),
+        OsString::from(identity.tournament_uuid.to_string()),
+        OsString::from("--candidate-index"),
+        OsString::from(identity.candidate_index.to_string()),
+        OsString::from("--generation"),
+        OsString::from(identity.generation.to_string()),
+        OsString::from("--control"),
+        OsString::from("/run/lterm-control/control.sock"),
+    ];
+    arguments.extend([OsString::from("--chdir"), OsString::from("/workspace")]);
+    #[cfg(debug_assertions)]
+    let delayed_runner_exec_seconds = if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        std::env::var_os("LTERM_INTERNAL_SPECULATION_DELAY_RUNNER_EXEC_SECONDS")
+            .map(|value| {
+                value
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| (6..=30).contains(seconds))
+                    .ok_or(ContainmentErrorCode::InvalidIdentity)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(not(debug_assertions))]
+    let delayed_runner_exec_seconds: Option<u64> = None;
+    if let Some(seconds) = delayed_runner_exec_seconds {
+        arguments.extend([
+            OsString::from("/usr/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "printf 'lterm-managed-stdout-marker\\n'; printf 'lterm-managed-stderr-marker\\n' >&2; exec /usr/bin/sleep \"$1\"",
+            ),
+            OsString::from("lterm-delayed-runner"),
+            OsString::from(seconds.to_string()),
+        ]);
+    } else {
+        arguments.push(OsString::from("/run/lterm-control/lterm"));
+        arguments.append(&mut runner_arguments);
+    }
     Ok(FixedBwrapInvocation {
         executable: PathBuf::from("/usr/bin/bwrap"),
         arguments,
@@ -2811,6 +2837,179 @@ impl Drop for PrivateRunnerControl {
 }
 
 #[cfg(target_os = "linux")]
+struct PendingRunnerControl {
+    waiter: Option<ManagedWaiter>,
+    private_control: Option<PrivateRunnerControl>,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingRunnerControl {
+    fn new(waiter: ManagedWaiter, private_control: PrivateRunnerControl) -> Self {
+        Self {
+            waiter: Some(waiter),
+            private_control: Some(private_control),
+        }
+    }
+
+    fn private_control(&self) -> ContainmentResult<&PrivateRunnerControl> {
+        self.private_control
+            .as_ref()
+            .ok_or(ContainmentErrorCode::EvidenceUnavailable)
+    }
+
+    fn private_control_mut(&mut self) -> ContainmentResult<&mut PrivateRunnerControl> {
+        self.private_control
+            .as_mut()
+            .ok_or(ContainmentErrorCode::EvidenceUnavailable)
+    }
+
+    fn into_parts(mut self) -> (ManagedWaiter, PrivateRunnerControl) {
+        let waiter = self.waiter.take().expect("pending runner waiter invariant");
+        let private_control = self
+            .private_control
+            .take()
+            .expect("pending private control invariant");
+        (waiter, private_control)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingRunnerControl {
+    fn drop(&mut self) {
+        let (Some(waiter), Some(private_control)) =
+            (self.waiter.take(), self.private_control.take())
+        else {
+            return;
+        };
+        match waiter.terminate_and_reap_bounded(Duration::from_secs(2)) {
+            ManagedBoundedReap::Reaped => {
+                observe_failed_runner_lifetime(&private_control);
+                drop(private_control);
+            }
+            ManagedBoundedReap::Pending(waiter) => {
+                handoff_pending_runner_reaper(waiter, private_control);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn handoff_pending_runner_reaper(waiter: ManagedWaiter, private_control: PrivateRunnerControl) {
+    observe_pending_runner_handoff(&private_control);
+    #[cfg(debug_assertions)]
+    let observed_reap_marker = if std::env::var_os("LTERM_INTERNAL_MANAGED_FORCE_PENDING_REAP")
+        .as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
+        Some(
+            private_control
+                .path
+                .parent()
+                .unwrap_or(&private_control.path)
+                .join("failed-runner-reaped-before-private-control-drop"),
+        )
+    } else {
+        None
+    };
+    let payload = Arc::new(Mutex::new(Some((waiter, private_control))));
+    #[cfg(debug_assertions)]
+    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && std::env::var_os("LTERM_INTERNAL_SPECULATION_FORCE_REAPER_SPAWN_FAILURE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
+        // This deterministic test seam takes the same conservative branch as
+        // an OS thread-spawn failure: retain the child handle and private
+        // control together rather than unlinking under an unproven process.
+        std::mem::forget(payload);
+        return;
+    }
+    let worker_payload = Arc::clone(&payload);
+    let spawned = std::thread::Builder::new()
+        .name("lterm-speculation-runner-reaper".into())
+        .spawn(move || {
+            let pair = match worker_payload.lock() {
+                Ok(mut payload) => payload.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some((waiter, private_control)) = pair {
+                match waiter.reap_killed_child() {
+                    Ok(()) => {
+                        observe_failed_runner_lifetime(&private_control);
+                        drop(private_control);
+                    }
+                    Err(waiter) => {
+                        // A live or unprovably reaped bwrap must retain its
+                        // exact child handle and private control together.
+                        // Recovery owns the unresolved durable state.
+                        std::mem::forget((waiter, private_control));
+                    }
+                }
+            }
+        });
+    match spawned {
+        Err(_) => {
+            // The payload still owns both the exact child handle and private
+            // control. Leak that closed capability rather than unlink under a
+            // possibly live bwrap.
+            std::mem::forget(payload);
+        }
+        Ok(_reaper) => {
+            #[cfg(debug_assertions)]
+            if let Some(marker) = observed_reap_marker {
+                // Test-only synchronization makes the forced-Pending branch
+                // deterministic without changing the production bound.
+                for _ in 0..200 {
+                    if marker.is_file() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_pending_runner_handoff(private_control: &PrivateRunnerControl) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && private_control.path.join("lterm").is_file()
+        && private_control.socket_path.exists()
+    {
+        let _ = std::fs::write(
+            private_control
+                .path
+                .parent()
+                .unwrap_or(&private_control.path)
+                .join("failed-runner-pending-reaper-retained-private-control"),
+            b"1\n",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_failed_runner_lifetime(private_control: &PrivateRunnerControl) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && private_control.path.join("lterm").is_file()
+        && private_control.socket_path.exists()
+    {
+        let _ = std::fs::write(
+            private_control
+                .path
+                .parent()
+                .unwrap_or(&private_control.path)
+                .join("failed-runner-reaped-before-private-control-drop"),
+            b"1\n",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct CandidateContainment {
     control: CandidateControl,
     observer: CandidateObserver,
@@ -2998,7 +3197,7 @@ fn launch_runner_with_argv(
     revalidate_cgroup_node(control_node)?;
     revalidate_cgroup_node(payload_node)?;
     let identity = context.candidate_identity(candidate_index)?;
-    let mut private_control = prepare_runner_control(context, candidate_index)?;
+    let private_control = prepare_runner_control(context, candidate_index)?;
     let invocation = build_fixed_bwrap_invocation(
         &context.candidate_path(candidate_index)?,
         &private_control.path,
@@ -3036,30 +3235,32 @@ fn launch_runner_with_argv(
         arguments: invocation.arguments,
         current_dir: None,
         environment: Vec::new(),
+        stdio: ManagedStdioPolicy::Null,
     })
     .map_err(|_| ContainmentErrorCode::PinnedBwrapFailure)?;
-    let owner_receipt = managed
-        .owner_receipt
-        .clone()
-        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
+    let managed_controller = managed.controller;
+    let owner_receipt = managed.owner_receipt;
+    let mut pending_control = PendingRunnerControl::new(managed.waiter, private_control);
+    let owner_receipt = owner_receipt.ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
     failpoint("after_managed_launch")?;
-    let listener = private_control
+    let listener = pending_control
+        .private_control()?
         .listener
         .as_ref()
         .ok_or(ContainmentErrorCode::PeerRejected)?;
     let peer = accept_authenticated_peer(
         listener,
-        &managed.controller,
+        &managed_controller,
         &control_membership,
         identity,
         deadline,
     )?;
     failpoint("after_control_accept")?;
     failpoint("before_control_unlink")?;
-    std::fs::remove_file(&private_control.socket_path)
+    std::fs::remove_file(&pending_control.private_control()?.socket_path)
         .map_err(|_| ContainmentErrorCode::PeerRejected)?;
     failpoint("after_control_unlink")?;
-    private_control.listener.take();
+    pending_control.private_control_mut()?.listener.take();
     let mut validator =
         SequenceValidator::new(identity).map_err(|_| ContainmentErrorCode::PeerRejected)?;
     wait_fd_until(&peer, libc::POLLIN, deadline)?;
@@ -3094,7 +3295,7 @@ fn launch_runner_with_argv(
     }
     for directory in [
         &context.candidates[usize::from(candidate_index)],
-        &private_control.directory,
+        &pending_control.private_control()?.directory,
     ] {
         directory.revalidate().map_err(map_evidence)?;
     }
@@ -3120,6 +3321,7 @@ fn launch_runner_with_argv(
         validator,
         output_limit_observed: false,
     }));
+    let (managed_waiter, private_control) = pending_control.into_parts();
     let lifetime = Arc::new(private_control);
     Ok(CandidateContainment {
         control: CandidateControl {
@@ -3134,8 +3336,8 @@ fn launch_runner_with_argv(
             identity,
             peer: observer_peer,
             protocol,
-            controller: managed.controller,
-            waiter: Some(managed.waiter),
+            controller: managed_controller,
+            waiter: Some(managed_waiter),
             sync_read,
             payload_node: observer_payload_node,
             payload_membership,
@@ -5961,6 +6163,7 @@ fn launch_peer_test_process(
         arguments,
         current_dir: None,
         environment,
+        stdio: ManagedStdioPolicy::Inherit,
     })
     .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
 }

@@ -39,6 +39,9 @@ const GATE_PLACEMENT_FD: RawFd = 5;
 pub(crate) const MANAGED_SYNC_PIPE_TARGET_FD: RawFd = 10;
 #[cfg(target_os = "linux")]
 const MAX_COMMIT_FDS: usize = 8;
+#[cfg(all(debug_assertions, target_os = "linux"))]
+static FIRST_SPECULATION_CLEANUP_UNKNOWN_INJECTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "evidence", content = "value")]
@@ -467,6 +470,12 @@ pub(crate) enum ManagedAuxiliary {
     SyncPipeWrite(SyncPipeWrite),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedStdioPolicy {
+    Inherit,
+    Null,
+}
+
 #[derive(Debug)]
 pub(crate) struct ManagedLaunchRequest {
     pub owner: Option<ManagedOwnerTag>,
@@ -477,6 +486,7 @@ pub(crate) struct ManagedLaunchRequest {
     pub arguments: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub environment: Vec<(OsString, OsString)>,
+    pub stdio: ManagedStdioPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -503,6 +513,12 @@ pub(crate) struct ManagedLaunch {
     pub controller: ManagedController,
     pub waiter: ManagedWaiter,
     pub owner_receipt: Option<ManagedOwnerReceipt>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) enum ManagedBoundedReap {
+    Reaped,
+    Pending(ManagedWaiter),
 }
 
 impl ManagedController {
@@ -564,6 +580,30 @@ impl ManagedController {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn terminate(&self) -> Result<ReconcileOutcome> {
+        #[cfg(debug_assertions)]
+        if self
+            .inner
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.kind == ManagedOwnerKind::Speculation)
+            && std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("LTERM_INTERNAL_MANAGED_FIRST_CLEANUP_UNKNOWN").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            && !FIRST_SPECULATION_CLEANUP_UNKNOWN_INJECTED
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(fixture) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT") {
+                let _ = std::fs::write(
+                    PathBuf::from(fixture)
+                        .join("control/managed-first-cleanup-unknown-orphan-risk"),
+                    b"1\n",
+                );
+            }
+            return Ok(ReconcileOutcome::UnknownOrphanRisk(
+                ManagedReconcileCode::ProcessEvidenceUnavailable,
+            ));
+        }
         self.inner
             .registry
             .cleanup(self.inner.key.slot, self.inner.key.generation)
@@ -596,6 +636,45 @@ impl ManagedKey {
 }
 
 impl ManagedWaiter {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn terminate_and_reap_bounded(
+        mut self,
+        reap_timeout: Duration,
+    ) -> ManagedBoundedReap {
+        let _ = self.controller.terminate();
+        let Some(child) = self.child.as_mut() else {
+            return ManagedBoundedReap::Reaped;
+        };
+        let _ = child.kill();
+        #[cfg(debug_assertions)]
+        if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("LTERM_INTERNAL_MANAGED_FORCE_PENDING_REAP").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        {
+            return ManagedBoundedReap::Pending(self);
+        }
+        match reap_child_until(child, reap_timeout) {
+            Ok(true) => {
+                self.child.take();
+                let _ = self.controller.terminate();
+                ManagedBoundedReap::Reaped
+            }
+            Ok(false) | Err(_) => ManagedBoundedReap::Pending(self),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reap_killed_child(mut self) -> Result<(), Self> {
+        let reaped = self.child.as_mut().is_none_or(|child| child.wait().is_ok());
+        if !reaped {
+            return Err(self);
+        }
+        self.child.take();
+        let _ = self.controller.terminate();
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn wait_until(
         &mut self,
@@ -1672,11 +1751,16 @@ fn open_verified_pidfd(expected: &ProcessIdentity) -> Evidence<PidFd> {
 #[cfg(target_os = "linux")]
 pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<ManagedLaunch> {
     use std::os::unix::process::CommandExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     if let Some(owner) = &request.owner {
         owner.validate()?;
     }
+    ensure!(
+        request.executable_policy != ManagedExecutablePolicy::PinnedSystemBwrap
+            || request.stdio == ManagedStdioPolicy::Null,
+        "pinned bwrap requires closed managed stdio"
+    );
     let registry = Registry::open_default()?;
     managed_test_failpoint("parent_before_intent");
     let intent = registry.allocate_intent(now_unix_secs()?, request.owner.clone())?;
@@ -1719,6 +1803,12 @@ pub(crate) fn launch_managed_process(request: ManagedLaunchRequest) -> Result<Ma
         .args(&request.arguments)
         .env_clear()
         .envs(request.environment);
+    if request.stdio == ManagedStdioPolicy::Null {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
     if let Some(current_dir) = request.current_dir {
         command.current_dir(current_dir);
     }
@@ -2078,6 +2168,7 @@ pub(crate) fn dispatch_internal_test_driver() -> Result<bool> {
             arguments: arguments.collect(),
             current_dir: None,
             environment: launch_environment,
+            stdio: ManagedStdioPolicy::Inherit,
         })?;
         let key = process.controller.key();
         let pid = process.controller.identity().pid;
@@ -3211,6 +3302,7 @@ mod tests {
                 arguments: Vec::new(),
                 current_dir: None,
                 environment: Vec::new(),
+                stdio: ManagedStdioPolicy::Inherit,
             });
             assert!(result.unwrap_err().to_string().contains("only on Linux"));
         }
