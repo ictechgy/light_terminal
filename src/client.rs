@@ -413,10 +413,10 @@ pub type SpeculationClientResult<T> = std::result::Result<T, SpeculationClientEr
 #[cfg(any(target_os = "linux", test))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictSpeculationOuter {
+struct StrictSpeculationOuter<T> {
     ok: bool,
     error: Option<String>,
-    result: Option<serde_json::Value>,
+    result: Option<T>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -476,12 +476,10 @@ fn strict_rpc_on_stream<T: DeserializeOwned>(
     if bytes.len() as u64 > MAX_SPECULATION_RESPONSE_BYTES {
         return Err(SpeculationClientError::TransportProtocol);
     }
-    let outer: StrictSpeculationOuter =
+    let outer: StrictSpeculationOuter<T> =
         serde_json::from_slice(&bytes).map_err(|_| SpeculationClientError::ResponseInvalid)?;
     match (outer.ok, outer.error, outer.result) {
-        (true, None, Some(result)) => {
-            serde_json::from_value(result).map_err(|_| SpeculationClientError::ResponseInvalid)
-        }
+        (true, None, Some(result)) => Ok(result),
         (false, Some(code), None) => Err(SpeculationClientError::from_daemon_code(&code)),
         _ => Err(SpeculationClientError::ResponseInvalid),
     }
@@ -8757,6 +8755,59 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<Request>(&requests[0]),
             Ok(Request::Speculation(_))
+        ));
+    }
+
+    #[test]
+    fn strict_transport_rejects_original_duplicate_protocol_and_status_fields() {
+        for protocol_version in [8, 9] {
+            let response = format!(
+                concat!(
+                    r#"{{"ok":true,"error":null,"result":{{"version":"test","protocol_version":{0},"protocol_version":{0},"session_count":0,"active_connections":1,"shutting_down":false}}}}"#
+                ),
+                protocol_version
+            )
+            .into_bytes();
+            let (_directory, socket, server) = fake_speculation_socket(vec![response]);
+            assert_eq!(
+                require_speculation_protocol_at(&socket),
+                Err(SpeculationClientError::ResponseInvalid)
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[0]),
+                Ok(Request::Status)
+            ));
+        }
+
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let encoded_status = serde_json::to_string(&status).unwrap();
+        let duplicate_status =
+            encoded_status.replacen(r#""generation":1"#, r#""generation":1,"generation":1"#, 1);
+        assert_ne!(duplicate_status, encoded_status);
+        let response =
+            format!(r#"{{"ok":true,"error":null,"result":{{"status":{duplicate_status}}}}}"#)
+                .into_bytes();
+        let (_directory, socket, server) = fake_speculation_socket(vec![response]);
+        let request = SpeculationStatusRequest {
+            tournament_uuid: status.tournament_uuid,
+            daemon_instance_uuid: status.daemon_instance_uuid,
+            generation: status.generation,
+        };
+        assert_eq!(
+            speculation_rpc_at::<SpeculationStatusResponse>(
+                &socket,
+                SpeculationRequest::Status(request),
+            ),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
         ));
     }
 
