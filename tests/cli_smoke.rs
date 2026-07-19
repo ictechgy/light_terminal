@@ -1213,7 +1213,7 @@ fn codex_home_reaches_fake_omx_launcher_through_prestarted_daemon() -> TestResul
     std::fs::create_dir(&fake_bin)?;
     write_executable(
         &fake_bin.join("omx"),
-        "#!/bin/sh\nprintf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"\n",
+        "#!/bin/sh\nprintf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"\nsleep 2\n",
     )?;
     let path = path_with_prepended(&fake_bin)?;
     let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
