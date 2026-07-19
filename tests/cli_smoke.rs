@@ -1233,6 +1233,53 @@ fn codex_home_reaches_fake_omx_launcher_through_prestarted_daemon() -> TestResul
 }
 
 #[test]
+fn agent_launch_scrubs_stale_daemon_claudecode_and_preserves_arguments() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut daemon = env.cmd();
+    daemon
+        .arg("daemon")
+        .env("CLAUDECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _daemon = ChildCleanup::new(daemon.spawn()?);
+    env.wait_for_reachable_daemon()?;
+
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omc"),
+        "#!/bin/sh\n\
+         printf 'CLAUDECODE:<%s>\\n' \"${CLAUDECODE-}\"\n\
+         printf 'ARGC:%s\\n' \"$#\"\n\
+         printf 'ARG1:<%s>\\n' \"${1-}\"\n\
+         printf 'ARG2:<%s>\\n' \"${2-unset}\"\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env_remove("CLAUDECODE")
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .args(["omc", "--madmax"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    for expected in ["CLAUDECODE:<>", "ARGC:1", "ARG1:<--madmax>", "ARG2:<unset>"] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?}: {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn capture_alias_captures_output() -> TestResult {
     let env = TestEnv::new()?;
     let status = env
