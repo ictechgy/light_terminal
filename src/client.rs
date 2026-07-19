@@ -708,6 +708,9 @@ fn observe_and_mirror_newer_status(
         current.value.generation,
     )?;
     if status.generation == current.value.generation {
+        if status != &current.value.status {
+            return Err(SpeculationClientError::ResponseInvalid);
+        }
         return Ok(current);
     }
     let stored = ledger
@@ -9091,6 +9094,53 @@ mod tests {
         assert_eq!(exact.value.action, LedgerAction::StatusMirrored);
         assert_eq!(exact.value.generation, rolled_back.generation);
         assert_eq!(exact.value.status, rolled_back);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn contradictory_equal_generation_status_is_rejected_before_output_or_journal_change() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let expected_identity = prepared.identity;
+        let expected_record = prepared.value.clone();
+        let tournament = ledger
+            .read_tournament(prepared.value.tournament_uuid)
+            .unwrap();
+        let contradictory = speculation_status(SpeculationPhase::RolledBack, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_rollback_at(&socket, ledger, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[1]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        ));
+
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                expected_record.tournament_uuid,
+                expected_record.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, expected_identity);
+        assert_eq!(exact.value, expected_record);
+        assert_eq!(exact.value.action, LedgerAction::Prepared);
     }
 
     #[test]
