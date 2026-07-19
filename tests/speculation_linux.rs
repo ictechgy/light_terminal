@@ -48,6 +48,13 @@ fn run_required_component(failpoint: Option<&str>) -> Option<(tempfile::TempDir,
 }
 
 fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Output)> {
+    run_required_actor_service_case(terminal, None)
+}
+
+fn run_required_actor_service_case(
+    terminal: &str,
+    prepare_failpoint: Option<&str>,
+) -> Option<(tempfile::TempDir, Output)> {
     if std::env::var_os("LTERM_REQUIRE_REAL_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return None;
     }
@@ -63,7 +70,8 @@ fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Outp
     fs::copy(env!("CARGO_BIN_EXE_lterm"), &self_exe).expect("copy retained actor executable");
     fs::set_permissions(&self_exe, fs::Permissions::from_mode(0o500))
         .expect("retained actor executable mode");
-    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lterm"));
+    command
         .arg("--internal-speculation-containment-test-v1")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -74,9 +82,11 @@ fn run_required_actor_service(terminal: &str) -> Option<(tempfile::TempDir, Outp
         .env("LTERM_DATA_DIR", &data)
         .env("LTERM_REQUIRE_REAL_BWRAP", "1")
         .env("LTERM_SPECULATION_CGROUP_ROOT", cgroup_root)
-        .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", fixture.path())
-        .output()
-        .expect("run real actor service driver");
+        .env("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT", fixture.path());
+    if let Some(failpoint) = prepare_failpoint {
+        command.env("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT", failpoint);
+    }
+    let output = command.output().expect("run real actor service driver");
     Some((fixture, output))
 }
 
@@ -309,6 +319,28 @@ fn required_real_actor_service_rollback_expiry_and_shutdown_converge() {
             "actor service {terminal} emitted stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_no_tournament_domains();
+    }
+}
+
+#[test]
+fn required_real_prepare_post_allocation_failpoints_close_positive_terminal() {
+    for failpoint in [
+        "after_prepared_allocation",
+        "after_prepared_readback",
+        "after_prepared_index_insert",
+    ] {
+        let Some((_fixture, output)) = run_required_actor_service_case("finalize", Some(failpoint))
+        else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "prepare failpoint {failpoint} failed with bounded stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"speculation-actor-service=1\n");
+        assert!(output.stderr.is_empty());
         assert_no_tournament_domains();
     }
 }

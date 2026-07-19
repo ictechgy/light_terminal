@@ -168,6 +168,15 @@ impl PrivateCgroupRootLocator {
         }
         Ok(directory)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_value(identity: DurableDirectoryIdentity) -> Self {
+        Self {
+            canonical_path: SpeculationUnixPath::from_path(Path::new("/cgroup"))
+                .expect("fixed test cgroup path"),
+            identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1389,6 +1398,18 @@ impl TournamentStore {
                 .map(|_| TournamentRecoveryRecord::Corrupt { slot: None }),
         );
         Ok(recovery)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = self.state.lock().expect("unpoisoned test store");
+                    panic!("poison tournament store for fail-closed coverage");
+                })
+                .join()
+        });
     }
 }
 

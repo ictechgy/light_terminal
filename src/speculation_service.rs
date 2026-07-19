@@ -35,13 +35,16 @@ use crate::speculation_linux::{
     ContainmentDeadline, ContainmentErrorCode, LiveTournamentContext, PrepareInputs,
     validate_prepare,
 };
+use crate::speculation_registry::StoredTournamentUpdate;
+#[cfg(target_os = "linux")]
+use crate::speculation_registry::TournamentRecoveryRecord;
 use crate::speculation_registry::{
     CandidateCgroupEvidence, CgroupForwardState, CgroupLifecycleState, TournamentCgroupEvidence,
     TournamentCgroupLifecycleState, TournamentKey, TournamentRecord, TournamentRecordSchema,
     TournamentStore, TournamentWriteKind,
 };
 #[cfg(target_os = "linux")]
-use crate::speculation_registry::{StoredTournamentUpdate, TournamentRecoveryRecord};
+use crate::speculation_registry::{ManagedOwnerEvidence, ManagedOwnerRoleEvidence};
 #[cfg(target_os = "linux")]
 use crate::speculation_runner::{DecisionKind, RunnerExitCategory};
 use std::collections::HashMap;
@@ -49,8 +52,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -213,6 +216,7 @@ struct LivePipeline {
 
 #[derive(Clone)]
 struct ActorHandle {
+    slot: u16,
     sender: SyncSender<ActorEvent>,
     snapshot: Arc<Mutex<SpeculationStatus>>,
 }
@@ -220,11 +224,91 @@ struct ActorHandle {
 #[derive(Default)]
 struct ServiceIndex {
     live: HashMap<Uuid, ActorHandle>,
-    terminal: HashMap<Uuid, Arc<SpeculationStatus>>,
+    live_slots: HashMap<u16, Uuid>,
+    terminal: HashMap<Uuid, TerminalCacheEntry>,
+    terminal_slots: HashMap<u16, Uuid>,
+}
+
+struct TerminalCacheEntry {
+    slot: u16,
+    status: Arc<SpeculationStatus>,
+}
+
+impl ServiceIndex {
+    fn insert_live(
+        &mut self,
+        slot: u16,
+        tournament_uuid: Uuid,
+        handle: ActorHandle,
+    ) -> Result<(), ServiceError> {
+        if usize::from(slot) >= crate::speculation_registry::MAX_TOURNAMENT_RECORDS {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        let replacing_slot = self.live_slots.get(&slot).copied();
+        if self.live.len() >= crate::speculation::MAX_LIVE_TOURNAMENTS
+            && replacing_slot.is_none()
+            && !self.live.contains_key(&tournament_uuid)
+        {
+            return Err(ServiceError::Capacity);
+        }
+        self.evict_slot(slot);
+        if let Some(previous) = self.live.insert(tournament_uuid, handle) {
+            self.live_slots.remove(&previous.slot);
+        }
+        self.live_slots.insert(slot, tournament_uuid);
+        Ok(())
+    }
+
+    fn cache_terminal(
+        &mut self,
+        slot: u16,
+        status: Arc<SpeculationStatus>,
+    ) -> Result<(), ServiceError> {
+        if usize::from(slot) >= crate::speculation_registry::MAX_TOURNAMENT_RECORDS {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        let tournament_uuid = status.tournament_uuid;
+        self.evict_slot(slot);
+        if let Some(previous) = self
+            .terminal
+            .insert(tournament_uuid, TerminalCacheEntry { slot, status })
+        {
+            self.terminal_slots.remove(&previous.slot);
+        }
+        self.terminal_slots.insert(slot, tournament_uuid);
+        if self.terminal.len() > crate::speculation_registry::MAX_TOURNAMENT_RECORDS {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        Ok(())
+    }
+
+    fn publish_actor_terminal(
+        &mut self,
+        slot: u16,
+        tournament_uuid: Uuid,
+        status: Arc<SpeculationStatus>,
+    ) -> Result<(), ServiceError> {
+        if self.live_slots.get(&slot) != Some(&tournament_uuid)
+            || !self.live.contains_key(&tournament_uuid)
+        {
+            return Ok(());
+        }
+        self.cache_terminal(slot, status)
+    }
+
+    fn evict_slot(&mut self, slot: u16) {
+        if let Some(previous) = self.live_slots.remove(&slot) {
+            self.live.remove(&previous);
+        }
+        if let Some(previous) = self.terminal_slots.remove(&slot) {
+            self.terminal.remove(&previous);
+        }
+    }
 }
 
 struct ServiceCore {
     availability: AtomicU8,
+    admission: Mutex<()>,
     index: Mutex<ServiceIndex>,
     store: OnceLock<Arc<TournamentStore>>,
     control_root: OnceLock<PathBuf>,
@@ -237,11 +321,46 @@ pub(crate) struct SpeculationService {
     core: Arc<ServiceCore>,
 }
 
+struct PreparedAllocationGuard<'a> {
+    service: &'a SpeculationService,
+    store: Arc<TournamentStore>,
+    key: TournamentKey,
+    record: TournamentRecord,
+    armed: bool,
+}
+
+impl PreparedAllocationGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedAllocationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match close_unowned_prepared(&self.store, self.key, self.record.clone()) {
+            Ok(stored) => {
+                if self
+                    .service
+                    .cache_terminal_update(&stored.key, &stored.record.status)
+                    .is_err()
+                {
+                    self.service.mark_unresolved();
+                }
+            }
+            Err(_) => self.service.mark_unresolved(),
+        }
+    }
+}
+
 impl Default for SpeculationService {
     fn default() -> Self {
         Self {
             core: Arc::new(ServiceCore {
                 availability: AtomicU8::new(Availability::Disabled as u8),
+                admission: Mutex::new(()),
                 index: Mutex::new(ServiceIndex::default()),
                 store: OnceLock::new(),
                 control_root: OnceLock::new(),
@@ -276,6 +395,7 @@ impl SpeculationService {
         Ok(Self {
             core: Arc::new(ServiceCore {
                 availability: AtomicU8::new(Availability::Reconciling as u8),
+                admission: Mutex::new(()),
                 index: Mutex::new(ServiceIndex::default()),
                 store: OnceLock::new(),
                 control_root: OnceLock::new(),
@@ -338,20 +458,12 @@ impl SpeculationService {
         );
         let managed = crate::launch_registry::reconcile_managed_processes()
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
-        if managed.entries.iter().any(|entry| {
-            entry.owner.is_none()
-                || matches!(
-                    entry.outcome,
-                    crate::launch_registry::ReconcileOutcome::Live
-                        | crate::launch_registry::ReconcileOutcome::UnknownOrphanRisk(_)
-                )
-        }) {
-            return Err(ServiceError::EvidenceUnavailable);
-        }
-        let recovery = store
+        let mut recovery = store
             .scan_recovery()
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
-        let mut terminal = HashMap::new();
+        validate_recovery_records(&recovery)?;
+        correlate_managed_startup(&store, &managed, &mut recovery)?;
+        let mut terminal = ServiceIndex::default();
         let mut seen = std::collections::HashSet::new();
         for entry in recovery {
             let TournamentRecoveryRecord::Valid { key, record } = entry else {
@@ -361,10 +473,7 @@ impl SpeculationService {
                 return Err(ServiceError::EvidenceUnavailable);
             }
             if record.is_positive_terminal() {
-                terminal.insert(
-                    record.status.tournament_uuid,
-                    Arc::new(record.status.clone()),
-                );
+                terminal.cache_terminal(key.slot(), Arc::new(record.status.clone()))?;
                 continue;
             }
             let mut normalized = store
@@ -385,14 +494,12 @@ impl SpeculationService {
             if !normalized.record.is_positive_terminal() {
                 return Err(ServiceError::EvidenceUnavailable);
             }
-            terminal.insert(
-                normalized.record.status.tournament_uuid,
-                Arc::new(normalized.record.status),
-            );
+            terminal.cache_terminal(normalized.key.slot(), Arc::new(normalized.record.status))?;
         }
         {
             let mut index = self.index_lock()?;
-            index.terminal = terminal;
+            index.terminal = terminal.terminal;
+            index.terminal_slots = terminal.terminal_slots;
         }
         self.install_ready(store, control_path)?;
         self.start_watchdog()?;
@@ -422,6 +529,11 @@ impl SpeculationService {
         &self,
         request: SpeculationPrepareRequest,
     ) -> Result<SpeculationPrepareResponse, ServiceError> {
+        self.require_ready()?;
+        let admission_end = std::time::Instant::now()
+            .checked_add(crate::speculation::CONTROL_ACK_TIMEOUT)
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let _admission = self.admission_lock_until(admission_end)?;
         self.require_ready()?;
         let store = Arc::clone(self.core.store.get().ok_or(ServiceError::Unavailable)?);
         let control_root = self
@@ -501,42 +613,53 @@ impl SpeculationService {
             terminal_completed_unix_ms: None,
             status: status.clone(),
         };
+        let unowned_record = record.clone();
         let key = store
             .allocate_prepared(record, now)
-            .map_err(map_store_error)?;
-        let exact = store
-            .load_by_uuid(tournament_uuid)
-            .map_err(|_| ServiceError::EvidenceUnavailable)?
+            .map_err(|error| self.map_store_error(error))?;
+        let mut allocation_guard = PreparedAllocationGuard {
+            service: self,
+            store: Arc::clone(&store),
+            key,
+            record: unowned_record,
+            armed: true,
+        };
+        prepare_failpoint("after_prepared_allocation")?;
+        let exact = self
+            .load_store_record(&store, tournament_uuid)?
             .ok_or(ServiceError::EvidenceUnavailable)?;
         if exact.status != status || exact.status.generation != key.generation() {
             self.mark_unresolved();
             return Err(ServiceError::EvidenceUnavailable);
         }
+        prepare_failpoint("after_prepared_readback")?;
         let snapshot = Arc::new(Mutex::new(exact.status.clone()));
         let (sender, receiver) = sync_channel(ACTOR_MAILBOX_CAPACITY);
         {
             let mut index = self.index_lock()?;
-            if index.live.len() >= crate::speculation::MAX_LIVE_TOURNAMENTS
-                || index.live.contains_key(&tournament_uuid)
-            {
+            if index.live.contains_key(&tournament_uuid) {
                 self.mark_unresolved();
                 return Err(ServiceError::Capacity);
             }
-            index.live.insert(
+            index.insert_live(
+                key.slot(),
                 tournament_uuid,
                 ActorHandle {
+                    slot: key.slot(),
                     sender: sender.clone(),
                     snapshot: Arc::clone(&snapshot),
                 },
-            );
+            )?;
         }
+        prepare_failpoint("after_prepared_index_insert")?;
         let core = Arc::clone(&self.core);
+        let actor_store = Arc::clone(&store);
         thread::Builder::new()
             .name("lterm-speculation-actor".into())
             .spawn(move || {
                 actor_loop(ActorState {
                     core,
-                    store,
+                    store: actor_store,
                     key,
                     record: exact,
                     context,
@@ -549,10 +672,8 @@ impl SpeculationService {
                     interrupt_requested: false,
                 });
             })
-            .map_err(|_| {
-                self.mark_unresolved();
-                ServiceError::EvidenceUnavailable
-            })?;
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        allocation_guard.disarm();
         Ok(SpeculationPrepareResponse { status })
     }
 
@@ -629,9 +750,13 @@ impl SpeculationService {
     }
 
     pub(crate) fn claim_shutdown(&self, deadline: Duration) -> Result<(), ServiceError> {
+        let end = std::time::Instant::now()
+            .checked_add(deadline)
+            .ok_or(ServiceError::EvidenceUnavailable)?;
         self.core
             .availability
             .store(Availability::ShuttingDown as u8, Ordering::Release);
+        let admission = self.admission_lock_until(end)?;
         let senders = {
             let index = self.index_lock()?;
             index
@@ -640,15 +765,11 @@ impl SpeculationService {
                 .map(|handle| handle.sender.clone())
                 .collect::<Vec<_>>()
         };
-        let end = std::time::Instant::now()
-            .checked_add(deadline)
-            .ok_or(ServiceError::EvidenceUnavailable)?;
+        drop(admission);
         let mut replies = Vec::with_capacity(senders.len());
         for sender in senders {
             let (reply, receive) = sync_channel(1);
-            sender
-                .send(ActorEvent::Shutdown { reply })
-                .map_err(|_| ServiceError::EvidenceUnavailable)?;
+            send_actor_event_until(&sender, ActorEvent::Shutdown { reply }, end)?;
             replies.push(receive);
         }
         for reply in replies {
@@ -680,6 +801,24 @@ impl SpeculationService {
         tournament_uuid: Uuid,
         event: impl FnOnce(RpcReply) -> ActorEvent,
     ) -> Result<SpeculationStatus, ServiceError> {
+        self.request_actor_until(
+            tournament_uuid,
+            event,
+            crate::speculation::CONTROL_ACK_TIMEOUT,
+        )
+    }
+
+    fn request_actor_until(
+        &self,
+        tournament_uuid: Uuid,
+        event: impl FnOnce(RpcReply) -> ActorEvent,
+        timeout: Duration,
+    ) -> Result<SpeculationStatus, ServiceError> {
+        self.require_ready()?;
+        let end = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let admission = self.admission_lock_until(end)?;
         self.require_ready()?;
         let sender = {
             let index = self.index_lock()?;
@@ -690,19 +829,19 @@ impl SpeculationService {
                 .ok_or(ServiceError::InvalidRequest)?
         };
         let (reply, receive) = sync_channel(1);
-        sender
-            .send(event(reply))
-            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        send_actor_event_until(&sender, event(reply), end)?;
+        drop(admission);
+        let remaining = end.saturating_duration_since(std::time::Instant::now());
         receive
-            .recv_timeout(crate::speculation::CONTROL_ACK_TIMEOUT)
+            .recv_timeout(remaining)
             .map_err(|_| ServiceError::EvidenceUnavailable)?
     }
 
     fn cached_status(&self, tournament_uuid: Uuid) -> Result<SpeculationStatus, ServiceError> {
         let source = {
             let index = self.index_lock()?;
-            if let Some(status) = index.terminal.get(&tournament_uuid) {
-                return Ok((**status).clone());
+            if let Some(entry) = index.terminal.get(&tournament_uuid) {
+                return Ok((*entry.status).clone());
             }
             index
                 .live
@@ -724,7 +863,7 @@ impl SpeculationService {
         Ok(index
             .terminal
             .get(&tournament_uuid)
-            .map(|status| (**status).clone()))
+            .map(|entry| (*entry.status).clone()))
     }
 
     fn require_ready(&self) -> Result<(), ServiceError> {
@@ -743,6 +882,255 @@ impl SpeculationService {
             ServiceError::EvidenceUnavailable
         })
     }
+
+    fn admission_lock_until(
+        &self,
+        end: std::time::Instant,
+    ) -> Result<MutexGuard<'_, ()>, ServiceError> {
+        loop {
+            match self.core.admission.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    self.mark_unresolved();
+                    return Err(ServiceError::EvidenceUnavailable);
+                }
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < end => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(ServiceError::EvidenceUnavailable);
+                }
+            }
+        }
+    }
+
+    fn map_store_error(&self, error: crate::speculation_fs::EvidenceError) -> ServiceError {
+        map_store_error_for_core(&self.core, error)
+    }
+
+    fn load_store_record(
+        &self,
+        store: &TournamentStore,
+        tournament_uuid: Uuid,
+    ) -> Result<Option<TournamentRecord>, ServiceError> {
+        store
+            .load_by_uuid(tournament_uuid)
+            .map_err(|error| self.map_store_error(error))
+    }
+
+    fn cache_terminal_update(
+        &self,
+        key: &TournamentKey,
+        status: &SpeculationStatus,
+    ) -> Result<(), ServiceError> {
+        let mut index = self.index_lock()?;
+        index.cache_terminal(key.slot(), Arc::new(status.clone()))
+    }
+}
+
+fn send_actor_event_until(
+    sender: &SyncSender<ActorEvent>,
+    mut event: ActorEvent,
+    end: std::time::Instant,
+) -> Result<(), ServiceError> {
+    loop {
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            Err(TrySendError::Full(returned)) if std::time::Instant::now() < end => {
+                event = returned;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Full(_)) => return Err(ServiceError::EvidenceUnavailable),
+        }
+    }
+}
+
+fn close_unowned_prepared(
+    store: &Arc<TournamentStore>,
+    key: TournamentKey,
+    record: TournamentRecord,
+) -> Result<StoredTournamentUpdate, ServiceError> {
+    if record.status.phase != SpeculationPhase::Prepared
+        || record.status.generation != key.generation()
+        || record.status.tournament_uuid != key.tournament_uuid()
+    {
+        return Err(ServiceError::EvidenceUnavailable);
+    }
+    let mut next = record;
+    next.status.generation = increment(key.generation())?;
+    next.status.phase = SpeculationPhase::RollbackPending;
+    next.status.rollback_required = true;
+    next.status.reason_code = Some(SpeculationReasonCode::ContainmentEvidenceUnavailable);
+    next.status.selected_index = None;
+    let mut stored = store
+        .write(
+            &key,
+            key.generation(),
+            next,
+            TournamentWriteKind::LivePhaseTransition,
+        )
+        .map_err(map_store_error)?;
+    for candidate in 0..2 {
+        let mut next = stored.record.clone();
+        next.status.generation = increment(stored.key.generation())?;
+        next.cgroups[candidate].lifecycle = CgroupLifecycleState::Removed;
+        next.status.candidates[candidate].cleanup = fully_closed_cleanup();
+        stored = store
+            .write(
+                &stored.key,
+                stored.key.generation(),
+                next,
+                TournamentWriteKind::SamePhaseEvidence,
+            )
+            .map_err(map_store_error)?;
+    }
+    let mut next = stored.record.clone();
+    next.status.generation = increment(stored.key.generation())?;
+    next.tournament_cgroup.lifecycle = TournamentCgroupLifecycleState::Removed;
+    stored = store
+        .write(
+            &stored.key,
+            stored.key.generation(),
+            next,
+            TournamentWriteKind::SamePhaseEvidence,
+        )
+        .map_err(map_store_error)?;
+    let mut next = stored.record.clone();
+    next.status.generation = increment(stored.key.generation())?;
+    next.status.phase = SpeculationPhase::RolledBack;
+    next.status.rollback_required = false;
+    next.terminal_completed_unix_ms = Some(unix_time_ms()?);
+    store
+        .write(
+            &stored.key,
+            stored.key.generation(),
+            next,
+            TournamentWriteKind::LivePhaseTransition,
+        )
+        .map_err(map_store_error)
+}
+
+fn prepare_failpoint(name: &str) -> Result<(), ServiceError> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && std::env::var("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").as_deref() == Ok(name)
+    {
+        return Err(ServiceError::EvidenceUnavailable);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_recovery_records(recovery: &[TournamentRecoveryRecord]) -> Result<(), ServiceError> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in recovery {
+        let TournamentRecoveryRecord::Valid { record, .. } = entry else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        if !seen.insert(record.status.tournament_uuid) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn correlate_managed_startup(
+    store: &Arc<TournamentStore>,
+    managed: &crate::launch_registry::ManagedReconcileReport,
+    recovery: &mut [TournamentRecoveryRecord],
+) -> Result<(), ServiceError> {
+    use crate::launch_registry::{ManagedOwnerRole, ReconcileOutcome};
+
+    let records = recovery
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| match entry {
+            TournamentRecoveryRecord::Valid { record, .. } => {
+                Ok((record.status.tournament_uuid, index))
+            }
+            TournamentRecoveryRecord::Corrupt { .. } => Err(ServiceError::EvidenceUnavailable),
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    if records.len() != recovery.len() {
+        return Err(ServiceError::EvidenceUnavailable);
+    }
+
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_owners = std::collections::HashSet::new();
+    for entry in &managed.entries {
+        if !matches!(
+            entry.outcome,
+            ReconcileOutcome::Absent | ReconcileOutcome::ResolvedTombstone
+        ) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        if let Some(key) = entry.key {
+            if !seen_keys.insert((key.slot(), key.generation())) {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+        }
+        let Some(owner) = entry.owner.as_ref() else {
+            continue;
+        };
+        owner
+            .validate()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let key = entry.key.ok_or(ServiceError::EvidenceUnavailable)?;
+        let role_key = matches!(owner.role, ManagedOwnerRole::Runner);
+        if !seen_owners.insert((owner.tournament_uuid, owner.candidate_index, role_key)) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        let position = *records
+            .get(&owner.tournament_uuid)
+            .ok_or(ServiceError::EvidenceUnavailable)?;
+        let candidate = usize::from(owner.candidate_index);
+        let evidence = ManagedOwnerEvidence {
+            candidate_index: owner.candidate_index,
+            role: match owner.role {
+                ManagedOwnerRole::Probe => ManagedOwnerRoleEvidence::Probe,
+                ManagedOwnerRole::Runner => ManagedOwnerRoleEvidence::Runner,
+            },
+            slot: key.slot(),
+            generation: key.generation(),
+        };
+        let TournamentRecoveryRecord::Valid {
+            key: tournament_key,
+            record,
+        } = &mut recovery[position]
+        else {
+            return Err(ServiceError::EvidenceUnavailable);
+        };
+        match record.managed_owners[candidate].as_ref() {
+            Some(existing) if existing == &evidence => continue,
+            Some(existing)
+                if existing.candidate_index == evidence.candidate_index
+                    && existing.role == ManagedOwnerRoleEvidence::Probe
+                    && evidence.role == ManagedOwnerRoleEvidence::Runner => {}
+            Some(_) => return Err(ServiceError::EvidenceUnavailable),
+            None if record.is_positive_terminal() => {
+                return Err(ServiceError::EvidenceUnavailable);
+            }
+            None => {}
+        }
+        let mut next = (**record).clone();
+        next.status.generation = increment(tournament_key.generation())?;
+        next.managed_owners[candidate] = Some(evidence);
+        let stored = store
+            .write(
+                tournament_key,
+                tournament_key.generation(),
+                next,
+                TournamentWriteKind::SamePhaseEvidence,
+            )
+            .map_err(map_store_error)?;
+        *tournament_key = stored.key;
+        **record = stored.record;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1098,7 +1486,6 @@ fn finish_recovery(
         .map_err(map_store_error)
 }
 
-#[cfg(target_os = "linux")]
 fn fully_closed_cleanup() -> crate::protocol::SpeculationCleanupStatus {
     crate::protocol::SpeculationCleanupStatus {
         runner_ack: true,
@@ -1226,6 +1613,10 @@ fn actor_loop(mut actor: ActorState) {
 }
 
 impl ActorState {
+    fn map_store_error(&self, error: crate::speculation_fs::EvidenceError) -> ServiceError {
+        map_store_error_for_core(&self.core, error)
+    }
+
     fn arm(&mut self, request: SpeculationArmRequest) -> Result<SpeculationStatus, ServiceError> {
         validate_status_identity(
             &self.record.status,
@@ -1323,7 +1714,7 @@ impl ActorState {
                 next,
                 TournamentWriteKind::LivePhaseTransition,
             )
-            .map_err(map_store_error)?;
+            .map_err(|error| self.map_store_error(error))?;
         self.key = stored.key;
         self.record = stored.record;
         let status = self.record.status.clone();
@@ -1354,7 +1745,7 @@ impl ActorState {
                 next,
                 TournamentWriteKind::SamePhaseEvidence,
             )
-            .map_err(map_store_error)?;
+            .map_err(|error| self.map_store_error(error))?;
         self.install_stored(stored)
     }
 
@@ -2472,7 +2863,7 @@ impl ActorState {
                 next,
                 TournamentWriteKind::LivePhaseTransition,
             )
-            .map_err(map_store_error)?;
+            .map_err(|error| self.map_store_error(error))?;
         self.install_stored(stored)
     }
 
@@ -2590,8 +2981,14 @@ impl ActorState {
         let tournament_uuid = self.record.status.tournament_uuid;
         match self.core.index.lock() {
             Ok(mut index) => {
-                index.live.remove(&tournament_uuid);
-                index.terminal.insert(tournament_uuid, terminal);
+                if index
+                    .publish_actor_terminal(self.key.slot(), tournament_uuid, terminal)
+                    .is_err()
+                {
+                    self.core
+                        .availability
+                        .store(Availability::Unresolved as u8, Ordering::Release);
+                }
             }
             Err(_) => self
                 .core
@@ -2710,6 +3107,26 @@ fn map_store_error(error: crate::speculation_fs::EvidenceError) -> ServiceError 
     }
 }
 
+fn store_error_invalidates_authority(error: &crate::speculation_fs::EvidenceError) -> bool {
+    matches!(
+        error,
+        crate::speculation_fs::EvidenceError::Poisoned
+            | crate::speculation_fs::EvidenceError::Corrupt
+            | crate::speculation_fs::EvidenceError::Stale
+    )
+}
+
+fn map_store_error_for_core(
+    core: &ServiceCore,
+    error: crate::speculation_fs::EvidenceError,
+) -> ServiceError {
+    if store_error_invalidates_authority(&error) {
+        core.availability
+            .store(Availability::Unresolved as u8, Ordering::Release);
+    }
+    map_store_error(error)
+}
+
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode> {
     use crate::protocol::{SpeculationArgv, SpeculationUnixPath};
@@ -2756,7 +3173,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     let service = SpeculationService::new_reconciling(Uuid::new_v4())
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     service
-        .install_ready(store, control)
+        .install_ready(Arc::clone(&store), control)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let request = SpeculationPrepareRequest::new(
         SpeculationUnixPath::from_path(&source)
@@ -2779,6 +3196,29 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
         .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
     )
     .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").is_some() {
+        if service.prepare(request).is_ok() {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        let recovery = store
+            .scan_recovery()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if recovery.len() != 1
+            || !matches!(
+                &recovery[0],
+                TournamentRecoveryRecord::Valid { record, .. }
+                    if record.is_positive_terminal()
+                        && record.status.phase == SpeculationPhase::RolledBack
+            )
+            || service.availability() != Availability::Ready
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        service
+            .claim_shutdown(Duration::from_millis(250))
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        return Ok(());
+    }
     let prepared = service
         .prepare(request)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
@@ -2936,6 +3376,50 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
 mod tests {
     use super::*;
 
+    fn test_prepared_record(tournament_uuid: Uuid, daemon_instance_uuid: Uuid) -> TournamentRecord {
+        let identity = crate::speculation_fs::DurableDirectoryIdentity::test_value();
+        let candidate_uuids = [Uuid::new_v4(), Uuid::new_v4()];
+        TournamentRecord {
+            schema_version: TournamentRecordSchema::V1,
+            boot_uuid: identity.boot_uuid,
+            roots: crate::speculation_registry::PrivateRootIdentities {
+                source: identity,
+                candidates: [identity, identity],
+                ledger_root: identity,
+                cgroup_root: identity,
+            },
+            cgroup_root_locator: crate::speculation_registry::PrivateCgroupRootLocator::test_value(
+                identity,
+            ),
+            tournament_cgroup: TournamentCgroupEvidence {
+                deterministic_name_uuid: tournament_uuid,
+                lifecycle: TournamentCgroupLifecycleState::Planned,
+                domain: None,
+            },
+            cgroups: std::array::from_fn(|candidate| CandidateCgroupEvidence {
+                candidate_index: candidate as u8,
+                deterministic_name_uuid: candidate_uuids[candidate],
+                lifecycle: CgroupLifecycleState::Forward(CgroupForwardState::Planned),
+                parent: None,
+                control: None,
+                payload: None,
+            }),
+            managed_owners: [None, None],
+            restart_prior_phase: None,
+            terminal_completed_unix_ms: None,
+            status: prepared_status(tournament_uuid, daemon_instance_uuid, candidate_uuids, 1, 2),
+        }
+    }
+
+    fn ready_service() -> SpeculationService {
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        service
+            .core
+            .availability
+            .store(Availability::Ready as u8, Ordering::Release);
+        service
+    }
+
     #[cfg(target_os = "linux")]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeEffectStep {
@@ -3084,13 +3568,22 @@ mod tests {
             1,
             2,
         );
-        service.core.index.lock().unwrap().live.insert(
-            status.tournament_uuid,
-            ActorHandle {
-                sender,
-                snapshot: Arc::new(Mutex::new(status)),
-            },
-        );
+        let tournament_uuid = status.tournament_uuid;
+        service
+            .core
+            .index
+            .lock()
+            .unwrap()
+            .insert_live(
+                0,
+                tournament_uuid,
+                ActorHandle {
+                    slot: 0,
+                    sender,
+                    snapshot: Arc::new(Mutex::new(status)),
+                },
+            )
+            .unwrap();
         assert_eq!(
             service.claim_shutdown(Duration::from_millis(25)),
             Err(ServiceError::EvidenceUnavailable)
@@ -3117,6 +3610,240 @@ mod tests {
     }
 
     #[test]
+    fn admitted_prepare_is_inserted_before_shutdown_authoritative_snapshot() {
+        let service = ready_service();
+        let tournament_uuid = Uuid::new_v4();
+        let status = prepared_status(
+            tournament_uuid,
+            service.core.daemon_instance_uuid,
+            [Uuid::new_v4(), Uuid::new_v4()],
+            1,
+            2,
+        );
+        let (actor_sender, actor_receiver) = sync_channel(ACTOR_MAILBOX_CAPACITY);
+        let actor = thread::spawn(move || match actor_receiver.recv().unwrap() {
+            ActorEvent::Shutdown { reply } => reply.send(Ok(())).unwrap(),
+            _ => panic!("shutdown snapshot sent the wrong actor event"),
+        });
+        let (held_sender, held_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let preparing = {
+            let service = service.clone();
+            thread::spawn(move || {
+                let end = std::time::Instant::now() + Duration::from_secs(2);
+                let admission = service.admission_lock_until(end).unwrap();
+                held_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                service
+                    .core
+                    .index
+                    .lock()
+                    .unwrap()
+                    .insert_live(
+                        7,
+                        tournament_uuid,
+                        ActorHandle {
+                            slot: 7,
+                            sender: actor_sender,
+                            snapshot: Arc::new(Mutex::new(status)),
+                        },
+                    )
+                    .unwrap();
+                drop(admission);
+            })
+        };
+        held_receiver.recv().unwrap();
+        let (done_sender, done_receiver) = sync_channel(1);
+        let shutdown = {
+            let service = service.clone();
+            thread::spawn(move || {
+                done_sender
+                    .send(service.claim_shutdown(Duration::from_secs(1)))
+                    .unwrap();
+            })
+        };
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "shutdown bypassed an admitted prepare"
+        );
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            done_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(()))
+        );
+        preparing.join().unwrap();
+        shutdown.join().unwrap();
+        actor.join().unwrap();
+    }
+
+    #[test]
+    fn full_actor_mailbox_bounds_mutation_and_shutdown_admission() {
+        let service = ready_service();
+        let tournament_uuid = Uuid::new_v4();
+        let status = prepared_status(
+            tournament_uuid,
+            service.core.daemon_instance_uuid,
+            [Uuid::new_v4(), Uuid::new_v4()],
+            1,
+            2,
+        );
+        let (sender, _receiver) = sync_channel(1);
+        sender
+            .try_send(ActorEvent::WatchdogTick { now_unix_ms: 1 })
+            .unwrap();
+        service
+            .core
+            .index
+            .lock()
+            .unwrap()
+            .insert_live(
+                0,
+                tournament_uuid,
+                ActorHandle {
+                    slot: 0,
+                    sender,
+                    snapshot: Arc::new(Mutex::new(status.clone())),
+                },
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            service.request_actor_until(
+                tournament_uuid,
+                |reply| ActorEvent::Arm {
+                    request: SpeculationArmRequest {
+                        tournament_uuid,
+                        daemon_instance_uuid: status.daemon_instance_uuid,
+                        generation: status.generation,
+                    },
+                    reply,
+                },
+                Duration::from_millis(25),
+            ),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(service.availability(), Availability::Ready);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            service.claim_shutdown(Duration::from_millis(25)),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(service.availability(), Availability::ShuttingDown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_allocation_owner_closes_every_pre_actor_failure_boundary() {
+        for boundary in ["allocation", "readback", "index-insert", "spawn"] {
+            let root = tempfile::tempdir().unwrap();
+            let store =
+                Arc::new(TournamentStore::open_or_create(&root.path().join("store")).unwrap());
+            let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+            service
+                .install_ready(Arc::clone(&store), root.path().join("control"))
+                .unwrap();
+            let tournament_uuid = Uuid::new_v4();
+            let record = test_prepared_record(tournament_uuid, service.core.daemon_instance_uuid);
+            let key = store.allocate_prepared(record.clone(), 1).unwrap();
+            let guard = PreparedAllocationGuard {
+                service: &service,
+                store: Arc::clone(&store),
+                key,
+                record,
+                armed: true,
+            };
+            if matches!(boundary, "readback" | "index-insert" | "spawn") {
+                assert!(store.load_by_uuid(tournament_uuid).unwrap().is_some());
+            }
+            if matches!(boundary, "index-insert" | "spawn") {
+                let (sender, _receiver) = sync_channel(1);
+                let status = store.load_by_uuid(tournament_uuid).unwrap().unwrap().status;
+                service
+                    .core
+                    .index
+                    .lock()
+                    .unwrap()
+                    .insert_live(
+                        key.slot(),
+                        tournament_uuid,
+                        ActorHandle {
+                            slot: key.slot(),
+                            sender,
+                            snapshot: Arc::new(Mutex::new(status)),
+                        },
+                    )
+                    .unwrap();
+            }
+            drop(guard);
+            let closed = store.load_by_uuid(tournament_uuid).unwrap().unwrap();
+            assert!(closed.is_positive_terminal(), "unclosed {boundary}");
+            assert_eq!(closed.status.phase, SpeculationPhase::RolledBack);
+            let index = service.core.index.lock().unwrap();
+            assert!(!index.live.contains_key(&tournament_uuid));
+            assert!(index.terminal.contains_key(&tournament_uuid));
+        }
+    }
+
+    #[test]
+    fn terminal_cache_tracks_store_slots_and_evicts_recycled_uuid() {
+        let mut index = ServiceIndex::default();
+        let daemon = Uuid::new_v4();
+        let oldest = Uuid::from_u128(1);
+        for value in 1_u128..=1025 {
+            let status = prepared_status(
+                Uuid::from_u128(value),
+                daemon,
+                [Uuid::new_v4(), Uuid::new_v4()],
+                1,
+                2,
+            );
+            index
+                .cache_terminal(((value - 1) % 1024) as u16, Arc::new(status))
+                .unwrap();
+        }
+        assert_eq!(index.terminal.len(), 1024);
+        assert_eq!(index.terminal_slots.len(), 1024);
+        assert!(!index.terminal.contains_key(&oldest));
+        assert!(index.terminal.contains_key(&Uuid::from_u128(1025)));
+        assert_eq!(index.terminal_slots.get(&0), Some(&Uuid::from_u128(1025)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn poisoned_or_invalid_store_authority_transitions_out_of_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(TournamentStore::open_or_create(&root.path().join("store")).unwrap());
+        let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
+        service
+            .install_ready(Arc::clone(&store), root.path().join("control"))
+            .unwrap();
+        store.poison_for_test();
+        assert_eq!(
+            service.load_store_record(&store, Uuid::new_v4()),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+        assert_eq!(service.availability(), Availability::Unresolved);
+
+        for error in [
+            crate::speculation_fs::EvidenceError::Corrupt,
+            crate::speculation_fs::EvidenceError::Stale,
+        ] {
+            let service = ready_service();
+            assert_eq!(
+                service.map_store_error(error),
+                ServiceError::EvidenceUnavailable
+            );
+            assert_eq!(service.availability(), Availability::Unresolved);
+        }
+    }
+
+    #[test]
     fn live_index_capacity_is_eight_without_touching_terminal_cache() {
         let service = SpeculationService::new_reconciling(Uuid::new_v4()).unwrap();
         let mut index = service.core.index.lock().unwrap();
@@ -3129,16 +3856,247 @@ mod tests {
                 1,
                 2,
             );
-            index.live.insert(
-                status.tournament_uuid,
-                ActorHandle {
-                    sender,
-                    snapshot: Arc::new(Mutex::new(status)),
-                },
-            );
+            let tournament_uuid = status.tournament_uuid;
+            index
+                .insert_live(
+                    (value - 1) as u16,
+                    tournament_uuid,
+                    ActorHandle {
+                        slot: (value - 1) as u16,
+                        sender,
+                        snapshot: Arc::new(Mutex::new(status)),
+                    },
+                )
+                .unwrap();
         }
         assert_eq!(index.live.len(), crate::speculation::MAX_LIVE_TOURNAMENTS);
         assert!(index.terminal.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn managed_owner_tag(
+        tournament_uuid: Uuid,
+        candidate_index: u8,
+        role: crate::launch_registry::ManagedOwnerRole,
+    ) -> crate::launch_registry::ManagedOwnerTag {
+        crate::launch_registry::ManagedOwnerTag {
+            kind: crate::launch_registry::ManagedOwnerKind::Speculation,
+            tournament_uuid,
+            candidate_index,
+            role,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn managed_entry(
+        owner: Option<crate::launch_registry::ManagedOwnerTag>,
+        slot: u16,
+        generation: u64,
+        outcome: crate::launch_registry::ReconcileOutcome,
+    ) -> crate::launch_registry::ManagedReconcileEntry {
+        crate::launch_registry::ManagedReconcileEntry {
+            key: Some(crate::launch_registry::ManagedKey::test_value(
+                slot, generation,
+            )),
+            owner,
+            outcome,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn correlation_store(
+        record: TournamentRecord,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TournamentStore>,
+        Vec<TournamentRecoveryRecord>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(TournamentStore::open_or_create(&root.path().join("store")).unwrap());
+        store.allocate_prepared(record, 1).unwrap();
+        let recovery = store.scan_recovery().unwrap();
+        (root, store, recovery)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_owner_correlation_persists_crash_gap_and_rejects_invalid_matrix() {
+        use crate::launch_registry::{
+            ManagedOwnerRole, ManagedReconcileCode, ManagedReconcileReport, ReconcileOutcome,
+        };
+
+        let daemon = Uuid::new_v4();
+        let tournament_uuid = Uuid::new_v4();
+        let record = test_prepared_record(tournament_uuid, daemon);
+        let (_root, store, mut recovery) = correlation_store(record);
+        let report = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                Some(managed_owner_tag(
+                    tournament_uuid,
+                    0,
+                    ManagedOwnerRole::Runner,
+                )),
+                7,
+                9,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        correlate_managed_startup(&store, &report, &mut recovery).unwrap();
+        assert_eq!(
+            store
+                .load_by_uuid(tournament_uuid)
+                .unwrap()
+                .unwrap()
+                .managed_owners[0],
+            Some(ManagedOwnerEvidence {
+                candidate_index: 0,
+                role: ManagedOwnerRoleEvidence::Runner,
+                slot: 7,
+                generation: 9,
+            })
+        );
+
+        let mut record = test_prepared_record(Uuid::new_v4(), daemon);
+        record.managed_owners[0] = Some(ManagedOwnerEvidence {
+            candidate_index: 0,
+            role: ManagedOwnerRoleEvidence::Probe,
+            slot: 1,
+            generation: 2,
+        });
+        let tournament_uuid = record.status.tournament_uuid;
+        let (_root, store, mut recovery) = correlation_store(record);
+        let runner_crash_gap = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                Some(managed_owner_tag(
+                    tournament_uuid,
+                    0,
+                    ManagedOwnerRole::Runner,
+                )),
+                3,
+                4,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        correlate_managed_startup(&store, &runner_crash_gap, &mut recovery).unwrap();
+        assert_eq!(
+            store
+                .load_by_uuid(tournament_uuid)
+                .unwrap()
+                .unwrap()
+                .managed_owners[0]
+                .as_ref()
+                .unwrap()
+                .role,
+            ManagedOwnerRoleEvidence::Runner
+        );
+
+        let record = test_prepared_record(Uuid::new_v4(), daemon);
+        let (_root, store, mut recovery) = correlation_store(record.clone());
+        let owner = managed_owner_tag(record.status.tournament_uuid, 0, ManagedOwnerRole::Probe);
+        let duplicate = ManagedReconcileReport {
+            entries: vec![
+                managed_entry(
+                    Some(owner.clone()),
+                    1,
+                    2,
+                    ReconcileOutcome::ResolvedTombstone,
+                ),
+                managed_entry(Some(owner), 2, 3, ReconcileOutcome::ResolvedTombstone),
+            ],
+        };
+        assert_eq!(
+            correlate_managed_startup(&store, &duplicate, &mut recovery),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+
+        let record = test_prepared_record(Uuid::new_v4(), daemon);
+        let (_root, store, mut recovery) = correlation_store(record);
+        let orphan = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                Some(managed_owner_tag(
+                    Uuid::new_v4(),
+                    0,
+                    ManagedOwnerRole::Runner,
+                )),
+                1,
+                2,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        assert_eq!(
+            correlate_managed_startup(&store, &orphan, &mut recovery),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+
+        let record = test_prepared_record(Uuid::new_v4(), daemon);
+        let tournament_uuid = record.status.tournament_uuid;
+        let (_root, store, mut recovery) = correlation_store(record);
+        let wrong_candidate = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                Some(managed_owner_tag(
+                    tournament_uuid,
+                    2,
+                    ManagedOwnerRole::Runner,
+                )),
+                1,
+                2,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        assert_eq!(
+            correlate_managed_startup(&store, &wrong_candidate, &mut recovery),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+
+        let mut record = test_prepared_record(Uuid::new_v4(), daemon);
+        record.managed_owners[0] = Some(ManagedOwnerEvidence {
+            candidate_index: 0,
+            role: ManagedOwnerRoleEvidence::Runner,
+            slot: 1,
+            generation: 2,
+        });
+        let tournament_uuid = record.status.tournament_uuid;
+        let (_root, store, mut recovery) = correlation_store(record);
+        let wrong_role = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                Some(managed_owner_tag(
+                    tournament_uuid,
+                    0,
+                    ManagedOwnerRole::Probe,
+                )),
+                1,
+                2,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        assert_eq!(
+            correlate_managed_startup(&store, &wrong_role, &mut recovery),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+
+        let record = test_prepared_record(Uuid::new_v4(), daemon);
+        let (_root, store, mut recovery) = correlation_store(record);
+        let resolved_ownerless = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                None,
+                1,
+                2,
+                ReconcileOutcome::ResolvedTombstone,
+            )],
+        };
+        correlate_managed_startup(&store, &resolved_ownerless, &mut recovery).unwrap();
+        let unresolved_ownerless = ManagedReconcileReport {
+            entries: vec![managed_entry(
+                None,
+                2,
+                3,
+                ReconcileOutcome::UnknownOrphanRisk(ManagedReconcileCode::UnknownSlot),
+            )],
+        };
+        assert_eq!(
+            correlate_managed_startup(&store, &unresolved_ownerless, &mut recovery),
+            Err(ServiceError::EvidenceUnavailable)
+        );
     }
 
     #[cfg(target_os = "linux")]

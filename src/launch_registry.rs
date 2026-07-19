@@ -588,6 +588,11 @@ impl ManagedKey {
     pub(crate) fn generation(self) -> u64 {
         self.generation
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_value(slot: u16, generation: u64) -> Self {
+        Self { slot, generation }
+    }
 }
 
 impl ManagedWaiter {
