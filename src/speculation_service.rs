@@ -753,10 +753,10 @@ impl SpeculationService {
         let end = std::time::Instant::now()
             .checked_add(deadline)
             .ok_or(ServiceError::EvidenceUnavailable)?;
+        let admission = self.admission_lock_until(end)?;
         self.core
             .availability
             .store(Availability::ShuttingDown as u8, Ordering::Release);
-        let admission = self.admission_lock_until(end)?;
         let senders = {
             let index = self.index_lock()?;
             index
@@ -1013,10 +1013,10 @@ fn close_unowned_prepared(
         .map_err(map_store_error)
 }
 
-fn prepare_failpoint(name: &str) -> Result<(), ServiceError> {
+fn prepare_failpoint(_name: &str) -> Result<(), ServiceError> {
     #[cfg(debug_assertions)]
     if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && std::env::var("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").as_deref() == Ok(name)
+        && std::env::var("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").as_deref() == Ok(_name)
     {
         return Err(ServiceError::EvidenceUnavailable);
     }
@@ -3676,6 +3676,69 @@ mod tests {
         preparing.join().unwrap();
         shutdown.join().unwrap();
         actor.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_admission_timeout_leaves_admitted_prepare_ready_and_owned() {
+        let service = ready_service();
+        let tournament_uuid = Uuid::new_v4();
+        let status = prepared_status(
+            tournament_uuid,
+            service.core.daemon_instance_uuid,
+            [Uuid::new_v4(), Uuid::new_v4()],
+            1,
+            2,
+        );
+        let (actor_sender, _actor_receiver) = sync_channel(ACTOR_MAILBOX_CAPACITY);
+        let (held_sender, held_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let preparing = {
+            let service = service.clone();
+            thread::spawn(move || {
+                let end = std::time::Instant::now() + Duration::from_secs(2);
+                let admission = service.admission_lock_until(end).unwrap();
+                held_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                service
+                    .core
+                    .index
+                    .lock()
+                    .unwrap()
+                    .insert_live(
+                        7,
+                        tournament_uuid,
+                        ActorHandle {
+                            slot: 7,
+                            sender: actor_sender,
+                            snapshot: Arc::new(Mutex::new(status)),
+                        },
+                    )
+                    .unwrap();
+                drop(admission);
+            })
+        };
+        held_receiver.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            service.claim_shutdown(Duration::from_millis(25)),
+            Err(ServiceError::EvidenceUnavailable)
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(service.availability(), Availability::Ready);
+
+        release_sender.send(()).unwrap();
+        preparing.join().unwrap();
+        assert_eq!(service.availability(), Availability::Ready);
+        assert!(
+            service
+                .core
+                .index
+                .lock()
+                .unwrap()
+                .live
+                .contains_key(&tournament_uuid)
+        );
     }
 
     #[test]
