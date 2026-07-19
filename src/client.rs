@@ -1238,29 +1238,24 @@ fn speculate_rollback_at(
     match classify_rollback_phase(observed.phase) {
         RollbackPhaseAction::Return => return Ok(observed),
         RollbackPhaseAction::Poll => {
-            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
-                status.is_terminal() || status.phase.is_rollback_only()
-            })?;
+            let (status, _) = poll_journaled_status_until(
+                socket,
+                &ledger,
+                current,
+                SpeculationStatus::is_terminal,
+            )?;
             return Ok(status);
         }
         RollbackPhaseAction::Start => {}
     }
     match requested_action_plan(current.value.action, LedgerAction::RollbackRequested) {
         RequestedActionPlan::RecoverStatusOnly => {
-            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
-                status.is_terminal() || status.phase == SpeculationPhase::RollbackPending
-            })?;
-            if status.phase == SpeculationPhase::RollbackPending {
-                let (terminal, _) = poll_journaled_status_until(
-                    socket,
-                    &ledger,
-                    ledger
-                        .read_verified(status.tournament_uuid, status.daemon_instance_uuid)
-                        .map_err(map_speculation_evidence)?,
-                    SpeculationStatus::is_terminal,
-                )?;
-                return Ok(terminal);
-            }
+            let (status, _) = poll_journaled_status_until(
+                socket,
+                &ledger,
+                current,
+                SpeculationStatus::is_terminal,
+            )?;
             return Ok(status);
         }
         RequestedActionPlan::Reject => {
@@ -8996,6 +8991,55 @@ mod tests {
             assert_eq!(exact.identity, requested.identity);
             assert_eq!(exact.value, requested.value);
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn existing_rollback_request_polls_status_only_until_terminal() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let requested =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::RollbackRequested)
+                .unwrap();
+        let tournament = ledger
+            .read_tournament(requested.value.tournament_uuid)
+            .unwrap();
+        let rollback_pending = speculation_status(SpeculationPhase::RollbackPending, 2);
+        let rolled_back = speculation_status(SpeculationPhase::RolledBack, 3);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&rollback_pending),
+            speculation_response(&rollback_pending),
+            speculation_response(&rolled_back),
+        ]);
+
+        let result = super::speculate_rollback_at(&socket, ledger, tournament).unwrap();
+        assert_eq!(result, rolled_back);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(requests[1..].iter().all(|request| matches!(
+            serde_json::from_slice::<Request>(request),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        )));
+
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                requested.value.tournament_uuid,
+                requested.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.value.action, LedgerAction::StatusMirrored);
+        assert_eq!(exact.value.generation, rolled_back.generation);
+        assert_eq!(exact.value.status, rolled_back);
     }
 
     #[test]
