@@ -2923,8 +2923,64 @@ fn parse_speculation_timeout_arg(value: &str) -> std::result::Result<Duration, S
     Ok(duration)
 }
 
-fn dispatch_speculation(_command: SpeculationCommands) -> Result<()> {
-    bail!("speculation_unsupported_phase1")
+fn dispatch_speculation(command: SpeculationCommands) -> Result<()> {
+    let status = match command {
+        SpeculationCommands::Run {
+            source,
+            candidate,
+            ledger_root,
+            cgroup_root,
+            timeout,
+            command,
+        } => {
+            let candidates: [PathBuf; speculation::CANDIDATE_COUNT] = candidate
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("speculation_requires_exactly_two_candidates"))?;
+            client::speculate_run(
+                source,
+                candidates,
+                ledger_root,
+                cgroup_root,
+                timeout,
+                command,
+            )?
+        }
+        SpeculationCommands::Status {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_status(&ledger_root, tournament)?
+        }
+        SpeculationCommands::Finalize {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_finalize(&ledger_root, tournament)?
+        }
+        SpeculationCommands::Rollback {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_rollback(&ledger_root, tournament)?
+        }
+    };
+    let stdout = std::io::stdout();
+    write_speculation_status(&mut stdout.lock(), &status)
+}
+
+fn write_speculation_status(
+    out: &mut impl Write,
+    status: &protocol::SpeculationStatus,
+) -> Result<()> {
+    serde_json::to_writer(&mut *out, status)?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
@@ -4133,7 +4189,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn speculation_cli_preserves_non_utf8_exact_argv_and_dispatches_fail_closed() {
+    fn speculation_cli_preserves_non_utf8_exact_argv() {
         use std::os::unix::ffi::OsStringExt;
 
         let marker = OsString::from_vec(vec![b'f', 0x80, b'o']);
@@ -4166,8 +4222,55 @@ mod tests {
             unreachable!();
         };
         assert_eq!(argv, &[OsString::from("command"), marker]);
-        let error = dispatch_speculation(command).expect_err("phase 1 must fail closed");
-        assert_eq!(error.to_string(), "speculation_unsupported_phase1");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn speculation_dispatch_is_unsupported_before_filesystem_or_socket_side_effects() {
+        let command = SpeculationCommands::Run {
+            source: PathBuf::from("/private/source-marker"),
+            candidate: vec![
+                PathBuf::from("/private/candidate-zero-marker"),
+                PathBuf::from("/private/candidate-one-marker"),
+            ],
+            ledger_root: PathBuf::from("/private/ledger-marker"),
+            cgroup_root: PathBuf::from("/private/cgroup-marker"),
+            timeout: Duration::from_secs(1),
+            command: vec![OsString::from("argv-marker")],
+        };
+        let error = dispatch_speculation(command).expect_err("non-Linux must fail closed");
+        assert_eq!(error.to_string(), "speculation_unsupported");
+        assert!(!error.to_string().contains("marker"));
+    }
+
+    #[test]
+    fn speculation_status_writer_emits_one_compact_json_line() {
+        let status: protocol::SpeculationStatus =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": "lterm.speculation.status.v1",
+                "tournament_uuid": Uuid::from_u128(1),
+                "daemon_instance_uuid": Uuid::from_u128(2),
+                "phase": "prepared",
+                "generation": 1,
+                "lease_deadline_unix_ms": 2,
+                "reason_code": "prepared_lease",
+                "candidates": [
+                    {"candidate_uuid": Uuid::from_u128(3), "index": 0, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": false, "bwrap_reaped": false, "sync_eof": false, "cgroup_empty": false, "managed_tombstone": false}},
+                    {"candidate_uuid": Uuid::from_u128(4), "index": 1, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": false, "bwrap_reaped": false, "sync_eof": false, "cgroup_empty": false, "managed_tombstone": false}}
+                ],
+                "fixed_score_order": ["eligibility_descending", "exit_success_descending", "elapsed_ns_ascending", "output_bytes_ascending", "input_index_ascending"],
+                "selected_index": null,
+                "rollback_required": false,
+                "error_codes": []
+            }))
+            .unwrap();
+        let mut output = Vec::new();
+        write_speculation_status(&mut output, &status).unwrap();
+        let mut expected = serde_json::to_vec(&status).unwrap();
+        expected.push(b'\n');
+        assert_eq!(output, expected);
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(!output.contains(&b' '));
     }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
