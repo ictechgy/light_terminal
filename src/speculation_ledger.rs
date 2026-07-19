@@ -47,6 +47,9 @@ pub struct ClientLedgerRecord {
 impl ClientLedgerRecord {
     pub fn validate(&self) -> EvidenceResult<()> {
         if self.schema_version != ClientLedgerSchema::V1
+            || self.tournament_uuid.is_nil()
+            || self.daemon_instance_uuid.is_nil()
+            || self.generation == 0
             || self.tournament_uuid != self.status.tournament_uuid
             || self.daemon_instance_uuid != self.status.daemon_instance_uuid
             || self.generation != self.status.generation
@@ -71,6 +74,18 @@ impl ClientLedgerRecord {
 }
 
 pub type ClientLedgerEntry = StoredJson<ClientLedgerRecord>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientLedgerAuthority {
+    CurrentBoot,
+    CleanupOnlyAfterBoot,
+}
+
+#[derive(Debug)]
+pub struct TournamentLedgerEntry {
+    pub entry: ClientLedgerEntry,
+    pub authority: ClientLedgerAuthority,
+}
 
 pub struct ClientLedger {
     root: ValidatedDirectory,
@@ -117,6 +132,7 @@ impl ClientLedger {
     ) -> EvidenceResult<ClientLedgerEntry> {
         current.value.validate()?;
         next.validate()?;
+        self.require_current_root(&current.value)?;
         if !current.value.same_identity_as(next)
             || next.action != action
             || next.generation != generation
@@ -141,6 +157,7 @@ impl ClientLedger {
         status: &SpeculationStatus,
     ) -> EvidenceResult<ClientLedgerEntry> {
         current.value.validate()?;
+        self.require_current_root(&current.value)?;
         if status.tournament_uuid != current.value.tournament_uuid
             || status.daemon_instance_uuid != current.value.daemon_instance_uuid
             || status.generation < current.value.generation
@@ -179,12 +196,49 @@ impl ClientLedger {
         entry.value.validate()?;
         if entry.value.tournament_uuid != tournament_uuid
             || entry.value.daemon_instance_uuid != daemon_instance_uuid
-            || entry.value.roots.ledger_root != self.root.identity()
-            || entry.value.roots.ledger_root.boot_uuid != self.root.identity().boot_uuid
         {
             return Err(EvidenceError::Stale);
         }
+        self.require_current_root(&entry.value)?;
         Ok(entry)
+    }
+
+    pub fn read_tournament(&self, tournament_uuid: Uuid) -> EvidenceResult<TournamentLedgerEntry> {
+        if tournament_uuid.is_nil() {
+            return Err(EvidenceError::InvalidIdentity);
+        }
+        let entry: ClientLedgerEntry = read_json(
+            &self.root,
+            &record_leaf(tournament_uuid)?,
+            MAX_SPECULATION_JSON_BYTES,
+        )?;
+        entry.value.validate()?;
+        if entry.value.tournament_uuid != tournament_uuid {
+            return Err(EvidenceError::Stale);
+        }
+        let authority =
+            classify_ledger_authority(entry.value.roots.ledger_root, self.root.identity())?;
+        Ok(TournamentLedgerEntry { entry, authority })
+    }
+
+    fn require_current_root(&self, record: &ClientLedgerRecord) -> EvidenceResult<()> {
+        if record.roots.ledger_root != self.root.identity() {
+            return Err(EvidenceError::Stale);
+        }
+        Ok(())
+    }
+}
+
+fn classify_ledger_authority(
+    stored_root: DurableDirectoryIdentity,
+    current_root: DurableDirectoryIdentity,
+) -> EvidenceResult<ClientLedgerAuthority> {
+    if stored_root == current_root {
+        Ok(ClientLedgerAuthority::CurrentBoot)
+    } else if stored_root.boot_uuid != current_root.boot_uuid {
+        Ok(ClientLedgerAuthority::CleanupOnlyAfterBoot)
+    } else {
+        Err(EvidenceError::Stale)
     }
 }
 
@@ -205,11 +259,13 @@ fn record_leaf(tournament_uuid: Uuid) -> EvidenceResult<CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt as _;
 
-    fn status() -> SpeculationStatus {
+    fn status(tournament_uuid: Uuid) -> SpeculationStatus {
         serde_json::from_value(serde_json::json!({
             "schema_version": "lterm.speculation.status.v1",
-            "tournament_uuid": Uuid::nil(),
+            "tournament_uuid": tournament_uuid,
             "daemon_instance_uuid": Uuid::from_u128(1),
             "phase": "prepared",
             "generation": 1,
@@ -236,17 +292,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ledger_contract_is_versioned_strict_and_raw_free() {
-        let record = ClientLedgerRecord {
+    fn test_record(tournament_uuid: Uuid, roots: ClientRootIdentities) -> ClientLedgerRecord {
+        ClientLedgerRecord {
             schema_version: ClientLedgerSchema::V1,
-            tournament_uuid: Uuid::nil(),
+            tournament_uuid,
             daemon_instance_uuid: Uuid::from_u128(1),
             generation: 1,
             action: LedgerAction::Prepared,
-            roots: roots(),
-            status: status(),
-        };
+            roots,
+            status: status(tournament_uuid),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_ledger() -> (tempfile::TempDir, ClientLedger) {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger_path = directory.path().join("ledger");
+        std::fs::create_dir(&ledger_path).unwrap();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap();
+        (directory, ClientLedger::new(root))
+    }
+
+    #[test]
+    fn authority_classification_is_exact_and_boot_scoped() {
+        let current = DurableDirectoryIdentity::test_value();
+        assert_eq!(
+            classify_ledger_authority(current, current),
+            Ok(ClientLedgerAuthority::CurrentBoot)
+        );
+        let mut replaced = current;
+        replaced.ino = replaced.ino.saturating_add(1);
+        assert_eq!(
+            classify_ledger_authority(replaced, current),
+            Err(EvidenceError::Stale)
+        );
+        let mut old_boot = replaced;
+        old_boot.boot_uuid = Uuid::new_v4();
+        assert_ne!(old_boot.boot_uuid, current.boot_uuid);
+        assert_eq!(
+            classify_ledger_authority(old_boot, current),
+            Ok(ClientLedgerAuthority::CleanupOnlyAfterBoot)
+        );
+    }
+
+    #[test]
+    fn ledger_contract_is_versioned_strict_and_raw_free() {
+        let record = test_record(Uuid::from_u128(7), roots());
         record.validate().unwrap();
         let encoded = serde_json::to_string(&record).unwrap();
         for prohibited in [
@@ -267,19 +359,195 @@ mod tests {
 
     #[test]
     fn ledger_identity_or_generation_mismatch_is_fail_closed() {
-        let mut record = ClientLedgerRecord {
-            schema_version: ClientLedgerSchema::V1,
-            tournament_uuid: Uuid::nil(),
-            daemon_instance_uuid: Uuid::from_u128(1),
-            generation: 1,
-            action: LedgerAction::Prepared,
-            roots: roots(),
-            status: status(),
-        };
+        let mut record = test_record(Uuid::from_u128(7), roots());
         record.generation = 2;
         assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
         record.generation = 1;
         record.daemon_instance_uuid = Uuid::from_u128(9);
         assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
+    }
+
+    #[test]
+    fn ledger_rejects_nil_authority_and_zero_generation() {
+        let mut record = test_record(Uuid::from_u128(7), roots());
+        record.tournament_uuid = Uuid::nil();
+        record.status.tournament_uuid = Uuid::nil();
+        assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
+
+        let mut record = test_record(Uuid::from_u128(7), roots());
+        record.daemon_instance_uuid = Uuid::nil();
+        record.status.daemon_instance_uuid = Uuid::nil();
+        assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
+
+        let mut record = test_record(Uuid::from_u128(7), roots());
+        record.generation = 0;
+        record.status.generation = 0;
+        assert_eq!(record.validate(), Err(EvidenceError::Corrupt));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn standalone_lookup_distinguishes_current_and_cleanup_only_authority() {
+        let (_directory, ledger) = private_ledger();
+        let tournament = Uuid::from_u128(7);
+        let current_roots = ClientRootIdentities {
+            source: ledger.root.identity(),
+            candidates: [ledger.root.identity(), ledger.root.identity()],
+            ledger_root: ledger.root.identity(),
+            cgroup_root: ledger.root.identity(),
+        };
+        ledger
+            .create_prepared(&test_record(tournament, current_roots.clone()))
+            .unwrap();
+        let current = ledger.read_tournament(tournament).unwrap();
+        assert_eq!(current.authority, ClientLedgerAuthority::CurrentBoot);
+        assert_eq!(current.entry.value.roots, current_roots);
+
+        let (_old_directory, old_ledger) = private_ledger();
+        let old_tournament = Uuid::from_u128(8);
+        let mut old_identity = old_ledger.root.identity();
+        old_identity.boot_uuid = Uuid::new_v4();
+        assert_ne!(old_identity.boot_uuid, old_ledger.root.identity().boot_uuid);
+        let old_roots = ClientRootIdentities {
+            source: old_identity,
+            candidates: [old_identity, old_identity],
+            ledger_root: old_identity,
+            cgroup_root: old_identity,
+        };
+        let old_record = test_record(old_tournament, old_roots);
+        atomic_create_json(
+            &old_ledger.root,
+            &record_leaf(old_tournament).unwrap(),
+            &old_record,
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        let cleanup_only = old_ledger.read_tournament(old_tournament).unwrap();
+        assert_eq!(
+            cleanup_only.authority,
+            ClientLedgerAuthority::CleanupOnlyAfterBoot
+        );
+        assert!(matches!(
+            old_ledger.read_verified(old_tournament, Uuid::from_u128(1)),
+            Err(EvidenceError::Stale)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_boot_root_replacement_and_wrong_tournament_fail_closed() {
+        let (_directory, ledger) = private_ledger();
+        let tournament = Uuid::from_u128(9);
+        let mut replaced = ledger.root.identity();
+        replaced.ino = replaced.ino.saturating_add(1);
+        let replaced_roots = ClientRootIdentities {
+            source: replaced,
+            candidates: [replaced, replaced],
+            ledger_root: replaced,
+            cgroup_root: replaced,
+        };
+        atomic_create_json(
+            &ledger.root,
+            &record_leaf(tournament).unwrap(),
+            &test_record(tournament, replaced_roots),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert!(matches!(
+            ledger.read_tournament(tournament),
+            Err(EvidenceError::Stale)
+        ));
+
+        let wrong_leaf = Uuid::from_u128(10);
+        atomic_create_json(
+            &ledger.root,
+            &record_leaf(wrong_leaf).unwrap(),
+            &test_record(Uuid::from_u128(11), {
+                let identity = ledger.root.identity();
+                ClientRootIdentities {
+                    source: identity,
+                    candidates: [identity, identity],
+                    ledger_root: identity,
+                    cgroup_root: identity,
+                }
+            }),
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        assert!(matches!(
+            ledger.read_tournament(wrong_leaf),
+            Err(EvidenceError::Stale)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cleanup_only_entry_cannot_rewrite_or_mirror() {
+        let (_directory, ledger) = private_ledger();
+        let tournament = Uuid::from_u128(12);
+        let mut old_identity = ledger.root.identity();
+        old_identity.boot_uuid = Uuid::new_v4();
+        let old_roots = ClientRootIdentities {
+            source: old_identity,
+            candidates: [old_identity, old_identity],
+            ledger_root: old_identity,
+            cgroup_root: old_identity,
+        };
+        let old_record = test_record(tournament, old_roots);
+        atomic_create_json(
+            &ledger.root,
+            &record_leaf(tournament).unwrap(),
+            &old_record,
+            MAX_SPECULATION_JSON_BYTES,
+        )
+        .unwrap();
+        let cleanup_only = ledger.read_tournament(tournament).unwrap();
+        let mut next = cleanup_only.entry.value.clone();
+        next.action = LedgerAction::RollbackRequested;
+        assert!(matches!(
+            ledger.write_before_action(
+                &cleanup_only.entry,
+                &next,
+                LedgerAction::RollbackRequested,
+                next.generation,
+            ),
+            Err(EvidenceError::Stale)
+        ));
+        assert!(matches!(
+            ledger.mirror_status(&cleanup_only.entry, &cleanup_only.entry.value.status),
+            Err(EvidenceError::Stale)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_corruption_and_live_root_replacement_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, ledger) = private_ledger();
+        let ledger_path = directory.path().join("ledger");
+        let corrupt = Uuid::from_u128(13);
+        let corrupt_path = ledger_path.join(format!("{corrupt}.json"));
+        std::fs::write(&corrupt_path, b"{}\n").unwrap();
+        std::fs::set_permissions(&corrupt_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            ledger.read_tournament(corrupt),
+            Err(EvidenceError::Corrupt)
+        ));
+
+        let linked = Uuid::from_u128(14);
+        let target = directory.path().join("attacker-record");
+        std::fs::write(&target, b"{}\n").unwrap();
+        symlink(&target, ledger_path.join(format!("{linked}.json"))).unwrap();
+        assert!(ledger.read_tournament(linked).is_err());
+
+        let moved = directory.path().join("ledger-old");
+        std::fs::rename(&ledger_path, &moved).unwrap();
+        std::fs::create_dir(&ledger_path).unwrap();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            ledger.read_tournament(Uuid::from_u128(15)),
+            Err(EvidenceError::Stale)
+        ));
     }
 }
