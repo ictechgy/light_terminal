@@ -26,8 +26,8 @@ use crate::speculation_linux::{
     prepare_candidate_empty_proof, prepare_tournament_empty_proof, prove_candidate_empty,
     prove_tournament_empty, receive_decision_ack, receive_execution_event, receive_go_receipt,
     receive_output_drained, receive_payload_fd_ack, receive_payload_placed_owned,
-    reconcile_different_boot, reconcile_from_record, send_go, send_payload_release,
-    send_select_or_abort, transfer_payload_fd_owned,
+    reconcile_different_boot, reconcile_from_record, reconcile_private_runner_controls, send_go,
+    send_payload_release, send_select_or_abort, transfer_payload_fd_owned,
 };
 use crate::speculation_linux::{
     ContainmentDeadline, ContainmentErrorCode, LiveTournamentContext, PrepareInputs,
@@ -329,6 +329,28 @@ pub(crate) struct SpeculationService {
     core: Arc<ServiceCore>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ServiceStartupConfig {
+    control_path: PathBuf,
+    store_path: PathBuf,
+    managed_registry_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ServiceStartupConfig {
+    fn capture() -> Result<Self, ServiceError> {
+        Ok(Self {
+            control_path: crate::paths::speculation_control_dir()
+                .map_err(|_| ServiceError::EvidenceUnavailable)?,
+            store_path: crate::paths::tournament_registry_dir()
+                .map_err(|_| ServiceError::EvidenceUnavailable)?,
+            managed_registry_path: crate::paths::process_registry_dir()
+                .map_err(|_| ServiceError::EvidenceUnavailable)?,
+        })
+    }
+}
+
 struct PreparedAllocationGuard<'a> {
     service: &'a SpeculationService,
     store: Arc<TournamentStore>,
@@ -384,13 +406,109 @@ impl Default for SpeculationService {
 impl SpeculationService {
     #[cfg(target_os = "linux")]
     pub(crate) fn production() -> Result<Self, ServiceError> {
+        Self::production_with_recovery_gate(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_with_recovery_gate(
+        recovery_gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Result<Self, ServiceError> {
+        let startup = ServiceStartupConfig::capture()?;
+        Self::production_with_startup_config(startup, recovery_gate)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn production_with_startup_config(
+        startup: ServiceStartupConfig,
+        recovery_gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Result<Self, ServiceError> {
+        crate::launch_registry::initialize_managed_process_registry_path(
+            &startup.managed_registry_path,
+        )
+        .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        crate::launch_registry::initialize_managed_reaper_config();
+        crate::speculation_linux::initialize_speculation_process_config();
         let service = Self::new_reconciling(Uuid::new_v4())?;
         let worker = service.clone();
         thread::Builder::new()
             .name("lterm-speculation-recovery".into())
-            .spawn(move || worker.reconcile_startup())
+            .spawn(move || {
+                if let Some(gate) = recovery_gate {
+                    gate.wait();
+                }
+                worker.reconcile_startup(startup);
+            })
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
         Ok(service)
+    }
+
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    pub(crate) fn run_startup_config_capture_test_driver() -> Result<(), ServiceError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+            .map(PathBuf::from)
+            .ok_or(ServiceError::InvalidRequest)?;
+        let primary_runtime = fixture.join("primary-runtime");
+        let primary_data = fixture.join("primary-data");
+        let alternate_runtime = fixture.join("alternate-runtime");
+        let alternate_data = fixture.join("alternate-data");
+        for path in [
+            &primary_runtime,
+            &primary_data,
+            &alternate_runtime,
+            &alternate_data,
+        ] {
+            std::fs::create_dir(path).map_err(|_| ServiceError::EvidenceUnavailable)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        }
+        // This debug-only driver is a fresh subprocess with no threads yet.
+        unsafe {
+            std::env::set_var("LTERM_RUNTIME_DIR", &primary_runtime);
+            std::env::set_var("LTERM_DATA_DIR", &primary_data);
+        }
+        let caller = std::thread::current().id();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let service = Self::production_with_recovery_gate(Some(Arc::clone(&gate)))?;
+        if !crate::speculation_linux::speculation_process_config_initialized_on(caller) {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        // production_with_recovery_gate synchronously captured every relevant
+        // path and managed-reaper seam before spawning the gated worker. No
+        // background thread can read the process environment after this point.
+        unsafe {
+            std::env::set_var("LTERM_RUNTIME_DIR", &alternate_runtime);
+            std::env::set_var("LTERM_DATA_DIR", &alternate_data);
+        }
+        gate.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while service.availability() == Availability::Reconciling
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if service.availability() != Availability::Ready
+            || service.core.control_root.get()
+                != Some(&primary_runtime.join("speculation/control-v1"))
+            || !primary_data
+                .join("speculation/tournament-registry-v1")
+                .is_dir()
+            || !primary_data
+                .join("speculation/process-registry-v1")
+                .is_dir()
+            || alternate_runtime.join("speculation").exists()
+            || alternate_data.join("speculation").exists()
+        {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        crate::launch_registry::reconcile_managed_processes()
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        if alternate_data.join("speculation").exists() {
+            return Err(ServiceError::EvidenceUnavailable);
+        }
+        service.core.watchdog_stop.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -399,6 +517,8 @@ impl SpeculationService {
     }
 
     pub(crate) fn new_reconciling(daemon_instance_uuid: Uuid) -> Result<Self, ServiceError> {
+        #[cfg(target_os = "linux")]
+        crate::speculation_linux::initialize_speculation_process_config();
         if daemon_instance_uuid.is_nil() {
             return Err(ServiceError::InvalidRequest);
         }
@@ -446,30 +566,27 @@ impl SpeculationService {
     }
 
     #[cfg(target_os = "linux")]
-    fn reconcile_startup(&self) {
-        if self.reconcile_startup_inner().is_err() {
+    fn reconcile_startup(&self, startup: ServiceStartupConfig) {
+        if self.reconcile_startup_inner(&startup).is_err() {
             self.mark_unresolved();
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn reconcile_startup_inner(&self) -> Result<(), ServiceError> {
-        let control_path = crate::paths::speculation_control_dir()
-            .map_err(|_| ServiceError::EvidenceUnavailable)?;
-        let control_root = crate::speculation_fs::open_or_create_private_dir(&control_path)
+    fn reconcile_startup_inner(&self, startup: &ServiceStartupConfig) -> Result<(), ServiceError> {
+        let control_root = crate::speculation_fs::open_or_create_private_dir(&startup.control_path)
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
         let current_private_identity = control_root.identity();
         control_root
             .revalidate()
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
-        let store_path = crate::paths::tournament_registry_dir()
-            .map_err(|_| ServiceError::EvidenceUnavailable)?;
         let store = Arc::new(
-            TournamentStore::open_or_create(&store_path)
+            TournamentStore::open_or_create(&startup.store_path)
                 .map_err(|_| ServiceError::EvidenceUnavailable)?,
         );
-        let managed = crate::launch_registry::reconcile_managed_processes()
-            .map_err(|_| ServiceError::EvidenceUnavailable)?;
+        let managed =
+            crate::launch_registry::reconcile_managed_processes_at(&startup.managed_registry_path)
+                .map_err(|_| ServiceError::EvidenceUnavailable)?;
         let mut recovery = store
             .scan_recovery()
             .map_err(|_| ServiceError::EvidenceUnavailable)?;
@@ -508,12 +625,14 @@ impl SpeculationService {
             }
             terminal.cache_terminal(normalized.key.slot(), Arc::new(normalized.record.status))?;
         }
+        reconcile_private_runner_controls(&control_root, &managed)
+            .map_err(|_| ServiceError::EvidenceUnavailable)?;
         {
             let mut index = self.index_lock()?;
             index.terminal = terminal.terminal;
             index.terminal_slots = terminal.terminal_slots;
         }
-        self.install_ready(store, control_path)?;
+        self.install_ready(store, startup.control_path.clone())?;
         self.start_watchdog()?;
         Ok(())
     }
@@ -1012,9 +1131,9 @@ fn close_unowned_prepared(
 }
 
 fn prepare_failpoint(_name: &str) -> Result<(), ServiceError> {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && std::env::var("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").as_deref() == Ok(_name)
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if crate::speculation_linux::active_speculation_test_config()
+        .is_some_and(|config| config.prepare_failpoint.as_deref() == Some(_name))
     {
         return Err(ServiceError::EvidenceUnavailable);
     }
@@ -3268,8 +3387,11 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
-        .map(PathBuf::from)
+    let test_config = crate::speculation_linux::active_speculation_test_config()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let fixture = test_config
+        .fixture_root
+        .clone()
         .ok_or(ContainmentErrorCode::InvalidIdentity)?;
     std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
@@ -3298,8 +3420,9 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o500))
             .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     }
-    let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
-        .map(PathBuf::from)
+    let cgroup_root = test_config
+        .cgroup_root
+        .clone()
         .ok_or(ContainmentErrorCode::Unsupported)?;
     let store = Arc::new(
         TournamentStore::open_or_create(&fixture.join("store"))
@@ -3310,14 +3433,10 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     service
         .install_ready(Arc::clone(&store), control)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    let observed_run_timeout_ms = std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_LEASE_MS")
-        .map(|value| {
-            value
-                .to_str()
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or(ContainmentErrorCode::InvalidIdentity)
-        })
-        .transpose()?;
+    if test_config.observed_run_timeout_invalid {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let observed_run_timeout_ms = test_config.observed_run_timeout_ms;
     let lease_receiver = if observed_run_timeout_ms.is_some() {
         let (observer, receiver) = sync_channel(2);
         *service
@@ -3351,7 +3470,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
         .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
     )
     .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT").is_some() {
+    if test_config.prepare_failpoint.is_some() {
         if service.prepare(request).is_ok() {
             return Err(ContainmentErrorCode::EvidenceUnavailable);
         }
@@ -3384,9 +3503,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
     {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_CLIENT_DIES_BEFORE_LEDGER").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    if test_config.client_dies_before_ledger {
         let prepared_record = service
             .load_store_record(&store, prepared.status.tournament_uuid)
             .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
@@ -3447,9 +3564,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
         cgroup_root: prepared_record.roots.cgroup_root,
     };
     let mut roots = roots;
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_ARM_ROOT_MISMATCH").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    if test_config.arm_root_mismatch {
         roots.source.dev = roots.source.dev.saturating_add(1);
     }
     let created = ledger
@@ -3485,9 +3600,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
             prepared.status.generation,
         )
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_ARM_ROOT_MISMATCH").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    if test_config.arm_root_mismatch {
         if service
             .arm(SpeculationArmRequest {
                 tournament_uuid: prepared.status.tournament_uuid,
@@ -3572,11 +3685,7 @@ pub(crate) fn run_real_actor_service_driver() -> Result<(), ContainmentErrorCode
             }
         }
     }
-    let terminal_phase = match std::env::var_os("LTERM_INTERNAL_SPECULATION_ACTOR_TERMINAL")
-        .as_deref()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("finalize")
-    {
+    let terminal_phase = match test_config.actor_terminal.as_deref().unwrap_or("finalize") {
         "finalize" => {
             let finalizing = service
                 .finalize(SpeculationFinalizeRequest {
@@ -4420,6 +4529,7 @@ mod tests {
                 slot, generation,
             )),
             owner,
+            artifact_binding: None,
             outcome,
         }
     }
@@ -4699,7 +4809,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fresh_startup_reconciles_before_ready_and_starts_one_watchdog() {
-        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
         let data = root.path().join("data");
@@ -4708,14 +4817,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let previous_runtime = std::env::var_os("LTERM_RUNTIME_DIR");
-        let previous_data = std::env::var_os("LTERM_DATA_DIR");
-        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
-        unsafe {
-            std::env::set_var("LTERM_RUNTIME_DIR", &runtime);
-            std::env::set_var("LTERM_DATA_DIR", &data);
-        }
-        let service = SpeculationService::production().unwrap();
+        let startup = ServiceStartupConfig {
+            control_path: runtime.join("speculation/control-v1"),
+            store_path: data.join("speculation/tournament-registry-v1"),
+            managed_registry_path: data.join("speculation/process-registry-v1"),
+        };
+        let service = SpeculationService::production_with_startup_config(startup, None).unwrap();
         // Fresh registry genesis durably creates and syncs its bounded slot set.
         // Slow hosted filesystems can legitimately take longer than the service's
         // per-request budget, so this asynchronous-startup test needs its own
@@ -4730,16 +4837,5 @@ mod tests {
         assert!(service.core.store.get().is_some());
         assert!(service.core.control_root.get().is_some());
         service.core.watchdog_stop.store(true, Ordering::Release);
-        // SAFETY: TEST_ENV_LOCK serializes process-wide environment mutation.
-        unsafe {
-            match previous_runtime {
-                Some(value) => std::env::set_var("LTERM_RUNTIME_DIR", value),
-                None => std::env::remove_var("LTERM_RUNTIME_DIR"),
-            }
-            match previous_data {
-                Some(value) => std::env::set_var("LTERM_DATA_DIR", value),
-                None => std::env::remove_var("LTERM_DATA_DIR"),
-            }
-        }
     }
 }

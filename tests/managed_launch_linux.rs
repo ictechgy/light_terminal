@@ -115,6 +115,143 @@ fn run_managed_launch_with_layout(close_stdin: bool) {
 }
 
 #[test]
+fn forced_reaper_failures_retain_and_eventually_release_exact_guard_in_process() {
+    for mode in [
+        "spawn-failure",
+        "wait-error",
+        "cleanup-error",
+        "sync-cleanup-error",
+        "sync-terminate-cleanup-error",
+    ] {
+        let temp = private_temp();
+        let marker = temp.path().join(format!("{mode}-guard-released"));
+        let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+            .arg(INTERNAL_TEST_LAUNCH_ARG)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LTERM_INTERNAL_TEST_MODE", "1")
+            .env("LTERM_DATA_DIR", temp.path())
+            .env("LTERM_INTERNAL_MANAGED_REAPER_SELF_TEST", mode)
+            .env("LTERM_INTERNAL_MANAGED_REAPER_GUARD_MARKER", &marker)
+            .output()
+            .expect("run in-process managed reaper regression");
+        assert!(
+            output.status.success(),
+            "{mode} regression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"managed-reaper-self-test=1\n");
+        assert!(output.stderr.is_empty());
+        assert_eq!(fs::read(&marker).unwrap(), b"released\n");
+        assert_eq!(
+            slot_state(&slot_path(&temp)).as_deref(),
+            Some("resolved_tombstone")
+        );
+    }
+}
+
+#[test]
+fn managed_reaper_environment_is_caller_initialized_before_parallel_supervisors() {
+    let fixtures = (0..4).map(|_| private_temp()).collect::<Vec<_>>();
+    let children = fixtures
+        .iter()
+        .map(|fixture| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_lterm"));
+            command
+                .arg(INTERNAL_TEST_LAUNCH_ARG)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LTERM_INTERNAL_TEST_MODE", "1")
+                .env("LTERM_DATA_DIR", fixture.path())
+                .env(
+                    "LTERM_INTERNAL_MANAGED_REAPER_SELF_TEST",
+                    "environment-initialization-order",
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            command.spawn().expect("spawn reaper initialization probe")
+        })
+        .collect::<Vec<_>>();
+    for child in children {
+        let output = child
+            .wait_with_output()
+            .expect("wait for reaper initialization probe");
+        assert!(
+            output.status.success(),
+            "reaper initialization probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"managed-reaper-self-test=1\n");
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn cleanup_retry_is_fair_across_multiple_exact_child_jobs() {
+    let temp = private_temp();
+    let marker = temp.path().join("cleanup-fairness");
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .env(
+            "LTERM_INTERNAL_MANAGED_REAPER_SELF_TEST",
+            "cleanup-fairness",
+        )
+        .env("LTERM_INTERNAL_MANAGED_REAPER_GUARD_MARKER", &marker)
+        .output()
+        .expect("run managed cleanup fairness regression");
+    assert!(
+        output.status.success(),
+        "cleanup fairness regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"managed-reaper-self-test=1\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read(marker.with_extension("first-released")).unwrap(),
+        b"released\n"
+    );
+    assert_eq!(
+        fs::read(marker.with_extension("second-released")).unwrap(),
+        b"released\n"
+    );
+}
+
+#[test]
+fn stuck_first_child_does_not_starve_completed_second_reap_job() {
+    let temp = private_temp();
+    let marker = temp.path().join("reap-fairness");
+    let output = Command::new(env!("CARGO_BIN_EXE_lterm"))
+        .arg(INTERNAL_TEST_LAUNCH_ARG)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LTERM_INTERNAL_TEST_MODE", "1")
+        .env("LTERM_DATA_DIR", temp.path())
+        .env("LTERM_INTERNAL_MANAGED_REAPER_SELF_TEST", "reap-fairness")
+        .env("LTERM_INTERNAL_MANAGED_REAPER_GUARD_MARKER", &marker)
+        .output()
+        .expect("run managed reap fairness regression");
+    assert!(
+        output.status.success(),
+        "reap fairness regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"managed-reaper-self-test=1\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read(marker.with_extension("stuck-first-released")).unwrap(),
+        b"released\n"
+    );
+    assert_eq!(
+        fs::read(marker.with_extension("ready-second-released")).unwrap(),
+        b"released\n"
+    );
+}
+
+#[test]
 fn managed_launch_executes_with_ordinary_descriptor_layout() {
     run_managed_launch_with_layout(false);
 }

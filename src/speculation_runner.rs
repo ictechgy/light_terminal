@@ -806,6 +806,15 @@ fn run_internal_runner(
         return Err(RunnerProtocolError::Io);
     }
     unsafe { libc::close(10) };
+    for fd in [11, 12, 13, 14] {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+        {
+            return Err(RunnerProtocolError::InvalidFrame);
+        }
+    }
+    #[cfg(debug_assertions)]
+    observe_pinned_workspace_mount()?;
     let peer = connect_seqpacket(control_path)?;
     let mut validator = SequenceValidator::new(identity)?;
     send_runner_frame(&peer, &mut validator, identity, ControlMessage::Hello)?;
@@ -978,6 +987,33 @@ fn run_internal_runner(
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn observe_pinned_workspace_mount() -> RunnerResult<()> {
+    if std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_WORKSPACE").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return Ok(());
+    }
+    let fd = unsafe {
+        libc::open(
+            c"/workspace/.lterm-retained-workspace-mounted".as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    let marker = b"retained-workspace-mounted\n";
+    let written = unsafe { libc::write(fd, marker.as_ptr().cast(), marker.len()) };
+    let synced = unsafe { libc::fsync(fd) };
+    unsafe { libc::close(fd) };
+    if written != marker.len() as isize || synced != 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn run_internal_probe() -> RunnerResult<()> {
     let expected = [
@@ -1019,10 +1055,10 @@ fn run_internal_probe() -> RunnerResult<()> {
         || std::path::Path::new("/run/podman/podman.sock").exists()
         || std::path::Path::new("/var/run/docker.sock").exists()
         || std::path::Path::new("/run/dbus/system_bus_socket").exists()
-        || std::path::Path::new("/run/lterm-control/control.sock").exists()
     {
         return Err(RunnerProtocolError::InvalidFrame);
     }
+    prove_retired_control_endpoint_is_inert()?;
     let mut stdin_byte = 0_u8;
     if unsafe { libc::read(0, (&mut stdin_byte as *mut u8).cast(), 1) } != 0
         || unsafe { libc::isatty(1) } != 1
@@ -1094,6 +1130,47 @@ fn run_internal_probe() -> RunnerResult<()> {
         } != bytes.len() as isize
         || bytes != *b"probe"
     {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prove_retired_control_endpoint_is_inert() -> RunnerResult<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let path = std::path::Path::new("/run/lterm-control/control.sock");
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(RunnerProtocolError::InvalidFrame),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.len() >= address.sun_path.len() {
+        return Err(RunnerProtocolError::InvalidFrame);
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(RunnerProtocolError::Io);
+    }
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t,
+        )
+    };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    unsafe { libc::close(fd) };
+    if result == 0 || errno != Some(libc::ECONNREFUSED) {
         return Err(RunnerProtocolError::InvalidFrame);
     }
     Ok(())

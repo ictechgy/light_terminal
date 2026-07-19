@@ -1,12 +1,28 @@
 //! Linux-only speculation containment adapter.
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+use crate::launch_registry::reconcile_managed_processes;
 #[cfg(target_os = "linux")]
 use crate::launch_registry::{
-    ControlCgroupPlacement, MANAGED_SYNC_PIPE_TARGET_FD, ManagedAuxiliary, ManagedBoundedReap,
+    ControlCgroupPlacement, MANAGED_SYNC_PIPE_TARGET_FD, ManagedArtifactBinding,
+    ManagedArtifactCleanupStep, ManagedArtifactIdentity, ManagedAuxiliary, ManagedBoundedReap,
     ManagedCgroupDirectoryIdentity, ManagedCgroupMembership, ManagedController,
-    ManagedDescendantProof, ManagedExecutablePolicy, ManagedLaunchRequest, ManagedOwnerKind,
-    ManagedOwnerOutcome, ManagedOwnerRole, ManagedOwnerTag, ManagedPlacement, ManagedStdioPolicy,
-    ManagedWaiter, SyncPipeWrite, launch_managed_process, reconcile_managed_owner,
+    ManagedDescendantProof, ManagedDirectoryIdentity, ManagedExecutablePolicy, ManagedKey,
+    ManagedLaunchRequest, ManagedLifetimeGuard, ManagedOwnerKind, ManagedOwnerOutcome,
+    ManagedOwnerRole, ManagedOwnerTag, ManagedPinnedCandidateDirectory,
+    ManagedPinnedControlDirectory, ManagedPinnedControlSocket, ManagedPinnedRunner,
+    ManagedPlacement, ManagedReconcileReport, ManagedStdioPolicy, ManagedWaiter, ReconcileOutcome,
+    SyncPipeWrite, abort_managed_launch_reservation, acknowledge_managed_artifact_cleanup,
+    begin_managed_artifact_cleanup, begin_managed_artifact_socket_retirement,
+    begin_managed_artifact_unlink, drain_managed_reaper_queue_bounded,
+    finish_managed_artifact_cleanup, finish_managed_artifact_create_pending_absence,
+    finish_managed_artifact_logical_absence, finish_managed_artifact_socket_retirement,
+    finish_managed_artifact_unlink, launch_managed_process, read_managed_artifact_binding,
+    reconcile_managed_owner, reserve_managed_launch,
+};
+use crate::launch_registry::{
+    MANAGED_PINNED_CANDIDATE_DIRECTORY_TARGET_FD, MANAGED_PINNED_CONTROL_DIRECTORY_TARGET_FD,
+    MANAGED_PINNED_CONTROL_SOCKET_TARGET_FD, MANAGED_PINNED_RUNNER_TARGET_FD,
 };
 use crate::speculation_fs::{DurableDirectoryIdentity, EvidenceError, ValidatedDirectory};
 #[cfg(target_os = "linux")]
@@ -40,13 +56,19 @@ use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+#[cfg(all(target_os = "linux", debug_assertions))]
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -320,16 +342,6 @@ impl LiveTournamentContext {
         ))
     }
 
-    fn candidate_path(&self, candidate_index: u8) -> ContainmentResult<PathBuf> {
-        let candidate = self
-            .candidates
-            .get(usize::from(candidate_index))
-            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
-        Ok(PathBuf::from(OsString::from_vec(
-            candidate.canonical_locator_bytes().to_vec(),
-        )))
-    }
-
     fn control_root_path(&self) -> PathBuf {
         PathBuf::from(OsString::from_vec(
             self.control_root.canonical_locator_bytes().to_vec(),
@@ -344,15 +356,11 @@ pub(crate) struct FixedBwrapInvocation {
 }
 
 pub(crate) fn build_fixed_bwrap_invocation(
-    candidate_path: &Path,
-    control_path: &Path,
     identity: RunnerIdentity,
 ) -> ContainmentResult<FixedBwrapInvocation> {
     identity
         .validate()
         .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
-    validate_fixed_host_path(candidate_path)?;
-    validate_fixed_host_path(control_path)?;
     let mut arguments = [
         "--unshare-user",
         "--unshare-pid",
@@ -384,8 +392,6 @@ pub(crate) fn build_fixed_bwrap_invocation(
         "--symlink",
         "usr/lib64",
         "/lib64",
-        "--proc",
-        "/proc",
         "--dev",
         "/dev",
         "--tmpfs",
@@ -416,19 +422,35 @@ pub(crate) fn build_fixed_bwrap_invocation(
         "--setenv",
         "TERM",
         "xterm-256color",
-        "--bind",
+        "--bind-fd",
     ]
     .into_iter()
     .map(OsString::from)
     .collect::<Vec<_>>();
-    arguments.push(candidate_path.as_os_str().to_owned());
+    arguments.push(OsString::from(
+        MANAGED_PINNED_CANDIDATE_DIRECTORY_TARGET_FD.to_string(),
+    ));
     arguments.push(OsString::from("/workspace"));
-    arguments.push(OsString::from("--ro-bind"));
-    arguments.push(control_path.as_os_str().to_owned());
+    arguments.push(OsString::from("--ro-bind-fd"));
+    arguments.push(OsString::from(
+        MANAGED_PINNED_CONTROL_DIRECTORY_TARGET_FD.to_string(),
+    ));
     arguments.push(OsString::from("/run/lterm-control"));
+    arguments.extend([
+        OsString::from("--ro-bind-fd"),
+        OsString::from(MANAGED_PINNED_CONTROL_SOCKET_TARGET_FD.to_string()),
+        OsString::from("/run/lterm-control/control.sock"),
+        OsString::from("--ro-bind-fd"),
+        OsString::from(MANAGED_PINNED_RUNNER_TARGET_FD.to_string()),
+        OsString::from("/run/lterm-control/lterm"),
+        OsString::from("--proc"),
+        OsString::from("/proc"),
+    ]);
     #[cfg(all(debug_assertions, target_os = "linux"))]
-    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        if let Some(value) = std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT")
+    let test_config = active_speculation_test_config();
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if let Some(config) = test_config.as_ref() {
+        if let Some(value) = config.failpoint.as_deref()
             && (value.as_bytes().starts_with(b"runner_")
                 || value.as_bytes() == b"probe_after_workspace_canary_write")
             && value.as_bytes().len() <= 96
@@ -436,16 +458,21 @@ pub(crate) fn build_fixed_bwrap_invocation(
             arguments.extend([
                 OsString::from("--setenv"),
                 OsString::from("LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT"),
-                value,
+                value.to_os_string(),
             ]);
         }
-        if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
-            == Some(std::ffi::OsStr::new("exit"))
-        {
+        if config.action.as_deref() == Some(std::ffi::OsStr::new("exit")) {
             arguments.extend([
                 OsString::from("--setenv"),
                 OsString::from("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION"),
                 OsString::from("exit"),
+            ]);
+        }
+        if config.observe_pinned_workspace {
+            arguments.extend([
+                OsString::from("--setenv"),
+                OsString::from("LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_WORKSPACE"),
+                OsString::from("1"),
             ]);
         }
     }
@@ -461,23 +488,15 @@ pub(crate) fn build_fixed_bwrap_invocation(
         OsString::from("/run/lterm-control/control.sock"),
     ];
     arguments.extend([OsString::from("--chdir"), OsString::from("/workspace")]);
-    #[cfg(debug_assertions)]
-    let delayed_runner_exec_seconds = if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        std::env::var_os("LTERM_INTERNAL_SPECULATION_DELAY_RUNNER_EXEC_SECONDS")
-            .map(|value| {
-                value
-                    .to_str()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|seconds| (6..=30).contains(seconds))
-                    .ok_or(ContainmentErrorCode::InvalidIdentity)
-            })
-            .transpose()?
-    } else {
-        None
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    let delayed_runner_exec_seconds = match test_config.as_ref() {
+        Some(config) if config.delayed_runner_exec_invalid => {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        Some(config) => config.delayed_runner_exec_seconds,
+        None => None,
     };
-    #[cfg(not(debug_assertions))]
+    #[cfg(any(not(debug_assertions), not(target_os = "linux")))]
     let delayed_runner_exec_seconds: Option<u64> = None;
     if let Some(seconds) = delayed_runner_exec_seconds {
         arguments.extend([
@@ -499,24 +518,6 @@ pub(crate) fn build_fixed_bwrap_invocation(
     })
 }
 
-fn validate_fixed_host_path(path: &Path) -> ContainmentResult<()> {
-    use std::os::unix::ffi::OsStrExt;
-    if !path.is_absolute()
-        || path.as_os_str().as_bytes().is_empty()
-        || path.as_os_str().as_bytes().len() > 4096
-        || path.as_os_str().as_bytes().contains(&0)
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        return Err(ContainmentErrorCode::InvalidIdentity);
-    }
-    Ok(())
-}
-
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn validate_prepare(
     _inputs: PrepareInputs,
@@ -530,6 +531,7 @@ pub(crate) fn validate_prepare(
     inputs: PrepareInputs,
     deadline: ContainmentDeadline,
 ) -> ContainmentResult<LiveTournamentContext> {
+    initialize_speculation_process_config();
     deadline.remaining()?;
     let identity = RunnerIdentity {
         tournament_uuid: inputs.tournament_uuid,
@@ -560,17 +562,8 @@ pub(crate) fn validate_prepare(
     scan_workspace(&source, deadline)?;
     scan_workspace(&candidate_zero, deadline)?;
     scan_workspace(&candidate_one, deadline)?;
-    #[cfg(debug_assertions)]
-    let test_executable = (std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
-        == Some(std::ffi::OsStr::new("1")))
-    .then(|| std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE"))
-    .flatten();
-    #[cfg(not(debug_assertions))]
-    let test_executable: Option<OsString> = None;
-    let current_executable_path = test_executable
-        .map(PathBuf::from)
-        .map_or_else(std::env::current_exe, Ok)
-        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+    let current_executable_path = configured_current_executable_path()
+        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?
         .canonicalize()
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let current_executable = retain_current_executable(&current_executable_path)?;
@@ -1421,17 +1414,354 @@ fn write_leaf(node: &RetainedCgroupNode, leaf: &CStr, bytes: &[u8]) -> Containme
 #[cfg(target_os = "linux")]
 fn failpoint(_name: &str) -> ContainmentResult<()> {
     #[cfg(debug_assertions)]
-    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && std::env::var("LTERM_INTERNAL_SPECULATION_FAILPOINT").as_deref() == Ok(_name)
+    if let Some(config) = active_speculation_test_config()
+        && config.failpoint.as_deref() == Some(std::ffi::OsStr::new(_name))
     {
-        if std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION").as_deref()
-            == Some(std::ffi::OsStr::new("exit"))
-        {
+        if config.action.as_deref() == Some(std::ffi::OsStr::new("exit")) {
             unsafe { libc::_exit(86) };
+        }
+        if config.action.as_deref() == Some(std::ffi::OsStr::new("hostile-swap")) {
+            return perform_internal_hostile_swap(&config);
         }
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn crash_failpoint(_name: &str) -> ContainmentResult<()> {
+    #[cfg(debug_assertions)]
+    if let Some(config) = active_speculation_test_config()
+        && config.failpoint.as_deref() == Some(std::ffi::OsStr::new(_name))
+        && config.action.as_deref() == Some(std::ffi::OsStr::new("exit"))
+    {
+        unsafe { libc::_exit(86) };
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[derive(Clone, Default)]
+pub(crate) struct SpeculationTestConfig {
+    failpoint: Option<OsString>,
+    action: Option<OsString>,
+    swap_path: Option<PathBuf>,
+    swap_backup: Option<PathBuf>,
+    swap_kind: Option<String>,
+    observe_failed_runner_lifetime: bool,
+    force_reaper_spawn_failure: bool,
+    observe_pinned_workspace: bool,
+    delayed_runner_exec_seconds: Option<u64>,
+    delayed_runner_exec_invalid: bool,
+    observe_pinned_control: bool,
+    observe_socket_retirement: bool,
+    pub(crate) prepare_failpoint: Option<String>,
+    pub(crate) fixture_root: Option<PathBuf>,
+    pub(crate) cgroup_root: Option<PathBuf>,
+    pub(crate) observed_run_timeout_ms: Option<u64>,
+    pub(crate) observed_run_timeout_invalid: bool,
+    pub(crate) client_dies_before_ledger: bool,
+    pub(crate) arm_root_mismatch: bool,
+    pub(crate) actor_terminal: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct SpeculationProcessConfig {
+    #[cfg(debug_assertions)]
+    initialized_on: std::thread::ThreadId,
+    current_executable_path: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    test: Option<SpeculationTestConfig>,
+}
+
+#[cfg(target_os = "linux")]
+static SPECULATION_PROCESS_CONFIG: OnceLock<SpeculationProcessConfig> = OnceLock::new();
+
+#[cfg(all(debug_assertions, target_os = "linux", test))]
+thread_local! {
+    static SPECULATION_LOCAL_TEST_CONFIG: std::cell::RefCell<Option<SpeculationTestConfig>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(debug_assertions, target_os = "linux", test))]
+pub(crate) fn with_speculation_test_config<T>(
+    config: SpeculationTestConfig,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<SpeculationTestConfig>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPECULATION_LOCAL_TEST_CONFIG.with(|state| {
+                state.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = SPECULATION_LOCAL_TEST_CONFIG.with(|state| state.replace(Some(config)));
+    let _restore = Restore(previous);
+    action()
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn active_speculation_test_config() -> Option<SpeculationTestConfig> {
+    #[cfg(test)]
+    if let Some(config) = SPECULATION_LOCAL_TEST_CONFIG.with(|state| state.borrow().clone()) {
+        return Some(config);
+    }
+
+    SPECULATION_PROCESS_CONFIG
+        .get()
+        .and_then(|config| config.test.clone())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn initialize_speculation_process_config() {
+    let _ = SPECULATION_PROCESS_CONFIG.get_or_init(SpeculationProcessConfig::capture);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn speculation_process_config_initialized_on(expected: std::thread::ThreadId) -> bool {
+    SPECULATION_PROCESS_CONFIG
+        .get()
+        .is_some_and(|config| config.initialized_on == expected)
+}
+
+#[cfg(target_os = "linux")]
+impl SpeculationProcessConfig {
+    fn capture() -> Self {
+        // This is the only product-path environment snapshot. Callers invoke
+        // initialize_speculation_process_config before creating service,
+        // actor, recovery, or managed-reaper threads; background consumers
+        // only read the immutable OnceLock value (or cfg(test) TLS override).
+        #[cfg(debug_assertions)]
+        let initialized_on = std::thread::current().id();
+        let default_executable = std::env::current_exe().ok();
+        #[cfg(all(debug_assertions, not(test)))]
+        {
+            let enabled = std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+            let enabled_env =
+                |name: &str| std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"));
+            let delayed_runner_exec = enabled
+                .then(|| std::env::var_os("LTERM_INTERNAL_SPECULATION_DELAY_RUNNER_EXEC_SECONDS"))
+                .flatten();
+            let delayed_runner_exec_seconds = delayed_runner_exec
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| (6..=30).contains(seconds));
+            let observed_run_timeout = enabled
+                .then(|| std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_LEASE_MS"))
+                .flatten();
+            let observed_run_timeout_ms = observed_run_timeout
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|value| value.parse::<u64>().ok());
+            let test = enabled.then(|| SpeculationTestConfig {
+                failpoint: std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT"),
+                action: std::env::var_os("LTERM_INTERNAL_SPECULATION_FAILPOINT_ACTION"),
+                swap_path: std::env::var_os("LTERM_INTERNAL_SPECULATION_SWAP_PATH")
+                    .map(PathBuf::from),
+                swap_backup: std::env::var_os("LTERM_INTERNAL_SPECULATION_SWAP_BACKUP")
+                    .map(PathBuf::from),
+                swap_kind: std::env::var("LTERM_INTERNAL_SPECULATION_SWAP_KIND").ok(),
+                observe_failed_runner_lifetime: enabled_env(
+                    "LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME",
+                ),
+                force_reaper_spawn_failure: enabled_env(
+                    "LTERM_INTERNAL_MANAGED_FORCE_REAPER_SPAWN_FAILURE",
+                ),
+                observe_pinned_workspace: enabled_env(
+                    "LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_WORKSPACE",
+                ),
+                delayed_runner_exec_seconds,
+                delayed_runner_exec_invalid: delayed_runner_exec.is_some()
+                    && delayed_runner_exec_seconds.is_none(),
+                observe_pinned_control: enabled_env(
+                    "LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_CONTROL",
+                ),
+                observe_socket_retirement: enabled_env(
+                    "LTERM_INTERNAL_SPECULATION_OBSERVE_SOCKET_RETIREMENT",
+                ),
+                prepare_failpoint: std::env::var("LTERM_INTERNAL_SPECULATION_PREPARE_FAILPOINT")
+                    .ok(),
+                fixture_root: std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
+                    .map(PathBuf::from),
+                cgroup_root: std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT").map(PathBuf::from),
+                observed_run_timeout_ms,
+                observed_run_timeout_invalid: observed_run_timeout.is_some()
+                    && observed_run_timeout_ms.is_none(),
+                client_dies_before_ledger: enabled_env(
+                    "LTERM_INTERNAL_SPECULATION_CLIENT_DIES_BEFORE_LEDGER",
+                ),
+                arm_root_mismatch: enabled_env("LTERM_INTERNAL_SPECULATION_ARM_ROOT_MISMATCH"),
+                actor_terminal: std::env::var("LTERM_INTERNAL_SPECULATION_ACTOR_TERMINAL").ok(),
+            });
+            let current_executable_path = std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE")
+                .filter(|_| enabled)
+                .map(PathBuf::from)
+                .or(default_executable);
+            Self {
+                #[cfg(debug_assertions)]
+                initialized_on,
+                current_executable_path,
+                test,
+            }
+        }
+        #[cfg(any(not(debug_assertions), test))]
+        {
+            Self {
+                #[cfg(debug_assertions)]
+                initialized_on,
+                current_executable_path: default_executable,
+                #[cfg(debug_assertions)]
+                test: None,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configured_current_executable_path() -> Option<PathBuf> {
+    SPECULATION_PROCESS_CONFIG
+        .get()
+        .and_then(|config| config.current_executable_path.clone())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn perform_internal_hostile_swap(config: &SpeculationTestConfig) -> ContainmentResult<()> {
+    let path = config
+        .swap_path
+        .clone()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let backup = config
+        .swap_backup
+        .clone()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let kind = config
+        .swap_kind
+        .as_deref()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    std::fs::rename(&path, &backup).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    match kind {
+        "runner" | "owner" => {
+            std::fs::write(&path, b"hostile replacement")
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            let mode = if kind == "runner" { 0o500 } else { 0o600 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        }
+        "socket" => {
+            let replacement = bind_seqpacket_listener(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            let holder = HOSTILE_CONTROL_LISTENER.get_or_init(|| Mutex::new(None));
+            let mut holder = holder
+                .lock()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if holder.replace(replacement).is_some() {
+                return Err(ContainmentErrorCode::InvalidIdentity);
+            }
+        }
+        "directory" => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            std::fs::write(path.join("hostile"), b"retain")
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        }
+        "control-directory" => {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            std::fs::write(path.join("hostile"), b"retain")
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            let listener = bind_seqpacket_listener(&path.join("control.sock"))?;
+            std::fs::set_permissions(
+                path.join("control.sock"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            let holder = HOSTILE_CONTROL_LISTENER.get_or_init(|| Mutex::new(None));
+            let mut holder = holder
+                .lock()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            if holder.replace(listener).is_some() {
+                return Err(ContainmentErrorCode::InvalidIdentity);
+            }
+        }
+        _ => return Err(ContainmentErrorCode::InvalidIdentity),
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+static HOSTILE_CONTROL_LISTENER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn prove_hostile_control_listener_uncontacted() -> ContainmentResult<()> {
+    let Some(holder) = HOSTILE_CONTROL_LISTENER.get() else {
+        return Ok(());
+    };
+    let mut holder = holder
+        .lock()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let Some(listener) = holder.take() else {
+        return Ok(());
+    };
+    let mut readiness = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut readiness, 1, 0) };
+    if ready < 0 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    if ready == 0 {
+        let replacement = active_speculation_test_config()
+            .and_then(|config| config.swap_path)
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        let marker_path = if replacement.is_dir() {
+            replacement.join(".lterm-rogue-control-uncontacted")
+        } else {
+            replacement.with_file_name(".lterm-rogue-socket-uncontacted")
+        };
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(marker_path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        marker
+            .write_all(b"rogue-control-uncontacted\n")
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        marker
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        return Ok(());
+    }
+    if readiness.revents & libc::POLLIN == 0 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let accepted = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )
+    };
+    if accepted >= 0 {
+        unsafe { libc::close(accepted) };
+    } else {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    Err(ContainmentErrorCode::InvalidIdentity)
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -1449,6 +1779,56 @@ const DURABLE_EDGE_FAILPOINTS: &[(&str, &str)] = &[
     (
         "before_payload_limit_readback",
         "after_payload_limit_readback",
+    ),
+    (
+        "before_private_control_reservation",
+        "after_private_control_reservation",
+    ),
+    (
+        "before_private_control_binding",
+        "after_private_control_binding",
+    ),
+    (
+        "before_private_runner_binding",
+        "after_private_runner_binding",
+    ),
+    ("before_private_socket_mode", "after_private_socket_mode"),
+    (
+        "before_private_socket_publish",
+        "after_private_socket_publish",
+    ),
+    (
+        "before_private_socket_binding",
+        "after_private_socket_binding",
+    ),
+    (
+        "before_private_owner_publish",
+        "after_private_owner_publish",
+    ),
+    (
+        "before_private_quarantine_publish",
+        "after_private_quarantine_publish",
+    ),
+    ("before_private_owner_unlink", "after_private_owner_unlink"),
+    (
+        "before_private_partial_owner_unlink",
+        "after_private_partial_owner_unlink",
+    ),
+    (
+        "before_private_socket_unlink",
+        "after_private_socket_unlink",
+    ),
+    (
+        "before_private_partial_socket_unlink",
+        "after_private_partial_socket_unlink",
+    ),
+    (
+        "before_private_runner_unlink",
+        "after_private_runner_unlink",
+    ),
+    (
+        "before_private_directory_unlink",
+        "after_private_directory_unlink",
     ),
     ("before_managed_launch", "after_managed_launch"),
     ("before_control_accept", "after_control_accept"),
@@ -2810,11 +3190,46 @@ fn remove_cgroup_child(
 }
 
 #[cfg(target_os = "linux")]
+const PRIVATE_RUNNER_OWNER_LEAF: &CStr = c"owner.json";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateArtifactIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateRunnerOwnership {
+    schema_version: u32,
+    owner: ManagedOwnerTag,
+    slot: u16,
+    generation: u64,
+    binding: ManagedArtifactBinding,
+    directory: DurableDirectoryIdentity,
+    runner: PrivateArtifactIdentity,
+    socket: PrivateArtifactIdentity,
+}
+
+#[cfg(target_os = "linux")]
 struct PrivateRunnerControl {
+    parent: File,
+    parent_identity: DurableDirectoryIdentity,
+    leaf: CString,
     directory: ValidatedDirectory,
     path: PathBuf,
     socket_path: PathBuf,
+    runner_file: File,
+    socket_file: File,
     listener: Option<File>,
+    ownership: Option<PrivateRunnerOwnership>,
+    ownership_file: Option<PrivateArtifactIdentity>,
+    managed_key: Option<ManagedKey>,
+    managed_binding: Option<ManagedArtifactBinding>,
+    cleanup_complete: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -2827,163 +3242,1253 @@ impl fmt::Debug for PrivateRunnerControl {
 }
 
 #[cfg(target_os = "linux")]
+impl PrivateRunnerControl {
+    #[cfg(debug_assertions)]
+    fn observe_authenticated_retained_control(&self) -> ContainmentResult<()> {
+        if !active_speculation_test_config().is_some_and(|config| config.observe_pinned_control) {
+            return Ok(());
+        }
+        let directory = self
+            .directory
+            .try_clone_retained_fd()
+            .map_err(map_evidence)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c".lterm-retained-control-authenticated".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        let mut marker = unsafe { File::from_raw_fd(fd) };
+        marker
+            .write_all(b"retained-control-authenticated\n")
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        marker
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        directory
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)
+    }
+
+    fn retire_socket_listener(&mut self) -> ContainmentResult<()> {
+        self.directory.revalidate().map_err(map_evidence)?;
+        let directory_fd = self
+            .directory
+            .try_clone_retained_fd()
+            .map_err(map_evidence)?;
+        let socket = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            c"control.sock",
+            PrivateArtifactKind::Socket,
+            self.ownership.as_ref().map(|record| record.socket),
+        )?
+        .ok_or(ContainmentErrorCode::PeerRejected)?;
+        if !validate_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            c"control.sock",
+            PrivateArtifactKind::Socket,
+            Some(artifact_identity(
+                &socket
+                    .metadata()
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+            )),
+        )? {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+        let pending = match (self.managed_key, self.managed_binding.as_ref()) {
+            (Some(key), Some(binding)) => Some(
+                begin_managed_artifact_socket_retirement(key, binding)
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+            ),
+            (None, None) => None,
+            _ => return Err(ContainmentErrorCode::InvalidIdentity),
+        };
+        if pending
+            .as_ref()
+            .is_some_and(|binding| binding.socket_retired())
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        if pending.is_some() {
+            failpoint("after_private_socket_retirement_intent")?;
+        }
+        let expected_socket = artifact_identity(
+            &socket
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+        let final_socket = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            c"control.sock",
+            PrivateArtifactKind::Socket,
+            Some(expected_socket),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if artifact_identity(
+            &final_socket
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) != expected_socket
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        self.listener.take();
+        if unsafe { libc::unlinkat(directory_fd.as_raw_fd(), c"control.sock".as_ptr(), 0) } != 0 {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if socket
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .nlink()
+            != 0
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        if pending.is_some() {
+            crash_failpoint("after_private_socket_retirement_physical_unlink")?;
+        }
+        if let (Some(key), Some(pending)) = (self.managed_key, pending) {
+            self.managed_binding = Some(
+                finish_managed_artifact_socket_retirement(key, &pending)
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+            );
+            #[cfg(debug_assertions)]
+            if active_speculation_test_config()
+                .is_some_and(|config| config.observe_socket_retirement)
+            {
+                let runner = self
+                    .runner_file
+                    .metadata()
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                let socket = socket
+                    .metadata()
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                let marker = self
+                    .path
+                    .parent()
+                    .ok_or(ContainmentErrorCode::InvalidIdentity)?
+                    .join("socket-retirement-receipt");
+                let mut marker = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(marker)
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                write!(
+                    marker,
+                    "socket_nlink={}\nrunner_dev={}\nrunner_ino={}\n",
+                    socket.nlink(),
+                    runner.dev(),
+                    runner.ino()
+                )
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                marker
+                    .sync_all()
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                self.parent
+                    .sync_all()
+                    .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            }
+            crash_failpoint("after_private_socket_retirement_receipt")?;
+        }
+        self.directory.revalidate().map_err(map_evidence)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for PrivateRunnerControl {
     fn drop(&mut self) {
         self.listener.take();
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_file(self.path.join("lterm"));
-        let _ = std::fs::remove_dir(&self.path);
+        if self.cleanup_complete || self.managed_key.is_some() {
+            return;
+        }
+        let _ = remove_private_runner_control_fd_relative(
+            &self.parent,
+            self.parent_identity,
+            &self.leaf,
+            &self.directory,
+            PrivateControlCleanupExpectations {
+                ownership: self.ownership.as_ref(),
+                ownership_file: self.ownership_file,
+                runner: self.ownership.as_ref().map(|record| record.runner),
+                socket: self.ownership.as_ref().map(|record| record.socket),
+                partial_socket_leaf: None,
+                partial_owner_leaf: None,
+                allow_unbound_files: true,
+            },
+            None,
+        );
     }
 }
 
 #[cfg(target_os = "linux")]
-struct PendingRunnerControl {
-    waiter: Option<ManagedWaiter>,
-    private_control: Option<PrivateRunnerControl>,
+fn managed_directory_identity(identity: DurableDirectoryIdentity) -> ManagedDirectoryIdentity {
+    ManagedDirectoryIdentity {
+        boot_uuid: identity.boot_uuid,
+        dev: identity.dev,
+        ino: identity.ino,
+        statx_mnt_id_unique: identity.statx_mnt_id_unique,
+    }
 }
 
 #[cfg(target_os = "linux")]
-impl PendingRunnerControl {
-    fn new(waiter: ManagedWaiter, private_control: PrivateRunnerControl) -> Self {
+fn durable_directory_identity(identity: ManagedDirectoryIdentity) -> DurableDirectoryIdentity {
+    DurableDirectoryIdentity {
+        boot_uuid: identity.boot_uuid,
+        dev: identity.dev,
+        ino: identity.ino,
+        statx_mnt_id_unique: identity.statx_mnt_id_unique,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn artifact_identity(metadata: &std::fs::Metadata) -> PrivateArtifactIdentity {
+    PrivateArtifactIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn managed_artifact_identity(identity: PrivateArtifactIdentity) -> ManagedArtifactIdentity {
+    ManagedArtifactIdentity {
+        dev: identity.dev,
+        ino: identity.ino,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn private_artifact_identity(identity: ManagedArtifactIdentity) -> PrivateArtifactIdentity {
+    PrivateArtifactIdentity {
+        dev: identity.dev,
+        ino: identity.ino,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PrivateArtifactKind {
+    Runner,
+    Socket,
+    PartialSocket,
+    Ownership,
+    PartialOwnership,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_artifact_at(
+    directory_fd: RawFd,
+    leaf: &CStr,
+    kind: PrivateArtifactKind,
+    expected: Option<PrivateArtifactIdentity>,
+) -> ContainmentResult<bool> {
+    open_validated_private_artifact_at(directory_fd, leaf, kind, expected)
+        .map(|artifact| artifact.is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn open_validated_private_artifact_at(
+    directory_fd: RawFd,
+    leaf: &CStr,
+    kind: PrivateArtifactKind,
+    expected: Option<PrivateArtifactIdentity>,
+) -> ContainmentResult<Option<File>> {
+    let flags = match kind {
+        PrivateArtifactKind::Runner
+        | PrivateArtifactKind::Ownership
+        | PrivateArtifactKind::PartialOwnership => {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        }
+        PrivateArtifactKind::Socket | PrivateArtifactKind::PartialSocket => {
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        }
+    };
+    let fd = unsafe { libc::openat(directory_fd, leaf.as_ptr(), flags) };
+    if fd < 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            if expected.is_some() {
+                Err(ContainmentErrorCode::InvalidIdentity)
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(ContainmentErrorCode::EvidenceUnavailable)
+        };
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let valid_kind = match kind {
+        PrivateArtifactKind::Runner
+        | PrivateArtifactKind::Ownership
+        | PrivateArtifactKind::PartialOwnership => metadata.is_file(),
+        PrivateArtifactKind::Socket | PrivateArtifactKind::PartialSocket => {
+            metadata.file_type().is_socket()
+        }
+    };
+    let expected_mode = match kind {
+        PrivateArtifactKind::Runner => 0o500,
+        PrivateArtifactKind::Socket
+        | PrivateArtifactKind::Ownership
+        | PrivateArtifactKind::PartialOwnership => 0o600,
+        PrivateArtifactKind::PartialSocket => metadata.mode() & 0o7777,
+    };
+    if !valid_kind
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != expected_mode
+        || matches!(kind, PrivateArtifactKind::PartialSocket) && metadata.mode() & 0o7000 != 0
+        || metadata.nlink() != 1
+        || expected.is_some_and(|identity| artifact_identity(&metadata) != identity)
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(target_os = "linux")]
+fn reopen_private_child_from_parent(
+    parent: &File,
+    leaf: &CStr,
+    expected: DurableDirectoryIdentity,
+) -> ContainmentResult<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let child = unsafe { File::from_raw_fd(fd) };
+    if durable_identity_from_fd(&child).map_err(map_evidence)? != expected {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateControlCleanupExpectations<'a> {
+    ownership: Option<&'a PrivateRunnerOwnership>,
+    ownership_file: Option<PrivateArtifactIdentity>,
+    runner: Option<PrivateArtifactIdentity>,
+    socket: Option<PrivateArtifactIdentity>,
+    partial_socket_leaf: Option<&'a CStr>,
+    partial_owner_leaf: Option<&'a CStr>,
+    allow_unbound_files: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct ManagedPrivateCleanupProgress {
+    key: ManagedKey,
+    current: ManagedArtifactBinding,
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedPrivateCleanupProgress {
+    fn new(
+        key: ManagedKey,
+        seed: ManagedArtifactBinding,
+        current: ManagedArtifactBinding,
+    ) -> ContainmentResult<Self> {
+        if !same_private_artifact_binding(&seed, &current) {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        Ok(Self { key, current })
+    }
+
+    fn step_completed(&self, step: ManagedArtifactCleanupStep) -> bool {
+        self.current.cleanup_step_completed(step)
+    }
+
+    fn begin(&mut self, step: ManagedArtifactCleanupStep) -> ContainmentResult<()> {
+        self.current = begin_managed_artifact_unlink(self.key, &self.current, step)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        Ok(())
+    }
+
+    fn finish(&mut self, step: ManagedArtifactCleanupStep) -> ContainmentResult<()> {
+        self.current = finish_managed_artifact_unlink(self.key, &self.current, step)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_private_runner_control_fd_relative(
+    parent: &File,
+    parent_identity: DurableDirectoryIdentity,
+    leaf: &CStr,
+    directory: &ValidatedDirectory,
+    expected: PrivateControlCleanupExpectations<'_>,
+    mut managed_progress: Option<&mut ManagedPrivateCleanupProgress>,
+) -> ContainmentResult<()> {
+    if durable_identity_from_fd(parent).map_err(map_evidence)? != parent_identity {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    directory.revalidate().map_err(map_evidence)?;
+    let directory_identity = directory.identity();
+    let reopened = reopen_private_child_from_parent(parent, leaf, directory_identity)?;
+    let names = directory.list_leaf_names().map_err(map_evidence)?;
+    if names.iter().any(|name| {
+        !matches!(name.to_bytes(), b"lterm" | b"control.sock" | b"owner.json")
+            && expected
+                .partial_socket_leaf
+                .is_none_or(|partial| name.as_c_str() != partial)
+            && expected
+                .partial_owner_leaf
+                .is_none_or(|partial| name.as_c_str() != partial)
+    }) {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    if !expected.allow_unbound_files
+        && expected.runner.is_none()
+        && names.iter().any(|name| name.to_bytes() == b"control.sock")
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if expected.ownership.is_some_and(|record| {
+        expected
+            .runner
+            .is_some_and(|identity| identity != record.runner)
+            || expected
+                .socket
+                .is_some_and(|identity| identity != record.socket)
+    }) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let expected_runner = expected
+        .runner
+        .or_else(|| expected.ownership.map(|record| record.runner));
+    let expected_socket = expected
+        .socket
+        .or_else(|| expected.ownership.map(|record| record.socket));
+    if expected
+        .ownership
+        .is_some_and(|record| record.directory != directory_identity)
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let ownership_completed = managed_progress
+        .as_ref()
+        .is_some_and(|progress| progress.step_completed(ManagedArtifactCleanupStep::Ownership));
+    let socket_completed = managed_progress
+        .as_ref()
+        .is_some_and(|progress| progress.step_completed(ManagedArtifactCleanupStep::Socket));
+    let runner_completed = managed_progress
+        .as_ref()
+        .is_some_and(|progress| progress.step_completed(ManagedArtifactCleanupStep::Runner));
+    let socket_retired = managed_progress
+        .as_ref()
+        .is_some_and(|progress| progress.current.socket_retired());
+    let managed_cleanup = managed_progress.is_some();
+    let open_step_artifact = |name: &CStr,
+                              kind: PrivateArtifactKind,
+                              expected_identity: Option<PrivateArtifactIdentity>,
+                              completed: bool|
+     -> ContainmentResult<Option<File>> {
+        if completed {
+            if open_validated_private_artifact_at(reopened.as_raw_fd(), name, kind, None)?.is_some()
+            {
+                return Err(ContainmentErrorCode::InvalidIdentity);
+            }
+            return Ok(None);
+        }
+        let artifact = open_validated_private_artifact_at(
+            reopened.as_raw_fd(),
+            name,
+            kind,
+            expected_identity,
+        )?;
+        if managed_cleanup && expected_identity.is_none() && artifact.is_some() {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        Ok(artifact)
+    };
+    let runner = open_step_artifact(
+        c"lterm",
+        PrivateArtifactKind::Runner,
+        expected_runner,
+        runner_completed,
+    )?;
+    let socket = open_step_artifact(
+        c"control.sock",
+        PrivateArtifactKind::Socket,
+        expected_socket,
+        socket_completed || socket_retired,
+    )?;
+    let ownership_file = open_step_artifact(
+        PRIVATE_RUNNER_OWNER_LEAF,
+        PrivateArtifactKind::Ownership,
+        expected.ownership_file,
+        ownership_completed,
+    )?;
+    let partial_socket = expected
+        .partial_socket_leaf
+        .map(|leaf| {
+            open_validated_private_artifact_at(
+                reopened.as_raw_fd(),
+                leaf,
+                PrivateArtifactKind::PartialSocket,
+                None,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let partial_owner = expected
+        .partial_owner_leaf
+        .map(|leaf| {
+            open_validated_private_artifact_at(
+                reopened.as_raw_fd(),
+                leaf,
+                PrivateArtifactKind::PartialOwnership,
+                None,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if ownership_file.is_some() && partial_owner.is_some() {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if managed_cleanup
+        && (partial_socket.is_some()
+            || partial_owner.is_some()
+            || expected.ownership_file.is_none() && ownership_file.is_some())
+    {
+        // Partial socket/owner names and a final owner without a durable inode
+        // binding are only pathname-shaped evidence. A same-UID actor can
+        // relocate the genuine object and install an indistinguishable
+        // replacement, so managed recovery must preserve them for operator
+        // resolution rather than unlink or acknowledge them.
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if managed_cleanup
+        && !ownership_completed
+        && expected.ownership_file.is_some()
+        && ownership_file.is_none()
+    {
+        // Once the final owner inode is bound, absence without the durable
+        // Ownership receipt is ambiguous between our unlink and relocation.
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    reopen_private_child_from_parent(parent, leaf, directory_identity)?;
+    let unlink = |artifact: Option<&File>,
+                  name: &CStr,
+                  kind: PrivateArtifactKind,
+                  before: &'static str|
+     -> ContainmentResult<()> {
+        let Some(artifact) = artifact else {
+            return Ok(());
+        };
+        let identity = artifact_identity(
+            &artifact
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+        failpoint(before)?;
+        // Catch deterministic hostile swaps before mutation. A racing swap
+        // after this check still cannot produce a cleanup ACK because the
+        // retained owned inode must reach nlink=0 below.
+        if open_validated_private_artifact_at(reopened.as_raw_fd(), name, kind, Some(identity))?
+            .is_none()
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        if unsafe { libc::unlinkat(reopened.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        reopened
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if artifact
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .nlink()
+            != 0
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        Ok(())
+    };
+    if !ownership_completed {
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.begin(ManagedArtifactCleanupStep::Ownership)?;
+        }
+        unlink(
+            ownership_file.as_ref(),
+            PRIVATE_RUNNER_OWNER_LEAF,
+            PrivateArtifactKind::Ownership,
+            "before_private_owner_unlink",
+        )?;
+        if let Some(partial_leaf) = expected.partial_owner_leaf {
+            unlink(
+                partial_owner.as_ref(),
+                partial_leaf,
+                PrivateArtifactKind::PartialOwnership,
+                "before_private_partial_owner_unlink",
+            )?;
+            failpoint("after_private_partial_owner_unlink")?;
+        }
+        crash_failpoint("after_private_ownership_physical_unlink")?;
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.finish(ManagedArtifactCleanupStep::Ownership)?;
+        }
+        failpoint("after_private_owner_unlink")?;
+    }
+    if !socket_completed {
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.begin(ManagedArtifactCleanupStep::Socket)?;
+        }
+        unlink(
+            socket.as_ref(),
+            c"control.sock",
+            PrivateArtifactKind::Socket,
+            "before_private_socket_unlink",
+        )?;
+        if let Some(partial_leaf) = expected.partial_socket_leaf {
+            unlink(
+                partial_socket.as_ref(),
+                partial_leaf,
+                PrivateArtifactKind::PartialSocket,
+                "before_private_partial_socket_unlink",
+            )?;
+            failpoint("after_private_partial_socket_unlink")?;
+        }
+        crash_failpoint("after_private_socket_physical_unlink")?;
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.finish(ManagedArtifactCleanupStep::Socket)?;
+        }
+        failpoint("after_private_socket_unlink")?;
+    }
+    if !runner_completed {
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.begin(ManagedArtifactCleanupStep::Runner)?;
+        }
+        unlink(
+            runner.as_ref(),
+            c"lterm",
+            PrivateArtifactKind::Runner,
+            "before_private_runner_unlink",
+        )?;
+        crash_failpoint("after_private_runner_physical_unlink")?;
+        if let Some(progress) = managed_progress.as_deref_mut() {
+            progress.finish(ManagedArtifactCleanupStep::Runner)?;
+        }
+        failpoint("after_private_runner_unlink")?;
+    }
+    drop(reopened);
+    let final_reopened = reopen_private_child_from_parent(parent, leaf, directory_identity)?;
+    if let Some(progress) = managed_progress.as_deref_mut() {
+        progress.begin(ManagedArtifactCleanupStep::Directory)?;
+    }
+    failpoint("before_private_directory_unlink")?;
+    reopen_private_child_from_parent(parent, leaf, directory_identity)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    parent
+        .sync_all()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if durable_identity_from_fd(parent).map_err(map_evidence)? != parent_identity
+        || durable_identity_from_fd(&final_reopened).map_err(map_evidence)? != directory_identity
+        || final_reopened
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .nlink()
+            != 0
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    crash_failpoint("after_private_directory_unlink")?;
+    if let Some(progress) = managed_progress {
+        progress.current = finish_managed_artifact_cleanup(progress.key, &progress.current)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    failpoint("after_private_cleanup_completion_receipt")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn private_leaf_exists_at(parent: &File, leaf: &CStr) -> ContainmentResult<bool> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(ContainmentErrorCode::EvidenceUnavailable)
+        };
+    }
+    drop(unsafe { File::from_raw_fd(fd) });
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn same_private_artifact_binding(
+    ownership: &ManagedArtifactBinding,
+    cleanup: &ManagedArtifactBinding,
+) -> bool {
+    ownership.nonce() == cleanup.nonce()
+        && ownership.control_root() == cleanup.control_root()
+        && ownership.private_leaf() == cleanup.private_leaf()
+        && ownership.private_directory() == cleanup.private_directory()
+        && ownership.runner() == cleanup.runner()
+        && ownership.socket() == cleanup.socket()
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_runner_ownership_against_binding(
+    record: &PrivateRunnerOwnership,
+    key: ManagedKey,
+    binding: &ManagedArtifactBinding,
+    expected_owner: Option<&ManagedOwnerTag>,
+    resolved_aliases: Option<&[&crate::launch_registry::ManagedReconcileEntry]>,
+) -> ContainmentResult<()> {
+    let expected_directory = binding
+        .private_directory()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let expected_runner = binding
+        .runner()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let expected_socket = binding
+        .socket()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    if record.slot != key.slot()
+        || record.generation != key.generation()
+        || record.directory != durable_directory_identity(expected_directory)
+        || record.runner != private_artifact_identity(expected_runner)
+        || record.socket != private_artifact_identity(expected_socket)
+        || record.binding.cleanup_quarantine().is_some()
+        || !record.binding.owner_create_pending()
+        || binding.owner_create_pending()
+        || !same_private_artifact_binding(&record.binding, binding)
+        || expected_owner.is_some_and(|owner| owner != &record.owner)
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if let Some(aliases) = resolved_aliases
+        && !aliases.iter().any(|entry| {
+            entry.owner.as_ref() == Some(&record.owner)
+                && entry.key == Some(key)
+                && entry.outcome == ReconcileOutcome::ResolvedTombstone
+        })
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_bound_private_runner_control(
+    parent: &File,
+    parent_identity: DurableDirectoryIdentity,
+    parent_path: &Path,
+    key: ManagedKey,
+    binding: &ManagedArtifactBinding,
+    expected_owner: Option<&ManagedOwnerTag>,
+    resolved_aliases: Option<&[&crate::launch_registry::ManagedReconcileEntry]>,
+) -> ContainmentResult<()> {
+    let owner = expected_owner.ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let Some(mut authoritative) = read_managed_artifact_binding(key, owner)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+    else {
+        return Ok(());
+    };
+    if !same_private_artifact_binding(binding, &authoritative) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if authoritative.creation_pending() {
+        // Before an exact runner/socket/owner inode is durably bound,
+        // disappearance of its physical name is indistinguishable from
+        // hostile relocation.
+        // Preserve the directory and binding for operator resolution.
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    if authoritative.control_root().boot_uuid != parent_identity.boot_uuid {
+        let completed = finish_managed_artifact_logical_absence(key, &authoritative)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        return acknowledge_managed_artifact_cleanup(key, &completed)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable);
+    }
+    if durable_identity_from_fd(parent).map_err(map_evidence)? != parent_identity
+        || binding.control_root() != managed_directory_identity(parent_identity)
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let reopened_parent = open_existing_private_dir(parent_path).map_err(map_evidence)?;
+    if reopened_parent.identity() != parent_identity {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+
+    if authoritative.socket_retire_pending() {
+        let source_leaf = CString::new(authoritative.private_leaf())
+            .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+        let expected_directory = authoritative
+            .private_directory()
+            .map(durable_directory_identity)
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        let directory = reopen_private_child_from_parent(parent, &source_leaf, expected_directory)?;
+        let directory_fd = directory
+            .try_clone()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        let expected_socket = authoritative
+            .socket()
+            .map(private_artifact_identity)
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        let socket = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            c"control.sock",
+            PrivateArtifactKind::Socket,
+            Some(expected_socket),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if unsafe { libc::unlinkat(directory_fd.as_raw_fd(), c"control.sock".as_ptr(), 0) } != 0 {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if socket
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
+            .nlink()
+            != 0
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        crash_failpoint("after_private_socket_retirement_physical_unlink")?;
+        authoritative = finish_managed_artifact_socket_retirement(key, &authoritative)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+
+    // The quarantine name must be durable before any mutation.  It is derived
+    // from the externally bound nonce, so a restart can distinguish the owned
+    // directory from a replacement installed at the live leaf.
+    let cleanup_binding = begin_managed_artifact_cleanup(key, &authoritative)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if cleanup_binding.cleanup_completed() {
+        return acknowledge_managed_artifact_cleanup(key, &cleanup_binding)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let quarantine_text = cleanup_binding
+        .cleanup_quarantine()
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let source_leaf = CString::new(cleanup_binding.private_leaf())
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let quarantine_leaf =
+        CString::new(quarantine_text).map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let expected_directory = cleanup_binding.private_directory();
+    let expected_durable = expected_directory.map(durable_directory_identity);
+    let quarantine_present = private_leaf_exists_at(parent, &quarantine_leaf)?;
+
+    if quarantine_present {
+        let expected = expected_durable.ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        reopen_private_child_from_parent(parent, &quarantine_leaf, expected)?;
+    } else if private_leaf_exists_at(parent, &source_leaf)? {
+        let expected = expected_durable.ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        let source = reopen_private_child_from_parent(parent, &source_leaf, expected)?;
+        failpoint("before_private_quarantine_publish")?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                parent.as_raw_fd(),
+                source_leaf.as_ptr(),
+                parent.as_raw_fd(),
+                quarantine_leaf.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        parent
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        failpoint("after_private_quarantine_publish")?;
+        if durable_identity_from_fd(parent).map_err(map_evidence)? != parent_identity
+            || durable_identity_from_fd(&source).map_err(map_evidence)? != expected
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        reopen_private_child_from_parent(parent, &quarantine_leaf, expected)?;
+    } else {
+        if cleanup_binding.private_directory().is_none()
+            && cleanup_binding.runner().is_none()
+            && cleanup_binding.socket().is_none()
+        {
+            let completed = finish_managed_artifact_create_pending_absence(key, &cleanup_binding)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            return acknowledge_managed_artifact_cleanup(key, &completed)
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable);
+        }
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+
+    let expected = expected_durable.ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    let quarantine_path = parent_path.join(std::ffi::OsStr::from_bytes(quarantine_leaf.to_bytes()));
+    let directory = open_existing_private_dir(&quarantine_path).map_err(map_evidence)?;
+    if directory.identity() != expected {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let ownership = read_private_runner_ownership(&directory)?;
+    if let Some((record, _)) = &ownership {
+        validate_private_runner_ownership_against_binding(
+            record,
+            key,
+            &cleanup_binding,
+            expected_owner,
+            resolved_aliases,
+        )?;
+    }
+    let expected_runner = cleanup_binding.runner().map(private_artifact_identity);
+    let expected_socket = cleanup_binding.socket().map(private_artifact_identity);
+    let partial_socket_leaf = cleanup_binding
+        .socket_create_pending()
+        .then(|| private_socket_temp_leaf(cleanup_binding.nonce()));
+    let partial_owner_leaf = cleanup_binding.owner_create_pending().then(|| {
+        CString::new(format!(
+            ".owner.json.create-{}",
+            cleanup_binding.nonce().simple()
+        ))
+        .expect("UUID-derived private owner leaf")
+    });
+    let expected_ownership_file = cleanup_binding.owner_file().map(private_artifact_identity);
+    let mut cleanup_progress =
+        ManagedPrivateCleanupProgress::new(key, binding.clone(), cleanup_binding)?;
+    remove_private_runner_control_fd_relative(
+        parent,
+        parent_identity,
+        &quarantine_leaf,
+        &directory,
+        PrivateControlCleanupExpectations {
+            ownership: ownership.as_ref().map(|(record, _)| record),
+            ownership_file: expected_ownership_file,
+            runner: expected_runner,
+            socket: expected_socket,
+            partial_socket_leaf: partial_socket_leaf.as_deref(),
+            partial_owner_leaf: partial_owner_leaf.as_deref(),
+            allow_unbound_files: false,
+        },
+        Some(&mut cleanup_progress),
+    )?;
+    if durable_identity_from_fd(parent).map_err(map_evidence)? != parent_identity {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    acknowledge_managed_artifact_cleanup(key, &cleanup_progress.current)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    failpoint("after_private_cleanup_ack")
+}
+
+#[cfg(target_os = "linux")]
+struct RunnerLifetime {
+    private_control: Mutex<PrivateRunnerControl>,
+}
+
+#[cfg(target_os = "linux")]
+struct BoundPrivateArtifactCleanup {
+    parent_identity: DurableDirectoryIdentity,
+    parent_path: PathBuf,
+    private_leaf: String,
+    key: ManagedKey,
+    owner: ManagedOwnerTag,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundPrivateArtifactCleanup {
+    fn cleanup(&self) -> anyhow::Result<bool> {
+        let Some(binding) = read_managed_artifact_binding(self.key, &self.owner)? else {
+            return Ok(true);
+        };
+        if binding.control_root() != managed_directory_identity(self.parent_identity)
+            || binding.private_leaf() != self.private_leaf
+        {
+            anyhow::bail!("prepared private artifact authority mismatch");
+        }
+        let parent_directory = open_existing_private_dir(&self.parent_path)
+            .map_err(|code| anyhow::anyhow!("prepared private parent reopen failed: {code}"))?;
+        if parent_directory.identity() != self.parent_identity {
+            anyhow::bail!("prepared private parent identity changed");
+        }
+        let parent = parent_directory
+            .try_clone_retained_fd()
+            .map_err(|error| anyhow::anyhow!("prepared private parent clone failed: {error}"))?;
+        cleanup_bound_private_runner_control(
+            &parent,
+            self.parent_identity,
+            &self.parent_path,
+            self.key,
+            &binding,
+            Some(&self.owner),
+            None,
+        )
+        .map_err(|code| anyhow::anyhow!("prepared private artifact cleanup failed: {code}"))?;
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn abort_prepared_runner_reservation(
+    context: &LiveTournamentContext,
+    owner: ManagedOwnerTag,
+    reservation: crate::launch_registry::ManagedLaunchReservation,
+) {
+    let private_leaf = format!(
+        "lterm-g003-{}-candidate-{}",
+        owner.tournament_uuid, owner.candidate_index
+    );
+    let cleanup = Arc::new(BoundPrivateArtifactCleanup {
+        parent_identity: context.control_root.identity(),
+        parent_path: context.control_root_path(),
+        private_leaf,
+        key: reservation.key(),
+        owner,
+    });
+    let callback = Arc::clone(&cleanup);
+    abort_managed_launch_reservation(
+        reservation,
+        ManagedLifetimeGuard::with_cleanup(cleanup, move || callback.cleanup()),
+    );
+    let _ = drain_managed_reaper_queue_bounded(Duration::from_secs(2));
+}
+
+#[cfg(target_os = "linux")]
+impl RunnerLifetime {
+    fn new(private_control: PrivateRunnerControl) -> Self {
         Self {
-            waiter: Some(waiter),
-            private_control: Some(private_control),
+            private_control: Mutex::new(private_control),
         }
     }
 
-    fn private_control(&self) -> ContainmentResult<&PrivateRunnerControl> {
+    fn private_control(&self) -> std::sync::MutexGuard<'_, PrivateRunnerControl> {
         self.private_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cleanup_managed_artifacts(&self) -> anyhow::Result<bool> {
+        let mut private_control = self.private_control();
+        if private_control.cleanup_complete {
+            return Ok(true);
+        }
+        let (Some(key), Some(binding)) = (
+            private_control.managed_key,
+            private_control.managed_binding.clone(),
+        ) else {
+            return Ok(true);
+        };
+        let owner = private_control
+            .ownership
             .as_ref()
-            .ok_or(ContainmentErrorCode::EvidenceUnavailable)
+            .map(|record| record.owner.clone())
+            .ok_or_else(|| anyhow::anyhow!("managed private artifact owner is absent"))?;
+        let Some(authoritative) = read_managed_artifact_binding(key, &owner)? else {
+            private_control.cleanup_complete = true;
+            private_control.managed_key = None;
+            private_control.managed_binding = None;
+            return Ok(true);
+        };
+        if !same_private_artifact_binding(&binding, &authoritative) {
+            anyhow::bail!("managed private artifact authority changed");
+        }
+        // The supervisor invokes physical artifact cleanup only after it has
+        // positively reaped the exact managed child and durably resolved the
+        // process slot. Record the debug lifetime proof at that boundary,
+        // while the retained runner inode still exists.
+        observe_failed_runner_lifetime(&private_control);
+        cleanup_bound_private_runner_control(
+            &private_control.parent,
+            private_control.parent_identity,
+            private_control
+                .path
+                .parent()
+                .unwrap_or(&private_control.path),
+            key,
+            &authoritative,
+            Some(&owner),
+            None,
+        )
+        .map_err(|code| anyhow::anyhow!("managed private artifact cleanup failed: {code}"))?;
+        private_control.cleanup_complete = true;
+        private_control.managed_key = None;
+        private_control.managed_binding = None;
+        Ok(true)
     }
+}
 
-    fn private_control_mut(&mut self) -> ContainmentResult<&mut PrivateRunnerControl> {
-        self.private_control
-            .as_mut()
-            .ok_or(ContainmentErrorCode::EvidenceUnavailable)
-    }
+#[cfg(target_os = "linux")]
+fn managed_runner_lifetime_guard(lifetime: &Arc<RunnerLifetime>) -> ManagedLifetimeGuard {
+    let cleanup = Arc::clone(lifetime);
+    ManagedLifetimeGuard::with_cleanup(Arc::clone(lifetime), move || {
+        cleanup.cleanup_managed_artifacts()
+    })
+}
 
-    fn into_parts(mut self) -> (ManagedWaiter, PrivateRunnerControl) {
-        let waiter = self.waiter.take().expect("pending runner waiter invariant");
+#[cfg(target_os = "linux")]
+impl Drop for RunnerLifetime {
+    fn drop(&mut self) {
         let private_control = self
             .private_control
-            .take()
-            .expect("pending private control invariant");
-        (waiter, private_control)
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observe_failed_runner_lifetime(private_control);
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for PendingRunnerControl {
-    fn drop(&mut self) {
-        let (Some(waiter), Some(private_control)) =
-            (self.waiter.take(), self.private_control.take())
-        else {
-            return;
-        };
-        match waiter.terminate_and_reap_bounded(Duration::from_secs(2)) {
-            ManagedBoundedReap::Reaped => {
-                observe_failed_runner_lifetime(&private_control);
-                drop(private_control);
-            }
-            ManagedBoundedReap::Pending(waiter) => {
-                handoff_pending_runner_reaper(waiter, private_control);
-            }
+struct RunnerLaunchFailureObserver {
+    lifetime: Arc<RunnerLifetime>,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct PendingManagedRunner {
+    waiter: Option<ManagedWaiter>,
+    lifetime: Arc<RunnerLifetime>,
+}
+
+#[cfg(target_os = "linux")]
+struct PendingManagedReservation {
+    reservation: Option<crate::launch_registry::ManagedLaunchReservation>,
+    lifetime_guard: Option<ManagedLifetimeGuard>,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingManagedReservation {
+    fn new(
+        reservation: crate::launch_registry::ManagedLaunchReservation,
+        lifetime_guard: ManagedLifetimeGuard,
+    ) -> Self {
+        Self {
+            reservation: Some(reservation),
+            lifetime_guard: Some(lifetime_guard),
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-fn handoff_pending_runner_reaper(waiter: ManagedWaiter, private_control: PrivateRunnerControl) {
-    observe_pending_runner_handoff(&private_control);
-    #[cfg(debug_assertions)]
-    let observed_reap_marker = if std::env::var_os("LTERM_INTERNAL_MANAGED_FORCE_PENDING_REAP")
-        .as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-        && std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-    {
-        Some(
-            private_control
-                .path
-                .parent()
-                .unwrap_or(&private_control.path)
-                .join("failed-runner-reaped-before-private-control-drop"),
+    fn into_parts(
+        mut self,
+    ) -> (
+        crate::launch_registry::ManagedLaunchReservation,
+        ManagedLifetimeGuard,
+    ) {
+        (
+            self.reservation
+                .take()
+                .expect("pending managed reservation invariant"),
+            self.lifetime_guard
+                .take()
+                .expect("pending managed lifetime invariant"),
         )
-    } else {
-        None
-    };
-    let payload = Arc::new(Mutex::new(Some((waiter, private_control))));
-    #[cfg(debug_assertions)]
-    if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && std::env::var_os("LTERM_INTERNAL_SPECULATION_FORCE_REAPER_SPAWN_FAILURE").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-    {
-        // This deterministic test seam takes the same conservative branch as
-        // an OS thread-spawn failure: retain the child handle and private
-        // control together rather than unlinking under an unproven process.
-        std::mem::forget(payload);
-        return;
     }
-    let worker_payload = Arc::clone(&payload);
-    let spawned = std::thread::Builder::new()
-        .name("lterm-speculation-runner-reaper".into())
-        .spawn(move || {
-            let pair = match worker_payload.lock() {
-                Ok(mut payload) => payload.take(),
-                Err(poisoned) => poisoned.into_inner().take(),
-            };
-            if let Some((waiter, private_control)) = pair {
-                match waiter.reap_killed_child() {
-                    Ok(()) => {
-                        observe_failed_runner_lifetime(&private_control);
-                        drop(private_control);
-                    }
-                    Err(waiter) => {
-                        // A live or unprovably reaped bwrap must retain its
-                        // exact child handle and private control together.
-                        // Recovery owns the unresolved durable state.
-                        std::mem::forget((waiter, private_control));
-                    }
-                }
-            }
-        });
-    match spawned {
-        Err(_) => {
-            // The payload still owns both the exact child handle and private
-            // control. Leak that closed capability rather than unlink under a
-            // possibly live bwrap.
-            std::mem::forget(payload);
-        }
-        Ok(_reaper) => {
-            #[cfg(debug_assertions)]
-            if let Some(marker) = observed_reap_marker {
-                // Test-only synchronization makes the forced-Pending branch
-                // deterministic without changing the production bound.
-                for _ in 0..200 {
-                    if marker.is_file() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingManagedReservation {
+    fn drop(&mut self) {
+        if let (Some(reservation), Some(lifetime_guard)) =
+            (self.reservation.take(), self.lifetime_guard.take())
+        {
+            abort_managed_launch_reservation(reservation, lifetime_guard);
+            let _ = drain_managed_reaper_queue_bounded(Duration::from_secs(2));
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn observe_pending_runner_handoff(private_control: &PrivateRunnerControl) {
+impl PendingManagedRunner {
+    fn new(waiter: ManagedWaiter, lifetime: Arc<RunnerLifetime>) -> Self {
+        Self {
+            waiter: Some(waiter),
+            lifetime,
+        }
+    }
+
+    fn into_waiter(mut self) -> ManagedWaiter {
+        self.waiter
+            .take()
+            .expect("pending managed runner invariant")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingManagedRunner {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            cleanup_managed_runner_waiter(waiter, Some(&self.lifetime));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_managed_runner_waiter(waiter: ManagedWaiter, lifetime: Option<&RunnerLifetime>) {
+    if let ManagedBoundedReap::Pending(waiter) =
+        waiter.terminate_and_reap_bounded(Duration::from_secs(2))
+    {
+        if let Some(lifetime) = lifetime {
+            observe_pending_runner_handoff(&lifetime.private_control());
+        }
+        drop(waiter);
+    }
     #[cfg(debug_assertions)]
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-        && private_control.path.join("lterm").is_file()
-        && private_control.socket_path.exists()
+    if active_speculation_test_config().is_some_and(|config| {
+        config.observe_failed_runner_lifetime && !config.force_reaper_spawn_failure
+    }) {
+        // A positive reap can still enqueue cleanup-only work when the first
+        // durable cleanup attempt is inconclusive. The real daemon keeps the
+        // supervisor alive; the short-lived test driver waits here so it can
+        // observe the same automatic retry before process exit.
+        let _ = drain_managed_reaper_queue_bounded(Duration::from_secs(2));
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RunnerLaunchFailureObserver {
+    fn new(lifetime: Arc<RunnerLifetime>) -> Self {
+        Self {
+            lifetime,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RunnerLaunchFailureObserver {
+    fn drop(&mut self) {
+        if self.armed {
+            observe_pending_runner_handoff(&self.lifetime.private_control());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_pending_runner_handoff(_private_control: &PrivateRunnerControl) {
+    #[cfg(debug_assertions)]
+    if active_speculation_test_config().is_some_and(|config| config.observe_failed_runner_lifetime)
+        && _private_control.path.join("lterm").is_file()
     {
         let _ = std::fs::write(
-            private_control
+            _private_control
                 .path
                 .parent()
-                .unwrap_or(&private_control.path)
+                .unwrap_or(&_private_control.path)
                 .join("failed-runner-pending-reaper-retained-private-control"),
             b"1\n",
         );
@@ -2991,22 +4496,193 @@ fn observe_pending_runner_handoff(private_control: &PrivateRunnerControl) {
 }
 
 #[cfg(target_os = "linux")]
-fn observe_failed_runner_lifetime(private_control: &PrivateRunnerControl) {
+fn observe_failed_runner_lifetime(_private_control: &PrivateRunnerControl) {
     #[cfg(debug_assertions)]
-    if std::env::var_os("LTERM_INTERNAL_SPECULATION_OBSERVE_FAILED_RUNNER_LIFETIME").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-        && private_control.path.join("lterm").is_file()
-        && private_control.socket_path.exists()
+    if active_speculation_test_config().is_some_and(|config| config.observe_failed_runner_lifetime)
+        && _private_control.path.join("lterm").is_file()
     {
         let _ = std::fs::write(
-            private_control
+            _private_control
                 .path
                 .parent()
-                .unwrap_or(&private_control.path)
+                .unwrap_or(&_private_control.path)
                 .join("failed-runner-reaped-before-private-control-drop"),
             b"1\n",
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reconcile_private_runner_controls(
+    control_root: &ValidatedDirectory,
+    managed: &ManagedReconcileReport,
+) -> ContainmentResult<()> {
+    let Some(aliases) = private_runner_alias_groups(managed)? else {
+        return Ok(());
+    };
+    for entries in aliases.values() {
+        if !entries.iter().all(|entry| {
+            entry.key.is_some() && entry.outcome == ReconcileOutcome::ResolvedTombstone
+        }) {
+            continue;
+        }
+        let owner = entries[0]
+            .owner
+            .as_ref()
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        remove_resolved_private_runner_control(control_root, owner, entries)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+type PrivateRunnerAliasGroups<'a> =
+    std::collections::BTreeMap<(Uuid, u8), Vec<&'a crate::launch_registry::ManagedReconcileEntry>>;
+
+#[cfg(target_os = "linux")]
+fn private_runner_alias_groups(
+    managed: &ManagedReconcileReport,
+) -> ContainmentResult<Option<PrivateRunnerAliasGroups<'_>>> {
+    // An unreadable slot or unresolved ownerless record makes global alias
+    // correlation uncertain.  A resolved generic (ownerless) tombstone has no
+    // physical speculation alias and therefore must not leak unrelated private
+    // controls forever.
+    if managed.entries.iter().any(|entry| {
+        entry.key.is_none()
+            || entry.owner.is_none() && entry.outcome != ReconcileOutcome::ResolvedTombstone
+    }) {
+        return Ok(None);
+    }
+    let mut aliases = std::collections::BTreeMap::<
+        (Uuid, u8),
+        Vec<&crate::launch_registry::ManagedReconcileEntry>,
+    >::new();
+    for entry in &managed.entries {
+        let Some(owner) = entry.owner.as_ref() else {
+            continue;
+        };
+        owner
+            .validate()
+            .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+        aliases
+            .entry((owner.tournament_uuid, owner.candidate_index))
+            .or_default()
+            .push(entry);
+    }
+    Ok(Some(aliases))
+}
+
+#[cfg(target_os = "linux")]
+fn read_private_runner_ownership(
+    directory: &ValidatedDirectory,
+) -> ContainmentResult<Option<(PrivateRunnerOwnership, PrivateArtifactIdentity)>> {
+    let directory_fd = directory.try_clone_retained_fd().map_err(map_evidence)?;
+    let fd = unsafe {
+        libc::openat(
+            directory_fd.as_raw_fd(),
+            PRIVATE_RUNNER_OWNER_LEAF.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(ContainmentErrorCode::EvidenceUnavailable)
+        };
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let mut bytes = Vec::new();
+    file.take(4 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if bytes.len() > 4 * 1024 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let record: PrivateRunnerOwnership =
+        serde_json::from_slice(&bytes).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if record.schema_version != 1 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(Some((record, artifact_identity(&metadata))))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_resolved_private_runner_control(
+    control_root: &ValidatedDirectory,
+    owner: &ManagedOwnerTag,
+    resolved_aliases: &[&crate::launch_registry::ManagedReconcileEntry],
+) -> ContainmentResult<()> {
+    owner
+        .validate()
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    control_root.revalidate().map_err(map_evidence)?;
+    let mut bound = resolved_aliases
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.key?,
+                entry.artifact_binding.as_ref()?,
+                entry.owner.as_ref()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if bound.len() > 1 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let bound = bound.pop();
+    if bound.is_some_and(|(_, binding, _)| {
+        let expected = binding.control_root();
+        let current = managed_directory_identity(control_root.identity());
+        expected.boot_uuid == current.boot_uuid && expected != current
+    }) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let leaf = cgroup_name(&format!(
+        "lterm-g003-{}-candidate-{}",
+        owner.tournament_uuid, owner.candidate_index
+    ))?;
+    let leaf_text = leaf
+        .to_str()
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    if bound.is_some_and(|(_, binding, _)| binding.private_leaf() != leaf_text) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let control_root_path = Path::new(std::ffi::OsStr::from_bytes(
+        control_root.canonical_locator_bytes(),
+    ));
+    let path = control_root_path.join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+    let Some((managed_key, managed_binding, binding_owner)) = bound else {
+        return match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(ContainmentErrorCode::InvalidIdentity),
+        };
+    };
+    if binding_owner.tournament_uuid != owner.tournament_uuid
+        || binding_owner.candidate_index != owner.candidate_index
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let parent = control_root.try_clone_retained_fd().map_err(map_evidence)?;
+    cleanup_bound_private_runner_control(
+        &parent,
+        control_root.identity(),
+        control_root_path,
+        managed_key,
+        managed_binding,
+        Some(binding_owner),
+        Some(resolved_aliases),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3029,7 +4705,7 @@ pub(crate) struct CandidateControl {
     protocol: Arc<Mutex<CandidateProtocol>>,
     payload_node: RetainedCgroupNode,
     payload_proof: Option<ManagedDescendantProof>,
-    _lifetime: Arc<PrivateRunnerControl>,
+    _lifetime: Arc<RunnerLifetime>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3038,13 +4714,22 @@ pub(crate) struct CandidateObserver {
     peer: File,
     protocol: Arc<Mutex<CandidateProtocol>>,
     controller: ManagedController,
-    waiter: Option<ManagedWaiter>,
     sync_read: File,
     payload_node: RetainedCgroupNode,
     payload_membership: ManagedCgroupMembership,
     sync_eof_observed: bool,
     managed_reaped_observed: bool,
-    _lifetime: Arc<PrivateRunnerControl>,
+    waiter: Option<ManagedWaiter>,
+    lifetime: Arc<RunnerLifetime>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CandidateObserver {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            cleanup_managed_runner_waiter(waiter, Some(&self.lifetime));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3197,12 +4882,27 @@ fn launch_runner_with_argv(
     revalidate_cgroup_node(control_node)?;
     revalidate_cgroup_node(payload_node)?;
     let identity = context.candidate_identity(candidate_index)?;
-    let private_control = prepare_runner_control(context, candidate_index)?;
-    let invocation = build_fixed_bwrap_invocation(
-        &context.candidate_path(candidate_index)?,
-        &private_control.path,
-        identity,
-    )?;
+    let owner = ManagedOwnerTag {
+        kind: ManagedOwnerKind::Speculation,
+        tournament_uuid: identity.tournament_uuid,
+        candidate_index,
+        role: owner_role,
+    };
+    let mut reservation = reserve_managed_launch(Some(owner.clone()))
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let private_control =
+        match prepare_managed_runner_control(context, candidate_index, &owner, &mut reservation) {
+            Ok(private_control) => private_control,
+            Err(error) => {
+                abort_prepared_runner_reservation(context, owner, reservation);
+                return Err(error);
+            }
+        };
+    let lifetime = Arc::new(RunnerLifetime::new(private_control));
+    let mut failure_observer = RunnerLaunchFailureObserver::new(Arc::clone(&lifetime));
+    let pending_reservation =
+        PendingManagedReservation::new(reservation, managed_runner_lifetime_guard(&lifetime));
+    let invocation = build_fixed_bwrap_invocation(identity)?;
     let control_membership = managed_membership(control_node, identity)?;
     let payload_membership = managed_membership(payload_node, identity)?;
     let placement = ControlCgroupPlacement::new(
@@ -3217,50 +4917,156 @@ fn launch_runner_with_argv(
     }
     let sync_read = unsafe { File::from_raw_fd(sync_fds[0]) };
     let sync_write = unsafe { File::from_raw_fd(sync_fds[1]) };
+    let sync_auxiliary = SyncPipeWrite::new(sync_write, MANAGED_SYNC_PIPE_TARGET_FD)
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    let pinned_runner = {
+        let private_control = lifetime.private_control();
+        private_control
+            .directory
+            .revalidate()
+            .map_err(map_evidence)?;
+        let directory_fd = private_control
+            .directory
+            .try_clone_retained_fd()
+            .map_err(map_evidence)?;
+        let expected = artifact_identity(
+            &private_control
+                .runner_file
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+        let reopened = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            c"lterm",
+            PrivateArtifactKind::Runner,
+            Some(expected),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if artifact_identity(
+            &reopened
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) != expected
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        ManagedPinnedRunner::new(
+            private_control
+                .runner_file
+                .try_clone()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        )
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?
+    };
+    let candidate_directory = {
+        let candidate = context
+            .candidates
+            .get(usize::from(candidate_index))
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        candidate.revalidate().map_err(map_evidence)?;
+        ManagedPinnedCandidateDirectory::new(
+            candidate.try_clone_retained_fd().map_err(map_evidence)?,
+            managed_directory_identity(candidate.identity()),
+        )
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?
+    };
+    let control_directory = {
+        let private_control = lifetime.private_control();
+        private_control
+            .directory
+            .revalidate()
+            .map_err(map_evidence)?;
+        let expected = private_control
+            .managed_binding
+            .as_ref()
+            .and_then(ManagedArtifactBinding::private_directory)
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if expected != managed_directory_identity(private_control.directory.identity()) {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        ManagedPinnedControlDirectory::new(
+            private_control
+                .directory
+                .try_clone_retained_fd()
+                .map_err(map_evidence)?,
+            expected,
+        )
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?
+    };
+    let control_socket = {
+        let private_control = lifetime.private_control();
+        let expected = private_control
+            .managed_binding
+            .as_ref()
+            .and_then(ManagedArtifactBinding::socket)
+            .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        ManagedPinnedControlSocket::new(
+            private_control
+                .socket_file
+                .try_clone()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+            expected,
+        )
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?
+    };
     failpoint("before_managed_launch")?;
-    let managed = launch_managed_process(ManagedLaunchRequest {
-        owner: Some(ManagedOwnerTag {
-            kind: ManagedOwnerKind::Speculation,
-            tournament_uuid: identity.tournament_uuid,
-            candidate_index,
-            role: owner_role,
-        }),
+    let (reservation, lifetime_guard) = pending_reservation.into_parts();
+    let managed = match launch_managed_process(ManagedLaunchRequest {
+        owner: Some(owner),
+        reservation: Some(reservation),
+        lifetime_guard: Some(lifetime_guard),
         executable_policy: ManagedExecutablePolicy::PinnedSystemBwrap,
         placement: ManagedPlacement::CgroupV2(placement),
-        auxiliary: ManagedAuxiliary::SyncPipeWrite(
-            SyncPipeWrite::new(sync_write, MANAGED_SYNC_PIPE_TARGET_FD)
-                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
-        ),
+        auxiliary: ManagedAuxiliary::Speculation {
+            sync_pipe: sync_auxiliary,
+            pinned_runner,
+            candidate_directory,
+            control_directory,
+            control_socket,
+        },
         executable: invocation.executable,
         arguments: invocation.arguments,
         current_dir: None,
         environment: Vec::new(),
         stdio: ManagedStdioPolicy::Null,
-    })
-    .map_err(|_| ContainmentErrorCode::PinnedBwrapFailure)?;
+    }) {
+        Ok(managed) => managed,
+        Err(failure) => {
+            drop(failure);
+            return Err(ContainmentErrorCode::PinnedBwrapFailure);
+        }
+    };
     let managed_controller = managed.controller;
     let owner_receipt = managed.owner_receipt;
-    let mut pending_control = PendingRunnerControl::new(managed.waiter, private_control);
+    let pending_waiter = PendingManagedRunner::new(managed.waiter, Arc::clone(&lifetime));
     let owner_receipt = owner_receipt.ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
     failpoint("after_managed_launch")?;
-    let listener = pending_control
-        .private_control()?
+    let listener = lifetime
+        .private_control()
         .listener
         .as_ref()
-        .ok_or(ContainmentErrorCode::PeerRejected)?;
+        .ok_or(ContainmentErrorCode::PeerRejected)?
+        .try_clone()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     let peer = accept_authenticated_peer(
-        listener,
+        &listener,
         &managed_controller,
         &control_membership,
         identity,
         deadline,
     )?;
+    #[cfg(debug_assertions)]
+    {
+        lifetime
+            .private_control()
+            .observe_authenticated_retained_control()?;
+        prove_hostile_control_listener_uncontacted()?;
+    }
     failpoint("after_control_accept")?;
     failpoint("before_control_unlink")?;
-    std::fs::remove_file(&pending_control.private_control()?.socket_path)
-        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    drop(listener);
+    lifetime.private_control().retire_socket_listener()?;
     failpoint("after_control_unlink")?;
-    pending_control.private_control_mut()?.listener.take();
     let mut validator =
         SequenceValidator::new(identity).map_err(|_| ContainmentErrorCode::PeerRejected)?;
     wait_fd_until(&peer, libc::POLLIN, deadline)?;
@@ -3293,12 +5099,14 @@ fn launch_runner_with_argv(
     if !matches!(ready.message, ControlMessage::Ready) {
         return Err(ContainmentErrorCode::PeerRejected);
     }
-    for directory in [
-        &context.candidates[usize::from(candidate_index)],
-        &pending_control.private_control()?.directory,
-    ] {
-        directory.revalidate().map_err(map_evidence)?;
-    }
+    context.candidates[usize::from(candidate_index)]
+        .revalidate()
+        .map_err(map_evidence)?;
+    lifetime
+        .private_control()
+        .directory
+        .revalidate()
+        .map_err(map_evidence)?;
     let owner = owner_receipt.owner();
     let observation = CandidateObservation {
         identity,
@@ -3321,8 +5129,8 @@ fn launch_runner_with_argv(
         validator,
         output_limit_observed: false,
     }));
-    let (managed_waiter, private_control) = pending_control.into_parts();
-    let lifetime = Arc::new(private_control);
+    failure_observer.disarm();
+    let managed_waiter = pending_waiter.into_waiter();
     Ok(CandidateContainment {
         control: CandidateControl {
             identity,
@@ -3337,13 +5145,13 @@ fn launch_runner_with_argv(
             peer: observer_peer,
             protocol,
             controller: managed_controller,
-            waiter: Some(managed_waiter),
             sync_read,
             payload_node: observer_payload_node,
             payload_membership,
             sync_eof_observed: false,
             managed_reaped_observed: false,
-            _lifetime: lifetime,
+            waiter: Some(managed_waiter),
+            lifetime,
         },
         observation,
     })
@@ -3937,17 +5745,18 @@ pub(crate) fn observe_managed_reaped(
     if observer.managed_reaped_observed {
         return Err(ContainmentErrorCode::EvidenceUnavailable);
     }
-    let waiter = observer
+    observer
         .waiter
         .as_mut()
-        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
-    waiter.wait_until(deadline.instant()).map_err(|_| {
-        if deadline.expired() {
-            ContainmentErrorCode::Timeout
-        } else {
-            ContainmentErrorCode::EvidenceUnavailable
-        }
-    })?;
+        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?
+        .wait_until(deadline.instant())
+        .map_err(|_| {
+            if deadline.expired() {
+                ContainmentErrorCode::Timeout
+            } else {
+                ContainmentErrorCode::EvidenceUnavailable
+            }
+        })?;
     observer.waiter.take();
     observer.managed_reaped_observed = true;
     Ok(ContainmentEvent::ManagedReaped {
@@ -3996,6 +5805,28 @@ fn prepare_runner_control(
     context: &LiveTournamentContext,
     candidate_index: u8,
 ) -> ContainmentResult<PrivateRunnerControl> {
+    prepare_runner_control_inner(context, candidate_index, None)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_managed_runner_control(
+    context: &LiveTournamentContext,
+    candidate_index: u8,
+    owner: &ManagedOwnerTag,
+    reservation: &mut crate::launch_registry::ManagedLaunchReservation,
+) -> ContainmentResult<PrivateRunnerControl> {
+    prepare_runner_control_inner(context, candidate_index, Some((owner, reservation)))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_runner_control_inner(
+    context: &LiveTournamentContext,
+    candidate_index: u8,
+    mut managed: Option<(
+        &ManagedOwnerTag,
+        &mut crate::launch_registry::ManagedLaunchReservation,
+    )>,
+) -> ContainmentResult<PrivateRunnerControl> {
     context.control_root.revalidate().map_err(map_evidence)?;
     let leaf = cgroup_name(&format!(
         "lterm-g003-{}-candidate-{candidate_index}",
@@ -4005,14 +5836,50 @@ fn prepare_runner_control(
         .control_root
         .try_clone_retained_fd()
         .map_err(map_evidence)?;
-    if unsafe { libc::mkdirat(root.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
-        return Err(ContainmentErrorCode::EvidenceUnavailable);
-    }
     let path = context
         .control_root_path()
         .join(std::ffi::OsStr::from_bytes(leaf.to_bytes()));
+    failpoint("before_private_control_reservation")?;
+    if let Some((_, reservation)) = managed.as_mut() {
+        reservation
+            .begin_artifact_creation(
+                managed_directory_identity(context.control_root.identity()),
+                leaf.to_str()
+                    .map_err(|_| ContainmentErrorCode::InvalidIdentity)?,
+            )
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    }
+    failpoint("after_private_control_reservation")?;
+    if unsafe { libc::mkdirat(root.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
     let directory = open_existing_private_dir(&path).map_err(map_evidence)?;
+    directory
+        .try_clone_retained_fd()
+        .map_err(map_evidence)?
+        .sync_all()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    root.sync_all()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    failpoint("before_private_control_binding")?;
+    let mut managed_binding = managed
+        .as_mut()
+        .map(|(_, reservation)| {
+            reservation.finish_artifact_creation(managed_directory_identity(directory.identity()))
+        })
+        .transpose()
+        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    failpoint("after_private_control_binding")?;
+    let managed_key = managed.as_ref().map(|(_, reservation)| reservation.key());
     let runner_path = path.join("lterm");
+    if let Some((_, reservation)) = managed.as_mut() {
+        managed_binding = Some(
+            reservation
+                .begin_artifact_runner_creation()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_runner_creation_intent")?;
     let mut runner = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -4028,24 +5895,563 @@ fn prepare_runner_control(
         .open(&runner_path)
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
     verify_runner_copy(&context.current_executable, &runner)?;
+    let runner_identity = artifact_identity(
+        &runner
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    );
     directory
         .try_clone_retained_fd()
         .map_err(map_evidence)?
         .sync_all()
         .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    revalidate_retained_private_runner(&directory, &runner, runner_identity)?;
+    failpoint("before_private_runner_binding")?;
+    // Re-run after the failpoint so a test or concurrent actor cannot swap the
+    // published name between the initial retained proof and durable binding.
+    revalidate_retained_private_runner(&directory, &runner, runner_identity)?;
+    if let Some((_, reservation)) = managed.as_mut() {
+        managed_binding = Some(
+            reservation
+                .finish_artifact_runner(managed_artifact_identity(runner_identity))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_runner_binding")?;
+    if let Some((_, reservation)) = managed.as_mut() {
+        managed_binding = Some(
+            reservation
+                .begin_artifact_socket_creation()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_socket_creation_intent")?;
     let socket_path = path.join("control.sock");
-    let listener = create_seqpacket_listener(&socket_path)?;
+    let (listener, socket_identity) = create_published_seqpacket_listener(
+        &directory,
+        &socket_path,
+        managed_binding
+            .as_ref()
+            .map(ManagedArtifactBinding::nonce)
+            .unwrap_or_else(Uuid::new_v4),
+    )?;
+    directory.revalidate().map_err(map_evidence)?;
+    failpoint("before_private_socket_binding")?;
+    let final_socket = open_validated_private_artifact_at(
+        directory
+            .try_clone_retained_fd()
+            .map_err(map_evidence)?
+            .as_raw_fd(),
+        c"control.sock",
+        PrivateArtifactKind::Socket,
+        Some(socket_identity),
+    )?
+    .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    if artifact_identity(
+        &final_socket
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    ) != socket_identity
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    prove_seqpacket_listener_path_continuity(&listener, &socket_path)?;
+    directory.revalidate().map_err(map_evidence)?;
+    if let Some((_, reservation)) = managed.as_mut() {
+        managed_binding = Some(
+            reservation
+                .finish_artifact_socket(managed_artifact_identity(socket_identity))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_socket_binding")?;
+    failpoint("after_private_artifact_binding")?;
+    if let Some((_, reservation)) = managed.as_mut() {
+        managed_binding = Some(
+            reservation
+                .begin_artifact_owner_creation()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_owner_creation_intent")?;
+    let ownership = managed
+        .as_ref()
+        .map(|(owner, reservation)| PrivateRunnerOwnership {
+            schema_version: 1,
+            owner: (*owner).clone(),
+            slot: reservation.key().slot(),
+            generation: reservation.key().generation(),
+            binding: managed_binding
+                .clone()
+                .expect("managed private runner binding invariant"),
+            directory: directory.identity(),
+            runner: runner_identity,
+            socket: socket_identity,
+        });
+    let ownership_file = ownership
+        .as_ref()
+        .map(|record| write_private_runner_ownership(&directory, record))
+        .transpose()?;
+    if let (Some(identity), Some((_, reservation))) = (ownership_file, managed.as_mut()) {
+        managed_binding = Some(
+            reservation
+                .finish_artifact_owner(managed_artifact_identity(identity))
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        );
+    }
+    failpoint("after_private_owner_binding")?;
     directory.revalidate().map_err(map_evidence)?;
     Ok(PrivateRunnerControl {
+        parent: root,
+        parent_identity: context.control_root.identity(),
+        leaf,
         directory,
         path,
         socket_path,
+        runner_file: runner,
+        socket_file: final_socket,
         listener: Some(listener),
+        ownership,
+        ownership_file,
+        managed_key,
+        managed_binding,
+        cleanup_complete: false,
     })
 }
 
 #[cfg(target_os = "linux")]
+fn revalidate_retained_private_runner(
+    directory: &ValidatedDirectory,
+    runner: &File,
+    runner_identity: PrivateArtifactIdentity,
+) -> ContainmentResult<()> {
+    let reopened_runner = open_validated_private_artifact_at(
+        directory
+            .try_clone_retained_fd()
+            .map_err(map_evidence)?
+            .as_raw_fd(),
+        c"lterm",
+        PrivateArtifactKind::Runner,
+        Some(runner_identity),
+    )?
+    .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+    if artifact_identity(
+        &reopened_runner
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    ) != artifact_identity(
+        &runner
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+    ) {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_private_runner_ownership(
+    directory: &ValidatedDirectory,
+    ownership: &PrivateRunnerOwnership,
+) -> ContainmentResult<PrivateArtifactIdentity> {
+    let bytes =
+        serde_json::to_vec(ownership).map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+    if bytes.len() > 4 * 1024 {
+        return Err(ContainmentErrorCode::EvidenceUnavailable);
+    }
+    let directory_fd = directory.try_clone_retained_fd().map_err(map_evidence)?;
+    let temp_leaf = CString::new(format!(
+        ".owner.json.create-{}",
+        ownership.binding.nonce().simple()
+    ))
+    .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let mut temp_owned = false;
+    let mut temp_identity = None;
+    let result = (|| {
+        let fd = unsafe {
+            libc::openat(
+                directory_fd.as_raw_fd(),
+                temp_leaf.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        temp_owned = true;
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        let unpublished = file
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if !unpublished.is_file()
+            || unpublished.uid() != unsafe { libc::geteuid() }
+            || unpublished.mode() & 0o7777 != 0o600
+            || unpublished.nlink() != 1
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        let unpublished_identity = artifact_identity(&unpublished);
+        temp_identity = Some(unpublished_identity);
+        if !validate_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            &temp_leaf,
+            PrivateArtifactKind::PartialOwnership,
+            Some(unpublished_identity),
+        )? {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        failpoint("before_private_owner_publish")?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory_fd.as_raw_fd(),
+                temp_leaf.as_ptr(),
+                directory_fd.as_raw_fd(),
+                PRIVATE_RUNNER_OWNER_LEAF.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(ContainmentErrorCode::EvidenceUnavailable);
+        }
+        failpoint("after_private_owner_rename_before_identity")?;
+        let final_file = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            PRIVATE_RUNNER_OWNER_LEAF,
+            PrivateArtifactKind::Ownership,
+            Some(unpublished_identity),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if artifact_identity(
+            &final_file
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) != artifact_identity(
+            &file
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        failpoint("after_private_owner_publish")?;
+        let published = file
+            .metadata()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        if published.nlink() != 1 {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        directory.revalidate().map_err(map_evidence)?;
+        Ok(artifact_identity(&published))
+    })();
+    if result.is_err()
+        && temp_owned
+        && temp_identity.is_some_and(|identity| {
+            validate_private_artifact_at(
+                directory_fd.as_raw_fd(),
+                &temp_leaf,
+                PrivateArtifactKind::PartialOwnership,
+                Some(identity),
+            ) == Ok(true)
+        })
+        && unsafe { libc::unlinkat(directory_fd.as_raw_fd(), temp_leaf.as_ptr(), 0) } == 0
+    {
+        let _ = directory_fd.sync_all();
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
 fn create_seqpacket_listener(path: &Path) -> ContainmentResult<File> {
+    let listener = bind_seqpacket_listener(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+fn private_socket_temp_leaf(nonce: Uuid) -> CString {
+    // sockaddr_un paths are short.  The directory itself is already uniquely
+    // bound to the full nonce, so an eight-hex suffix is sufficient to make
+    // the single in-directory creation leaf deterministic without making an
+    // otherwise valid final socket path exceed sun_path.
+    CString::new(format!(".sock-{:08x}", nonce.as_u128() as u32))
+        .expect("UUID-derived private socket leaf")
+}
+
+#[cfg(target_os = "linux")]
+fn create_published_seqpacket_listener(
+    directory: &ValidatedDirectory,
+    path: &Path,
+    nonce: Uuid,
+) -> ContainmentResult<(File, PrivateArtifactIdentity)> {
+    let temp_leaf = private_socket_temp_leaf(nonce);
+    let final_leaf = c"control.sock";
+    let temp_path = path.with_file_name(std::ffi::OsStr::from_bytes(temp_leaf.as_bytes()));
+    let directory_fd = directory.try_clone_retained_fd().map_err(map_evidence)?;
+    let mut temp_owned = false;
+    let mut temp_identity = None;
+    let result = (|| {
+        let listener = bind_seqpacket_listener(&temp_path)?;
+        temp_owned = true;
+        failpoint("after_private_socket_bind_before_identity")?;
+        let metadata = std::fs::symlink_metadata(&temp_path)
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        let identity = artifact_identity(&metadata);
+        let unpublished = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            &temp_leaf,
+            PrivateArtifactKind::PartialSocket,
+            Some(identity),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        temp_identity = Some(identity);
+        failpoint("before_private_socket_mode")?;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| ContainmentErrorCode::PeerRejected)?;
+        failpoint("after_private_socket_mode")?;
+        if !validate_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            &temp_leaf,
+            PrivateArtifactKind::PartialSocket,
+            Some(identity),
+        )? {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        failpoint("before_private_socket_publish")?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory_fd.as_raw_fd(),
+                temp_leaf.as_ptr(),
+                directory_fd.as_raw_fd(),
+                final_leaf.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+        failpoint("after_private_socket_rename_before_identity")?;
+        let published = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            final_leaf,
+            PrivateArtifactKind::Socket,
+            Some(identity),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if artifact_identity(
+            &published
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) != artifact_identity(
+            &unpublished
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        prove_seqpacket_listener_path_continuity(&listener, path)?;
+        directory_fd
+            .sync_all()
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+        failpoint("after_private_socket_publish")?;
+        let final_readback = open_validated_private_artifact_at(
+            directory_fd.as_raw_fd(),
+            final_leaf,
+            PrivateArtifactKind::Socket,
+            Some(identity),
+        )?
+        .ok_or(ContainmentErrorCode::InvalidIdentity)?;
+        if artifact_identity(
+            &final_readback
+                .metadata()
+                .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?,
+        ) != identity
+        {
+            return Err(ContainmentErrorCode::InvalidIdentity);
+        }
+        directory.revalidate().map_err(map_evidence)?;
+        Ok((listener, identity))
+    })();
+    if result.is_err()
+        && temp_owned
+        && temp_identity.is_some_and(|identity| {
+            validate_private_artifact_at(
+                directory_fd.as_raw_fd(),
+                &temp_leaf,
+                PrivateArtifactKind::PartialSocket,
+                Some(identity),
+            ) == Ok(true)
+        })
+        && unsafe { libc::unlinkat(directory_fd.as_raw_fd(), temp_leaf.as_ptr(), 0) } == 0
+    {
+        let _ = directory_fd.sync_all();
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn prove_seqpacket_listener_path_continuity(listener: &File, path: &Path) -> ContainmentResult<()> {
+    let client = connect_seqpacket_nonblocking(path)?;
+    let token = Uuid::new_v4().into_bytes();
+    if unsafe {
+        libc::send(
+            client.as_raw_fd(),
+            token.as_ptr().cast(),
+            token.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    } != token.len() as isize
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let mut pollfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pollfd, 1, 250) } != 1 || pollfd.revents & libc::POLLIN == 0 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let accepted_fd = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )
+    };
+    if accepted_fd < 0 {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let accepted = unsafe { File::from_raw_fd(accepted_fd) };
+    let mut accepted_pollfd = libc::pollfd {
+        fd: accepted.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut accepted_pollfd, 1, 250) } != 1
+        || accepted_pollfd.revents & libc::POLLIN == 0
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let mut observed = [0_u8; 16];
+    if unsafe {
+        libc::recv(
+            accepted.as_raw_fd(),
+            observed.as_mut_ptr().cast(),
+            observed.len(),
+            libc::MSG_DONTWAIT,
+        )
+    } != observed.len() as isize
+        || observed != token
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            accepted.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of::<libc::ucred>()
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    if credentials.pid != std::process::id() as libc::pid_t
+        || credentials.uid != unsafe { libc::geteuid() }
+    {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn connect_seqpacket_nonblocking(path: &Path) -> ContainmentResult<File> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    let address_mut = unsafe { address.assume_init_mut() };
+    if bytes.is_empty() || bytes.len() >= address_mut.sun_path.len() {
+        return Err(ContainmentErrorCode::InvalidIdentity);
+    }
+    address_mut.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address_mut.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(ContainmentErrorCode::Unsupported);
+    }
+    let socket = unsafe { File::from_raw_fd(fd) };
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+        .try_into()
+        .map_err(|_| ContainmentErrorCode::InvalidIdentity)?;
+    let result = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            address_mut as *const libc::sockaddr_un as *const libc::sockaddr,
+            length,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+        let mut pollfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pollfd, 1, 250) } != 1 || pollfd.revents & libc::POLLOUT == 0 {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+        let mut socket_error = 0;
+        let mut socket_error_len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut i32).cast(),
+                &mut socket_error_len,
+            )
+        } != 0
+            || socket_error != 0
+        {
+            return Err(ContainmentErrorCode::PeerRejected);
+        }
+    }
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_seqpacket_listener(path: &Path) -> ContainmentResult<File> {
     let bytes = path.as_os_str().as_bytes();
     let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
     let address_mut = unsafe { address.assume_init_mut() };
@@ -4075,8 +6481,6 @@ fn create_seqpacket_listener(path: &Path) -> ContainmentResult<File> {
     {
         return Err(ContainmentErrorCode::PeerRejected);
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| ContainmentErrorCode::PeerRejected)?;
     Ok(listener)
 }
 
@@ -4404,6 +6808,23 @@ pub(crate) fn dispatch_internal_containment_test_driver(
             return Ok(true);
         }
     }
+    if mode == Some("--internal-speculation-startup-config-test-v1") {
+        if std::env::var_os("LTERM_INTERNAL_TEST_MODE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(ContainmentErrorCode::Unsupported);
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(ContainmentErrorCode::Unsupported);
+        #[cfg(target_os = "linux")]
+        {
+            crate::speculation_service::SpeculationService::run_startup_config_capture_test_driver(
+            )
+            .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+            println!("speculation-startup-config-captured=1");
+            return Ok(true);
+        }
+    }
     if mode != Some("--internal-speculation-containment-test-v1") {
         return Ok(false);
     }
@@ -4414,6 +6835,7 @@ pub(crate) fn dispatch_internal_containment_test_driver(
     return Err(ContainmentErrorCode::Unsupported);
     #[cfg(target_os = "linux")]
     {
+        initialize_speculation_process_config();
         if std::env::var_os("LTERM_INTERNAL_SPECULATION_ACTOR_SERVICE").as_deref()
             == Some(std::ffi::OsStr::new("1"))
         {
@@ -4436,8 +6858,14 @@ pub(crate) fn dispatch_internal_containment_test_driver(
             println!("speculation-restart-recovered=1 adopted={adopted}");
             return Ok(true);
         }
-        run_real_component_driver()?;
-        println!("speculation-real-cases=14");
+        let endpoint_only = std::env::var_os("LTERM_INTERNAL_SPECULATION_ENDPOINT_ONLY").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        run_real_component_driver(endpoint_only)?;
+        if endpoint_only {
+            println!("speculation-endpoint-probes=2");
+        } else {
+            println!("speculation-real-cases=14");
+        }
         Ok(true)
     }
 }
@@ -4461,15 +6889,23 @@ fn run_runtime_restart_driver(mode: &std::ffi::OsStr) -> ContainmentResult<()> {
                 candidate_index: 0,
                 role: ManagedOwnerRole::Runner,
             };
-            match reconcile_managed_owner(&owner)
+            let private_cleanup = (|| match reconcile_managed_owner(&owner)
                 .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?
             {
-                ManagedOwnerOutcome::Absent | ManagedOwnerOutcome::ResolvedTombstone(_) => {}
-                ManagedOwnerOutcome::UnknownOrphanRisk(_) => {
-                    return Err(ContainmentErrorCode::EvidenceUnavailable);
+                ManagedOwnerOutcome::Absent => Ok(()),
+                ManagedOwnerOutcome::ResolvedTombstone(_) => {
+                    let control_root = open_existing_private_dir(&fixture.join("control"))
+                        .map_err(map_evidence)?;
+                    let managed = reconcile_managed_processes()
+                        .map_err(|_| ContainmentErrorCode::EvidenceUnavailable)?;
+                    reconcile_private_runner_controls(&control_root, &managed)
                 }
-            }
-            cleanup_restart_record(&record_path, &mut record)
+                ManagedOwnerOutcome::UnknownOrphanRisk(_) => {
+                    Err(ContainmentErrorCode::EvidenceUnavailable)
+                }
+            })();
+            cleanup_restart_record(&record_path, &mut record)?;
+            private_cleanup
         }
         _ => Err(ContainmentErrorCode::InvalidIdentity),
     }
@@ -5622,13 +8058,23 @@ fn require_recovery_action_complete(evidence: RecoveryEvidence) -> ContainmentRe
 }
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
-fn run_real_component_driver() -> ContainmentResult<()> {
+fn run_real_component_driver(endpoint_only: bool) -> ContainmentResult<()> {
     let fixture = std::env::var_os("LTERM_INTERNAL_SPECULATION_FIXTURE_ROOT")
         .map(PathBuf::from)
         .ok_or(ContainmentErrorCode::InvalidIdentity)?;
     let cgroup_root = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT")
         .map(PathBuf::from)
         .ok_or(ContainmentErrorCode::Unsupported)?;
+    if endpoint_only {
+        run_real_execution_case(
+            &fixture.join("endpoint"),
+            &cgroup_root,
+            vec![OsString::from("/usr/bin/true")],
+            None,
+            RealExecutionExpectation::ProbeOnly,
+        )?;
+        return Ok(());
+    }
     run_real_topology_attack_matrix(&cgroup_root)?;
     run_real_peer_attack_matrix(&fixture.join("p"), &cgroup_root)?;
     let elapsed = run_real_execution_case(
@@ -5863,9 +8309,8 @@ fn run_real_peer_attack_matrix(fixture: &Path, cgroup_root: &Path) -> Containmen
     }
     let identity = context.candidate_identity(0)?;
     let expected_membership = managed_membership(topology.candidate(0)?.control()?, identity)?;
-    let self_exe = std::env::var_os("LTERM_INTERNAL_SPECULATION_SELF_EXE")
-        .map(PathBuf::from)
-        .ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
+    let self_exe =
+        configured_current_executable_path().ok_or(ContainmentErrorCode::EvidenceUnavailable)?;
 
     let same_uid_control = prepare_runner_control(&context, 0)?;
     let mut sleep = launch_peer_test_process(
@@ -6156,6 +8601,8 @@ fn launch_peer_test_process(
     .map_err(|_| ContainmentErrorCode::PlacementUnproven)?;
     launch_managed_process(ManagedLaunchRequest {
         owner: None,
+        reservation: None,
+        lifetime_guard: None,
         executable_policy: ManagedExecutablePolicy::Legacy,
         placement: ManagedPlacement::CgroupV2(placement),
         auxiliary: ManagedAuxiliary::None,
@@ -6171,6 +8618,7 @@ fn launch_peer_test_process(
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[derive(Clone, Copy)]
 enum RealExecutionExpectation {
+    ProbeOnly,
     Complete { output_bytes: u64 },
     DescendantsRemain,
     PidsExhausted,
@@ -6353,6 +8801,16 @@ fn run_real_execution_case(
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         }
     }
+    if matches!(expectation, RealExecutionExpectation::ProbeOnly) {
+        cleanup_real_topology(&mut tournament)?;
+        tournament.disarm();
+        return Ok([RealExecutionEvidence {
+            elapsed_ns: 0,
+            output_bytes: 0,
+            exited_zero: true,
+            overflowed: false,
+        }; 2]);
+    }
     let containments = [
         launch_runner(
             &context,
@@ -6373,14 +8831,20 @@ fn run_real_execution_case(
     for (candidate, containment) in containments.iter().enumerate() {
         let observation = containment.observation();
         let before_second_connect = test_open_fd_count()?;
-        let second_connect = connect_seqpacket_test(&containment.control._lifetime.socket_path);
+        let second_connect =
+            connect_seqpacket_test(&containment.control._lifetime.private_control().socket_path);
         let second_connect_accepted = second_connect.is_ok();
         drop(second_connect);
         let after_second_connect = test_open_fd_count()?;
         if usize::from(observation.identity.candidate_index) != candidate
             || usize::from(observation.managed_owner.candidate_index) != candidate
             || observation.managed_owner.role != ManagedOwnerRoleEvidence::Runner
-            || containment.control._lifetime.socket_path.exists()
+            || containment
+                .control
+                ._lifetime
+                .private_control()
+                .socket_path
+                .exists()
             || second_connect_accepted
             || after_second_connect != before_second_connect
         {
@@ -6439,6 +8903,7 @@ fn run_real_execution_case(
         overflowed: false,
     }; 2];
     match expectation {
+        RealExecutionExpectation::ProbeOnly => unreachable!("probe-only returned before launch"),
         RealExecutionExpectation::Complete { .. }
         | RealExecutionExpectation::DescendantsRemain
         | RealExecutionExpectation::PidsExhausted => {
@@ -6459,6 +8924,9 @@ fn run_real_execution_case(
                 evidence[index].elapsed_ns = elapsed_ns;
                 evidence[index].exited_zero = category == RunnerExitCategory::ExitedZero;
                 match expectation {
+                    RealExecutionExpectation::ProbeOnly => {
+                        unreachable!("probe-only returned before execution")
+                    }
                     RealExecutionExpectation::DescendantsRemain => {
                         prove_descendants_remain(tournament.candidate(candidate)?.payload()?)?
                     }
@@ -6542,6 +9010,7 @@ fn run_real_execution_case(
             return Err(ContainmentErrorCode::TerminalBoundaryFailure);
         };
         match expectation {
+            RealExecutionExpectation::ProbeOnly => unreachable!("probe-only returned before drain"),
             RealExecutionExpectation::Complete { output_bytes } if bytes == output_bytes => {}
             RealExecutionExpectation::DescendantsRemain
             | RealExecutionExpectation::PidsExhausted
@@ -6665,6 +9134,612 @@ fn cleanup_real_topology(tournament: &mut TournamentTopology) -> ContainmentResu
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    struct ScopedSpeculationTestConfig(Option<SpeculationTestConfig>);
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    impl ScopedSpeculationTestConfig {
+        fn new() -> Self {
+            Self(SPECULATION_LOCAL_TEST_CONFIG.with(|state| state.replace(None)))
+        }
+
+        fn hostile_swap(
+            &self,
+            failpoint: &str,
+            path: &std::path::Path,
+            backup: &std::path::Path,
+            kind: &str,
+        ) {
+            SPECULATION_LOCAL_TEST_CONFIG.with(|state| {
+                state.replace(Some(SpeculationTestConfig {
+                    failpoint: Some(OsString::from(failpoint)),
+                    action: Some(OsString::from("hostile-swap")),
+                    swap_path: Some(path.to_owned()),
+                    swap_backup: Some(backup.to_owned()),
+                    swap_kind: Some(kind.to_owned()),
+                    ..SpeculationTestConfig::default()
+                }));
+            });
+        }
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    impl Drop for ScopedSpeculationTestConfig {
+        fn drop(&mut self) {
+            SPECULATION_LOCAL_TEST_CONFIG.with(|state| {
+                state.replace(self.0.take());
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_recovery_fixture(
+        owner: &ManagedOwnerTag,
+        key: ManagedKey,
+    ) -> (
+        tempfile::TempDir,
+        ValidatedDirectory,
+        PathBuf,
+        PrivateRunnerOwnership,
+        PrivateArtifactIdentity,
+        File,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let control_path = temp.path().join("control");
+        let control_root =
+            crate::speculation_fs::open_or_create_private_dir(&control_path).unwrap();
+        let leaf = format!(
+            "lterm-g003-{}-candidate-{}",
+            owner.tournament_uuid, owner.candidate_index
+        );
+        let path = control_path.join(&leaf);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let directory = open_existing_private_dir(&path).unwrap();
+        let runner_path = path.join("lterm");
+        std::fs::write(&runner_path, b"runner").unwrap();
+        std::fs::set_permissions(&runner_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let runner = std::fs::File::open(&runner_path).unwrap();
+        let listener = create_seqpacket_listener(&path.join("control.sock")).unwrap();
+        let socket_metadata = std::fs::symlink_metadata(path.join("control.sock")).unwrap();
+        let runner_identity = artifact_identity(&runner.metadata().unwrap());
+        let socket_identity = artifact_identity(&socket_metadata);
+        let binding = ManagedArtifactBinding::test_value(
+            Uuid::new_v4(),
+            managed_directory_identity(control_root.identity()),
+            &leaf,
+            Some(managed_directory_identity(directory.identity())),
+        )
+        .test_with_files(
+            managed_artifact_identity(runner_identity),
+            managed_artifact_identity(socket_identity),
+        );
+        let mut record = PrivateRunnerOwnership {
+            schema_version: 1,
+            owner: owner.clone(),
+            slot: key.slot(),
+            generation: key.generation(),
+            binding: binding.clone(),
+            directory: directory.identity(),
+            runner: runner_identity,
+            socket: socket_identity,
+        };
+        let ownership_identity = write_private_runner_ownership(&directory, &record).unwrap();
+        // owner.json deliberately records the pre-owner binding so its own
+        // inode is not self-referential. Recovery receives the authoritative
+        // post-publication owner identity from the external registry binding.
+        record.binding = record
+            .binding
+            .clone()
+            .test_with_owner(managed_artifact_identity(ownership_identity));
+        (
+            temp,
+            control_root,
+            path,
+            record,
+            ownership_identity,
+            listener,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_recovery_requires_every_probe_runner_alias_to_be_resolved() {
+        let tournament_uuid = Uuid::new_v4();
+        let runner_owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid,
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let probe_owner = ManagedOwnerTag {
+            role: ManagedOwnerRole::Probe,
+            ..runner_owner.clone()
+        };
+        let runner_key = ManagedKey::test_value(2, 8);
+        let (_temp, control_root, path, record, _ownership, _listener) =
+            private_recovery_fixture(&runner_owner, runner_key);
+        let report = ManagedReconcileReport {
+            entries: vec![
+                crate::launch_registry::ManagedReconcileEntry {
+                    key: Some(ManagedKey::test_value(1, 7)),
+                    owner: Some(probe_owner.clone()),
+                    artifact_binding: None,
+                    outcome: ReconcileOutcome::ResolvedTombstone,
+                },
+                crate::launch_registry::ManagedReconcileEntry {
+                    key: Some(runner_key),
+                    owner: Some(runner_owner.clone()),
+                    artifact_binding: Some(record.binding.clone()),
+                    outcome: ReconcileOutcome::UnknownOrphanRisk(
+                        crate::launch_registry::ManagedReconcileCode::ProcessEvidenceUnavailable,
+                    ),
+                },
+            ],
+        };
+        reconcile_private_runner_controls(&control_root, &report).unwrap();
+        assert!(path.join("lterm").is_file());
+
+        let mut ownerless_blocked = report;
+        ownerless_blocked.entries[1].outcome = ReconcileOutcome::ResolvedTombstone;
+        ownerless_blocked
+            .entries
+            .push(crate::launch_registry::ManagedReconcileEntry {
+                key: Some(ManagedKey::test_value(9, 11)),
+                owner: None,
+                artifact_binding: None,
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            });
+        let groups = private_runner_alias_groups(&ownerless_blocked)
+            .unwrap()
+            .expect("resolved generic ownerless tombstone blocked alias grouping");
+        let candidate = groups.get(&(tournament_uuid, 0)).unwrap();
+        assert_eq!(candidate.len(), 2);
+        assert!(
+            candidate
+                .iter()
+                .all(|entry| entry.outcome == ReconcileOutcome::ResolvedTombstone)
+        );
+
+        ownerless_blocked.entries.last_mut().unwrap().outcome = ReconcileOutcome::UnknownOrphanRisk(
+            crate::launch_registry::ManagedReconcileCode::ProcessEvidenceUnavailable,
+        );
+        assert!(
+            private_runner_alias_groups(&ownerless_blocked)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.join("lterm").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_recovery_path_swap_preserves_original_and_hostile_replacement() {
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let key = ManagedKey::test_value(3, 9);
+        let (_temp, control_root, path, record, ownership_identity, _listener) =
+            private_recovery_fixture(&owner, key);
+        let directory = open_existing_private_dir(&path).unwrap();
+        let original = path.with_extension("original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        std::fs::write(path.join("hostile"), b"retain").unwrap();
+        let parent = control_root.try_clone_retained_fd().unwrap();
+        let leaf = CString::new(path.file_name().unwrap().as_bytes()).unwrap();
+        assert!(
+            remove_private_runner_control_fd_relative(
+                &parent,
+                control_root.identity(),
+                &leaf,
+                &directory,
+                PrivateControlCleanupExpectations {
+                    ownership: Some(&record),
+                    ownership_file: Some(ownership_identity),
+                    runner: Some(record.runner),
+                    socket: Some(record.socket),
+                    partial_socket_leaf: None,
+                    partial_owner_leaf: None,
+                    allow_unbound_files: false,
+                },
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path.join("hostile")).unwrap(), b"retain");
+        assert!(original.join("lterm").is_file());
+        assert!(original.join("owner.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_runner_and_socket_relocation_fail_closed_until_restored() {
+        for artifact_leaf in ["lterm", "control.sock"] {
+            let owner = ManagedOwnerTag {
+                kind: ManagedOwnerKind::Speculation,
+                tournament_uuid: Uuid::new_v4(),
+                candidate_index: 0,
+                role: ManagedOwnerRole::Runner,
+            };
+            let key = ManagedKey::test_value(32, 92);
+            let (temp, control_root, path, record, ownership_identity, _listener) =
+                private_recovery_fixture(&owner, key);
+            let directory = open_existing_private_dir(&path).unwrap();
+            let parent = control_root.try_clone_retained_fd().unwrap();
+            let leaf = CString::new(path.file_name().unwrap().as_bytes()).unwrap();
+            let artifact = path.join(artifact_leaf);
+            let relocated = temp.path().join(format!("relocated-{artifact_leaf}"));
+            std::fs::rename(&artifact, &relocated).unwrap();
+
+            let cleanup = || {
+                remove_private_runner_control_fd_relative(
+                    &parent,
+                    control_root.identity(),
+                    &leaf,
+                    &directory,
+                    PrivateControlCleanupExpectations {
+                        ownership: Some(&record),
+                        ownership_file: Some(ownership_identity),
+                        runner: Some(record.runner),
+                        socket: Some(record.socket),
+                        partial_socket_leaf: None,
+                        partial_owner_leaf: None,
+                        allow_unbound_files: false,
+                    },
+                    None,
+                )
+            };
+            assert_eq!(cleanup(), Err(ContainmentErrorCode::InvalidIdentity));
+            assert!(relocated.exists(), "relocated {artifact_leaf} was deleted");
+            assert!(path.is_dir(), "private directory was acknowledged early");
+
+            std::fs::rename(&relocated, &artifact).unwrap();
+            cleanup().unwrap();
+            assert!(!path.exists(), "restored {artifact_leaf} did not converge");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_cleanup_pre_unlink_swaps_fail_closed_without_ack_proof() {
+        let test_config = ScopedSpeculationTestConfig::new();
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let key = ManagedKey::test_value(30, 90);
+        let (_temp, control_root, path, record, ownership_identity, _listener) =
+            private_recovery_fixture(&owner, key);
+        let directory = open_existing_private_dir(&path).unwrap();
+        let parent = control_root.try_clone_retained_fd().unwrap();
+        let leaf = CString::new(path.file_name().unwrap().as_bytes()).unwrap();
+        let runner = path.join("lterm");
+        let retained = path.join("owned-runner");
+        test_config.hostile_swap("before_private_runner_unlink", &runner, &retained, "runner");
+        let result = remove_private_runner_control_fd_relative(
+            &parent,
+            control_root.identity(),
+            &leaf,
+            &directory,
+            PrivateControlCleanupExpectations {
+                ownership: Some(&record),
+                ownership_file: Some(ownership_identity),
+                runner: Some(record.runner),
+                socket: Some(record.socket),
+                partial_socket_leaf: None,
+                partial_owner_leaf: None,
+                allow_unbound_files: false,
+            },
+            None,
+        );
+        assert_eq!(result, Err(ContainmentErrorCode::InvalidIdentity));
+        assert_eq!(std::fs::read(&runner).unwrap(), b"hostile replacement");
+        assert_eq!(std::fs::read(&retained).unwrap(), b"runner");
+        assert!(path.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_cleanup_final_rmdir_swap_preserves_hostile_replacement() {
+        let test_config = ScopedSpeculationTestConfig::new();
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let key = ManagedKey::test_value(31, 91);
+        let (_temp, control_root, path, record, ownership_identity, _listener) =
+            private_recovery_fixture(&owner, key);
+        let directory = open_existing_private_dir(&path).unwrap();
+        let parent = control_root.try_clone_retained_fd().unwrap();
+        let leaf = CString::new(path.file_name().unwrap().as_bytes()).unwrap();
+        let retained = path.with_extension("owned-directory");
+        test_config.hostile_swap(
+            "before_private_directory_unlink",
+            &path,
+            &retained,
+            "directory",
+        );
+        let result = remove_private_runner_control_fd_relative(
+            &parent,
+            control_root.identity(),
+            &leaf,
+            &directory,
+            PrivateControlCleanupExpectations {
+                ownership: Some(&record),
+                ownership_file: Some(ownership_identity),
+                runner: Some(record.runner),
+                socket: Some(record.socket),
+                partial_socket_leaf: None,
+                partial_owner_leaf: None,
+                allow_unbound_files: false,
+            },
+            None,
+        );
+        assert_eq!(result, Err(ContainmentErrorCode::InvalidIdentity));
+        assert_eq!(std::fs::read(path.join("hostile")).unwrap(), b"retain");
+        assert!(retained.is_dir(), "owned empty directory was lost");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_runner_binding_rejects_hostile_final_path_swap() {
+        let test_config = ScopedSpeculationTestConfig::new();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = open_existing_private_dir(temp.path()).unwrap();
+        let runner_path = temp.path().join("lterm");
+        std::fs::write(&runner_path, b"owned runner").unwrap();
+        std::fs::set_permissions(&runner_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let runner = File::open(&runner_path).unwrap();
+        let identity = artifact_identity(&runner.metadata().unwrap());
+        revalidate_retained_private_runner(&directory, &runner, identity).unwrap();
+        let retained = temp.path().join("owned-runner");
+        test_config.hostile_swap(
+            "before_private_runner_binding",
+            &runner_path,
+            &retained,
+            "runner",
+        );
+        failpoint("before_private_runner_binding").unwrap();
+        assert_eq!(
+            revalidate_retained_private_runner(&directory, &runner, identity),
+            Err(ContainmentErrorCode::InvalidIdentity)
+        );
+        assert_eq!(std::fs::read(&runner_path).unwrap(), b"hostile replacement");
+        assert_eq!(std::fs::read(&retained).unwrap(), b"owned runner");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_final_publication_rejects_hostile_owner_and_socket_swaps() {
+        let test_config = ScopedSpeculationTestConfig::new();
+
+        let pre_metadata_temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            pre_metadata_temp.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let pre_metadata_directory = open_existing_private_dir(pre_metadata_temp.path()).unwrap();
+        let pre_metadata_nonce = Uuid::new_v4();
+        let pre_metadata_path = pre_metadata_temp.path().join("control.sock");
+        let pre_metadata_leaf = private_socket_temp_leaf(pre_metadata_nonce);
+        let pre_metadata_socket = pre_metadata_temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(pre_metadata_leaf.as_bytes()));
+        let pre_metadata_owned = pre_metadata_temp.path().join("owned-pre-metadata.sock");
+        test_config.hostile_swap(
+            "after_private_socket_bind_before_identity",
+            &pre_metadata_socket,
+            &pre_metadata_owned,
+            "socket",
+        );
+        let pre_metadata_result = create_published_seqpacket_listener(
+            &pre_metadata_directory,
+            &pre_metadata_path,
+            pre_metadata_nonce,
+        );
+        let pre_metadata_replacement = std::fs::symlink_metadata(&pre_metadata_path)
+            .map(|metadata| metadata.file_type().is_socket());
+        let pre_metadata_original = std::fs::symlink_metadata(&pre_metadata_owned)
+            .map(|metadata| metadata.file_type().is_socket());
+
+        let socket_temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(socket_temp.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let socket_directory = open_existing_private_dir(socket_temp.path()).unwrap();
+        let socket = socket_temp.path().join("control.sock");
+        let socket_owned = socket_temp.path().join("owned.sock");
+        test_config.hostile_swap(
+            "after_private_socket_rename_before_identity",
+            &socket,
+            &socket_owned,
+            "socket",
+        );
+        let socket_result =
+            create_published_seqpacket_listener(&socket_directory, &socket, Uuid::new_v4());
+        let replacement_socket =
+            std::fs::symlink_metadata(&socket).map(|metadata| metadata.file_type().is_socket());
+        let owned_socket = std::fs::symlink_metadata(&socket_owned)
+            .map(|metadata| metadata.file_type().is_socket());
+
+        let owner_temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(owner_temp.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let owner_directory = open_existing_private_dir(owner_temp.path()).unwrap();
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let binding = ManagedArtifactBinding::test_value(
+            Uuid::new_v4(),
+            managed_directory_identity(owner_directory.identity()),
+            "private-runner",
+            Some(managed_directory_identity(owner_directory.identity())),
+        )
+        .test_with_files(
+            ManagedArtifactIdentity { dev: 1, ino: 2 },
+            ManagedArtifactIdentity { dev: 3, ino: 4 },
+        );
+        let record = PrivateRunnerOwnership {
+            schema_version: 1,
+            owner,
+            slot: 1,
+            generation: 2,
+            binding,
+            directory: owner_directory.identity(),
+            runner: PrivateArtifactIdentity { dev: 1, ino: 2 },
+            socket: PrivateArtifactIdentity { dev: 3, ino: 4 },
+        };
+        let owner_path = owner_temp.path().join("owner.json");
+        let owner_owned = owner_temp.path().join("owned-owner.json");
+        test_config.hostile_swap(
+            "after_private_owner_rename_before_identity",
+            &owner_path,
+            &owner_owned,
+            "owner",
+        );
+        let owner_result = write_private_runner_ownership(&owner_directory, &record);
+        let replacement_owner = std::fs::read(&owner_path);
+        let owned_owner = std::fs::read(owner_owned)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+
+        assert!(pre_metadata_result.is_err());
+        assert!(pre_metadata_replacement.unwrap());
+        assert!(pre_metadata_original.unwrap());
+        assert!(socket_result.is_err());
+        assert!(replacement_socket.unwrap());
+        assert!(owned_socket.unwrap());
+        assert!(owner_result.is_err());
+        assert_eq!(replacement_owner.unwrap(), b"hostile replacement");
+        assert!(owned_owner.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_recovery_rejects_external_binding_identity_mismatch() {
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let key = ManagedKey::test_value(4, 10);
+        let (_temp, control_root, path, record, _ownership, _listener) =
+            private_recovery_fixture(&owner, key);
+        let mismatched_binding = ManagedArtifactBinding::test_value(
+            record.binding.nonce(),
+            record.binding.control_root(),
+            record.binding.private_leaf(),
+            Some(ManagedDirectoryIdentity {
+                ino: record.binding.private_directory().unwrap().ino + 1,
+                ..record.binding.private_directory().unwrap()
+            }),
+        );
+        let report = ManagedReconcileReport {
+            entries: vec![crate::launch_registry::ManagedReconcileEntry {
+                key: Some(key),
+                owner: Some(owner),
+                artifact_binding: Some(mismatched_binding),
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            }],
+        };
+
+        assert!(reconcile_private_runner_controls(&control_root, &report).is_err());
+        assert!(path.join("lterm").is_file());
+        assert!(path.join("control.sock").exists());
+        assert!(path.join("owner.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_recovery_refuses_markerless_directory_without_external_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_root =
+            crate::speculation_fs::open_or_create_private_dir(&temp.path().join("control"))
+                .unwrap();
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let path = temp
+            .path()
+            .join("control")
+            .join(format!("lterm-g003-{}-candidate-0", owner.tournament_uuid));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let report = ManagedReconcileReport {
+            entries: vec![crate::launch_registry::ManagedReconcileEntry {
+                key: Some(ManagedKey::test_value(5, 11)),
+                owner: Some(owner),
+                artifact_binding: None,
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            }],
+        };
+
+        assert!(reconcile_private_runner_controls(&control_root, &report).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn creation_pending_recovery_refuses_unbound_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_root =
+            crate::speculation_fs::open_or_create_private_dir(&temp.path().join("control"))
+                .unwrap();
+        let owner = ManagedOwnerTag {
+            kind: ManagedOwnerKind::Speculation,
+            tournament_uuid: Uuid::new_v4(),
+            candidate_index: 0,
+            role: ManagedOwnerRole::Runner,
+        };
+        let leaf = format!("lterm-g003-{}-candidate-0", owner.tournament_uuid);
+        let path = temp.path().join("control").join(&leaf);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        std::fs::write(path.join("hostile"), b"retain").unwrap();
+        let binding = ManagedArtifactBinding::test_value(
+            Uuid::new_v4(),
+            managed_directory_identity(control_root.identity()),
+            &leaf,
+            None,
+        );
+        let report = ManagedReconcileReport {
+            entries: vec![crate::launch_registry::ManagedReconcileEntry {
+                key: Some(ManagedKey::test_value(6, 12)),
+                owner: Some(owner),
+                artifact_binding: Some(binding),
+                outcome: ReconcileOutcome::ResolvedTombstone,
+            }],
+        };
+
+        assert!(reconcile_private_runner_controls(&control_root, &report).is_err());
+        assert_eq!(std::fs::read(path.join("hostile")).unwrap(), b"retain");
+    }
+
     #[test]
     fn containment_errors_are_closed_and_raw_free() {
         assert_eq!(
@@ -6680,13 +9755,8 @@ mod tests {
             candidate_index: 1,
             generation: 9,
         };
-        let built = build_fixed_bwrap_invocation(
-            Path::new("/isolated/candidate"),
-            Path::new("/isolated/control"),
-            identity,
-        )
-        .unwrap();
-        assert_eq!(built.executable, Path::new("/usr/bin/bwrap"));
+        let built = build_fixed_bwrap_invocation(identity).unwrap();
+        assert_eq!(built.executable, std::path::Path::new("/usr/bin/bwrap"));
         let argv = built
             .arguments
             .iter()
@@ -6712,6 +9782,25 @@ mod tests {
                 "{required}"
             );
         }
+        let capability_mounts = argv
+            .windows(3)
+            .filter(|triple| matches!(triple[0].as_str(), "--bind-fd" | "--ro-bind-fd"))
+            .map(|triple| [triple[0].as_str(), triple[1].as_str(), triple[2].as_str()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            capability_mounts,
+            vec![
+                ["--bind-fd", "12", "/workspace"],
+                ["--ro-bind-fd", "13", "/run/lterm-control"],
+                ["--ro-bind-fd", "14", "/run/lterm-control/control.sock"],
+                ["--ro-bind-fd", "11", "/run/lterm-control/lterm"],
+            ]
+        );
+        assert!(
+            argv.iter()
+                .all(|argument| !argument.starts_with("/proc/self/fd/")),
+            "bwrap argv retained a mutable descriptor pathname mount"
+        );
         for forbidden in [
             "--as-pid-1",
             "--unshare-all",
@@ -6719,24 +9808,106 @@ mod tests {
             "--not-a-security-boundary",
             "/sys",
             "/var/run",
+            "/isolated/candidate",
+            "/isolated/control",
         ] {
             assert!(
                 !argv.iter().any(|argument| argument == forbidden),
                 "{forbidden}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn immutable_speculation_controls_are_thread_local_and_parallel_safe_in_process() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let configured = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                with_speculation_test_config(
+                    SpeculationTestConfig {
+                        failpoint: Some(OsString::from("runner_after_ready")),
+                        action: Some(OsString::from("exit")),
+                        observe_pinned_workspace: true,
+                        delayed_runner_exec_seconds: Some(6),
+                        prepare_failpoint: Some("after_prepared_allocation".to_owned()),
+                        ..SpeculationTestConfig::default()
+                    },
+                    || {
+                        barrier.wait();
+                        let built = build_fixed_bwrap_invocation(RunnerIdentity {
+                            tournament_uuid: Uuid::from_u128(101),
+                            candidate_index: 0,
+                            generation: 1,
+                        })
+                        .unwrap();
+                        let active = active_speculation_test_config().unwrap();
+                        (built.arguments, active.prepare_failpoint)
+                    },
+                )
+            })
+        };
+        let ordinary = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                with_speculation_test_config(SpeculationTestConfig::default(), || {
+                    barrier.wait();
+                    let built = build_fixed_bwrap_invocation(RunnerIdentity {
+                        tournament_uuid: Uuid::from_u128(102),
+                        candidate_index: 1,
+                        generation: 2,
+                    })
+                    .unwrap();
+                    let active = active_speculation_test_config().unwrap();
+                    (built.arguments, active.prepare_failpoint)
+                })
+            })
+        };
+        let (configured, configured_prepare) = configured.join().unwrap();
+        let (ordinary, ordinary_prepare) = ordinary.join().unwrap();
+        let configured = configured
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let ordinary = ordinary
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(configured.windows(3).any(|triple| {
+            triple
+                == [
+                    "--setenv",
+                    "LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT",
+                    "runner_after_ready",
+                ]
+        }));
+        assert!(configured.windows(3).any(|triple| {
+            triple
+                == [
+                    "--setenv",
+                    "LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_WORKSPACE",
+                    "1",
+                ]
+        }));
+        assert!(configured.iter().any(|argument| argument == "/usr/bin/sh"));
+        assert!(configured.iter().any(|argument| argument == "6"));
         assert_eq!(
-            argv.iter()
-                .filter(|argument| *argument == "/isolated/candidate")
-                .count(),
-            1
+            configured_prepare.as_deref(),
+            Some("after_prepared_allocation")
         );
-        assert_eq!(
-            argv.iter()
-                .filter(|argument| *argument == "/isolated/control")
-                .count(),
-            1
+        assert!(
+            ordinary
+                .iter()
+                .any(|argument| argument == "/run/lterm-control/lterm")
         );
+        assert!(!ordinary.iter().any(|argument| {
+            argument == "LTERM_INTERNAL_SPECULATION_RUNNER_FAILPOINT"
+                || argument == "LTERM_INTERNAL_SPECULATION_OBSERVE_PINNED_WORKSPACE"
+                || argument == "/usr/bin/sh"
+        }));
+        assert!(ordinary_prepare.is_none());
     }
 
     #[test]
