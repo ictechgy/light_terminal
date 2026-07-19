@@ -8497,6 +8497,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::thread;
@@ -8663,6 +8664,107 @@ mod tests {
             serde_json::from_slice::<Request>(&requests[0]),
             Ok(Request::Ping)
         ));
+    }
+
+    fn run_speculation_startup_capture_child(case: &str) {
+        match case {
+            "ready" => {
+                let (_directory, socket, server) =
+                    fake_speculation_socket(vec![daemon_ping_response()]);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        panic!("ready daemon was restarted")
+                    }),
+                    Ok(())
+                );
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+            "cold" => {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("startup-capture.sock");
+                let server = std::sync::Mutex::new(None);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        let listener = UnixListener::bind(&socket).unwrap();
+                        let response = daemon_ping_response();
+                        *server.lock().unwrap() = Some(thread::spawn(move || {
+                            let (mut stream, _) = listener.accept().unwrap();
+                            let mut request = Vec::new();
+                            stream.read_to_end(&mut request).unwrap();
+                            stream.write_all(&response).unwrap();
+                            request
+                        }));
+                        Ok(())
+                    }),
+                    Ok(())
+                );
+                let request = server.lock().unwrap().take().unwrap().join().unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<Request>(&request),
+                    Ok(Request::Ping)
+                ));
+            }
+            "malformed" => {
+                let marker = "daemon-controlled-startup-preview-marker";
+                let (_directory, socket, server) =
+                    fake_speculation_socket(vec![format!("not-json-{marker}").into_bytes()]);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        panic!("connected malformed peer triggered daemon start")
+                    }),
+                    Err(SpeculationClientError::ResponseInvalid)
+                );
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+            _ => panic!("unknown speculation startup capture case"),
+        }
+    }
+
+    #[test]
+    fn speculation_startup_process_capture_is_silent_and_raw_free() {
+        const CHILD_MODE: &str = "LTERM_INTERNAL_SPECULATION_STARTUP_CAPTURE_CASE";
+        const CHILD_TEST: &str =
+            "client::tests::speculation_startup_process_capture_is_silent_and_raw_free";
+        const MARKER: &[u8] = b"daemon-controlled-startup-preview-marker";
+
+        if let Ok(case) = std::env::var(CHILD_MODE) {
+            run_speculation_startup_capture_child(&case);
+            return;
+        }
+
+        for case in ["ready", "cold", "malformed"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, case)
+                .output()
+                .unwrap();
+            assert!(
+                !output
+                    .stdout
+                    .windows(MARKER.len())
+                    .any(|window| window == MARKER),
+                "{case} startup exposed the daemon-controlled marker on stdout"
+            );
+            assert!(
+                !output
+                    .stderr
+                    .windows(MARKER.len())
+                    .any(|window| window == MARKER),
+                "{case} startup exposed the daemon-controlled marker on stderr"
+            );
+            assert!(
+                output.status.success(),
+                "{case} child failed with status {:?}; stdout_bytes={}; stderr_bytes={}",
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{case} startup emitted {} stderr bytes",
+                output.stderr.len()
+            );
+        }
     }
 
     #[test]

@@ -4572,7 +4572,11 @@ mod tests {
             std::env::set_var("LTERM_DATA_DIR", &data);
         }
         let service = SpeculationService::production().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Fresh registry genesis durably creates and syncs its bounded slot set.
+        // Slow hosted filesystems can legitimately take longer than the service's
+        // per-request budget, so this asynchronous-startup test needs its own
+        // generous scheduling/I/O bound rather than borrowing that budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while service.availability() == Availability::Reconciling
             && std::time::Instant::now() < deadline
         {

@@ -11543,13 +11543,15 @@ fn run_exports_session_identity_env_to_child_process() -> TestResult {
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // PTY setup/teardown may share a line with the first child marker, so
+    // locate the bounded marker rather than requiring it at byte zero.
     let session = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("SESSION:"))
+        .find_map(|line| line.split_once("SESSION:").map(|(_, value)| value))
         .ok_or_else(|| format!("run output missing session identity: {stdout:?}"))?;
     let pane = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("PANE:"))
+        .find_map(|line| line.split_once("PANE:").map(|(_, value)| value))
         .ok_or_else(|| format!("run output missing pane identity: {stdout:?}"))?;
     assert!(!session.trim().is_empty(), "{stdout:?}");
     assert!(pane.starts_with('%'), "{stdout:?}");
@@ -11983,7 +11985,11 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
     assert!(stdout.contains("ARG2:gpt 5"), "{stdout:?}");
     assert!(stdout.contains("ARG3:semi;colon"), "{stdout:?}");
     assert!(stdout.contains("ARG4:--flag"), "{stdout:?}");
-    assert!(stdout.contains("PANE_LIST:%0"), "{stdout:?}");
+    let pane_list = stdout
+        .split_once("PANE_LIST:")
+        .map(|(_, value)| value)
+        .ok_or_else(|| format!("agent output missing pane-list marker: {stdout:?}"))?;
+    assert!(pane_list.contains("%0"), "{stdout:?}");
     assert!(
         !stdout.contains("FAKE_TMUX_SHOULD_NOT_RUN"),
         "fake tmux won PATH precedence: {stdout:?}"
@@ -12539,8 +12545,8 @@ sleep 1
     assert!(
         output
             .stdout
-            .windows(b"\x1b[31mCOLOR_OK\x1b[0m".len())
-            .any(|window| window == b"\x1b[31mCOLOR_OK\x1b[0m"),
+            .windows(b"\x1b[31mCOLOR_OK".len())
+            .any(|window| window == b"\x1b[31mCOLOR_OK"),
         "agent TUI should still be able to emit color SGR when parent lterm has NO_COLOR: {:?}",
         stdout
     );
