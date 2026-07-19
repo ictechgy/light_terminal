@@ -4125,7 +4125,14 @@ fn exits_json_uses_protocol_v8_bounded_raw_free_request_and_response() -> TestRe
         .args(["exits", "opaque-id", "--limit", "1", "--all", "--json"])
         .output()?;
     assert!(output.status.success(), "exits failed: {output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr.clone())?,
+        format!(
+            "warning: lterm client {} (protocol 9) is talking to daemon {} (protocol 8); run `lterm shutdown` and retry after upgrades\n",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(rows[0]["session_id"], "opaque-id");
     assert_eq!(rows[0]["trigger"]["type"], "leader_exited");

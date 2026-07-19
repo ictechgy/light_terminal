@@ -14,7 +14,7 @@ pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 #[allow(dead_code)]
 pub const SPECULATION_PROTOCOL_VERSION: u32 = 9;
 #[allow(dead_code)]
@@ -1615,7 +1615,7 @@ mod tests {
         MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MAX_SPECULATION_ARG_BYTES,
         MAX_SPECULATION_ARGV_BYTES, MAX_SPECULATION_ARGV_ENTRIES, MAX_SPECULATION_ERROR_CODES,
         MAX_SPECULATION_PATH_BYTES, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
-        MetadataPurgeAggregate, MetadataValue, RecentSessionExit, Request,
+        MetadataPurgeAggregate, MetadataValue, PROTOCOL_VERSION, RecentSessionExit, Request,
         SPECULATION_PROTOCOL_VERSION, SPECULATION_SCORE_ORDER, SensitiveCapabilityRequest,
         SessionExitTrigger, SessionInfo, SessionLifecycleState, SpeculationArgv,
         SpeculationArmRequest, SpeculationArmResponse, SpeculationCandidateStatus,
@@ -1683,6 +1683,7 @@ mod tests {
     fn speculation_status_is_strict_raw_free_and_has_exact_keys() {
         let status = sample_speculation_status();
 
+        assert_eq!(PROTOCOL_VERSION, SPECULATION_PROTOCOL_VERSION);
         assert_eq!(SPECULATION_PROTOCOL_VERSION, 9);
         let value = serde_json::to_value(&status).expect("serialize speculation status");
         let object = value.as_object().expect("status is an object");
