@@ -944,9 +944,22 @@ struct LoadedEvents {
     degraded: bool,
 }
 
+struct JournalLock {
+    file: File,
+}
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // Best effort by design: Drop cannot report an unlock error, and the owned File closes
+        // immediately afterward. Explicit unlock prevents a fork child that inherited the same
+        // open-file description from extending the parent storage instance's lock lifetime.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 struct SecureStorage {
     dir: File,
-    _lock: File,
+    _lock: JournalLock,
     current: File,
     current_bytes: u64,
 }
@@ -979,6 +992,7 @@ impl SecureStorage {
         if lock_result != 0 {
             return Err(std::io::Error::last_os_error()).context("lock lifecycle journal");
         }
+        let lock = JournalLock { file: lock_file };
 
         let mut current = open_regular_at(dir.as_raw_fd(), leaf(CURRENT_SEGMENT), true, true)?
             .context("open current lifecycle journal segment")?;
@@ -993,7 +1007,7 @@ impl SecureStorage {
             .len();
         Ok(Self {
             dir,
-            _lock: lock_file,
+            _lock: lock,
             current,
             current_bytes,
         })
@@ -1960,5 +1974,100 @@ mod tests {
         );
         drop(first);
         SecureStorage::open(temp.path()).expect("lock released after first storage drops");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secure_storage_drop_unlocks_while_fork_child_holds_inherited_descriptor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("private tempdir");
+        let first = SecureStorage::open(temp.path()).expect("first storage lock");
+        let mut ready = [-1; 2];
+        let mut release = [-1; 2];
+        // SAFETY: both arrays provide the two writable file-descriptor slots required by pipe.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+        // SAFETY: both arrays provide the two writable file-descriptor slots required by pipe.
+        assert_eq!(
+            unsafe { libc::pipe(release.as_mut_ptr()) },
+            0,
+            "release pipe"
+        );
+
+        // SAFETY: the child branch below performs only async-signal-safe libc operations before
+        // terminating with _exit; the parent deterministically releases and reaps it.
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            // SAFETY: child owns inherited copies of these descriptors and uses only raw libc.
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(release[1]);
+                let byte = [1_u8];
+                if libc::write(ready[1], byte.as_ptr().cast(), 1) != 1 {
+                    libc::_exit(101);
+                }
+                libc::close(ready[1]);
+                let mut byte = [0_u8];
+                if libc::read(release[0], byte.as_mut_ptr().cast(), 1) != 1 {
+                    libc::_exit(102);
+                }
+                libc::close(release[0]);
+                libc::_exit(0);
+            }
+        }
+
+        // SAFETY: parent closes only its unused pipe ends.
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        let mut ready_byte = [0_u8];
+        // SAFETY: ready[0] is a live read end and ready_byte has one writable byte.
+        let ready_read = unsafe { libc::read(ready[0], ready_byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: the readiness read is complete, so the parent no longer needs this descriptor.
+        unsafe { libc::close(ready[0]) };
+
+        drop(first);
+        let second = if ready_read == 1 {
+            SecureStorage::open(temp.path())
+        } else {
+            Err(anyhow::anyhow!("fork child did not signal readiness"))
+        };
+
+        let release_byte = [1_u8];
+        // SAFETY: release[1] is the live parent write end; a failed write is reported below.
+        let release_written = unsafe { libc::write(release[1], release_byte.as_ptr().cast(), 1) };
+        // SAFETY: release is complete and waitpid receives a valid child pid and status pointer.
+        let mut status = 0;
+        // SAFETY: release is complete; retrying waitpid only for EINTR guarantees the child is
+        // reaped without using time, sleeps, or a correctness retry loop.
+        unsafe { libc::close(release[1]) };
+        let waited = loop {
+            // SAFETY: child is the live fork result and status remains writable across EINTR.
+            let result = unsafe { libc::waitpid(child, &mut status, 0) };
+            if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break result;
+            }
+        };
+
+        assert_eq!(ready_read, 1, "child readiness pipe closed unexpectedly");
+        assert_eq!(release_written, 1, "child release pipe closed unexpectedly");
+        assert_eq!(
+            waited,
+            child,
+            "waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: {status}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child failed: {status}");
+        second.expect("parent drop must explicitly unlock despite inherited descriptor");
     }
 }

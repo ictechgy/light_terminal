@@ -585,7 +585,9 @@ Inside that session, `tmux` resolves to the `lterm tmux-compat` shim. This is a 
 - **Queries** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Panes** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffers / popups** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
-- **No-op compatibility** — `select-pane`, `select-layout`, `set-hook`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
+- **Stateful user-option mutation (partial)** — `set-option` (`set`) for the
+  bounded `@name` subset; read it with `show-options` (`show`, `show-option`)
+- **No-op compatibility** — `select-pane`, `select-layout`, `set-hook`, `set-window-option` (`setw`), `set-environment`, `show-environment`
 
 Compatibility notes: lterm models each root session as one pseudo-window
 (`window_index=0`, `window_panes=1`). `client_pid` and `client_tty` expand to
@@ -604,6 +606,39 @@ to cmux `left` and `up` placements respectively when a visible cmux split is
 created. Detached `new-window -d` / `neww -d` is intentionally partial: it creates
 a standalone lterm helper session, supports tmux-style `-P`/`-F` target printing,
 and rejects attached-window mode instead of silently changing the current pane.
+
+Stateful `set-option` / `set` behavior is deliberately limited to actual tmux
+user-option names; non-user-option invocations retain their legacy accepted
+no-op behavior. The accepted mutation grammar is
+`[-pqu] [-t target] [--] @option [value]`: `value` is required for set/replace
+(use `""` for a present-empty value) and must be omitted with `-u`. `-t` may be
+separate or attached as `-tTARGET`, but it may not be clustered; `--` ends option
+parsing. Reads through `show-options` / `show-option` / `show` accept the matching
+`-p`, `-q`, `-v`, `-t`, and `--` subset with exactly one `@option`. With `-q`, an
+absent option succeeds with zero output bytes; a present-empty value with `-v`
+prints exactly one newline. Without `-q`, absence is an error.
+
+Without `-p`, the option belongs to the immutable UUID of the target's containing
+root session; `-p` selects the target pane's immutable UUID. Values therefore
+survive session renames. Fresh live-session reconciliation on mutation and pane
+registration removes naturally exited or reused-pane identities; successful
+pane/session kill cleanup is limited to captured immutable identities (and
+captured root descendants), while failed kills preserve the store. Any missed
+best-effort kill cleanup is removed by the next reconciliation. `list-sessions`
+format tokens such as `#{@omx_instance_id}` read root-session values only, expand
+an absent value to an empty field, and do not leak pane/window values.
+
+User-option names are 2..=128 UTF-8 bytes and must be ASCII `@` followed by one
+or more `[A-Za-z0-9_.:-]` characters. Values are 0..=4096 UTF-8 bytes; ordinary
+printable text, spaces, and combining marks are allowed, while C0/C1/DEL controls
+and the published denylist of Unicode 17 `Cf` format characters, bidi/zero-width
+controls, variation selectors, tags, fillers, and line/paragraph separators are
+rejected. Limits are 64 combined pane/root-session entries per immutable
+identity, 512 combined live identities, 4096 combined entries, and 16 MiB for the
+whole compatibility store. This is not general tmux option storage: built-in,
+global, server, window, and inheritance semantics are not implemented, and
+`set-window-option` / `setw` remains an accepted no-op.
+
 `wait-for` channels are local lterm compatibility-store keys; they may be up to
 1024 bytes and must not contain control characters.
 Use `lterm tmux-compat list-commands --verbose` for tab-separated `command`,

@@ -30,23 +30,39 @@ const TMUX_BUFFER_MAX_BYTES: usize = MAX_SEND_DATA_BYTES;
 const MANAGED_ATTACH_ENV: &str = "LTERM_CMUX_MANAGED_ATTACH";
 const MANAGED_ATTACH_LEASE_TTL_SECS: u64 = 120;
 const MANAGED_ATTACH_RENEW_SECS: u64 = 30;
+const USER_OPTION_NAME_MAX_BYTES: usize = 128;
+const USER_OPTION_VALUE_MAX_BYTES: usize = 4_096;
+const USER_OPTIONS_PER_IDENTITY_MAX: usize = 64;
+const USER_OPTION_IDENTITIES_MAX: usize = 512;
+const USER_OPTION_ENTRIES_MAX: usize = 4_096;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct CompatStore {
     panes: HashMap<String, CompatPane>,
+    pane_user_options: HashMap<String, HashMap<String, String>>,
+    session_user_options: HashMap<String, HashMap<String, String>>,
     wait_generations: HashMap<String, u64>,
     wait_generation_touched_secs: HashMap<String, u64>,
     managed_attaches: HashMap<String, ManagedAttachLease>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CompatPane {
     pane_id: String,
     session_name: String,
+    #[serde(default)]
+    immutable_id: Option<String>,
     cmux_surface_id: Option<String>,
     cmux_workspace_id: Option<String>,
     cmux_window_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCompatPane {
+    pane_id: String,
+    immutable_id: String,
+    stored: Option<CompatPane>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,13 +202,10 @@ pub fn run_tmux_compat(raw_args: Vec<String>) -> Result<i32> {
         "select-pane" | "selectp" => Ok(0),
         "select-layout" | "selectl" => Ok(0),
         "set-hook" | "seth" => set_hook(rest),
-        "set-option" | "set" | "setw" | "set-window-option" => Ok(0),
-        "show-options"
-        | "show"
-        | "show-option"
-        | "showw"
-        | "show-window-option"
-        | "show-window-options" => show_option(rest),
+        "set-option" | "set" => set_option(rest),
+        "setw" | "set-window-option" => Ok(0),
+        "show-options" | "show" | "show-option" => show_option(rest),
+        "showw" | "show-window-option" | "show-window-options" => legacy_show_option(rest),
         "display-popup" | "popup" => display_popup(rest),
         "run-shell" | "run" => run_shell(rest),
         "wait-for" | "wait" => wait_for(rest),
@@ -533,8 +546,16 @@ fn target_matches_info(target: &str, info: &SessionInfo) -> bool {
 fn list_sessions(args: &[String]) -> Result<i32> {
     reject_filter(args)?;
     let format = parse_format(args).unwrap_or_else(|| "#{session_name}".to_string());
+    let session_user_options = if format_uses_session_user_options(&format) {
+        Some(read_store(|store| Ok(store.session_user_options.clone()))?)
+    } else {
+        None
+    };
     for pane in root_session_rows()? {
-        println!("{}", expand_format(&format, &pane));
+        println!(
+            "{}",
+            expand_format_with_session_user_options(&format, &pane, session_user_options.as_ref())
+        );
     }
     Ok(0)
 }
@@ -712,18 +733,13 @@ fn kill_session(args: &[String]) -> Result<i32> {
 }
 
 fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
-    let before = client::info(target).ok();
-    let pane_id = before
-        .as_ref()
-        .map(|info| info.pane_id.clone())
-        .or_else(|| target.strip_prefix('%').map(|digits| format!("%{digits}")));
-    let cmux_surface = pane_id
-        .as_deref()
-        .and_then(stored_cmux_surface_for_pane_best_effort);
-    client::kill(target)?;
-    if let Some(pane_id) = pane_id.as_deref() {
-        forget_pane_best_effort(pane_id);
-    }
+    let before = client::info(target)?;
+    let immutable_id = before.id.clone();
+    let pane_id = before.pane_id.clone();
+    let captured = capture_compat_pane_best_effort(&pane_id, &immutable_id);
+    client::kill(&immutable_id)?;
+    let cmux_surface = cmux_surface_from_captured_pane(&captured);
+    forget_panes_and_user_options_best_effort(&[captured], &[immutable_id], target);
     if let Some(surface) = cmux_surface.as_ref() {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm pane", surface);
     }
@@ -731,40 +747,136 @@ fn kill_pane_with_cmux_cleanup(target: &str) -> Result<()> {
 }
 
 fn kill_session_with_cmux_cleanup(target: &str) -> Result<()> {
-    let (kill_target, panes_before) = match window_pane_rows_for_target(target) {
-        Ok(panes_before) => {
-            let kill_target = panes_before
-                .first()
-                .map(|pane| pane.name.clone())
-                .unwrap_or_else(|| target.to_string());
-            (kill_target, panes_before)
-        }
-        Err(err) => {
-            eprintln!(
-                "warning: tmux compat pane enumeration failed for {}: {}",
-                sanitize::terminal_text(target),
-                sanitize::terminal_text(&err.to_string())
-            );
-            let fallback = client::info(target).ok().into_iter().collect();
-            (target.to_string(), fallback)
-        }
-    };
-    let mut cmux_surfaces = HashSet::new();
-    for pane in &panes_before {
-        if let Some(surface) = stored_cmux_surface_for_pane_best_effort(&pane.pane_id) {
-            cmux_surfaces.insert(surface);
-        }
-    }
+    let sessions = client::list_sessions().with_context(|| {
+        format!(
+            "capture pre-kill tmux session snapshot for {}",
+            sanitize::terminal_text(target)
+        )
+    })?;
+    let panes_before = session_tree_from_snapshot(target, &sessions)?;
+    let kill_target = panes_before
+        .first()
+        .context("validated tmux session snapshot has no root")?
+        .id
+        .clone();
+    let immutable_ids: Vec<String> = panes_before.iter().map(|pane| pane.id.clone()).collect();
+    let captured_panes: Vec<CapturedCompatPane> = panes_before
+        .iter()
+        .map(|pane| capture_compat_pane_best_effort(&pane.pane_id, &pane.id))
+        .collect();
+
+    let cmux_surfaces: HashSet<CmuxSurfaceContext> = captured_panes
+        .iter()
+        .filter_map(cmux_surface_from_captured_pane)
+        .collect();
 
     client::kill(&kill_target)?;
 
-    for pane in panes_before {
-        forget_pane_best_effort(&pane.pane_id);
-    }
+    forget_panes_and_user_options_best_effort(&captured_panes, &immutable_ids, target);
     for surface in &cmux_surfaces {
         close_cmux_surface_best_effort("cmux close-surface for killed lterm session", surface);
     }
     Ok(())
+}
+
+fn session_tree_from_snapshot<'a>(
+    target: &str,
+    sessions: &'a [SessionInfo],
+) -> Result<Vec<&'a SessionInfo>> {
+    let mut by_id = HashMap::new();
+    let mut by_pane = HashMap::new();
+    let mut by_name = HashMap::new();
+    for pane in sessions {
+        if pane.id.is_empty() || pane.pane_id.is_empty() || pane.name.is_empty() {
+            bail!("tmux session snapshot contains an empty immutable, pane, or name identity");
+        }
+        if by_id.insert(pane.id.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate immutable identity");
+        }
+        if by_pane.insert(pane.pane_id.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate pane identity");
+        }
+        if by_name.insert(pane.name.as_str(), pane).is_some() {
+            bail!("tmux session snapshot contains a duplicate session name");
+        }
+    }
+
+    let mut resolved = target
+        .starts_with('%')
+        .then(|| by_pane.get(target).copied())
+        .flatten()
+        .or_else(|| by_name.get(target).copied())
+        .or_else(|| by_id.get(target).copied());
+    if resolved.is_none() && !target.starts_with('%') {
+        resolved = by_pane.get(format!("%{target}").as_str()).copied();
+    }
+    let mut root = resolved.with_context(|| {
+        format!(
+            "tmux session target {} is absent from the pre-kill snapshot",
+            sanitize::terminal_text(target)
+        )
+    })?;
+
+    let mut ancestors = HashSet::new();
+    loop {
+        if !ancestors.insert(root.id.as_str()) {
+            bail!("tmux session snapshot contains a parent cycle");
+        }
+        let Some(parent) = snapshot_parent(root, &by_id)? else {
+            break;
+        };
+        root = parent;
+    }
+
+    let mut tree = vec![root];
+    let mut captured = HashSet::from([root.id.as_str()]);
+    let mut cursor = 0;
+    while cursor < tree.len() {
+        let parent = tree[cursor];
+        cursor += 1;
+        for child in sessions {
+            let references_parent_id =
+                child.parent_session_id.as_deref() == Some(parent.id.as_str());
+            let references_parent_pane =
+                child.parent_pane_id.as_deref() == Some(parent.pane_id.as_str());
+            if !references_parent_id && !references_parent_pane {
+                continue;
+            }
+            let actual_parent = snapshot_parent(child, &by_id)?
+                .context("tmux session snapshot descendant is missing its parent")?;
+            if actual_parent.id != parent.id {
+                bail!("tmux session snapshot contains inconsistent parent identities");
+            }
+            if !captured.insert(child.id.as_str()) {
+                bail!("tmux session snapshot contains a descendant cycle");
+            }
+            tree.push(child);
+        }
+    }
+    Ok(tree)
+}
+
+fn snapshot_parent<'a>(
+    pane: &SessionInfo,
+    by_id: &HashMap<&str, &'a SessionInfo>,
+) -> Result<Option<&'a SessionInfo>> {
+    match (
+        pane.parent_session_id.as_deref(),
+        pane.parent_pane_id.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(parent_id), Some(parent_pane_id)) => {
+            let parent = by_id
+                .get(parent_id)
+                .copied()
+                .context("tmux session snapshot references a missing parent")?;
+            if parent.pane_id != parent_pane_id {
+                bail!("tmux session snapshot parent identity does not match its pane identity");
+            }
+            Ok(Some(parent))
+        }
+        _ => bail!("tmux session snapshot contains an incomplete parent identity"),
+    }
 }
 
 /// Implements the tmux-compatible `rename-session [-t target] new-name` shim.
@@ -1474,7 +1586,60 @@ fn parse_resize_dimension(flag: char, value: Option<String>) -> Result<u16> {
     Ok(dimension)
 }
 
+#[derive(Debug)]
+struct UserOptionArgs {
+    quiet: bool,
+    value_only: bool,
+    pane: bool,
+    unset: bool,
+    target: Option<String>,
+    name: String,
+    value: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum UserOptionCommand {
+    Set,
+    Show,
+}
+
+fn set_option(args: &[String]) -> Result<i32> {
+    if actual_user_option_name(args, UserOptionCommand::Set).is_none() {
+        return Ok(0);
+    }
+    let parsed = parse_user_option_args(args, true)?;
+    validate_user_option_name(&parsed.name)?;
+    if let Some(value) = parsed.value.as_deref() {
+        validate_user_option_value(value)?;
+    }
+    mutate_user_option(&parsed)?;
+    Ok(0)
+}
+
 fn show_option(args: &[String]) -> Result<i32> {
+    if actual_user_option_name(args, UserOptionCommand::Show).is_none() {
+        return legacy_show_option(args);
+    }
+    let parsed = parse_user_option_args(args, false)?;
+    validate_user_option_name(&parsed.name)?;
+    match read_user_option(&parsed)? {
+        Some(value) => {
+            if parsed.value_only {
+                println!("{value}");
+            } else {
+                println!("{} {value}", parsed.name);
+            }
+            Ok(0)
+        }
+        None if parsed.quiet => Ok(0),
+        None => bail!(
+            "unknown tmux user option: {}",
+            sanitize::terminal_text(&parsed.name)
+        ),
+    }
+}
+
+fn legacy_show_option(args: &[String]) -> Result<i32> {
     if show_option_prints_value(args) {
         let option = show_option_name(args);
         let value = tmux_option_value(option.as_deref());
@@ -1487,6 +1652,367 @@ fn show_option(args: &[String]) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+fn actual_user_option_name(args: &[String], command: UserOptionCommand) -> Option<&str> {
+    // This is only a routing scan: once an actual @-prefixed name is found, the
+    // strict parser below remains the single authority for flag and arity errors.
+    let mut options = true;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if options && arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if options && arg == "-t" {
+            i += 2;
+            continue;
+        }
+        if options && arg.starts_with("-t") && arg.len() > 2 {
+            i += 1;
+            continue;
+        }
+        if options && arg.starts_with('-') && arg != "-" {
+            let Some(cluster) = short_cluster(arg) else {
+                i += 1;
+                continue;
+            };
+            if let Some((value_pos, value_flag)) = cluster.char_indices().find(|(_, flag)| {
+                *flag == 't'
+                    || (!user_option_flag_supported(command, *flag)
+                        && is_value_taking_short_flag(*flag))
+            }) {
+                let attached_value = &cluster[value_pos + value_flag.len_utf8()..];
+                if value_flag == 't' {
+                    i += usize::from(attached_value.is_empty() && args.get(i + 1).is_some()) + 1;
+                } else if attached_value.is_empty() {
+                    let value = args.get(i + 1)?;
+                    if value.starts_with('@') {
+                        return Some(value);
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        return arg.starts_with('@').then_some(arg.as_str());
+    }
+    None
+}
+
+fn user_option_flag_supported(command: UserOptionCommand, flag: char) -> bool {
+    matches!(flag, 'q' | 'p')
+        || matches!(
+            (command, flag),
+            (UserOptionCommand::Set, 'u') | (UserOptionCommand::Show, 'v')
+        )
+}
+
+fn parse_user_option_args(args: &[String], is_set: bool) -> Result<UserOptionArgs> {
+    let mut parsed = UserOptionArgs {
+        quiet: false,
+        value_only: false,
+        pane: false,
+        unset: false,
+        target: None,
+        name: String::new(),
+        value: None,
+    };
+    let mut positional = Vec::new();
+    let mut options = true;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if options && arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if options && arg == "-t" {
+            parsed.target = Some(value_for_option(args.get(i + 1).cloned(), "-t")?);
+            i += 2;
+            continue;
+        }
+        if options && arg.starts_with("-t") && arg.len() > 2 {
+            parsed.target = Some(value_for_option(Some(arg[2..].to_string()), "-t")?);
+            i += 1;
+            continue;
+        }
+        if options && arg.starts_with('-') && arg != "-" {
+            let Some(cluster) = short_cluster(arg) else {
+                bail!("unsupported tmux user-option flag: {arg}");
+            };
+            if cluster.contains('t') {
+                bail!("tmux user-option target flag -t may not be clustered");
+            }
+            for flag in cluster.chars() {
+                match flag {
+                    'q' => parsed.quiet = true,
+                    'p' => parsed.pane = true,
+                    'u' if is_set => parsed.unset = true,
+                    'v' if !is_set => parsed.value_only = true,
+                    _ => bail!("unsupported tmux user-option flag: -{flag}"),
+                }
+            }
+            i += 1;
+            continue;
+        }
+        options = false;
+        positional.push(arg.clone());
+        i += 1;
+    }
+    let expected = if is_set && !parsed.unset { 2 } else { 1 };
+    if positional.len() != expected {
+        bail!(
+            "tmux user-option command requires exactly {expected} positional argument{}",
+            if expected == 1 { "" } else { "s" }
+        );
+    }
+    parsed.name = positional.remove(0);
+    parsed.value = positional.pop();
+    Ok(parsed)
+}
+
+fn validate_user_option_name(name: &str) -> Result<()> {
+    if !(2..=USER_OPTION_NAME_MAX_BYTES).contains(&name.len())
+        || !name.starts_with('@')
+        || !name[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+    {
+        bail!("invalid tmux user-option name");
+    }
+    Ok(())
+}
+
+fn validate_user_option_value(value: &str) -> Result<()> {
+    if value.len() > USER_OPTION_VALUE_MAX_BYTES {
+        bail!("tmux user-option value exceeds {USER_OPTION_VALUE_MAX_BYTES} bytes");
+    }
+    if value.chars().any(is_unsafe_user_option_char) {
+        bail!("tmux user-option value contains a control or format character");
+    }
+    Ok(())
+}
+
+fn mutate_user_option(args: &UserOptionArgs) -> Result<()> {
+    let _lock = StoreLock::acquire()?;
+    let sessions = client::list_sessions()?;
+    let identity = user_option_identity_from_snapshot(args, &sessions)?;
+    let live_identities: HashSet<&str> = sessions.iter().map(|info| info.id.as_str()).collect();
+    let mut store = load_store()?;
+    prune_user_options(&mut store, &live_identities);
+    let result = (|| {
+        if args.unset {
+            let options = if args.pane {
+                &mut store.pane_user_options
+            } else {
+                &mut store.session_user_options
+            };
+            if let Some(identity_options) = options.get_mut(&identity) {
+                identity_options.remove(&args.name);
+                if identity_options.is_empty() {
+                    options.remove(&identity);
+                }
+            }
+            return Ok(());
+        }
+
+        let value = args
+            .value
+            .as_deref()
+            .context("tmux user option value missing")?;
+        let option_exists = if args.pane {
+            store
+                .pane_user_options
+                .get(&identity)
+                .is_some_and(|options| options.contains_key(&args.name))
+        } else {
+            store
+                .session_user_options
+                .get(&identity)
+                .is_some_and(|options| options.contains_key(&args.name))
+        };
+        if !option_exists {
+            let identity_exists = store.pane_user_options.contains_key(&identity)
+                || store.session_user_options.contains_key(&identity);
+            let identity_option_count = store
+                .pane_user_options
+                .get(&identity)
+                .map_or(0, HashMap::len)
+                + store
+                    .session_user_options
+                    .get(&identity)
+                    .map_or(0, HashMap::len);
+            let identity_count = user_option_identity_count(&store);
+            let entry_count = user_option_entry_count(&store);
+            if !identity_exists && identity_count >= USER_OPTION_IDENTITIES_MAX {
+                bail!("tmux user-option identity limit reached");
+            }
+            if entry_count >= USER_OPTION_ENTRIES_MAX {
+                bail!("tmux user-option entry limit reached");
+            }
+            if identity_option_count >= USER_OPTIONS_PER_IDENTITY_MAX {
+                bail!("tmux user-option per-identity limit reached");
+            }
+        }
+
+        let options = if args.pane {
+            &mut store.pane_user_options
+        } else {
+            &mut store.session_user_options
+        };
+        let identity_options = options.entry(identity).or_default();
+        identity_options.insert(args.name.clone(), value.to_string());
+        Ok(())
+    })();
+    result?;
+    save_store(&store)
+}
+
+fn read_user_option(args: &UserOptionArgs) -> Result<Option<String>> {
+    let _lock = StoreLock::acquire()?;
+    let sessions = client::list_sessions()?;
+    let identity = user_option_identity_from_snapshot(args, &sessions)?;
+    let store = load_store()?;
+    let options = if args.pane {
+        &store.pane_user_options
+    } else {
+        &store.session_user_options
+    };
+    Ok(options
+        .get(&identity)
+        .and_then(|identity_options| identity_options.get(&args.name))
+        .cloned())
+}
+
+fn user_option_identity_from_snapshot(
+    args: &UserOptionArgs,
+    sessions: &[SessionInfo],
+) -> Result<String> {
+    let target = args.target.clone().unwrap_or_else(default_target);
+    let target = normalize_tmux_target(&target)?;
+    let info = sessions
+        .iter()
+        .find(|info| target_matches_info(target.as_ref(), info))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "tmux user-option target {} is unavailable",
+                sanitize::terminal_text(target.as_ref())
+            )
+        })?;
+    if args.pane {
+        return Ok(info.id);
+    }
+    root_session_identity_from_snapshot(info, sessions)
+}
+
+fn root_session_identity_from_snapshot(
+    mut info: SessionInfo,
+    sessions: &[SessionInfo],
+) -> Result<String> {
+    let by_id: HashMap<String, SessionInfo> = sessions
+        .iter()
+        .cloned()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = info.parent_session_id.as_deref() {
+        if !seen.insert(info.id.clone()) {
+            bail!("tmux user-option target has a cyclic parent chain");
+        }
+        info = by_id.get(parent_id).cloned().with_context(|| {
+            format!(
+                "tmux user-option parent identity {} is unavailable",
+                sanitize::terminal_text(parent_id)
+            )
+        })?;
+    }
+    Ok(info.id)
+}
+
+fn prune_user_options(store: &mut CompatStore, live_identities: &HashSet<&str>) {
+    store.pane_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
+    store.session_user_options.retain(|identity, options| {
+        live_identities.contains(identity.as_str()) && !options.is_empty()
+    });
+}
+
+fn user_option_identity_count(store: &CompatStore) -> usize {
+    store
+        .pane_user_options
+        .keys()
+        .chain(store.session_user_options.keys())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn user_option_entry_count(store: &CompatStore) -> usize {
+    store
+        .pane_user_options
+        .values()
+        .chain(store.session_user_options.values())
+        .map(HashMap::len)
+        .sum()
+}
+
+// Unicode 17.0.0 General_Category=Cf ranges from the 2025-08-15 UCD UnicodeData.txt:
+// https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt
+const UNICODE_FORMAT_RANGES: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
+fn is_unsafe_user_option_char(ch: char) -> bool {
+    ch.is_control()
+        || UNICODE_FORMAT_RANGES
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&(ch as u32)))
+        || matches!(
+            ch,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{3164}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+        )
+        || matches!(ch as u32,
+            0x180b..=0x180f | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x206f
+            | 0xfe00..=0xfe0f | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0000..=0xe0fff)
 }
 
 fn show_option_prints_value(args: &[String]) -> bool {
@@ -2842,31 +3368,82 @@ fn find_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
 }
 
 fn remember_pane(info: &SessionInfo, cmux_surface: Option<&CmuxSurfaceContext>) -> Result<()> {
-    update_store(|store| {
-        store.panes.insert(
-            info.pane_id.clone(),
-            CompatPane {
-                pane_id: info.pane_id.clone(),
-                session_name: info.name.clone(),
-                cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
-                cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
-                cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
-            },
-        );
-        Ok(())
-    })
+    // 순서 유지: StoreLock 획득 -> list_sessions -> load/prune/insert/save.
+    let _lock = StoreLock::acquire()?;
+    let sessions = client::list_sessions()?;
+    let live_identities: HashSet<&str> =
+        sessions.iter().map(|session| session.id.as_str()).collect();
+    remember_pane_with_live(info, cmux_surface, &live_identities)
+}
+
+/// `remember_pane`의 락-보존 내부 갱신 단계. 호출자가 StoreLock을 이미 보유하고
+/// 살아있는 세션 identity 집합을 명시적으로 제공한다고 가정한다.
+///
+/// 왜: 테스트가 데몬 접촉(list_sessions -> ensure_server) 없이 스토어를
+/// 결정적으로 시드할 수 있게 하기 위한 분리이며, 프로덕션 경로의 순서와
+/// 동작은 바꾸지 않는다.
+fn remember_pane_with_live(
+    info: &SessionInfo,
+    cmux_surface: Option<&CmuxSurfaceContext>,
+    live_identities: &HashSet<&str>,
+) -> Result<()> {
+    let mut store = load_store()?;
+    prune_user_options(&mut store, live_identities);
+    store.panes.insert(
+        info.pane_id.clone(),
+        CompatPane {
+            pane_id: info.pane_id.clone(),
+            session_name: info.name.clone(),
+            immutable_id: Some(info.id.clone()),
+            cmux_surface_id: cmux_surface.map(|surface| surface.surface_ref.clone()),
+            cmux_workspace_id: cmux_surface.and_then(|surface| surface.workspace_ref.clone()),
+            cmux_window_id: cmux_surface.and_then(|surface| surface.window_ref.clone()),
+        },
+    );
+    save_store(&store)
 }
 
 fn stored_cmux_surface_for_pane(pane_id: &str) -> Result<Option<CmuxSurfaceContext>> {
-    read_store(|store| {
-        Ok(store.panes.get(pane_id).and_then(|pane| {
-            Some(CmuxSurfaceContext {
-                surface_ref: pane.cmux_surface_id.clone()?,
-                workspace_ref: pane.cmux_workspace_id.clone(),
-                window_ref: pane.cmux_window_id.clone(),
-            })
-        }))
+    read_store(|store| Ok(store.panes.get(pane_id).and_then(cmux_surface_from_pane)))
+}
+
+fn cmux_surface_from_pane(pane: &CompatPane) -> Option<CmuxSurfaceContext> {
+    Some(CmuxSurfaceContext {
+        surface_ref: pane.cmux_surface_id.clone()?,
+        workspace_ref: pane.cmux_workspace_id.clone(),
+        window_ref: pane.cmux_window_id.clone(),
     })
+}
+
+fn cmux_surface_from_captured_pane(captured: &CapturedCompatPane) -> Option<CmuxSurfaceContext> {
+    let stored = captured.stored.as_ref()?;
+    if stored
+        .immutable_id
+        .as_deref()
+        .is_some_and(|id| id != captured.immutable_id)
+    {
+        return None;
+    }
+    cmux_surface_from_pane(stored)
+}
+
+fn capture_compat_pane_best_effort(pane_id: &str, immutable_id: &str) -> CapturedCompatPane {
+    let stored = match read_store(|store| Ok(store.panes.get(pane_id).cloned())) {
+        Ok(stored) => stored,
+        Err(err) => {
+            eprintln!(
+                "warning: tmux compat store lookup failed for {}: {}",
+                sanitize::terminal_text(pane_id),
+                sanitize::terminal_text(&err.to_string())
+            );
+            None
+        }
+    };
+    CapturedCompatPane {
+        pane_id: pane_id.to_string(),
+        immutable_id: immutable_id.to_string(),
+        stored,
+    }
 }
 
 fn stored_cmux_surface_for_pane_best_effort(pane_id: &str) -> Option<CmuxSurfaceContext> {
@@ -2915,18 +3492,40 @@ pub(crate) fn cmux_status_identity(pane_id: &str) -> Option<CmuxSurfaceContext> 
     }
 }
 
-fn forget_pane(pane_id: &str) -> Result<()> {
+fn forget_panes_and_user_options(
+    captured_panes: &[CapturedCompatPane],
+    immutable_ids: &[String],
+) -> Result<()> {
     update_store(|store| {
-        store.panes.remove(pane_id);
+        for captured in captured_panes {
+            let matches_captured_generation = captured.stored.as_ref().is_some_and(|before| {
+                before
+                    .immutable_id
+                    .as_deref()
+                    .is_none_or(|id| id == captured.immutable_id)
+                    && store.panes.get(&captured.pane_id) == Some(before)
+            });
+            if matches_captured_generation {
+                store.panes.remove(&captured.pane_id);
+            }
+        }
+        for immutable_id in immutable_ids {
+            store.pane_user_options.remove(immutable_id);
+            store.session_user_options.remove(immutable_id);
+        }
         Ok(())
     })
 }
 
-fn forget_pane_best_effort(pane_id: &str) {
-    if let Err(err) = forget_pane(pane_id) {
+fn forget_panes_and_user_options_best_effort(
+    captured_panes: &[CapturedCompatPane],
+    immutable_ids: &[String],
+    target: &str,
+) {
+    if let Err(err) = forget_panes_and_user_options(captured_panes, immutable_ids) {
         eprintln!(
             "warning: tmux compat store cleanup failed for {}: {}",
-            sanitize::terminal_text(pane_id),
+            sanitize::terminal_text(target),
             sanitize::terminal_text(&err.to_string())
         );
     }
@@ -3694,6 +4293,14 @@ fn fish_quote(value: &str) -> String {
 }
 
 pub fn expand_format(format: &str, info: &SessionInfo) -> String {
+    expand_format_with_session_user_options(format, info, None)
+}
+
+fn expand_format_with_session_user_options(
+    format: &str,
+    info: &SessionInfo,
+    session_user_options: Option<&HashMap<String, HashMap<String, String>>>,
+) -> String {
     let current_command = current_command(&info.command);
     let mut out = String::new();
     let mut i = 0;
@@ -3705,6 +4312,11 @@ pub fn expand_format(format: &str, info: &SessionInfo) -> String {
         } else if rest.starts_with("#{pane_height}") {
             out.push_str(&info.rows.to_string());
             i += "#{pane_height}".len();
+        } else if let Some((len, value)) = session_user_options
+            .and_then(|options| session_user_option_format_replacement(rest, info, options))
+        {
+            out.push_str(&sanitize::terminal_text(value));
+            i += len;
         } else if let Some((needle, value)) = format_replacement(rest, info, &current_command) {
             out.push_str(&sanitize::terminal_text(value.as_ref()));
             i += needle.len();
@@ -3718,6 +4330,36 @@ pub fn expand_format(format: &str, info: &SessionInfo) -> String {
         }
     }
     out
+}
+
+fn format_uses_session_user_options(format: &str) -> bool {
+    format
+        .match_indices("#{@")
+        .any(|(start, _)| session_user_option_format_token(&format[start..]).is_some())
+}
+
+fn session_user_option_format_replacement<'a>(
+    rest: &str,
+    info: &SessionInfo,
+    session_user_options: &'a HashMap<String, HashMap<String, String>>,
+) -> Option<(usize, &'a str)> {
+    let (len, name) = session_user_option_format_token(rest)?;
+    let value = session_user_options
+        .get(&info.id)
+        .and_then(|options| options.get(name))
+        .map(String::as_str)
+        .unwrap_or_default();
+    Some((len, value))
+}
+
+fn session_user_option_format_token(rest: &str) -> Option<(usize, &str)> {
+    rest.strip_prefix("#{@")?;
+    let end = rest.find('}')?;
+    let name = &rest[2..end];
+    if validate_user_option_name(name).is_err() {
+        return None;
+    }
+    Some((end + 1, name))
 }
 
 fn format_replacement<'a>(
@@ -3825,8 +4467,8 @@ fn expand_command_format(format: &str, command: &str, alias: Option<&str>) -> St
 
 fn command_support_tier(command: &str) -> &'static str {
     match command {
-        "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-option"
-        | "set-hook" | "set-window-option" | "show-environment" => "noop",
+        "refresh-client" | "select-layout" | "select-pane" | "set-environment" | "set-hook"
+        | "set-window-option" | "show-environment" => "noop",
         "attach-session" | "capture-pane" | "has-session" | "kill-pane" | "kill-session"
         | "list-commands" | "list-sessions" | "rename-session" | "run-shell" | "send-keys" => {
             "full"
@@ -3969,7 +4611,7 @@ fn command_usage(command: &str) -> &'static str {
         "send-keys" => "[-l] [-t target-pane] [key ...]",
         "set-environment" => "[-t target-session] variable [value]",
         "set-hook" => "[-agpRuw] [-t target-session] hook-name [command]",
-        "set-option" => "[-t target-pane] option [value]",
+        "set-option" => "[-pqu] [-t target] [--] @option [value]",
         "set-window-option" => "[-t target-window] option [value]",
         "show-environment" => "[-t target-session] [variable]",
         "show-options" => "[-t target-pane] [option]",
@@ -5381,18 +6023,38 @@ mod tests {
     fn command_support_counts_match_public_coverage_rows() {
         let counts = command_support_counts();
         let coverage = command_coverage();
-        assert_eq!(counts.supported_command_count, coverage.len());
+        assert_eq!(
+            counts,
+            CommandSupportCounts {
+                supported_command_count: 33,
+                full_command_count: 10,
+                partial_command_count: 16,
+                noop_command_count: 7,
+            }
+        );
+        assert_eq!(coverage.len(), 33);
         assert_eq!(
             counts.supported_command_count,
             counts.full_command_count + counts.partial_command_count + counts.noop_command_count
         );
-        assert!(counts.full_command_count > 0, "{counts:?}");
-        assert!(counts.partial_command_count > 0, "{counts:?}");
-        assert!(counts.noop_command_count > 0, "{counts:?}");
         assert!(
             coverage
                 .iter()
                 .any(|command| command.name == "list-commands" && command.support == "full")
+        );
+        assert_eq!(
+            coverage
+                .iter()
+                .find(|command| command.name == "set-option")
+                .map(|command| command.support),
+            Some("partial")
+        );
+        assert_eq!(
+            coverage
+                .iter()
+                .find(|command| command.name == "set-window-option")
+                .map(|command| command.support),
+            Some("noop")
         );
         assert!(known_unsupported_common_commands().contains(&"join-pane"));
     }
@@ -5639,6 +6301,46 @@ mod tests {
             Some("focus-events")
         );
         assert!(!show_option_value_only(&args(["-g", "focus-events"])));
+    }
+
+    #[test]
+    fn user_option_name_classifier_tracks_real_positionals_and_fails_closed() {
+        let set_cases = [
+            (vec!["-t", "@42", "@owner", "value"], Some("@owner")),
+            (vec!["-t@42", "@owner", "value"], Some("@owner")),
+            (vec!["-pt", "%0", "@owner", "value"], Some("@owner")),
+            (vec!["-pt%0", "@owner", "value"], Some("@owner")),
+            (vec!["-F", "fmt", "@owner", "value"], Some("@owner")),
+            (vec!["-Ffmt", "@owner", "value"], Some("@owner")),
+            (vec!["-Fformat", "@owner", "value"], Some("@owner")),
+            (vec!["-F", "@owner", "value"], Some("@owner")),
+            (vec!["--", "@bad/name", "value"], Some("@bad/name")),
+            (vec!["-p", "status", "@legacy-value"], None),
+            (vec!["-F", "fmt", "status", "@legacy-value"], None),
+        ];
+        for (values, expected) in set_cases {
+            let values = args(values);
+            assert_eq!(
+                actual_user_option_name(&values, UserOptionCommand::Set),
+                expected,
+                "set args: {values:?}"
+            );
+        }
+
+        let show_cases = [
+            (vec!["-qv", "-t", "@42", "focus-events"], None),
+            (vec!["-qv", "-t@42", "focus-events"], None),
+            (vec!["-pt", "%0", "@owner"], Some("@owner")),
+            (vec!["focus-events", "@legacy-value"], None),
+        ];
+        for (values, expected) in show_cases {
+            let values = args(values);
+            assert_eq!(
+                actual_user_option_name(&values, UserOptionCommand::Show),
+                expected,
+                "show args: {values:?}"
+            );
+        }
     }
 
     #[test]
@@ -6512,7 +7214,15 @@ mod tests {
             status_theme: None,
             lifecycle_state: None,
         };
-        remember_pane(&info, Some(&stored)).expect("seed stored cmux surface");
+        // 데몬 접촉 없이 결정적으로 시드: 살아있는 identity를 명시적으로 제공한다.
+        // 프로덕션 계약과 동일하게 StoreLock을 보유한 상태로 내부 헬퍼를 호출하고,
+        // 스코프 종료로 락을 해제해 cmux_status_identity가 다시 획득하게 한다.
+        {
+            let _store_lock = StoreLock::acquire().expect("acquire store lock for seeding");
+            let live_identities: HashSet<&str> = HashSet::from(["session-uuid"]);
+            remember_pane_with_live(&info, Some(&stored), &live_identities)
+                .expect("seed stored cmux surface");
+        }
 
         let resolved = cmux_status_identity("%42").expect("stored context should resolve");
         assert_eq!(resolved, stored);

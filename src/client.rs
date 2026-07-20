@@ -1310,9 +1310,19 @@ pub fn new_session(
     tmux_parent_pane_id: Option<String>,
 ) -> Result<SessionInfo> {
     ensure_server()?;
-    if tmux_parent_pane_id.is_some() {
-        require_tmux_parent_pane_protocol()?;
-    }
+    let capability_parent = current_parent_request();
+    // 명시 부모도 capability 부모도 없을 때만 ambient env에서 기회적(암묵) 복구를 시도한다.
+    let implicit_recovery = tmux_parent_pane_id.is_none() && capability_parent.is_none();
+    let candidate = if implicit_recovery {
+        current_verified_lterm_tmux_parent()
+    } else {
+        tmux_parent_pane_id
+    };
+    let tmux_parent_pane_id = resolve_tmux_parent(
+        candidate,
+        implicit_recovery,
+        require_tmux_parent_pane_protocol,
+    )?;
     if status_theme.is_some() {
         require_status_theme_protocol()?;
     }
@@ -1320,7 +1330,7 @@ pub fn new_session(
     let parent = if tmux_parent_pane_id.is_some() {
         None
     } else {
-        current_parent_request()
+        capability_parent
     };
     inherit_client_session_home_env(&mut env);
     inherit_terminal_capability_env(&mut env);
@@ -1530,6 +1540,37 @@ fn require_metadata_protocol() -> Result<()> {
     Ok(())
 }
 
+/// tmux 부모 후보에 프로토콜 게이트를 적용해 최종 부모를 결정한다.
+///
+/// - `candidate`: 채택 후보 pane id (명시 인자 또는 암묵 env 복구 결과)
+/// - `implicit`: 후보가 기회적(암묵) 복구로 얻어진 것인지 여부
+/// - `protocol_check`: tmux-parent 프로토콜 지원 검사 (실패 시 Err)
+///
+/// 왜: 암묵 복구는 기회적 업그레이드이므로 프로토콜 미지원/검사 실패 시
+/// 하드 실패 대신 root 세션으로 안전 강등해야 한다. 명시 부모는 사용자의
+/// 의도이므로 기존대로 하드 실패를 유지한다.
+fn resolve_tmux_parent(
+    candidate: Option<String>,
+    implicit: bool,
+    protocol_check: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    if candidate.is_none() {
+        return Ok(None);
+    }
+    match protocol_check() {
+        Ok(()) => Ok(candidate),
+        Err(_) if implicit => {
+            // 암묵 복구 실패는 root 세션으로 안전 강등한다. 경고에는 pane id나
+            // 환경 값, 오류 내용 같은 식별 정보를 넣지 않는다(프라이버시-안전 진단).
+            eprintln!(
+                "warning: ignoring implicitly recovered tmux parent (creating a root session)"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn require_tmux_parent_pane_protocol() -> Result<()> {
     let status =
         daemon_status().context("check lterm daemon protocol for explicit tmux parent panes")?;
@@ -1613,6 +1654,33 @@ fn current_parent_request() -> Option<ParentRequest> {
         .ok()
         .filter(|token| !token.is_empty())?;
     Some(ParentRequest { pane_id, token })
+}
+
+/// Recover the explicit pane identity exported by lterm's own tmux-compatible
+/// session when an intermediary tool deliberately omits the lterm capability
+/// pair. A real tmux socket is never accepted, and a missing/invalid pane stays
+/// unparented rather than being inferred from names, cwd, or process state.
+fn current_verified_lterm_tmux_parent() -> Option<String> {
+    let tmux_env = std::env::var("TMUX").ok()?;
+    let tmux_socket = tmux_env.split(',').next().unwrap_or("");
+    let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
+    let lterm_socket_path = paths::socket_path()
+        .ok()
+        .map(|path| path.display().to_string());
+    let tmux_compat_socket_path = paths::tmux_compat_socket_path()
+        .ok()
+        .map(|path| path.display().to_string());
+    if !is_self_provided_tmux(
+        tmux_socket,
+        lterm_socket_env.as_deref(),
+        lterm_socket_path.as_deref(),
+        tmux_compat_socket_path.as_deref(),
+    ) {
+        return None;
+    }
+    std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|pane_id| is_lterm_pane_id(pane_id))
 }
 
 fn is_lterm_pane_id(value: &str) -> bool {
@@ -8445,6 +8513,34 @@ pub fn json_pretty<T: serde::Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 암묵(env) 복구된 tmux 부모는 프로토콜 검사 실패 시 root(None)로 안전 강등되어야 한다.
+    #[test]
+    fn implicit_tmux_parent_degrades_to_root_on_protocol_error() {
+        let resolved = super::resolve_tmux_parent(Some("%7".to_string()), true, || {
+            Err(anyhow::anyhow!("protocol too old"))
+        })
+        .expect("implicit recovery failure must degrade to a root session instead of erroring");
+        assert_eq!(resolved, None);
+    }
+
+    /// 명시적으로 지정된 tmux 부모는 프로토콜 검사 실패 시 기존대로 하드 실패해야 한다.
+    #[test]
+    fn explicit_tmux_parent_still_hard_fails_on_protocol_error() {
+        let err = super::resolve_tmux_parent(Some("%7".to_string()), false, || {
+            Err(anyhow::anyhow!("protocol too old"))
+        })
+        .expect_err("explicit parent must hard-fail on protocol error");
+        assert!(err.to_string().contains("protocol too old"), "{err:#}");
+    }
+
+    /// 프로토콜이 지원되면 암묵 복구된 부모는 그대로 유지된다(중첩 provenance 회귀 방지).
+    #[test]
+    fn implicit_tmux_parent_kept_when_protocol_ok() {
+        let resolved = super::resolve_tmux_parent(Some("%7".to_string()), true, || Ok(()))
+            .expect("supported protocol keeps the implicit parent");
+        assert_eq!(resolved, Some("%7".to_string()));
+    }
+
     use super::{
         AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,

@@ -525,7 +525,9 @@ lterm run -- codex exec "저장소를 요약해줘"
 - **조회** — `list-windows`, `list-clients`, `list-commands`, `show-options`, `show-window-options`
 - **Pane** — `split-window`, `list-panes`, `display-message`, `capture-pane`, `send-keys`, `kill-pane`, `resize-pane`
 - **Buffer / popup** — `display-popup`, `wait-for`, `load-buffer`, `save-buffer`, `paste-buffer`
-- **호환용 no-op** — `select-pane`, `select-layout`, `set-hook`, `set-option`, `set-window-option`, `set-environment`, `show-environment`
+- **상태 저장형 user-option 변경(partial)** — 상한이 있는 `@name` subset의
+  `set-option`(`set`); 조회는 `show-options`(`show`, `show-option`)
+- **호환용 no-op** — `select-pane`, `select-layout`, `set-hook`, `set-window-option`(`setw`), `set-environment`, `show-environment`
 
 호환성 참고: lterm은 각 root session을 하나의 pseudo-window로 모델링합니다
 (`window_index=0`, `window_panes=1`). lterm은 client별 process/TTY metadata를
@@ -544,9 +546,43 @@ target이면 현재 pane이 아니어도 허용합니다. 이는 tmux의 cross-p
 만들 때 각각 cmux `left`, `up` placement로 매핑됩니다. Detached `new-window -d` /
 `neww -d`는 의도적으로 partial 지원입니다. standalone lterm helper session을
 만들고, tmux 스타일 `-P`/`-F` target 출력을 지원하며, attached-window mode는
-현재 pane을 조용히 바꾸는 대신 거부합니다. `wait-for` channel은 lterm local
-compatibility store key이며, 최대 1024 bytes까지 허용하고 control character는
-거부합니다.
+현재 pane을 조용히 바꾸는 대신 거부합니다.
+
+상태를 저장하는 `set-option` / `set` 동작은 실제 tmux user-option 이름만
+의도적으로 지원하며, user-option이 아닌 호출은 기존 accepted no-op 동작을
+유지합니다. 허용하는 변경 grammar는
+`[-pqu] [-t target] [--] @option [value]`입니다. set/replace에는 `value`가
+필수이며(`""`는 존재하지만 빈 값), `-u` unset에서는 value를 생략해야 합니다.
+`-t`는 별도 인자 또는 `-tTARGET` 형태로 쓸 수 있지만 다른 short flag와 cluster할
+수 없고, `--` 뒤에서는 option parsing을 멈춥니다. `show-options` /
+`show-option` / `show` 조회는 정확히 하나의 `@option`과 대응하는 `-p`, `-q`,
+`-v`, `-t`, `--` subset을 받습니다. `-q`를 쓰면 없는 option은 성공하면서
+0 byte를 출력하고, 존재하지만 빈 값은 `-v` 조회에서 정확히 newline 하나를
+출력합니다. `-q`가 없으면 absence는 error입니다.
+
+`-p`가 없으면 option은 target이 속한 root session의 immutable UUID에 귀속되고,
+`-p`는 target pane의 immutable UUID를 선택합니다. 따라서 session rename 뒤에도
+값이 유지됩니다. mutation과 pane 등록 때 fresh live-session reconciliation을
+수행하여 자연 종료했거나 재사용된 pane identity를 제거합니다. 성공한 pane/session
+kill 뒤 cleanup은 미리 capture한 immutable identity(및 capture한 root
+descendant)로 제한하고, 실패한 kill은 store를 보존합니다. best-effort kill cleanup이
+누락되어도 다음 reconciliation에서 제거합니다. `list-sessions`의
+`#{@omx_instance_id}` 같은 format token은 root-session 값만 읽고, absence는 빈
+field로 확장하며, pane/window 값은 섞지 않습니다.
+
+User-option 이름은 UTF-8 기준 2..=128 bytes이며, ASCII `@` 뒤에 하나 이상의
+`[A-Za-z0-9_.:-]` 문자만 허용합니다. 값은 UTF-8 기준 0..=4096 bytes입니다.
+일반 printable text, space, combining mark는 허용하지만 C0/C1/DEL control과
+게시된 denylist의 Unicode 17 `Cf` format 문자, bidi/zero-width control, variation
+selector, tag, filler, line/paragraph separator는 거부합니다. 상한은 immutable
+identity 하나당 pane/root-session 합계 64 entries, live identity 합계 512개,
+전체 4096 entries이며, compatibility store 전체는 16 MiB입니다.
+이는 일반 tmux option 저장소가 아닙니다. built-in, global, server, window,
+inheritance semantics는 구현하지 않았고 `set-window-option` / `setw`는 계속
+accepted no-op입니다.
+
+`wait-for` channel은 lterm local compatibility store key이며, 최대 1024 bytes까지
+허용하고 control character는 거부합니다.
 `lterm tmux-compat list-commands --verbose`는 `command`, alias, support tier,
 usage를 tab-separated로 출력하고, `--json`은 machine-readable row를 출력합니다.
 Support tier는 lterm compatibility boundary 안에서 `full`, `partial`, `noop`

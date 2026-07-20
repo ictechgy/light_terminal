@@ -370,6 +370,45 @@ outside the 1.0 contract unless later added to the manifest.
 No-op compatibility commands, including `set-hook`, are stable only as accepted
 shim calls; lterm does not execute tmux hook dispatchers.
 
+### Stateful tmux user-option subset
+
+The canonical `set-option` command (alias `set`) is `partial`, not `noop`, for
+the bounded user-option subset below. Reads use `show-options` and its `show` /
+`show-option` aliases. `set-window-option` / `setw` remains an accepted `noop`;
+non-user-option `set-option` calls retain their legacy accepted `noop` behavior.
+This contract does not add general tmux built-in, global, server, window, or
+inheritance semantics.
+
+- **Grammar:** mutation accepts
+  `[-pqu] [-t target] [--] @option [value]`. A set/replace requires exactly
+  `@option value` (an empty string is a present-empty value); `-u` requires
+  exactly `@option` and unsets it. `-t` may be a separate argument or the
+  attached `-tTARGET` form, but may not be clustered. `--` terminates option
+  parsing. User-option reads accept the corresponding `-p`, `-q`, `-v`, `-t`,
+  and `--` subset with exactly one `@option`.
+- **Scope and identity:** the default scope is the target's containing root
+  session, keyed by its immutable `SessionInfo.id`; `-p` selects the target
+  pane's immutable ID. Names and reusable `%N` addresses are never persistence
+  keys, so session rename preserves values and pane-address reuse cannot inherit
+  them.
+- **Output:** quiet absence (`-q`) succeeds with zero output bytes. A present
+  empty value read with `-v` emits exactly one newline. Non-quiet absence is an
+  error. `list-sessions` expands `#{@name}` from root-session scope only, renders
+  absence as an empty field, and never substitutes pane/window-scoped values.
+- **Bounds and controls:** a name is 2..=128 UTF-8 bytes, consisting of ASCII
+  `@` plus one or more `[A-Za-z0-9_.:-]` characters. A value is 0..=4096 UTF-8
+  bytes. Printable text, ordinary spaces, and combining marks are accepted;
+  C0/C1/DEL controls and the published denylist of Unicode 17 `Cf` format
+  characters, bidi/zero-width controls, variation selectors, tags, fillers, and
+  line/paragraph separators are rejected. Limits are 64 combined
+  pane/root-session entries per immutable identity, 512 combined live
+  identities, 4096 combined entries, and the existing 16 MiB whole-store cap.
+- **Reconciliation:** every mutation and pane registration reconciles against
+  one fresh live-session snapshot. Cleanup after a successful pane/session kill
+  is limited to captured immutable IDs and captured root descendants; failed
+  kills leave the store unchanged. Empty maps, natural exits, and any missed
+  best-effort kill cleanup are removed idempotently on the next reconciliation.
+
 ## Manifest-listed examples
 
 The following examples are intentionally listed in
@@ -422,8 +461,8 @@ entirely. The schema lives at
   "tmux_compat": {
     "supported_command_count": 33,
     "full_command_count": 10,
-    "partial_command_count": 15,
-    "noop_command_count": 8,
+    "partial_command_count": 16,
+    "noop_command_count": 7,
     "known_gap_count": 12,
     "tmux_shim_exists": true,
     "shim_dir_in_path": true,
@@ -443,8 +482,10 @@ error.
 
 The `tmux_compat` object is a local compatibility measurement summary. Current
 builds emit it, but the stable schema keeps it optional/additive so older doctor
-outputs still validate during mixed-version upgrades. Counts come from lterm's
-documented `tmux-compat list-commands` metadata. PATH-order fields are
+outputs still validate during mixed-version upgrades. The 33 supported / 10 full
+/ 16 partial / 7 noop snapshot above is derived from the executable's
+`tmux-compat list-commands` metadata rather than maintained as a separate manual
+inventory. PATH-order fields are
 boolean/null indicators derived from executable `tmux` candidates on local
 `PATH`; null means the relevant lterm shim ordering could not be determined
 without exposing paths. `lterm_shim_shadowed_by_real_tmux=true` means an
