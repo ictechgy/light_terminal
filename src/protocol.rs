@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 
 /// Maximum decoded byte length accepted for `Request::Send` payloads.
 ///
@@ -11,7 +14,25 @@ pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
+#[allow(dead_code)]
+pub const SPECULATION_PROTOCOL_VERSION: u32 = 9;
+#[allow(dead_code)]
+pub const SPECULATION_UNSUPPORTED_ERROR_CODE: &str = "speculation_unsupported";
+#[allow(dead_code)]
+pub const MIN_SPECULATION_TIMEOUT_MS: u64 = 1_000;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_PATH_BYTES: usize = 4_096;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_ARGV_ENTRIES: usize = 256;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_ARG_BYTES: usize = 64 * 1_024;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_ARGV_BYTES: usize = 256 * 1_024;
+#[allow(dead_code)]
+pub const MAX_SPECULATION_ERROR_CODES: usize = 16;
 pub const MAX_METADATA_JOURNAL_ENTRIES: usize = 1024;
 pub const DEFAULT_RECENT_EXITS_LIMIT: u16 = 20;
 pub const MAX_RECENT_EXITS_LIMIT: u16 = 100;
@@ -23,6 +44,666 @@ pub const CMUX_CONTEXT_ENV: &[&str] = &[
 ];
 pub const CHILD_COLOR_POLICY_ENV: &[&str] =
     &["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"];
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationPhase {
+    Prepared,
+    Armed,
+    Starting,
+    Ready,
+    GoPending,
+    Running,
+    ResultPending,
+    PendingFinalize,
+    FinalizingLoser,
+    WinnerSelectionPending,
+    FinalizingWinner,
+    RollbackRequired,
+    DecisionUncertain,
+    RollbackPending,
+    Selected,
+    RolledBack,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpeculationSchemaVersion {
+    #[serde(rename = "lterm.speculation.status.v1")]
+    V1,
+}
+
+#[allow(dead_code)]
+impl SpeculationPhase {
+    pub const ALL: [Self; 16] = [
+        Self::Prepared,
+        Self::Armed,
+        Self::Starting,
+        Self::Ready,
+        Self::GoPending,
+        Self::Running,
+        Self::ResultPending,
+        Self::PendingFinalize,
+        Self::FinalizingLoser,
+        Self::WinnerSelectionPending,
+        Self::FinalizingWinner,
+        Self::RollbackRequired,
+        Self::DecisionUncertain,
+        Self::RollbackPending,
+        Self::Selected,
+        Self::RolledBack,
+    ];
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Selected | Self::RolledBack)
+    }
+
+    pub const fn is_rollback_only(self) -> bool {
+        matches!(
+            self,
+            Self::RollbackRequired | Self::DecisionUncertain | Self::RollbackPending
+        )
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationReasonCode {
+    PreparedLease,
+    ReadyLease,
+    RunningLease,
+    PendingFinalizeLease,
+    ControlAckTimeout,
+    ExplicitRollback,
+    DaemonShutdown,
+    BothCandidatesIneligible,
+    DecisionUncertainAfterRestart,
+    ContainmentEvidenceUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationErrorCode {
+    Unsupported,
+    ProtocolMismatch,
+    CapacityExhausted,
+    InvalidRequest,
+    InvalidTransition,
+    StaleGeneration,
+    GenerationExhausted,
+    ContainmentUnavailable,
+    OutputLimitExceeded,
+    RollbackRequired,
+    DecisionUncertain,
+    EvidenceUnavailable,
+}
+
+/// Error-code collection that cannot exceed the public status wire bound.
+///
+/// The inner vector is private so every value constructible outside this
+/// module is valid by construction and therefore serializes infallibly through
+/// [`Response::ok`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SpeculationErrorCodes(Vec<SpeculationErrorCode>);
+
+#[allow(dead_code)]
+impl SpeculationErrorCodes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_slice(&self) -> &[SpeculationErrorCode] {
+        &self.0
+    }
+
+    pub fn push(&mut self, code: SpeculationErrorCode) -> Result<(), SpeculationWireError> {
+        if self.0.len() >= MAX_SPECULATION_ERROR_CODES {
+            return Err(SpeculationWireError("too many speculation error codes"));
+        }
+        self.0.push(code);
+        Ok(())
+    }
+}
+
+impl From<SpeculationErrorCode> for SpeculationErrorCodes {
+    fn from(code: SpeculationErrorCode) -> Self {
+        Self(vec![code])
+    }
+}
+
+impl TryFrom<Vec<SpeculationErrorCode>> for SpeculationErrorCodes {
+    type Error = SpeculationWireError;
+
+    fn try_from(codes: Vec<SpeculationErrorCode>) -> Result<Self, Self::Error> {
+        if codes.len() > MAX_SPECULATION_ERROR_CODES {
+            return Err(SpeculationWireError("too many speculation error codes"));
+        }
+        Ok(Self(codes))
+    }
+}
+
+impl<'de> Deserialize<'de> for SpeculationErrorCodes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::try_from(Vec::<SpeculationErrorCode>::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Raw-free validation failures for the private speculation wire DTOs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeculationWireError(&'static str);
+
+impl fmt::Display for SpeculationWireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SpeculationWireError {}
+
+/// Canonical base64 wire representation of one exact Unix path.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpeculationUnixPath(Vec<u8>);
+
+#[allow(dead_code)]
+impl SpeculationUnixPath {
+    pub fn from_path(path: &Path) -> Result<Self, SpeculationWireError> {
+        Self::from_bytes(path.as_os_str().as_bytes().to_vec())
+    }
+
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, SpeculationWireError> {
+        if bytes.is_empty() {
+            return Err(SpeculationWireError("speculation_empty_path"));
+        }
+        if bytes.len() > MAX_SPECULATION_PATH_BYTES {
+            return Err(SpeculationWireError("speculation_path_too_long"));
+        }
+        if bytes.contains(&0) {
+            return Err(SpeculationWireError("speculation_interior_nul"));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        PathBuf::from(OsString::from_vec(self.0.clone()))
+    }
+}
+
+impl fmt::Debug for SpeculationUnixPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpeculationUnixPath")
+            .field("byte_len", &self.0.len())
+            .finish()
+    }
+}
+
+impl Serialize for SpeculationUnixPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&send_data_serde::encode_base64(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for SpeculationUnixPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = decode_canonical_speculation_base64(&encoded, MAX_SPECULATION_PATH_BYTES)
+            .map_err(|()| serde::de::Error::custom("invalid speculation path encoding"))?;
+        Self::from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded exact Unix argv; elements are canonical padded base64 strings.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpeculationArgv(Vec<Vec<u8>>);
+
+#[allow(dead_code)]
+impl SpeculationArgv {
+    pub fn from_os_strings(values: Vec<OsString>) -> Result<Self, SpeculationWireError> {
+        if values.is_empty() {
+            return Err(SpeculationWireError("speculation_empty_argv"));
+        }
+        if values.len() > MAX_SPECULATION_ARGV_ENTRIES {
+            return Err(SpeculationWireError("speculation_too_many_arguments"));
+        }
+        let mut arguments = Vec::with_capacity(values.len().min(MAX_SPECULATION_ARGV_ENTRIES));
+        let mut total_bytes = 0_usize;
+        for value in values {
+            let bytes = value.as_bytes().to_vec();
+            validate_speculation_argument(&bytes)?;
+            total_bytes = add_speculation_argument_bytes(total_bytes, bytes.len())?;
+            arguments.push(bytes);
+        }
+        Ok(Self(arguments))
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+
+    pub fn to_os_strings(&self) -> Vec<OsString> {
+        self.0.iter().cloned().map(OsString::from_vec).collect()
+    }
+}
+
+impl fmt::Debug for SpeculationArgv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total_bytes = self.0.iter().map(Vec::len).sum::<usize>();
+        formatter
+            .debug_struct("SpeculationArgv")
+            .field("argument_count", &self.0.len())
+            .field("total_bytes", &total_bytes)
+            .finish()
+    }
+}
+
+impl Serialize for SpeculationArgv {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq as _;
+
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for argument in &self.0 {
+            sequence.serialize_element(&send_data_serde::encode_base64(argument))?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SpeculationArgv {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ArgvVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ArgvVisitor {
+            type Value = SpeculationArgv;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("bounded canonical speculation argv")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut arguments = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or(0)
+                        .min(MAX_SPECULATION_ARGV_ENTRIES),
+                );
+                let mut total_bytes = 0_usize;
+                while let Some(encoded) = sequence.next_element::<String>()? {
+                    if arguments.len() >= MAX_SPECULATION_ARGV_ENTRIES {
+                        return Err(serde::de::Error::custom(SpeculationWireError(
+                            "speculation_too_many_arguments",
+                        )));
+                    }
+                    let argument =
+                        decode_canonical_speculation_base64(&encoded, MAX_SPECULATION_ARG_BYTES)
+                            .map_err(|()| {
+                                serde::de::Error::custom("invalid speculation argument encoding")
+                            })?;
+                    validate_speculation_argument(&argument).map_err(serde::de::Error::custom)?;
+                    total_bytes = add_speculation_argument_bytes(total_bytes, argument.len())
+                        .map_err(serde::de::Error::custom)?;
+                    arguments.push(argument);
+                }
+                if arguments.is_empty() {
+                    return Err(serde::de::Error::custom(SpeculationWireError(
+                        "speculation_empty_argv",
+                    )));
+                }
+                Ok(SpeculationArgv(arguments))
+            }
+        }
+
+        deserializer.deserialize_seq(ArgvVisitor)
+    }
+}
+
+fn validate_speculation_argument(bytes: &[u8]) -> Result<(), SpeculationWireError> {
+    if bytes.len() > MAX_SPECULATION_ARG_BYTES {
+        return Err(SpeculationWireError("speculation_argument_too_long"));
+    }
+    if bytes.contains(&0) {
+        return Err(SpeculationWireError("speculation_interior_nul"));
+    }
+    Ok(())
+}
+
+fn add_speculation_argument_bytes(
+    total: usize,
+    argument: usize,
+) -> Result<usize, SpeculationWireError> {
+    total
+        .checked_add(argument)
+        .filter(|total| *total <= MAX_SPECULATION_ARGV_BYTES)
+        .ok_or(SpeculationWireError("speculation_argv_too_large"))
+}
+
+fn decode_canonical_speculation_base64(value: &str, max_bytes: usize) -> Result<Vec<u8>, ()> {
+    if !value.is_ascii() || value.len() % 4 != 0 || value.len() > max_bytes.div_ceil(3) * 4 {
+        return Err(());
+    }
+    let decoded = send_data_serde::decode_base64(value).map_err(|_| ())?;
+    if decoded.len() > max_bytes || send_data_serde::encode_base64(&decoded) != value {
+        return Err(());
+    }
+    Ok(decoded)
+}
+
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationPrepareRequest {
+    source: SpeculationUnixPath,
+    candidates: [SpeculationUnixPath; 2],
+    ledger_root: SpeculationUnixPath,
+    cgroup_root: SpeculationUnixPath,
+    #[serde(deserialize_with = "deserialize_speculation_timeout")]
+    timeout_ms: u64,
+    argv: SpeculationArgv,
+}
+
+#[allow(dead_code)]
+impl SpeculationPrepareRequest {
+    pub fn new(
+        source: SpeculationUnixPath,
+        candidates: [SpeculationUnixPath; 2],
+        ledger_root: SpeculationUnixPath,
+        cgroup_root: SpeculationUnixPath,
+        timeout_ms: u64,
+        argv: SpeculationArgv,
+    ) -> Result<Self, SpeculationWireError> {
+        if !(MIN_SPECULATION_TIMEOUT_MS..=MAX_SPECULATION_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(SpeculationWireError("speculation_timeout_out_of_range"));
+        }
+        Ok(Self {
+            source,
+            candidates,
+            ledger_root,
+            cgroup_root,
+            timeout_ms,
+            argv,
+        })
+    }
+
+    pub fn source(&self) -> &SpeculationUnixPath {
+        &self.source
+    }
+
+    pub fn candidates(&self) -> &[SpeculationUnixPath; 2] {
+        &self.candidates
+    }
+
+    pub fn ledger_root(&self) -> &SpeculationUnixPath {
+        &self.ledger_root
+    }
+
+    pub fn cgroup_root(&self) -> &SpeculationUnixPath {
+        &self.cgroup_root
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    pub fn argv(&self) -> &SpeculationArgv {
+        &self.argv
+    }
+}
+
+impl fmt::Debug for SpeculationPrepareRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpeculationPrepareRequest")
+            .field("source", &self.source)
+            .field("candidates", &self.candidates)
+            .field("ledger_root", &self.ledger_root)
+            .field("cgroup_root", &self.cgroup_root)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("argv", &self.argv)
+            .finish()
+    }
+}
+
+fn deserialize_speculation_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let timeout_ms = u64::deserialize(deserializer)?;
+    if !(MIN_SPECULATION_TIMEOUT_MS..=MAX_SPECULATION_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(serde::de::Error::custom("speculation_timeout_out_of_range"));
+    }
+    Ok(timeout_ms)
+}
+
+macro_rules! speculation_identity_request {
+    ($name:ident) => {
+        #[allow(dead_code)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub tournament_uuid: uuid::Uuid,
+            pub daemon_instance_uuid: uuid::Uuid,
+            pub generation: u64,
+        }
+    };
+}
+
+speculation_identity_request!(SpeculationArmRequest);
+speculation_identity_request!(SpeculationStatusRequest);
+speculation_identity_request!(SpeculationFinalizeRequest);
+speculation_identity_request!(SpeculationRollbackRequest);
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SpeculationRequest {
+    Prepare(SpeculationPrepareRequest),
+    Arm(SpeculationArmRequest),
+    Status(SpeculationStatusRequest),
+    Finalize(SpeculationFinalizeRequest),
+    Rollback(SpeculationRollbackRequest),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationRequestEnvelope {
+    #[serde(deserialize_with = "deserialize_speculation_protocol_version")]
+    protocol_version: u32,
+    request: SpeculationRequest,
+}
+
+#[allow(dead_code)]
+impl SpeculationRequestEnvelope {
+    pub fn new(request: SpeculationRequest) -> Self {
+        Self {
+            protocol_version: SPECULATION_PROTOCOL_VERSION,
+            request,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn request(&self) -> &SpeculationRequest {
+        &self.request
+    }
+
+    pub fn into_request(self) -> SpeculationRequest {
+        self.request
+    }
+}
+
+impl fmt::Debug for SpeculationRequestEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpeculationRequestEnvelope")
+            .field("protocol_version", &self.protocol_version)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+fn deserialize_speculation_protocol_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version != SPECULATION_PROTOCOL_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported speculation protocol version",
+        ));
+    }
+    Ok(version)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationExitCategory {
+    ExitedZero,
+    ExitedNonzero,
+    Signaled,
+    SpawnFailed,
+    OutputLimitExceeded,
+    EvidenceIncomplete,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculationScoreField {
+    EligibilityDescending,
+    ExitSuccessDescending,
+    ElapsedNsAscending,
+    OutputBytesAscending,
+    InputIndexAscending,
+}
+
+#[allow(dead_code)]
+pub const SPECULATION_SCORE_ORDER: [SpeculationScoreField; 5] = [
+    SpeculationScoreField::EligibilityDescending,
+    SpeculationScoreField::ExitSuccessDescending,
+    SpeculationScoreField::ElapsedNsAscending,
+    SpeculationScoreField::OutputBytesAscending,
+    SpeculationScoreField::InputIndexAscending,
+];
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationCleanupStatus {
+    pub runner_ack: bool,
+    pub bwrap_reaped: bool,
+    pub sync_eof: bool,
+    pub cgroup_empty: bool,
+    pub managed_tombstone: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationCandidateStatus {
+    pub candidate_uuid: uuid::Uuid,
+    pub index: u8,
+    pub ready: bool,
+    pub ready_elapsed_ns: Option<u64>,
+    pub go_received: bool,
+    pub go_received_elapsed_ns: Option<u64>,
+    pub result_accepted: bool,
+    pub exit_success: Option<bool>,
+    pub exit_category: Option<SpeculationExitCategory>,
+    pub elapsed_ns: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub eligible: bool,
+    pub cleanup: SpeculationCleanupStatus,
+}
+
+/// Exact-field, raw-free public status/result contract for speculation.
+///
+/// This allowlist intentionally has no command, environment, raw output,
+/// filesystem path, process identifier, socket/control, credential, or host
+/// cgroup locator field.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationStatus {
+    pub schema_version: SpeculationSchemaVersion,
+    pub tournament_uuid: uuid::Uuid,
+    pub daemon_instance_uuid: uuid::Uuid,
+    pub phase: SpeculationPhase,
+    pub generation: u64,
+    pub lease_deadline_unix_ms: u64,
+    pub reason_code: Option<SpeculationReasonCode>,
+    pub candidates: [SpeculationCandidateStatus; 2],
+    pub fixed_score_order: [SpeculationScoreField; 5],
+    pub selected_index: Option<u8>,
+    pub rollback_required: bool,
+    pub error_codes: SpeculationErrorCodes,
+}
+
+#[allow(dead_code)]
+impl SpeculationStatus {
+    pub fn is_terminal(&self) -> bool {
+        self.phase.is_terminal()
+    }
+
+    pub fn permits_finalize(&self) -> bool {
+        self.phase == SpeculationPhase::PendingFinalize && !self.rollback_required
+    }
+}
+
+macro_rules! speculation_status_response {
+    ($name:ident) => {
+        #[allow(dead_code)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub status: SpeculationStatus,
+        }
+    };
+}
+
+speculation_status_response!(SpeculationPrepareResponse);
+speculation_status_response!(SpeculationArmResponse);
+speculation_status_response!(SpeculationStatusResponse);
+speculation_status_response!(SpeculationFinalizeResponse);
+speculation_status_response!(SpeculationRollbackResponse);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -482,6 +1163,7 @@ pub struct WaitContainsResult {
 pub enum Request {
     Ping,
     Status,
+    Speculation(SpeculationRequestEnvelope),
     New {
         name: Option<String>,
         command: Option<String>,
@@ -930,11 +1612,508 @@ mod tests {
     use super::{
         CapabilityAction, CapabilityToken, ExitEvidenceState, ExitListScope, ExitOutcomeState,
         InstrumentSnapshot, MAX_CAPABILITY_INPUT_BYTES, MAX_METADATA_JOURNAL_ENTRIES,
-        MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataJournalEntry,
-        MetadataOperation, MetadataPurgeAggregate, MetadataValue, RecentSessionExit, Request,
-        SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
-        StatusTheme,
+        MAX_RECENT_EXITS_LIMIT, MAX_SEND_DATA_BYTES, MAX_SPECULATION_ARG_BYTES,
+        MAX_SPECULATION_ARGV_BYTES, MAX_SPECULATION_ARGV_ENTRIES, MAX_SPECULATION_ERROR_CODES,
+        MAX_SPECULATION_PATH_BYTES, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
+        MetadataPurgeAggregate, MetadataValue, PROTOCOL_VERSION, RecentSessionExit, Request,
+        SPECULATION_PROTOCOL_VERSION, SPECULATION_SCORE_ORDER, SensitiveCapabilityRequest,
+        SessionExitTrigger, SessionInfo, SessionLifecycleState, SpeculationArgv,
+        SpeculationArmRequest, SpeculationArmResponse, SpeculationCandidateStatus,
+        SpeculationCleanupStatus, SpeculationErrorCode, SpeculationErrorCodes,
+        SpeculationExitCategory, SpeculationFinalizeRequest, SpeculationFinalizeResponse,
+        SpeculationPhase, SpeculationPrepareRequest, SpeculationPrepareResponse,
+        SpeculationReasonCode, SpeculationRequest, SpeculationRequestEnvelope,
+        SpeculationRollbackRequest, SpeculationRollbackResponse, SpeculationSchemaVersion,
+        SpeculationStatus, SpeculationStatusRequest, SpeculationStatusResponse,
+        SpeculationUnixPath, StatusTheme,
     };
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn sample_speculation_status() -> SpeculationStatus {
+        SpeculationStatus {
+            schema_version: SpeculationSchemaVersion::V1,
+            tournament_uuid: uuid::Uuid::nil(),
+            daemon_instance_uuid: uuid::Uuid::nil(),
+            phase: SpeculationPhase::PendingFinalize,
+            generation: 7,
+            lease_deadline_unix_ms: 42,
+            reason_code: Some(SpeculationReasonCode::PendingFinalizeLease),
+            candidates: [
+                SpeculationCandidateStatus {
+                    candidate_uuid: uuid::Uuid::nil(),
+                    index: 0,
+                    ready: true,
+                    ready_elapsed_ns: Some(1),
+                    go_received: true,
+                    go_received_elapsed_ns: Some(2),
+                    result_accepted: true,
+                    exit_success: Some(true),
+                    exit_category: Some(SpeculationExitCategory::ExitedZero),
+                    elapsed_ns: Some(9),
+                    output_bytes: Some(10),
+                    eligible: true,
+                    cleanup: SpeculationCleanupStatus::default(),
+                },
+                SpeculationCandidateStatus {
+                    candidate_uuid: uuid::Uuid::nil(),
+                    index: 1,
+                    ready: true,
+                    ready_elapsed_ns: Some(1),
+                    go_received: true,
+                    go_received_elapsed_ns: Some(2),
+                    result_accepted: true,
+                    exit_success: Some(false),
+                    exit_category: Some(SpeculationExitCategory::ExitedNonzero),
+                    elapsed_ns: Some(8),
+                    output_bytes: Some(9),
+                    eligible: true,
+                    cleanup: SpeculationCleanupStatus::default(),
+                },
+            ],
+            fixed_score_order: SPECULATION_SCORE_ORDER,
+            selected_index: Some(0),
+            rollback_required: false,
+            error_codes: SpeculationErrorCode::Unsupported.into(),
+        }
+    }
+
+    #[test]
+    fn speculation_status_is_strict_raw_free_and_has_exact_keys() {
+        let status = sample_speculation_status();
+
+        assert_eq!(PROTOCOL_VERSION, SPECULATION_PROTOCOL_VERSION);
+        assert_eq!(SPECULATION_PROTOCOL_VERSION, 9);
+        let value = serde_json::to_value(&status).expect("serialize speculation status");
+        let object = value.as_object().expect("status is an object");
+        assert_eq!(object["phase"], "pending_finalize");
+        assert_eq!(object["schema_version"], "lterm.speculation.status.v1");
+        assert_eq!(object["reason_code"], "pending_finalize_lease");
+        assert_eq!(
+            object["fixed_score_order"],
+            serde_json::json!([
+                "eligibility_descending",
+                "exit_success_descending",
+                "elapsed_ns_ascending",
+                "output_bytes_ascending",
+                "input_index_ascending"
+            ])
+        );
+        let keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "candidates",
+                "daemon_instance_uuid",
+                "error_codes",
+                "fixed_score_order",
+                "generation",
+                "lease_deadline_unix_ms",
+                "phase",
+                "reason_code",
+                "rollback_required",
+                "schema_version",
+                "selected_index",
+                "tournament_uuid",
+            ]
+        );
+        let candidate_keys = object["candidates"][0]
+            .as_object()
+            .expect("candidate is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidate_keys,
+            [
+                "candidate_uuid",
+                "cleanup",
+                "elapsed_ns",
+                "eligible",
+                "exit_category",
+                "exit_success",
+                "go_received",
+                "go_received_elapsed_ns",
+                "index",
+                "output_bytes",
+                "ready",
+                "ready_elapsed_ns",
+                "result_accepted",
+            ]
+        );
+        let cleanup_keys = object["candidates"][0]["cleanup"]
+            .as_object()
+            .expect("cleanup is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cleanup_keys,
+            [
+                "bwrap_reaped",
+                "cgroup_empty",
+                "managed_tombstone",
+                "runner_ack",
+                "sync_eof",
+            ]
+        );
+        let encoded = serde_json::to_string(&status).expect("serialize speculation status");
+        for prohibited in [
+            "argv",
+            "command",
+            "environment",
+            "output_raw",
+            "path",
+            "pid",
+            "socket",
+            "credential",
+            "cgroup_root",
+        ] {
+            assert!(!encoded.contains(prohibited), "leaked key {prohibited}");
+        }
+
+        let mut with_unknown = value;
+        with_unknown
+            .as_object_mut()
+            .expect("status object")
+            .insert("unknown".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<SpeculationStatus>(with_unknown).is_err());
+
+        let mut candidate_unknown = serde_json::to_value(&status).expect("serialize status");
+        candidate_unknown["candidates"][0]
+            .as_object_mut()
+            .expect("candidate object")
+            .insert(
+                "raw_output".to_string(),
+                serde_json::Value::String("secret".into()),
+            );
+        assert!(serde_json::from_value::<SpeculationStatus>(candidate_unknown).is_err());
+
+        let mut cleanup_unknown = serde_json::to_value(&status).expect("serialize status");
+        cleanup_unknown["candidates"][0]["cleanup"]
+            .as_object_mut()
+            .expect("cleanup object")
+            .insert("pid".to_string(), serde_json::Value::from(1));
+        assert!(serde_json::from_value::<SpeculationStatus>(cleanup_unknown).is_err());
+
+        let mut unknown_phase = serde_json::to_value(&status).expect("serialize status");
+        unknown_phase["phase"] = serde_json::Value::String("future_phase".into());
+        assert!(serde_json::from_value::<SpeculationStatus>(unknown_phase).is_err());
+    }
+
+    fn wire_path(path: &[u8]) -> SpeculationUnixPath {
+        SpeculationUnixPath::from_path(Path::new(OsStr::from_bytes(path)))
+            .expect("valid bounded Unix path")
+    }
+
+    fn wire_argv(argv: &[&[u8]]) -> SpeculationArgv {
+        SpeculationArgv::from_os_strings(
+            argv.iter()
+                .map(|arg| OsString::from(OsStr::from_bytes(arg)))
+                .collect(),
+        )
+        .expect("valid bounded argv")
+    }
+
+    fn prepare_request() -> Request {
+        Request::Speculation(SpeculationRequestEnvelope::new(
+            SpeculationRequest::Prepare(
+                SpeculationPrepareRequest::new(
+                    wire_path(b"/source"),
+                    [wire_path(b"/left"), wire_path(b"/right")],
+                    wire_path(b"/ledger"),
+                    wire_path(b"/sys/fs/cgroup/delegated"),
+                    60_000,
+                    wire_argv(&[b"/usr/bin/tool", b"--exact"]),
+                )
+                .expect("valid prepare request"),
+            ),
+        ))
+    }
+
+    #[test]
+    fn speculation_wire_requests_have_exact_nested_keys_and_reject_unknown_fields() {
+        let prepare = serde_json::to_value(prepare_request()).expect("serialize prepare request");
+        assert_eq!(
+            prepare
+                .as_object()
+                .expect("outer object")
+                .keys()
+                .collect::<Vec<_>>(),
+            ["protocol_version", "request", "type"]
+        );
+        assert_eq!(prepare["protocol_version"], SPECULATION_PROTOCOL_VERSION);
+        assert_eq!(
+            prepare["request"]
+                .as_object()
+                .expect("request object")
+                .keys()
+                .collect::<Vec<_>>(),
+            ["action", "body"]
+        );
+        assert_eq!(prepare["request"]["action"], "prepare");
+        assert_eq!(
+            prepare["request"]["body"]
+                .as_object()
+                .expect("prepare body")
+                .keys()
+                .collect::<Vec<_>>(),
+            [
+                "argv",
+                "candidates",
+                "cgroup_root",
+                "ledger_root",
+                "source",
+                "timeout_ms",
+            ]
+        );
+
+        let identity = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2), 3);
+        let requests = [
+            SpeculationRequest::Arm(SpeculationArmRequest {
+                tournament_uuid: identity.0,
+                daemon_instance_uuid: identity.1,
+                generation: identity.2,
+            }),
+            SpeculationRequest::Status(SpeculationStatusRequest {
+                tournament_uuid: identity.0,
+                daemon_instance_uuid: identity.1,
+                generation: identity.2,
+            }),
+            SpeculationRequest::Finalize(SpeculationFinalizeRequest {
+                tournament_uuid: identity.0,
+                daemon_instance_uuid: identity.1,
+                generation: identity.2,
+            }),
+            SpeculationRequest::Rollback(SpeculationRollbackRequest {
+                tournament_uuid: identity.0,
+                daemon_instance_uuid: identity.1,
+                generation: identity.2,
+            }),
+        ];
+        for request in requests {
+            let value = serde_json::to_value(Request::Speculation(
+                SpeculationRequestEnvelope::new(request),
+            ))
+            .expect("serialize identity request");
+            assert_eq!(
+                value["request"]["body"]
+                    .as_object()
+                    .expect("identity body")
+                    .keys()
+                    .collect::<Vec<_>>(),
+                ["daemon_instance_uuid", "generation", "tournament_uuid"]
+            );
+        }
+
+        let mut unknown_outer = prepare.clone();
+        unknown_outer["raw_path"] = serde_json::Value::String("secret".into());
+        assert!(serde_json::from_value::<Request>(unknown_outer).is_err());
+
+        let mut unknown_action = prepare.clone();
+        unknown_action["request"]["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<Request>(unknown_action).is_err());
+
+        let mut unknown_body = prepare;
+        unknown_body["request"]["body"]["environment"] = serde_json::Value::String("secret".into());
+        assert!(serde_json::from_value::<Request>(unknown_body).is_err());
+    }
+
+    #[test]
+    fn speculation_wire_round_trips_non_utf8_paths_and_exact_argv_without_debug_leakage() {
+        let source = b"/tmp/G007_RAW_SOURCE_MARKER-\xff";
+        let left = b"/tmp/G007_RAW_LEFT_MARKER-\xfe";
+        let argv = [
+            b"/usr/bin/G007_RAW_TOOL_MARKER".as_slice(),
+            b"G007_RAW_ARG_MARKER-\xfd".as_slice(),
+            b"".as_slice(),
+        ];
+        let request = Request::Speculation(SpeculationRequestEnvelope::new(
+            SpeculationRequest::Prepare(
+                SpeculationPrepareRequest::new(
+                    wire_path(source),
+                    [wire_path(left), wire_path(b"/tmp/right")],
+                    wire_path(b"/tmp/ledger"),
+                    wire_path(b"/sys/fs/cgroup/delegated"),
+                    1_000,
+                    wire_argv(&argv),
+                )
+                .expect("valid non-UTF-8 request"),
+            ),
+        ));
+        let encoded = serde_json::to_vec(&request).expect("serialize request");
+        let decoded: Request = serde_json::from_slice(&encoded).expect("deserialize request");
+        let Request::Speculation(envelope) = decoded else {
+            panic!("expected speculation request");
+        };
+        let SpeculationRequest::Prepare(decoded) = envelope.request() else {
+            panic!("expected prepare request");
+        };
+        assert_eq!(decoded.source().as_bytes(), source);
+        assert_eq!(decoded.candidates()[0].as_bytes(), left);
+        assert_eq!(decoded.argv().iter().collect::<Vec<_>>(), argv);
+
+        let debug = format!("{request:?}");
+        for secret in [
+            "G007_RAW_SOURCE_MARKER",
+            "G007_RAW_LEFT_MARKER",
+            "G007_RAW_TOOL_MARKER",
+            "G007_RAW_ARG_MARKER",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret:?}: {debug}");
+        }
+    }
+
+    #[test]
+    fn speculation_wire_rejects_bounds_wrong_cardinality_and_noncanonical_bytes() {
+        let base = serde_json::to_value(prepare_request()).expect("serialize request");
+        for candidates in [
+            serde_json::json!(["L2xlZnQ="]),
+            serde_json::json!(["L2xlZnQ=", "L3JpZ2h0", "L2V4dHJh"]),
+        ] {
+            let mut value = base.clone();
+            value["request"]["body"]["candidates"] = candidates;
+            assert!(serde_json::from_value::<Request>(value).is_err());
+        }
+
+        for timeout_ms in [999, 3_600_001] {
+            let mut value = base.clone();
+            value["request"]["body"]["timeout_ms"] = timeout_ms.into();
+            assert!(serde_json::from_value::<Request>(value).is_err());
+        }
+
+        for invalid in [
+            "L3NvdXJjZQ",
+            "L3NvdXJjZQ===",
+            "L3NvdXJjZB==",
+            "L3gAeQ==",
+            "****",
+        ] {
+            let mut value = base.clone();
+            value["request"]["body"]["source"] = invalid.into();
+            assert!(
+                serde_json::from_value::<Request>(value).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let mut oversized_path = base.clone();
+        oversized_path["request"]["body"]["source"] =
+            super::send_data_serde::encode_base64(&vec![b'x'; MAX_SPECULATION_PATH_BYTES + 1])
+                .into();
+        assert!(serde_json::from_value::<Request>(oversized_path).is_err());
+
+        let mut too_many_args = base.clone();
+        too_many_args["request"]["body"]["argv"] = serde_json::Value::Array(
+            (0..=MAX_SPECULATION_ARGV_ENTRIES)
+                .map(|_| serde_json::Value::String("YQ==".into()))
+                .collect(),
+        );
+        assert!(serde_json::from_value::<Request>(too_many_args).is_err());
+
+        let mut oversized_arg = base.clone();
+        oversized_arg["request"]["body"]["argv"] = serde_json::json!([
+            super::send_data_serde::encode_base64(&vec![b'a'; MAX_SPECULATION_ARG_BYTES + 1])
+        ]);
+        assert!(serde_json::from_value::<Request>(oversized_arg).is_err());
+
+        let mut oversized_argv = base.clone();
+        oversized_argv["request"]["body"]["argv"] = serde_json::Value::Array(
+            (0..=(MAX_SPECULATION_ARGV_BYTES / MAX_SPECULATION_ARG_BYTES))
+                .map(|_| {
+                    serde_json::Value::String(super::send_data_serde::encode_base64(&vec![
+                        b'a';
+                        MAX_SPECULATION_ARG_BYTES
+                    ]))
+                })
+                .collect(),
+        );
+        assert!(serde_json::from_value::<Request>(oversized_argv).is_err());
+
+        let mut old_protocol = base;
+        old_protocol["protocol_version"] = 8.into();
+        assert!(serde_json::from_value::<Request>(old_protocol).is_err());
+    }
+
+    #[test]
+    fn speculation_wire_responses_are_strict_and_status_errors_are_bounded() {
+        let mut status = sample_speculation_status();
+        status.error_codes = SpeculationErrorCodes::try_from(vec![
+            SpeculationErrorCode::Unsupported;
+            MAX_SPECULATION_ERROR_CODES
+        ])
+        .expect("the exact error-code cap is valid");
+        assert!(
+            status
+                .error_codes
+                .push(SpeculationErrorCode::InvalidRequest)
+                .is_err(),
+            "the public collection cannot be mutated past its wire cap"
+        );
+        assert_eq!(
+            status.error_codes.as_slice().len(),
+            MAX_SPECULATION_ERROR_CODES
+        );
+
+        let response_boundary = super::Response::ok(SpeculationStatusResponse {
+            status: status.clone(),
+        });
+        assert!(response_boundary.ok);
+        assert_eq!(
+            response_boundary.result.as_ref().expect("response result")["status"]["error_codes"]
+                .as_array()
+                .expect("error codes array")
+                .len(),
+            MAX_SPECULATION_ERROR_CODES
+        );
+        assert!(
+            SpeculationErrorCodes::try_from(vec![
+                SpeculationErrorCode::Unsupported;
+                MAX_SPECULATION_ERROR_CODES + 1
+            ])
+            .is_err(),
+            "an oversized in-memory collection must not be constructible"
+        );
+
+        let responses = [
+            serde_json::to_value(SpeculationPrepareResponse {
+                status: status.clone(),
+            })
+            .expect("prepare response"),
+            serde_json::to_value(SpeculationArmResponse {
+                status: status.clone(),
+            })
+            .expect("arm response"),
+            serde_json::to_value(SpeculationStatusResponse {
+                status: status.clone(),
+            })
+            .expect("status response"),
+            serde_json::to_value(SpeculationFinalizeResponse {
+                status: status.clone(),
+            })
+            .expect("finalize response"),
+            serde_json::to_value(SpeculationRollbackResponse { status })
+                .expect("rollback response"),
+        ];
+        assert!(responses.iter().all(|response| {
+            response
+                .as_object()
+                .is_some_and(|object| object.keys().collect::<Vec<_>>() == ["status"])
+        }));
+
+        let mut unknown = responses[0].clone();
+        unknown["raw"] = serde_json::Value::String("secret".into());
+        assert!(serde_json::from_value::<SpeculationPrepareResponse>(unknown).is_err());
+
+        let mut too_many_errors = responses[1].clone();
+        too_many_errors["status"]["error_codes"] = serde_json::Value::Array(
+            (0..=MAX_SPECULATION_ERROR_CODES)
+                .map(|_| serde_json::Value::String("unsupported".into()))
+                .collect(),
+        );
+        assert!(serde_json::from_value::<SpeculationArmResponse>(too_many_errors).is_err());
+    }
 
     #[test]
     fn status_theme_parse_aliases_and_round_trips_canonical_names() {

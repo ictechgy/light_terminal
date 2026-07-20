@@ -5,6 +5,19 @@ mod paths;
 mod protocol;
 mod sanitize;
 mod server;
+mod speculation;
+#[allow(dead_code)]
+mod speculation_fs;
+#[allow(dead_code)]
+mod speculation_ledger;
+#[allow(dead_code)]
+mod speculation_linux;
+#[allow(dead_code)]
+mod speculation_registry;
+#[allow(dead_code)]
+mod speculation_runner;
+#[allow(dead_code)]
+mod speculation_service;
 mod tmux_compat;
 
 #[cfg(test)]
@@ -296,6 +309,11 @@ enum Commands {
     Capability {
         #[command(subcommand)]
         command: CapabilityCommands,
+    },
+    /// Run and decide an exact-two isolated speculative tournament.
+    Speculate {
+        #[command(subcommand)]
+        command: SpeculationCommands,
     },
     /// Capture scrollback from a session or pane.
     #[command(name = "logs", visible_alias = "capture")]
@@ -708,6 +726,52 @@ enum CapabilityCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum SpeculationCommands {
+    /// Prepare and run exactly two candidates with the same exact argv.
+    Run {
+        #[arg(long, value_name = "SOURCE")]
+        source: PathBuf,
+        #[arg(long, value_name = "WORKSPACE", action = clap::ArgAction::Append)]
+        candidate: Vec<PathBuf>,
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long, value_name = "DELEGATED_CGROUP_V2_DIR")]
+        cgroup_root: PathBuf,
+        #[arg(long, value_name = "DURATION", default_value = "10m", value_parser = parse_speculation_timeout_arg)]
+        timeout: Duration,
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<OsString>,
+    },
+    /// Read the current raw-free tournament status.
+    Status {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Seal the fixed-score winner without applying either workspace.
+    Finalize {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// Idempotently abort and clean up both candidates.
+    Rollback {
+        #[arg(long, value_name = "PRIVATE_DIR")]
+        ledger_root: PathBuf,
+        #[arg(long)]
+        tournament: Uuid,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MetadataCommands {
     /// Print the raw-free live metadata journal.
     History {
@@ -771,7 +835,15 @@ fn run() -> Result<()> {
     if launch_registry::dispatch_internal_test_driver()? {
         return Ok(());
     }
-    let cli = Cli::parse_from(expand_attach_short_flag(std::env::args_os()));
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if speculation_runner::dispatch_internal_speculation_mode(&arguments)? {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if speculation_linux::dispatch_internal_containment_test_driver(&arguments)? {
+        return Ok(());
+    }
+    let cli = parse_cli_from(arguments).unwrap_or_else(|error| error.exit());
     match cli.command {
         Commands::Daemon => server::serve_forever(),
         Commands::New {
@@ -1072,6 +1144,7 @@ fn run() -> Result<()> {
             }
             CapabilityCommands::Revoke { capability } => client::revoke_capability(&capability),
         },
+        Commands::Speculate { command } => dispatch_speculation(command),
         Commands::Logs { target, start, end } => {
             let output = if end.is_some() {
                 client::capture_range(&target, start, end)?
@@ -2839,6 +2912,97 @@ fn parse_wait_duration_arg(value: &str) -> std::result::Result<Duration, String>
     Ok(Duration::from_millis(millis))
 }
 
+fn parse_speculation_timeout_arg(value: &str) -> std::result::Result<Duration, String> {
+    let duration = parse_wait_duration_arg(value)?;
+    if duration < speculation::MIN_RUN_TIMEOUT {
+        return Err("speculation_timeout_below_minimum".to_string());
+    }
+    if duration > speculation::MAX_RUN_TIMEOUT {
+        return Err("speculation_timeout_above_maximum".to_string());
+    }
+    Ok(duration)
+}
+
+fn dispatch_speculation(command: SpeculationCommands) -> Result<()> {
+    let status = match command {
+        SpeculationCommands::Run {
+            source,
+            candidate,
+            ledger_root,
+            cgroup_root,
+            timeout,
+            command,
+        } => {
+            let candidates: [PathBuf; speculation::CANDIDATE_COUNT] = candidate
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("speculation_requires_exactly_two_candidates"))?;
+            client::speculate_run(
+                source,
+                candidates,
+                ledger_root,
+                cgroup_root,
+                timeout,
+                command,
+            )?
+        }
+        SpeculationCommands::Status {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_status(&ledger_root, tournament)?
+        }
+        SpeculationCommands::Finalize {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_finalize(&ledger_root, tournament)?
+        }
+        SpeculationCommands::Rollback {
+            ledger_root,
+            tournament,
+            json,
+        } => {
+            let _ = json;
+            client::speculate_rollback(&ledger_root, tournament)?
+        }
+    };
+    let stdout = std::io::stdout();
+    write_speculation_status(&mut stdout.lock(), &status)
+}
+
+fn write_speculation_status(
+    out: &mut impl Write,
+    status: &protocol::SpeculationStatus,
+) -> Result<()> {
+    serde_json::to_writer(&mut *out, status)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let cli = Cli::try_parse_from(expand_attach_short_flag(argv))?;
+    if let Commands::Speculate {
+        command: SpeculationCommands::Run { candidate, .. },
+    } = &cli.command
+        && candidate.len() != speculation::CANDIDATE_COUNT
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::WrongNumberOfValues,
+            "speculation_requires_exactly_two_candidates",
+        ));
+    }
+    Ok(cli)
+}
+
 fn parse_trace_max_bytes_arg(value: &str) -> std::result::Result<u64, String> {
     let value = value.trim();
     let bytes = value
@@ -3936,6 +4100,186 @@ fn validate_ssh_host(host: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculation_cli_requires_exact_two_candidates_and_bounded_timeout() {
+        let base = [
+            "lterm",
+            "speculate",
+            "run",
+            "--source",
+            "/source",
+            "--candidate",
+            "/left",
+            "--candidate",
+            "/right",
+            "--ledger-root",
+            "/ledger",
+            "--cgroup-root",
+            "/cgroup",
+        ];
+        let mut default_timeout = base.to_vec();
+        default_timeout.extend(["--", "true"]);
+        let parsed = parse_cli_from(default_timeout).expect("default timeout should parse");
+        let Commands::Speculate {
+            command: SpeculationCommands::Run {
+                candidate, timeout, ..
+            },
+        } = parsed.command
+        else {
+            panic!("expected speculate run");
+        };
+        assert_eq!(candidate, [PathBuf::from("/left"), PathBuf::from("/right")]);
+        assert_eq!(timeout, speculation::DEFAULT_RUN_TIMEOUT);
+
+        let mut valid = base.to_vec();
+        valid.extend(["--timeout", "1s", "--", "printf", "%s", "raw"]);
+        assert!(parse_cli_from(valid).is_ok());
+
+        let mut missing_separator = base.to_vec();
+        missing_separator.push("true");
+        assert!(parse_cli_from(missing_separator).is_err());
+
+        let mut one = base.to_vec();
+        one.splice(7..9, std::iter::empty());
+        one.extend(["--", "true"]);
+        assert!(parse_cli_from(one).is_err());
+
+        let mut three = base.to_vec();
+        three.splice(9..9, ["--candidate", "/third"]);
+        three.extend(["--", "true"]);
+        assert!(parse_cli_from(three).is_err());
+
+        for timeout in ["999ms", "3600001ms"] {
+            let mut args = base.to_vec();
+            args.extend(["--timeout", timeout, "--", "true"]);
+            assert!(parse_cli_from(args).is_err(), "accepted {timeout}");
+        }
+        for timeout in ["1s", "1h"] {
+            let mut args = base.to_vec();
+            args.extend(["--timeout", timeout, "--", "true"]);
+            assert!(parse_cli_from(args).is_ok(), "rejected {timeout}");
+        }
+    }
+
+    #[test]
+    fn speculation_decision_commands_require_private_root_tournament_and_json() {
+        for subcommand in ["status", "finalize", "rollback"] {
+            assert!(
+                parse_cli_from([
+                    "lterm",
+                    "speculate",
+                    subcommand,
+                    "--ledger-root",
+                    "/ledger",
+                    "--tournament",
+                    "00000000-0000-0000-0000-000000000000",
+                    "--json",
+                ])
+                .is_ok(),
+                "{subcommand} should parse"
+            );
+            assert!(
+                parse_cli_from([
+                    "lterm",
+                    "speculate",
+                    subcommand,
+                    "--ledger-root",
+                    "/ledger",
+                    "--tournament",
+                    "00000000-0000-0000-0000-000000000000",
+                ])
+                .is_err(),
+                "{subcommand} must require --json"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speculation_cli_preserves_non_utf8_exact_argv() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let marker = OsString::from_vec(vec![b'f', 0x80, b'o']);
+        let args = vec![
+            OsString::from("lterm"),
+            OsString::from("speculate"),
+            OsString::from("run"),
+            OsString::from("--source"),
+            OsString::from("/source"),
+            OsString::from("--candidate"),
+            OsString::from("/left"),
+            OsString::from("--candidate"),
+            OsString::from("/right"),
+            OsString::from("--ledger-root"),
+            OsString::from("/ledger"),
+            OsString::from("--cgroup-root"),
+            OsString::from("/cgroup"),
+            OsString::from("--"),
+            OsString::from("command"),
+            marker.clone(),
+        ];
+        let cli = parse_cli_from(args).expect("speculation argv should parse");
+        let Commands::Speculate {
+            command: command @ SpeculationCommands::Run { .. },
+        } = cli.command
+        else {
+            panic!("expected speculate run");
+        };
+        let SpeculationCommands::Run { command: argv, .. } = &command else {
+            unreachable!();
+        };
+        assert_eq!(argv, &[OsString::from("command"), marker]);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn speculation_dispatch_is_unsupported_before_filesystem_or_socket_side_effects() {
+        let command = SpeculationCommands::Run {
+            source: PathBuf::from("/private/source-marker"),
+            candidate: vec![
+                PathBuf::from("/private/candidate-zero-marker"),
+                PathBuf::from("/private/candidate-one-marker"),
+            ],
+            ledger_root: PathBuf::from("/private/ledger-marker"),
+            cgroup_root: PathBuf::from("/private/cgroup-marker"),
+            timeout: Duration::from_secs(1),
+            command: vec![OsString::from("argv-marker")],
+        };
+        let error = dispatch_speculation(command).expect_err("non-Linux must fail closed");
+        assert_eq!(error.to_string(), "speculation_unsupported");
+        assert!(!error.to_string().contains("marker"));
+    }
+
+    #[test]
+    fn speculation_status_writer_emits_one_compact_json_line() {
+        let status: protocol::SpeculationStatus =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": "lterm.speculation.status.v1",
+                "tournament_uuid": Uuid::from_u128(1),
+                "daemon_instance_uuid": Uuid::from_u128(2),
+                "phase": "prepared",
+                "generation": 1,
+                "lease_deadline_unix_ms": 2,
+                "reason_code": "prepared_lease",
+                "candidates": [
+                    {"candidate_uuid": Uuid::from_u128(3), "index": 0, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": false, "bwrap_reaped": false, "sync_eof": false, "cgroup_empty": false, "managed_tombstone": false}},
+                    {"candidate_uuid": Uuid::from_u128(4), "index": 1, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": false, "bwrap_reaped": false, "sync_eof": false, "cgroup_empty": false, "managed_tombstone": false}}
+                ],
+                "fixed_score_order": ["eligibility_descending", "exit_success_descending", "elapsed_ns_ascending", "output_bytes_ascending", "input_index_ascending"],
+                "selected_index": null,
+                "rollback_required": false,
+                "error_codes": []
+            }))
+            .unwrap();
+        let mut output = Vec::new();
+        write_speculation_status(&mut output, &status).unwrap();
+        let mut expected = serde_json::to_vec(&status).unwrap();
+        expected.push(b'\n');
+        assert_eq!(output, expected);
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(!output.contains(&b' '));
+    }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
