@@ -8382,8 +8382,17 @@ fn stdin_input_state(fd: RawFd, timeout: Duration) -> Result<StdinInputState> {
     }
 }
 
+const FALLBACK_TERMINAL_SIZE: (u16, u16) = (80, 24);
+
+fn normalize_terminal_size(size: Option<(u16, u16)>) -> (u16, u16) {
+    match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => (cols, rows),
+        _ => FALLBACK_TERMINAL_SIZE,
+    }
+}
+
 pub fn terminal_size() -> (u16, u16) {
-    crossterm::terminal::size().unwrap_or((80, 24))
+    normalize_terminal_size(crossterm::terminal::size().ok())
 }
 
 pub fn terminal_cols() -> Option<u16> {
@@ -8468,11 +8477,12 @@ mod tests {
         join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
         matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
         mobile_transcript_grep_query, nested_known_agent_present_in_processes,
-        normal_attach_terminal_cleanup_bytes, observe_keyboard_protocol_sequences,
-        panic_terminal_cleanup_bytes, parse_status_command_bool, parse_status_command_interval,
-        parse_status_style, raw_attach_command_hint, read_attach_response_header,
-        read_private_capability_file, read_reconnect_state_best_effort_from_path,
-        read_reconnect_state_from_path, read_trace_jsonl_line, recent_exits_protocol_error,
+        normal_attach_terminal_cleanup_bytes, normalize_terminal_size,
+        observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
+        parse_status_command_bool, parse_status_command_interval, parse_status_style,
+        raw_attach_command_hint, read_attach_response_header, read_private_capability_file,
+        read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
+        read_trace_jsonl_line, recent_exits_protocol_error,
         remember_reconnect_target_best_effort_at_path, require_speculation_protocol_at,
         reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
         rpc_parse_error_preview, run_nested_agent_detection_loop, run_status_command,
@@ -9694,6 +9704,19 @@ mod tests {
             )
             .collect::<Vec<_>>();
         assert_eq!(actions, ["prepare", "arm", "status", "status"]);
+    }
+
+    #[test]
+    fn terminal_size_normalization_preserves_nonzero_sizes() {
+        assert_eq!(normalize_terminal_size(Some((80, 24))), (80, 24));
+        assert_eq!(normalize_terminal_size(Some((132, 43))), (132, 43));
+    }
+
+    #[test]
+    fn terminal_size_normalization_falls_back_for_missing_or_zero_components() {
+        for size in [None, Some((0, 0)), Some((0, 24)), Some((80, 0))] {
+            assert_eq!(normalize_terminal_size(size), (80, 24), "size={size:?}");
+        }
     }
 
     #[test]
