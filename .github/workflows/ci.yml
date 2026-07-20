@@ -29,6 +29,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           rustc --version
           cargo --version
       - name: Format check
@@ -43,10 +44,169 @@ jobs:
           python3 scripts/test_quad_brainstorming_manifest_summary.py
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Linux target checks
+        run: |
+          cargo check --locked --target x86_64-unknown-linux-gnu --tests
+          cargo check --locked --target aarch64-unknown-linux-gnu --tests
       - name: Tests
         run: cargo test --locked -- --test-threads=1
       - name: Release build
         run: cargo build --release --locked
+
+  g003-real-bwrap-cgroup:
+    name: g003-real-bwrap-cgroup
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install stable Rust, exact bubblewrap package, and targeted AppArmor policy
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            apparmor apparmor-profiles bubblewrap
+
+          profile_src=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          profile_dst=/etc/apparmor.d/bwrap-userns-restrict
+          test "$(dpkg-query --search "$profile_src")" = "apparmor-profiles: $profile_src"
+          test "$(readlink --canonicalize-existing "$profile_src")" = "$profile_src"
+          test "$(stat --format=%F "$profile_src")" = "regular file"
+          test "$(stat --format=%u "$profile_src")" = "0"
+          test "$(stat --format=%g "$profile_src")" = "0"
+          test "$((8#$(stat --format=%a "$profile_src") & 8#022))" = "0"
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+
+          sudo install --owner=root --group=root --mode=0644 \
+            "$profile_src" "$profile_dst"
+          test "$(sudo stat --format=%F "$profile_dst")" = "regular file"
+          test "$(sudo stat --format=%u:%g:%a "$profile_dst")" = "0:0:644"
+          sudo apparmor_parser --replace "$profile_dst"
+
+          test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+          sudo grep --fixed-strings --line-regexp --quiet \
+            'bwrap (enforce)' /sys/kernel/security/apparmor/profiles
+          sudo grep --fixed-strings --line-regexp --quiet \
+            'unpriv_bwrap (enforce)' /sys/kernel/security/apparmor/profiles
+          test "$(dpkg-query --search /usr/bin/bwrap)" = "bubblewrap: /usr/bin/bwrap"
+          test "$(stat --format=%F /usr/bin/bwrap)" = "regular file"
+          test "$(stat --format=%u /usr/bin/bwrap)" = "0"
+          test "$((8#$(stat --format=%a /usr/bin/bwrap) & 8#022))" = "0"
+          dpkg-query --show --showformat='bubblewrap=${Version}\n' bubblewrap
+          uname --kernel-release
+          rustc --version
+          cargo --version
+      - name: Run required real bwrap and cgroup Gate P
+        env:
+          LTERM_REQUIRE_REAL_BWRAP: "1"
+        run: |
+          set -euo pipefail
+          unit="lterm-g003-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          runner_subgroup="lterm-g003-runner"
+          gate_script="${RUNNER_TEMP}/lterm-g003-gate.sh"
+          cat >"$gate_script" <<'GATE_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          current_cgroup="$(awk -F: '$1 == "0" && $2 == "" { print $3 }' /proc/self/cgroup)"
+          case "$current_cgroup" in
+            */lterm-g003-runner) ;;
+            *)
+              echo "::error::required delegated cgroup subgroup is absent" >&2
+              exit 1
+              ;;
+          esac
+          delegated_relative="${current_cgroup%/lterm-g003-runner}"
+          export LTERM_G003_CGROUP_ROOT="/sys/fs/cgroup${delegated_relative}"
+          test -d "$LTERM_G003_CGROUP_ROOT"
+          test "$(stat --format=%u "$LTERM_G003_CGROUP_ROOT")" = "$(id -u)"
+
+          cleanup() {
+            main_status=$?
+            trap - EXIT
+            set +e
+            cleanup_status=0
+            shopt -s nullglob
+            fixtures=("$LTERM_G003_CGROUP_ROOT"/lterm-g003-*)
+            for fixture in "${fixtures[@]}"; do
+              if [[ "$(basename "$fixture")" == "lterm-g003-runner" ]]; then
+                continue
+              fi
+              if [[ -f "$fixture/cgroup.kill" ]]; then
+                printf '1\n' >"$fixture/cgroup.kill"
+                operation_status=$?
+                if (( operation_status != 0 )); then
+                  cleanup_status=$operation_status
+                fi
+              fi
+              for _ in {1..500}; do
+                populated=0
+                if [[ -r "$fixture/cgroup.events" ]]; then
+                  populated="$(awk '$1 == "populated" { print $2 }' "$fixture/cgroup.events")"
+                fi
+                if [[ "$populated" == "0" ]]; then
+                  break
+                fi
+                sleep 0.01
+              done
+              for directory in \
+                "$fixture/candidate-0/control" \
+                "$fixture/candidate-0/payload" \
+                "$fixture/candidate-1/control" \
+                "$fixture/candidate-1/payload" \
+                "$fixture/candidate-0" \
+                "$fixture/candidate-1" \
+                "$fixture"; do
+                if [[ -d "$directory" ]]; then
+                  rmdir "$directory" >/dev/null 2>&1
+                  operation_status=$?
+                  if (( operation_status != 0 )); then
+                    cleanup_status=$operation_status
+                  fi
+                fi
+              done
+            done
+            if (( main_status != 0 )); then
+              exit "$main_status"
+            fi
+            if (( cleanup_status != 0 )); then
+              echo "::error::delegated cgroup cleanup failed" >&2
+              exit "$cleanup_status"
+            fi
+            exit 0
+          }
+          trap cleanup EXIT
+
+          cargo test --locked --test g003_linux_feasibility \
+            g003_real_bwrap_cgroup_feasibility -- \
+            --exact --ignored --nocapture --test-threads=1
+          export LTERM_SPECULATION_CGROUP_ROOT="$LTERM_G003_CGROUP_ROOT"
+          cargo test --locked --test speculation_linux -- \
+            --nocapture --test-threads=1
+          GATE_SCRIPT
+          chmod 0700 "$gate_script"
+
+          sudo systemd-run \
+            --quiet \
+            --wait \
+            --pipe \
+            --collect \
+            --unit "$unit" \
+            --property Type=exec \
+            --property "User=$(id -u)" \
+            --property "Group=$(id -g)" \
+            --property "WorkingDirectory=${GITHUB_WORKSPACE}" \
+            --property Delegate=pids \
+            --property "DelegateSubgroup=${runner_subgroup}" \
+            --property Nice=-10 \
+            --property CPUWeight=10000 \
+            --setenv "HOME=${HOME}" \
+            --setenv "PATH=${PATH}" \
+            --setenv "LTERM_REQUIRE_REAL_BWRAP=${LTERM_REQUIRE_REAL_BWRAP}" \
+            /usr/bin/bash "$gate_script"
 
   cargo-audit:
     name: cargo-audit

@@ -5,9 +5,28 @@ use crate::protocol::{
     MAX_CAPABILITY_INPUT_BYTES, MAX_INPUT_CAPABILITY_BUDGET, MAX_RECENT_EXITS_LIMIT,
     MAX_SEND_DATA_BYTES, MetadataHistoryResult, MetadataPurgeResult, MetadataStepResult,
     PROTOCOL_VERSION, RecentSessionExit, Request, Response, SensitiveCapabilityRequest,
-    SessionInfo, SessionLifecycleState, StatusTheme, WaitContainsResult, WaitExitResult,
+    SessionInfo, SessionLifecycleState, SpeculationStatus, StatusTheme, WaitContainsResult,
+    WaitExitResult,
+};
+#[cfg(any(target_os = "linux", test))]
+use crate::protocol::{
+    SPECULATION_PROTOCOL_VERSION, SpeculationPhase, SpeculationRequest, SpeculationRequestEnvelope,
+};
+#[cfg(target_os = "linux")]
+use crate::protocol::{
+    SPECULATION_SCORE_ORDER, SpeculationArgv, SpeculationArmRequest, SpeculationArmResponse,
+    SpeculationFinalizeRequest, SpeculationFinalizeResponse, SpeculationPrepareRequest,
+    SpeculationPrepareResponse, SpeculationRollbackRequest, SpeculationRollbackResponse,
+    SpeculationStatusRequest, SpeculationStatusResponse, SpeculationUnixPath,
 };
 use crate::sanitize;
+#[cfg(any(target_os = "linux", test))]
+use crate::speculation_ledger::LedgerAction;
+#[cfg(target_os = "linux")]
+use crate::speculation_ledger::{
+    ClientLedger, ClientLedgerAuthority, ClientLedgerEntry, ClientLedgerRecord, ClientLedgerSchema,
+    ClientRootIdentities,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -34,6 +53,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RPC_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_SPECULATION_RESPONSE_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const SPECULATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RPC_PARSE_ERROR_PREVIEW_BYTES: usize = 4 * 1024;
 const ATTACH_RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
@@ -130,6 +153,26 @@ pub fn ensure_server() -> Result<()> {
         return Ok(());
     }
 
+    spawn_server_daemon()?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match rpc::<serde_json::Value>(&Request::Ping) {
+            Ok(_) => {
+                warn_daemon_version_mismatch();
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready. Run `lterm doctor` to inspect daemon state or `lterm shutdown && lterm list` to retry a clean start.")))
+}
+
+fn spawn_server_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let log = paths::log_path()?;
     rotate_log_if_large(&log)?;
@@ -155,22 +198,7 @@ pub fn ensure_server() -> Result<()> {
         });
     }
     daemon.spawn().context("spawn lterm daemon")?;
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        match rpc::<serde_json::Value>(&Request::Ping) {
-            Ok(_) => {
-                warn_daemon_version_mismatch();
-                return Ok(());
-            }
-            Err(err) => {
-                last_err = Some(err);
-                thread::sleep(Duration::from_millis(80));
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow!("daemon did not become ready. Run `lterm doctor` to inspect daemon state or `lterm shutdown && lterm list` to retry a clean start.")))
+    Ok(())
 }
 
 pub fn daemon_status() -> Result<DaemonStatus> {
@@ -283,6 +311,993 @@ fn rpc_parse_error_preview(bytes: &[u8]) -> String {
         ));
     }
     preview
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpeculationClientError {
+    Unsupported,
+    Unavailable,
+    CapacityExhausted,
+    InvalidRequest,
+    InvalidTransition,
+    StaleGeneration,
+    GenerationExhausted,
+    ContainmentUnavailable,
+    RollbackRequired,
+    DecisionUncertain,
+    EvidenceUnavailable,
+    ProtocolMismatch,
+    Transport,
+    TransportProtocol,
+    ResponseInvalid,
+    DaemonRejected,
+}
+
+impl SpeculationClientError {
+    #[allow(dead_code)]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unsupported => "speculation_unsupported",
+            Self::Unavailable => "speculation_unavailable",
+            Self::CapacityExhausted => "speculation_capacity_exhausted",
+            Self::InvalidRequest => "speculation_invalid_request",
+            Self::InvalidTransition => "speculation_invalid_transition",
+            Self::StaleGeneration => "speculation_stale_generation",
+            Self::GenerationExhausted => "speculation_generation_exhausted",
+            Self::ContainmentUnavailable => "speculation_containment_unavailable",
+            Self::RollbackRequired => "speculation_rollback_required",
+            Self::DecisionUncertain => "speculation_decision_uncertain",
+            Self::EvidenceUnavailable => "speculation_evidence_unavailable",
+            Self::ProtocolMismatch => "speculation_protocol_mismatch",
+            Self::Transport => "speculation_transport",
+            Self::TransportProtocol => "speculation_transport_protocol",
+            Self::ResponseInvalid => "speculation_response_invalid",
+            Self::DaemonRejected => "speculation_daemon_rejected",
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn from_daemon_code(code: &str) -> Self {
+        match code {
+            "speculation_unsupported" => Self::Unsupported,
+            "speculation_unavailable" => Self::Unavailable,
+            "speculation_capacity_exhausted" => Self::CapacityExhausted,
+            "speculation_invalid_request" => Self::InvalidRequest,
+            "speculation_invalid_transition" => Self::InvalidTransition,
+            "speculation_stale_generation" => Self::StaleGeneration,
+            "speculation_generation_exhausted" => Self::GenerationExhausted,
+            "speculation_containment_unavailable" => Self::ContainmentUnavailable,
+            "speculation_rollback_required" => Self::RollbackRequired,
+            "speculation_decision_uncertain" => Self::DecisionUncertain,
+            "speculation_evidence_unavailable" => Self::EvidenceUnavailable,
+            "speculation_protocol_mismatch" => Self::ProtocolMismatch,
+            _ => Self::DaemonRejected,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_ambiguous_mutation_loss(self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::TransportProtocol | Self::ResponseInvalid
+        )
+    }
+}
+
+impl std::fmt::Display for SpeculationClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::fmt::Debug for SpeculationClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for SpeculationClientError {}
+
+impl Serialize for SpeculationClientError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.code())
+    }
+}
+
+pub type SpeculationClientResult<T> = std::result::Result<T, SpeculationClientError>;
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSpeculationOuter<T> {
+    ok: bool,
+    error: Option<String>,
+    result: Option<T>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictDaemonStatus {
+    #[serde(rename = "version")]
+    _version: String,
+    protocol_version: u32,
+    #[serde(rename = "session_count")]
+    _session_count: u64,
+    #[serde(rename = "active_connections")]
+    _active_connections: u64,
+    #[serde(rename = "shutting_down")]
+    _shutting_down: bool,
+    #[serde(default, rename = "daemon_uid")]
+    _daemon_uid: Option<u32>,
+    #[serde(default, rename = "started_at_unix_secs")]
+    _started_at_unix_secs: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn strict_rpc_at<T: DeserializeOwned>(
+    socket: &Path,
+    request: &Request,
+) -> SpeculationClientResult<T> {
+    let stream = UnixStream::connect(socket).map_err(|_| SpeculationClientError::Transport)?;
+    strict_rpc_on_stream(stream, request)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn strict_rpc_on_stream<T: DeserializeOwned>(
+    mut stream: UnixStream,
+    request: &Request,
+) -> SpeculationClientResult<T> {
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .map_err(|_| SpeculationClientError::Transport)?;
+    stream
+        .set_write_timeout(Some(RPC_TIMEOUT))
+        .map_err(|_| SpeculationClientError::Transport)?;
+    let payload =
+        serde_json::to_vec(request).map_err(|_| SpeculationClientError::InvalidRequest)?;
+    stream
+        .write_all(&payload)
+        .and_then(|()| stream.write_all(b"\n"))
+        .map_err(|_| SpeculationClientError::Transport)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|_| SpeculationClientError::Transport)?;
+
+    let mut bytes = Vec::new();
+    stream
+        .take(MAX_SPECULATION_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SpeculationClientError::Transport)?;
+    if bytes.len() as u64 > MAX_SPECULATION_RESPONSE_BYTES {
+        return Err(SpeculationClientError::TransportProtocol);
+    }
+    let outer: StrictSpeculationOuter<T> =
+        serde_json::from_slice(&bytes).map_err(|_| SpeculationClientError::ResponseInvalid)?;
+    match (outer.ok, outer.error, outer.result) {
+        (true, None, Some(result)) => Ok(result),
+        (false, Some(code), None) => Err(SpeculationClientError::from_daemon_code(&code)),
+        _ => Err(SpeculationClientError::ResponseInvalid),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn require_speculation_protocol_at(socket: &Path) -> SpeculationClientResult<()> {
+    let status: StrictDaemonStatus = strict_rpc_at(socket, &Request::Status)?;
+    if status.protocol_version < SPECULATION_PROTOCOL_VERSION {
+        return Err(SpeculationClientError::ProtocolMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn speculation_rpc_at<T: DeserializeOwned>(
+    socket: &Path,
+    request: SpeculationRequest,
+) -> SpeculationClientResult<T> {
+    strict_rpc_at(
+        socket,
+        &Request::Speculation(SpeculationRequestEnvelope::new(request)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn map_speculation_evidence(error: crate::speculation_fs::EvidenceError) -> SpeculationClientError {
+    use crate::speculation_fs::EvidenceError;
+    match error {
+        EvidenceError::Unsupported => SpeculationClientError::Unsupported,
+        EvidenceError::InvalidDirectory
+        | EvidenceError::InvalidIdentity
+        | EvidenceError::Overlap
+        | EvidenceError::InvalidLeaf => SpeculationClientError::InvalidRequest,
+        EvidenceError::Capacity => SpeculationClientError::CapacityExhausted,
+        EvidenceError::GenerationMismatch => SpeculationClientError::StaleGeneration,
+        EvidenceError::AlreadyExists
+        | EvidenceError::Missing
+        | EvidenceError::TooLarge
+        | EvidenceError::Corrupt
+        | EvidenceError::Stale
+        | EvidenceError::Io
+        | EvidenceError::Poisoned => SpeculationClientError::EvidenceUnavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_speculation_status(
+    status: &SpeculationStatus,
+    tournament_uuid: uuid::Uuid,
+    daemon_instance_uuid: uuid::Uuid,
+    minimum_generation: u64,
+) -> SpeculationClientResult<()> {
+    if tournament_uuid.is_nil()
+        || daemon_instance_uuid.is_nil()
+        || minimum_generation == 0
+        || status.tournament_uuid != tournament_uuid
+        || status.daemon_instance_uuid != daemon_instance_uuid
+        || status.generation < minimum_generation
+        || status.candidates[0].index != 0
+        || status.candidates[1].index != 1
+        || status.candidates[0].candidate_uuid.is_nil()
+        || status.candidates[1].candidate_uuid.is_nil()
+        || status.candidates[0].candidate_uuid == status.candidates[1].candidate_uuid
+        || status.fixed_score_order != SPECULATION_SCORE_ORDER
+        || status.selected_index.is_some_and(|index| index > 1)
+        || status.lease_deadline_unix_ms == 0
+        || status.rollback_required != status.phase.is_rollback_only()
+    {
+        return Err(SpeculationClientError::ResponseInvalid);
+    }
+    let selection_required = matches!(
+        status.phase,
+        SpeculationPhase::PendingFinalize
+            | SpeculationPhase::FinalizingLoser
+            | SpeculationPhase::WinnerSelectionPending
+            | SpeculationPhase::FinalizingWinner
+            | SpeculationPhase::Selected
+    );
+    if selection_required != status.selected_index.is_some() {
+        return Err(SpeculationClientError::ResponseInvalid);
+    }
+    if status.is_terminal()
+        && status.candidates.iter().any(|candidate| {
+            let cleanup = candidate.cleanup;
+            !cleanup.runner_ack
+                || !cleanup.bwrap_reaped
+                || !cleanup.sync_eof
+                || !cleanup.cgroup_empty
+                || !cleanup.managed_tombstone
+        })
+    {
+        return Err(SpeculationClientError::ResponseInvalid);
+    }
+    match status.phase {
+        SpeculationPhase::Selected
+            if status.selected_index.is_none() || status.rollback_required =>
+        {
+            Err(SpeculationClientError::ResponseInvalid)
+        }
+        SpeculationPhase::RolledBack
+            if status.selected_index.is_some() || status.rollback_required =>
+        {
+            Err(SpeculationClientError::ResponseInvalid)
+        }
+        phase if phase.is_rollback_only() && status.selected_index.is_some() => {
+            Err(SpeculationClientError::ResponseInvalid)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_prepare_status(status: &SpeculationStatus) -> SpeculationClientResult<()> {
+    validate_speculation_status(
+        status,
+        status.tournament_uuid,
+        status.daemon_instance_uuid,
+        status.generation,
+    )?;
+    if status.phase != SpeculationPhase::Prepared
+        || status.selected_index.is_some()
+        || status.rollback_required
+    {
+        return Err(SpeculationClientError::ResponseInvalid);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_speculation_server_at(
+    socket: &Path,
+    start: impl FnOnce() -> SpeculationClientResult<()>,
+) -> SpeculationClientResult<()> {
+    match UnixStream::connect(socket) {
+        Ok(stream) => {
+            return strict_rpc_on_stream::<serde_json::Value>(stream, &Request::Ping).map(|_| ());
+        }
+        Err(_) => start()?,
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(stream) => match strict_rpc_on_stream::<serde_json::Value>(stream, &Request::Ping) {
+                Ok(_) => return Ok(()),
+                Err(SpeculationClientError::Transport) if Instant::now() < deadline => {}
+                Err(error) => return Err(error),
+            },
+            Err(_) if Instant::now() < deadline => {}
+            Err(_) => return Err(SpeculationClientError::Transport),
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn production_speculation_socket() -> SpeculationClientResult<PathBuf> {
+    let socket = paths::socket_path().map_err(|_| SpeculationClientError::Transport)?;
+    ensure_speculation_server_at(&socket, || {
+        spawn_server_daemon().map_err(|_| SpeculationClientError::Transport)
+    })?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn readback_ledger(
+    ledger: &ClientLedger,
+    candidate: ClientLedgerEntry,
+) -> SpeculationClientResult<ClientLedgerEntry> {
+    let exact = ledger
+        .read_verified(
+            candidate.value.tournament_uuid,
+            candidate.value.daemon_instance_uuid,
+        )
+        .map_err(map_speculation_evidence)?;
+    if exact.identity != candidate.identity || exact.value != candidate.value {
+        return Err(SpeculationClientError::EvidenceUnavailable);
+    }
+    Ok(exact)
+}
+
+#[cfg(target_os = "linux")]
+fn write_requested_action(
+    ledger: &ClientLedger,
+    current: &ClientLedgerEntry,
+    action: LedgerAction,
+) -> SpeculationClientResult<ClientLedgerEntry> {
+    let mut next = current.value.clone();
+    next.action = action;
+    let stored = ledger
+        .write_before_action(current, &next, action, current.value.generation)
+        .map_err(map_speculation_evidence)?;
+    readback_ledger(ledger, stored)
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedActionPlan {
+    Start,
+    RecoverStatusOnly,
+    Reject,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn requested_action_plan(current: LedgerAction, desired: LedgerAction) -> RequestedActionPlan {
+    if !current.is_requested() {
+        RequestedActionPlan::Start
+    } else if current == desired {
+        RequestedActionPlan::RecoverStatusOnly
+    } else {
+        RequestedActionPlan::Reject
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_observed_status_against_journal(
+    current: &ClientLedgerEntry,
+    status: &SpeculationStatus,
+) -> SpeculationClientResult<()> {
+    validate_speculation_status(
+        status,
+        current.value.tournament_uuid,
+        current.value.daemon_instance_uuid,
+        current.value.generation,
+    )?;
+    if status.generation == current.value.generation && status != &current.value.status {
+        return Err(SpeculationClientError::ResponseInvalid);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn observe_and_mirror_newer_status(
+    ledger: &ClientLedger,
+    current: ClientLedgerEntry,
+    status: &SpeculationStatus,
+) -> SpeculationClientResult<ClientLedgerEntry> {
+    validate_observed_status_against_journal(&current, status)?;
+    if status.generation == current.value.generation {
+        return Ok(current);
+    }
+    let stored = ledger
+        .mirror_status(&current, status)
+        .map_err(map_speculation_evidence)?;
+    readback_ledger(ledger, stored)
+}
+
+#[cfg(target_os = "linux")]
+fn status_rpc(
+    socket: &Path,
+    tournament_uuid: uuid::Uuid,
+    daemon_instance_uuid: uuid::Uuid,
+    generation: u64,
+) -> SpeculationClientResult<SpeculationStatus> {
+    let response: SpeculationStatusResponse = speculation_rpc_at(
+        socket,
+        SpeculationRequest::Status(SpeculationStatusRequest {
+            tournament_uuid,
+            daemon_instance_uuid,
+            generation,
+        }),
+    )?;
+    validate_speculation_status(
+        &response.status,
+        tournament_uuid,
+        daemon_instance_uuid,
+        generation,
+    )?;
+    Ok(response.status)
+}
+
+#[cfg(target_os = "linux")]
+fn observation_deadline(status: &SpeculationStatus) -> Instant {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(status.lease_deadline_unix_ms);
+    let remaining_ms = status
+        .lease_deadline_unix_ms
+        .saturating_sub(now_unix_ms)
+        .min(3_700_000);
+    Instant::now() + Duration::from_millis(remaining_ms) + crate::speculation::CONTROL_ACK_TIMEOUT
+}
+
+#[cfg(target_os = "linux")]
+fn poll_journaled_status_until(
+    socket: &Path,
+    ledger: &ClientLedger,
+    mut current: ClientLedgerEntry,
+    mut stop: impl FnMut(&SpeculationStatus) -> bool,
+) -> SpeculationClientResult<(SpeculationStatus, ClientLedgerEntry)> {
+    let mut deadline = observation_deadline(&current.value.status);
+    loop {
+        let status = match status_rpc(
+            socket,
+            current.value.tournament_uuid,
+            current.value.daemon_instance_uuid,
+            current.value.generation,
+        ) {
+            Ok(status) => status,
+            Err(error) if error.is_ambiguous_mutation_loss() && Instant::now() < deadline => {
+                thread::sleep(SPECULATION_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        current = observe_and_mirror_newer_status(ledger, current, &status)?;
+        deadline = deadline.max(observation_deadline(&status));
+        if stop(&status) {
+            return Ok((status, current));
+        }
+        if Instant::now() >= deadline {
+            return Err(SpeculationClientError::Transport);
+        }
+        thread::sleep(SPECULATION_POLL_INTERVAL);
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunObservation {
+    Continue,
+    Stop,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_run_phase(phase: SpeculationPhase) -> RunObservation {
+    match phase {
+        SpeculationPhase::Prepared
+        | SpeculationPhase::Armed
+        | SpeculationPhase::Starting
+        | SpeculationPhase::Ready
+        | SpeculationPhase::GoPending
+        | SpeculationPhase::Running
+        | SpeculationPhase::ResultPending
+        | SpeculationPhase::FinalizingLoser
+        | SpeculationPhase::WinnerSelectionPending
+        | SpeculationPhase::FinalizingWinner => RunObservation::Continue,
+        SpeculationPhase::PendingFinalize
+        | SpeculationPhase::RollbackRequired
+        | SpeculationPhase::DecisionUncertain
+        | SpeculationPhase::RollbackPending
+        | SpeculationPhase::Selected
+        | SpeculationPhase::RolledBack => RunObservation::Stop,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizePhaseAction {
+    Start,
+    Poll,
+    Return,
+    Reject,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_finalize_phase(phase: SpeculationPhase) -> FinalizePhaseAction {
+    match phase {
+        SpeculationPhase::PendingFinalize => FinalizePhaseAction::Start,
+        SpeculationPhase::FinalizingLoser
+        | SpeculationPhase::WinnerSelectionPending
+        | SpeculationPhase::FinalizingWinner
+        | SpeculationPhase::RollbackPending => FinalizePhaseAction::Poll,
+        SpeculationPhase::RollbackRequired
+        | SpeculationPhase::DecisionUncertain
+        | SpeculationPhase::Selected
+        | SpeculationPhase::RolledBack => FinalizePhaseAction::Return,
+        SpeculationPhase::Prepared
+        | SpeculationPhase::Armed
+        | SpeculationPhase::Starting
+        | SpeculationPhase::Ready
+        | SpeculationPhase::GoPending
+        | SpeculationPhase::Running
+        | SpeculationPhase::ResultPending => FinalizePhaseAction::Reject,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackPhaseAction {
+    Start,
+    Poll,
+    Return,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_rollback_phase(phase: SpeculationPhase) -> RollbackPhaseAction {
+    match phase {
+        SpeculationPhase::Selected | SpeculationPhase::RolledBack => RollbackPhaseAction::Return,
+        SpeculationPhase::FinalizingLoser
+        | SpeculationPhase::WinnerSelectionPending
+        | SpeculationPhase::FinalizingWinner
+        | SpeculationPhase::RollbackPending => RollbackPhaseAction::Poll,
+        SpeculationPhase::Prepared
+        | SpeculationPhase::Armed
+        | SpeculationPhase::Starting
+        | SpeculationPhase::Ready
+        | SpeculationPhase::GoPending
+        | SpeculationPhase::Running
+        | SpeculationPhase::ResultPending
+        | SpeculationPhase::PendingFinalize
+        | SpeculationPhase::RollbackRequired
+        | SpeculationPhase::DecisionUncertain => RollbackPhaseAction::Start,
+    }
+}
+
+#[allow(dead_code)]
+pub fn speculate_run(
+    source: PathBuf,
+    candidates: [PathBuf; 2],
+    ledger_root: PathBuf,
+    cgroup_root: PathBuf,
+    timeout: Duration,
+    argv: Vec<std::ffi::OsString>,
+) -> SpeculationClientResult<SpeculationStatus> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, candidates, ledger_root, cgroup_root, timeout, argv);
+        Err(SpeculationClientError::Unsupported)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        speculate_run_with_socket(
+            source,
+            candidates,
+            ledger_root,
+            cgroup_root,
+            timeout,
+            argv,
+            production_speculation_socket,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn speculate_run_at(
+    socket: &Path,
+    source: PathBuf,
+    candidates: [PathBuf; 2],
+    ledger_root: PathBuf,
+    cgroup_root: PathBuf,
+    timeout: Duration,
+    argv: Vec<std::ffi::OsString>,
+) -> SpeculationClientResult<SpeculationStatus> {
+    speculate_run_with_socket(
+        source,
+        candidates,
+        ledger_root,
+        cgroup_root,
+        timeout,
+        argv,
+        || Ok(socket.to_path_buf()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn speculate_run_with_socket(
+    source: PathBuf,
+    candidates: [PathBuf; 2],
+    ledger_root: PathBuf,
+    cgroup_root: PathBuf,
+    timeout: Duration,
+    argv: Vec<std::ffi::OsString>,
+    socket_provider: impl FnOnce() -> SpeculationClientResult<PathBuf>,
+) -> SpeculationClientResult<SpeculationStatus> {
+    let wire_source = SpeculationUnixPath::from_path(&source)
+        .map_err(|_| SpeculationClientError::InvalidRequest)?;
+    let wire_candidates = [
+        SpeculationUnixPath::from_path(&candidates[0])
+            .map_err(|_| SpeculationClientError::InvalidRequest)?,
+        SpeculationUnixPath::from_path(&candidates[1])
+            .map_err(|_| SpeculationClientError::InvalidRequest)?,
+    ];
+    let wire_ledger = SpeculationUnixPath::from_path(&ledger_root)
+        .map_err(|_| SpeculationClientError::InvalidRequest)?;
+    let wire_cgroup = SpeculationUnixPath::from_path(&cgroup_root)
+        .map_err(|_| SpeculationClientError::InvalidRequest)?;
+    let wire_argv = SpeculationArgv::from_os_strings(argv)
+        .map_err(|_| SpeculationClientError::InvalidRequest)?;
+    let timeout_ms =
+        u64::try_from(timeout.as_millis()).map_err(|_| SpeculationClientError::InvalidRequest)?;
+
+    let source_root = crate::speculation_fs::open_existing_workspace_dir(&source)
+        .map_err(map_speculation_evidence)?;
+    let candidate_roots = [
+        crate::speculation_fs::open_existing_workspace_dir(&candidates[0])
+            .map_err(map_speculation_evidence)?,
+        crate::speculation_fs::open_existing_workspace_dir(&candidates[1])
+            .map_err(map_speculation_evidence)?,
+    ];
+    let ledger_directory = crate::speculation_fs::open_existing_private_dir(&ledger_root)
+        .map_err(map_speculation_evidence)?;
+    let cgroup_directory = crate::speculation_fs::open_existing_delegated_cgroup_root(&cgroup_root)
+        .map_err(map_speculation_evidence)?;
+    crate::speculation_fs::validate_no_overlap(&[
+        &source_root,
+        &candidate_roots[0],
+        &candidate_roots[1],
+        &ledger_directory,
+        &cgroup_directory,
+    ])
+    .map_err(map_speculation_evidence)?;
+    let roots = ClientRootIdentities {
+        source: source_root.identity(),
+        candidates: [candidate_roots[0].identity(), candidate_roots[1].identity()],
+        ledger_root: ledger_directory.identity(),
+        cgroup_root: cgroup_directory.identity(),
+    };
+    let ledger = ClientLedger::new(ledger_directory);
+    drop((source_root, candidate_roots, cgroup_directory));
+
+    let socket = socket_provider()?;
+    require_speculation_protocol_at(&socket)?;
+    let prepare_request = SpeculationPrepareRequest::new(
+        wire_source,
+        wire_candidates,
+        wire_ledger,
+        wire_cgroup,
+        timeout_ms,
+        wire_argv,
+    )
+    .map_err(|_| SpeculationClientError::InvalidRequest)?;
+    let prepared: SpeculationPrepareResponse =
+        speculation_rpc_at(&socket, SpeculationRequest::Prepare(prepare_request))?;
+    validate_prepare_status(&prepared.status)?;
+
+    let created = ledger
+        .create_prepared(&ClientLedgerRecord {
+            schema_version: ClientLedgerSchema::V1,
+            tournament_uuid: prepared.status.tournament_uuid,
+            daemon_instance_uuid: prepared.status.daemon_instance_uuid,
+            generation: prepared.status.generation,
+            action: LedgerAction::Prepared,
+            roots,
+            status: prepared.status.clone(),
+        })
+        .map_err(map_speculation_evidence)?;
+    let prepared_entry = readback_ledger(&ledger, created)?;
+    let arm_entry = write_requested_action(&ledger, &prepared_entry, LedgerAction::ArmRequested)?;
+    let arm_request = SpeculationArmRequest {
+        tournament_uuid: arm_entry.value.tournament_uuid,
+        daemon_instance_uuid: arm_entry.value.daemon_instance_uuid,
+        generation: arm_entry.value.generation,
+    };
+    let current = match speculation_rpc_at::<SpeculationArmResponse>(
+        &socket,
+        SpeculationRequest::Arm(arm_request),
+    ) {
+        Ok(response) => {
+            validate_speculation_status(
+                &response.status,
+                arm_entry.value.tournament_uuid,
+                arm_entry.value.daemon_instance_uuid,
+                arm_entry.value.generation,
+            )?;
+            if response.status.generation == arm_entry.value.generation {
+                return Err(SpeculationClientError::ResponseInvalid);
+            }
+            observe_and_mirror_newer_status(&ledger, arm_entry, &response.status)?
+        }
+        Err(error)
+            if error.is_ambiguous_mutation_loss()
+                || error == SpeculationClientError::StaleGeneration =>
+        {
+            arm_entry
+        }
+        Err(error) => return Err(error),
+    };
+    let (status, _) = poll_journaled_status_until(&socket, &ledger, current, |status| {
+        classify_run_phase(status.phase) == RunObservation::Stop
+    })?;
+    Ok(status)
+}
+
+#[allow(dead_code)]
+pub fn speculate_status(
+    ledger_root: &Path,
+    tournament_uuid: uuid::Uuid,
+) -> SpeculationClientResult<SpeculationStatus> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ledger_root, tournament_uuid);
+        Err(SpeculationClientError::Unsupported)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let directory = crate::speculation_fs::open_existing_private_dir(ledger_root)
+            .map_err(map_speculation_evidence)?;
+        let ledger = ClientLedger::new(directory);
+        let tournament = ledger
+            .read_tournament(tournament_uuid)
+            .map_err(map_speculation_evidence)?;
+        let socket = production_speculation_socket()?;
+        speculate_status_at(&socket, tournament)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn speculate_status_at(
+    socket: &Path,
+    tournament: crate::speculation_ledger::TournamentLedgerEntry,
+) -> SpeculationClientResult<SpeculationStatus> {
+    require_speculation_protocol_at(socket)?;
+    let status = status_rpc(
+        socket,
+        tournament.entry.value.tournament_uuid,
+        tournament.entry.value.daemon_instance_uuid,
+        tournament.entry.value.generation,
+    )?;
+    validate_observed_status_against_journal(&tournament.entry, &status)?;
+    if tournament.authority == ClientLedgerAuthority::CleanupOnlyAfterBoot
+        && !cleanup_only_observable(status.phase)
+    {
+        return Err(SpeculationClientError::EvidenceUnavailable);
+    }
+    Ok(status)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_only_observable(phase: SpeculationPhase) -> bool {
+    matches!(
+        phase,
+        SpeculationPhase::RollbackRequired
+            | SpeculationPhase::DecisionUncertain
+            | SpeculationPhase::RollbackPending
+            | SpeculationPhase::Selected
+            | SpeculationPhase::RolledBack
+    )
+}
+
+#[allow(dead_code)]
+pub fn speculate_finalize(
+    ledger_root: &Path,
+    tournament_uuid: uuid::Uuid,
+) -> SpeculationClientResult<SpeculationStatus> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ledger_root, tournament_uuid);
+        Err(SpeculationClientError::Unsupported)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let directory = crate::speculation_fs::open_existing_private_dir(ledger_root)
+            .map_err(map_speculation_evidence)?;
+        let ledger = ClientLedger::new(directory);
+        let tournament = ledger
+            .read_tournament(tournament_uuid)
+            .map_err(map_speculation_evidence)?;
+        if tournament.authority != ClientLedgerAuthority::CurrentBoot {
+            return Err(SpeculationClientError::EvidenceUnavailable);
+        }
+        let socket = production_speculation_socket()?;
+        speculate_finalize_at(&socket, ledger, tournament.entry)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn speculate_finalize_at(
+    socket: &Path,
+    ledger: ClientLedger,
+    mut current: ClientLedgerEntry,
+) -> SpeculationClientResult<SpeculationStatus> {
+    require_speculation_protocol_at(socket)?;
+    let observed = status_rpc(
+        socket,
+        current.value.tournament_uuid,
+        current.value.daemon_instance_uuid,
+        current.value.generation,
+    )?;
+    current = observe_and_mirror_newer_status(&ledger, current, &observed)?;
+    match classify_finalize_phase(observed.phase) {
+        FinalizePhaseAction::Reject => return Err(SpeculationClientError::InvalidTransition),
+        FinalizePhaseAction::Return => return Ok(observed),
+        FinalizePhaseAction::Poll => {
+            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
+                status.is_terminal() || status.phase.is_rollback_only()
+            })?;
+            return Ok(status);
+        }
+        FinalizePhaseAction::Start => {}
+    }
+    match requested_action_plan(current.value.action, LedgerAction::FinalizeRequested) {
+        RequestedActionPlan::RecoverStatusOnly => {
+            let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
+                status.is_terminal() || status.phase.is_rollback_only()
+            })?;
+            return Ok(status);
+        }
+        RequestedActionPlan::Reject => {
+            return Err(SpeculationClientError::EvidenceUnavailable);
+        }
+        RequestedActionPlan::Start => {}
+    }
+    current = write_requested_action(&ledger, &current, LedgerAction::FinalizeRequested)?;
+    let request = SpeculationFinalizeRequest {
+        tournament_uuid: current.value.tournament_uuid,
+        daemon_instance_uuid: current.value.daemon_instance_uuid,
+        generation: current.value.generation,
+    };
+    match speculation_rpc_at::<SpeculationFinalizeResponse>(
+        socket,
+        SpeculationRequest::Finalize(request),
+    ) {
+        Ok(response) => {
+            if response.status.generation == current.value.generation {
+                return Err(SpeculationClientError::ResponseInvalid);
+            }
+            current = observe_and_mirror_newer_status(&ledger, current, &response.status)?;
+        }
+        Err(error) if error.is_ambiguous_mutation_loss() => {}
+        Err(SpeculationClientError::StaleGeneration) => {}
+        Err(error) => return Err(error),
+    }
+    let (status, _) = poll_journaled_status_until(socket, &ledger, current, |status| {
+        status.is_terminal() || status.phase.is_rollback_only()
+    })?;
+    Ok(status)
+}
+
+#[allow(dead_code)]
+pub fn speculate_rollback(
+    ledger_root: &Path,
+    tournament_uuid: uuid::Uuid,
+) -> SpeculationClientResult<SpeculationStatus> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ledger_root, tournament_uuid);
+        Err(SpeculationClientError::Unsupported)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let directory = crate::speculation_fs::open_existing_private_dir(ledger_root)
+            .map_err(map_speculation_evidence)?;
+        let ledger = ClientLedger::new(directory);
+        let tournament = ledger
+            .read_tournament(tournament_uuid)
+            .map_err(map_speculation_evidence)?;
+        let socket = production_speculation_socket()?;
+        speculate_rollback_at(&socket, ledger, tournament)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn speculate_rollback_at(
+    socket: &Path,
+    ledger: ClientLedger,
+    tournament: crate::speculation_ledger::TournamentLedgerEntry,
+) -> SpeculationClientResult<SpeculationStatus> {
+    require_speculation_protocol_at(socket)?;
+    let mut current = tournament.entry;
+    let observed = status_rpc(
+        socket,
+        current.value.tournament_uuid,
+        current.value.daemon_instance_uuid,
+        current.value.generation,
+    )?;
+    validate_observed_status_against_journal(&current, &observed)?;
+    if tournament.authority == ClientLedgerAuthority::CleanupOnlyAfterBoot {
+        return cleanup_only_observable(observed.phase)
+            .then_some(observed)
+            .ok_or(SpeculationClientError::EvidenceUnavailable);
+    }
+    current = observe_and_mirror_newer_status(&ledger, current, &observed)?;
+    match classify_rollback_phase(observed.phase) {
+        RollbackPhaseAction::Return => return Ok(observed),
+        RollbackPhaseAction::Poll => {
+            let (status, _) = poll_journaled_status_until(
+                socket,
+                &ledger,
+                current,
+                SpeculationStatus::is_terminal,
+            )?;
+            return Ok(status);
+        }
+        RollbackPhaseAction::Start => {}
+    }
+    match requested_action_plan(current.value.action, LedgerAction::RollbackRequested) {
+        RequestedActionPlan::RecoverStatusOnly => {
+            let (status, _) = poll_journaled_status_until(
+                socket,
+                &ledger,
+                current,
+                SpeculationStatus::is_terminal,
+            )?;
+            return Ok(status);
+        }
+        RequestedActionPlan::Reject => {
+            return Err(SpeculationClientError::EvidenceUnavailable);
+        }
+        RequestedActionPlan::Start => {}
+    }
+    current = write_requested_action(&ledger, &current, LedgerAction::RollbackRequested)?;
+    let request = SpeculationRollbackRequest {
+        tournament_uuid: current.value.tournament_uuid,
+        daemon_instance_uuid: current.value.daemon_instance_uuid,
+        generation: current.value.generation,
+    };
+    match speculation_rpc_at::<SpeculationRollbackResponse>(
+        socket,
+        SpeculationRequest::Rollback(request),
+    ) {
+        Ok(response) => {
+            if response.status.generation == current.value.generation {
+                return Err(SpeculationClientError::ResponseInvalid);
+            }
+            current = observe_and_mirror_newer_status(&ledger, current, &response.status)?;
+        }
+        Err(error) if error.is_ambiguous_mutation_loss() => {}
+        Err(SpeculationClientError::StaleGeneration) => {}
+        Err(error) => return Err(error),
+    }
+    let (status, _) =
+        poll_journaled_status_until(socket, &ledger, current, |status| status.is_terminal())?;
+    Ok(status)
 }
 
 pub fn new_session(
@@ -7435,8 +8450,17 @@ fn stdin_input_state(fd: RawFd, timeout: Duration) -> Result<StdinInputState> {
     }
 }
 
+const FALLBACK_TERMINAL_SIZE: (u16, u16) = (80, 24);
+
+fn normalize_terminal_size(size: Option<(u16, u16)>) -> (u16, u16) {
+    match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => (cols, rows),
+        _ => FALLBACK_TERMINAL_SIZE,
+    }
+}
+
 pub fn terminal_size() -> (u16, u16) {
-    crossterm::terminal::size().unwrap_or((80, 24))
+    normalize_terminal_size(crossterm::terminal::size().ok())
 }
 
 pub fn terminal_cols() -> Option<u16> {
@@ -7521,57 +8545,1275 @@ mod tests {
         AGENT_TITLE_REFRESH, ATTACH_ACTIVE, ATTACH_OUTPUT_IDLE_TIMEOUT,
         ATTACH_RESPONSE_HEADER_LIMIT, AgentPresenceCue, AgentTitleCueRuntime, AltScreenState,
         AttachActiveGuard, AttachMode, CapabilityFileIdentity, ComposeRenderAction, DaemonStatus,
-        HOST_TERMINAL_SGR_RESET, KeyboardProtocolRestoreState, MAX_EXTRACTED_URL_BYTES,
-        MAX_EXTRACTED_URLS, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS, MAX_TRACE_JSONL_LINE_BYTES,
-        MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext, MobileTranscriptOptions,
-        NESTED_AGENT_POLL, NestedAgentDetector, NestedAgentTransition, ProcessInfo, ProcessRow,
-        RECONNECT_STATE_SCHEMA_VERSION, RPC_PARSE_ERROR_PREVIEW_BYTES, ResizeTickOutcome,
-        STATUS_DAMAGE_HEARTBEAT, STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP,
+        FinalizePhaseAction, HOST_TERMINAL_SGR_RESET, KeyboardProtocolRestoreState,
+        MAX_EXTRACTED_URL_BYTES, MAX_EXTRACTED_URLS, MAX_KEYBOARD_PROTOCOL_RESTORE_POPS,
+        MAX_TRACE_JSONL_LINE_BYTES, MOBILE_TRANSCRIPT_SGR_RESET, MobileTranscriptInputContext,
+        MobileTranscriptOptions, NESTED_AGENT_POLL, NestedAgentDetector, NestedAgentTransition,
+        ProcessInfo, ProcessRow, RECONNECT_STATE_SCHEMA_VERSION, RPC_PARSE_ERROR_PREVIEW_BYTES,
+        ResizeTickOutcome, RollbackPhaseAction, RunObservation, STATUS_DAMAGE_HEARTBEAT,
+        STATUS_HEARTBEAT, STATUS_HEARTBEAT_FORCED, STATUS_PAYLOAD_CWD_CAP, SpeculationClientError,
         StatusBackend, StatusBar, StatusCommandConfig, StatusEnvSnapshot, StatusPresencePolicy,
         StatusPresenceRuntimeHandle, StatusPresenceState, StatusStyle, StatusTheme, SurfaceKind,
         TerminalOutputTracker, agent_name_from_command, agent_presence_banner_enabled,
         agent_presence_cue_enabled, alt_screen_param_matches, anyhow_error_is_broken_pipe,
         apply_pending_status_command, attach_pty_rows, automatic_reconnect_candidate,
-        build_process_tree_from_rows, build_status_payload, compose_commit_bytes,
-        compose_display_line, compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line,
-        compose_push_paste, compose_refresh_interval, compose_render_action,
-        compose_sanitized_display_line, compose_should_commit, compose_tail_start,
-        compose_terminal_enter_sequence, compose_terminal_leave_sequence, compute_in_grid,
-        compute_sink_enabled, create_private_capability_file, current_unix_ms,
-        cursor_clamp_into_scroll_region, dectcem_param_matches,
-        ensure_automatic_reconnect_candidate, ensure_panic_terminal_cleanup_hook,
-        ensure_trace_force_target_private, extract_search_matches, extract_urls,
-        finish_attach_results, format_attach_failure_diagnosis, format_status_line,
-        forward_pty_output_frame_or_detached, handle_mobile_transcript_input, handle_resize_tick,
-        heartbeat_due, hex_decode, hex_encode, hex_encoded_len, instrument_protocol_error,
-        interruptible_sleep, is_self_provided_tmux, join_attach_input_thread,
-        keyboard_protocol_restore_bytes, likely_agent_session, matches_env_bool,
-        mobile_client_detected, mobile_transcript_capture_changed, mobile_transcript_grep_query,
-        nested_known_agent_present_in_processes, normal_attach_terminal_cleanup_bytes,
+        build_process_tree_from_rows, build_status_payload, classify_finalize_phase,
+        classify_rollback_phase, classify_run_phase, compose_commit_bytes, compose_display_line,
+        compose_is_local_exit_key, compose_pop_grapheme, compose_prompt_line, compose_push_paste,
+        compose_refresh_interval, compose_render_action, compose_sanitized_display_line,
+        compose_should_commit, compose_tail_start, compose_terminal_enter_sequence,
+        compose_terminal_leave_sequence, compute_in_grid, compute_sink_enabled,
+        create_private_capability_file, current_unix_ms, cursor_clamp_into_scroll_region,
+        dectcem_param_matches, ensure_automatic_reconnect_candidate,
+        ensure_panic_terminal_cleanup_hook, ensure_trace_force_target_private,
+        extract_search_matches, extract_urls, finish_attach_results,
+        format_attach_failure_diagnosis, format_status_line, forward_pty_output_frame_or_detached,
+        handle_mobile_transcript_input, handle_resize_tick, heartbeat_due, hex_decode, hex_encode,
+        hex_encoded_len, instrument_protocol_error, interruptible_sleep, is_self_provided_tmux,
+        join_attach_input_thread, keyboard_protocol_restore_bytes, likely_agent_session,
+        matches_env_bool, mobile_client_detected, mobile_transcript_capture_changed,
+        mobile_transcript_grep_query, nested_known_agent_present_in_processes,
+        normal_attach_terminal_cleanup_bytes, normalize_terminal_size,
         observe_keyboard_protocol_sequences, panic_terminal_cleanup_bytes,
         parse_status_command_bool, parse_status_command_interval, parse_status_style,
         raw_attach_command_hint, read_attach_response_header, read_private_capability_file,
         read_reconnect_state_best_effort_from_path, read_reconnect_state_from_path,
         read_trace_jsonl_line, recent_exits_protocol_error,
-        remember_reconnect_target_best_effort_at_path, reset_raw_attach_initial_sgr_if_needed,
-        resolve_attach_mode, resolve_status_style, rpc_parse_error_preview,
-        run_nested_agent_detection_loop, run_status_command, select_status_backend,
-        should_mobile_transcript_auto, status_sgr_stack_supported, status_theme_protocol_error,
+        remember_reconnect_target_best_effort_at_path, require_speculation_protocol_at,
+        reset_raw_attach_initial_sgr_if_needed, resolve_attach_mode, resolve_status_style,
+        rpc_parse_error_preview, run_nested_agent_detection_loop, run_status_command,
+        select_status_backend, should_mobile_transcript_auto, speculation_rpc_at,
+        status_sgr_stack_supported, status_theme_protocol_error, strict_rpc_at,
         tmux_parent_pane_protocol_error, trace_file_summary, trace_output_open_context,
         trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
         write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
         write_mobile_transcript_urls, write_numbered_search_matches,
     };
     use crate::protocol::{
-        ExitEvidenceState, ExitOutcomeState, RecentSessionExit, SessionExitTrigger,
-        SessionLifecycleState,
+        ExitEvidenceState, ExitOutcomeState, RecentSessionExit, Request, SessionExitTrigger,
+        SessionLifecycleState, SpeculationArmRequest, SpeculationArmResponse,
+        SpeculationFinalizeRequest, SpeculationFinalizeResponse, SpeculationPhase,
+        SpeculationPrepareRequest, SpeculationPrepareResponse, SpeculationRequest,
+        SpeculationRollbackRequest, SpeculationRollbackResponse, SpeculationStatus,
+        SpeculationStatusRequest, SpeculationStatusResponse,
     };
+    use std::ffi::OsString;
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    fn speculation_status(phase: SpeculationPhase, generation: u64) -> SpeculationStatus {
+        let selected = matches!(
+            phase,
+            SpeculationPhase::PendingFinalize
+                | SpeculationPhase::FinalizingLoser
+                | SpeculationPhase::WinnerSelectionPending
+                | SpeculationPhase::FinalizingWinner
+                | SpeculationPhase::Selected
+        )
+        .then_some(0_u8);
+        let rollback_required = phase.is_rollback_only();
+        let cleanup = phase.is_terminal();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": "lterm.speculation.status.v1",
+            "tournament_uuid": uuid::Uuid::from_u128(1),
+            "daemon_instance_uuid": uuid::Uuid::from_u128(2),
+            "phase": serde_json::to_value(phase).unwrap(),
+            "generation": generation,
+            "lease_deadline_unix_ms": u64::MAX - 1,
+            "reason_code": null,
+            "candidates": [
+                {"candidate_uuid": uuid::Uuid::from_u128(3), "index": 0, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": cleanup, "bwrap_reaped": cleanup, "sync_eof": cleanup, "cgroup_empty": cleanup, "managed_tombstone": cleanup}},
+                {"candidate_uuid": uuid::Uuid::from_u128(4), "index": 1, "ready": false, "ready_elapsed_ns": null, "go_received": false, "go_received_elapsed_ns": null, "result_accepted": false, "exit_success": null, "exit_category": null, "elapsed_ns": null, "output_bytes": null, "eligible": false, "cleanup": {"runner_ack": cleanup, "bwrap_reaped": cleanup, "sync_eof": cleanup, "cgroup_empty": cleanup, "managed_tombstone": cleanup}}
+            ],
+            "fixed_score_order": ["eligibility_descending", "exit_success_descending", "elapsed_ns_ascending", "output_bytes_ascending", "input_index_ascending"],
+            "selected_index": selected,
+            "rollback_required": rollback_required,
+            "error_codes": []
+        }))
+        .unwrap()
+    }
+
+    fn fake_speculation_socket(
+        responses: Vec<Vec<u8>>,
+    ) -> (tempfile::TempDir, PathBuf, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                requests.push(request);
+                stream.write_all(&response).unwrap();
+            }
+            requests
+        });
+        (directory, socket, server)
+    }
+
+    fn daemon_ping_response() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "error": null,
+            "result": "pong"
+        }))
+        .unwrap()
+    }
+
+    fn daemon_status_response(protocol_version: u32) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "error": null,
+            "result": {
+                "version": "test",
+                "protocol_version": protocol_version,
+                "session_count": 0,
+                "active_connections": 1,
+                "shutting_down": false
+            }
+        }))
+        .unwrap()
+    }
+
+    fn speculation_response(status: &SpeculationStatus) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "error": null,
+            "result": {"status": status}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn speculation_startup_reuses_ready_daemon_without_warning_or_start() {
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_ping_response()]);
+        let starts = std::cell::Cell::new(0_u8);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || {
+                starts.set(starts.get() + 1);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(starts.get(), 0);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+    }
+
+    #[test]
+    fn speculation_startup_starts_once_and_uses_strict_ping_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("startup.sock");
+        let server = std::sync::Mutex::new(None);
+        let starts = std::cell::Cell::new(0_u8);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || {
+                starts.set(starts.get() + 1);
+                let listener = UnixListener::bind(&socket).unwrap();
+                let response = daemon_ping_response();
+                let handle = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    stream.read_to_end(&mut request).unwrap();
+                    stream.write_all(&response).unwrap();
+                    request
+                });
+                *server.lock().unwrap() = Some(handle);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(starts.get(), 1);
+        let request = server.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&request),
+            Ok(Request::Ping)
+        ));
+    }
+
+    #[test]
+    fn speculation_startup_rejects_connected_malformed_response_without_start_or_preview() {
+        let marker = "daemon-controlled-startup-preview-marker";
+        let (_directory, socket, server) =
+            fake_speculation_socket(vec![format!("not-json-{marker}").into_bytes()]);
+        let starts = std::cell::Cell::new(0_u8);
+
+        let error = super::ensure_speculation_server_at(&socket, || {
+            starts.set(starts.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, SpeculationClientError::ResponseInvalid);
+        assert_eq!(starts.get(), 0);
+        assert!(!error.to_string().contains(marker));
+        assert!(!format!("{error:?}").contains(marker));
+        assert!(!serde_json::to_string(&error).unwrap().contains(marker));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+    }
+
+    fn run_speculation_startup_capture_child(case: &str) {
+        match case {
+            "ready" => {
+                let (_directory, socket, server) =
+                    fake_speculation_socket(vec![daemon_ping_response()]);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        panic!("ready daemon was restarted")
+                    }),
+                    Ok(())
+                );
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+            "cold" => {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("startup-capture.sock");
+                let server = std::sync::Mutex::new(None);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        let listener = UnixListener::bind(&socket).unwrap();
+                        let response = daemon_ping_response();
+                        *server.lock().unwrap() = Some(thread::spawn(move || {
+                            let (mut stream, _) = listener.accept().unwrap();
+                            let mut request = Vec::new();
+                            stream.read_to_end(&mut request).unwrap();
+                            stream.write_all(&response).unwrap();
+                            request
+                        }));
+                        Ok(())
+                    }),
+                    Ok(())
+                );
+                let request = server.lock().unwrap().take().unwrap().join().unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<Request>(&request),
+                    Ok(Request::Ping)
+                ));
+            }
+            "malformed" => {
+                let marker = "daemon-controlled-startup-preview-marker";
+                let (_directory, socket, server) =
+                    fake_speculation_socket(vec![format!("not-json-{marker}").into_bytes()]);
+                assert_eq!(
+                    super::ensure_speculation_server_at(&socket, || {
+                        panic!("connected malformed peer triggered daemon start")
+                    }),
+                    Err(SpeculationClientError::ResponseInvalid)
+                );
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+            _ => panic!("unknown speculation startup capture case"),
+        }
+    }
+
+    #[test]
+    fn speculation_startup_process_capture_is_silent_and_raw_free() {
+        const CHILD_MODE: &str = "LTERM_INTERNAL_SPECULATION_STARTUP_CAPTURE_CASE";
+        const CHILD_TEST: &str =
+            "client::tests::speculation_startup_process_capture_is_silent_and_raw_free";
+        const MARKER: &[u8] = b"daemon-controlled-startup-preview-marker";
+
+        if let Ok(case) = std::env::var(CHILD_MODE) {
+            run_speculation_startup_capture_child(&case);
+            return;
+        }
+
+        for case in ["ready", "cold", "malformed"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, case)
+                .output()
+                .unwrap();
+            assert!(
+                !output
+                    .stdout
+                    .windows(MARKER.len())
+                    .any(|window| window == MARKER),
+                "{case} startup exposed the daemon-controlled marker on stdout"
+            );
+            assert!(
+                !output
+                    .stderr
+                    .windows(MARKER.len())
+                    .any(|window| window == MARKER),
+                "{case} startup exposed the daemon-controlled marker on stderr"
+            );
+            assert!(
+                output.status.success(),
+                "{case} child failed with status {:?}; stdout_bytes={}; stderr_bytes={}",
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{case} startup emitted {} stderr bytes",
+                output.stderr.len()
+            );
+        }
+    }
+
+    #[test]
+    fn speculation_startup_and_protocol_guard_emit_exact_ping_status_frames() {
+        let (_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_ping_response(),
+            daemon_status_response(crate::protocol::SPECULATION_PROTOCOL_VERSION),
+        ]);
+
+        assert_eq!(
+            super::ensure_speculation_server_at(&socket, || panic!("ready daemon was restarted")),
+            Ok(())
+        );
+        assert_eq!(require_speculation_protocol_at(&socket), Ok(()));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Ping)
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[1]),
+            Ok(Request::Status)
+        ));
+    }
+
+    #[test]
+    fn speculation_protocol_guard_rejects_v8_without_speculation_frame_and_accepts_v9() {
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(8)]);
+        assert_eq!(
+            require_speculation_protocol_at(&socket),
+            Err(SpeculationClientError::ProtocolMismatch)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(9)]);
+        assert_eq!(require_speculation_protocol_at(&socket), Ok(()));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn speculation_transport_uses_fresh_connections_and_exact_action_wrappers() {
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let responses = (0..5)
+            .map(|_| speculation_response(&status))
+            .collect::<Vec<_>>();
+        let (_directory, socket, server) = fake_speculation_socket(responses);
+        let path =
+            crate::protocol::SpeculationUnixPath::from_path(Path::new("/tmp/source")).unwrap();
+        let prepare = SpeculationPrepareRequest::new(
+            path.clone(),
+            [path.clone(), path.clone()],
+            path.clone(),
+            path,
+            1_000,
+            crate::protocol::SpeculationArgv::from_os_strings(vec![OsString::from("/bin/true")])
+                .unwrap(),
+        )
+        .unwrap();
+        let _: SpeculationPrepareResponse =
+            speculation_rpc_at(&socket, SpeculationRequest::Prepare(prepare)).unwrap();
+        let identity = SpeculationStatusRequest {
+            tournament_uuid: status.tournament_uuid,
+            daemon_instance_uuid: status.daemon_instance_uuid,
+            generation: status.generation,
+        };
+        let _: SpeculationArmResponse = speculation_rpc_at(
+            &socket,
+            SpeculationRequest::Arm(SpeculationArmRequest {
+                tournament_uuid: identity.tournament_uuid,
+                daemon_instance_uuid: identity.daemon_instance_uuid,
+                generation: identity.generation,
+            }),
+        )
+        .unwrap();
+        let _: SpeculationStatusResponse =
+            speculation_rpc_at(&socket, SpeculationRequest::Status(identity.clone())).unwrap();
+        let _: SpeculationFinalizeResponse = speculation_rpc_at(
+            &socket,
+            SpeculationRequest::Finalize(SpeculationFinalizeRequest {
+                tournament_uuid: identity.tournament_uuid,
+                daemon_instance_uuid: identity.daemon_instance_uuid,
+                generation: identity.generation,
+            }),
+        )
+        .unwrap();
+        let _: SpeculationRollbackResponse = speculation_rpc_at(
+            &socket,
+            SpeculationRequest::Rollback(SpeculationRollbackRequest {
+                tournament_uuid: identity.tournament_uuid,
+                daemon_instance_uuid: identity.daemon_instance_uuid,
+                generation: identity.generation,
+            }),
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Speculation(_))
+        ));
+    }
+
+    #[test]
+    fn strict_transport_rejects_original_duplicate_protocol_and_status_fields() {
+        for protocol_version in [8, 9] {
+            let response = format!(
+                concat!(
+                    r#"{{"ok":true,"error":null,"result":{{"version":"test","protocol_version":{0},"protocol_version":{0},"session_count":0,"active_connections":1,"shutting_down":false}}}}"#
+                ),
+                protocol_version
+            )
+            .into_bytes();
+            let (_directory, socket, server) = fake_speculation_socket(vec![response]);
+            assert_eq!(
+                require_speculation_protocol_at(&socket),
+                Err(SpeculationClientError::ResponseInvalid)
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[0]),
+                Ok(Request::Status)
+            ));
+        }
+
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let encoded_status = serde_json::to_string(&status).unwrap();
+        let duplicate_status =
+            encoded_status.replacen(r#""generation":1"#, r#""generation":1,"generation":1"#, 1);
+        assert_ne!(duplicate_status, encoded_status);
+        let response =
+            format!(r#"{{"ok":true,"error":null,"result":{{"status":{duplicate_status}}}}}"#)
+                .into_bytes();
+        let (_directory, socket, server) = fake_speculation_socket(vec![response]);
+        let request = SpeculationStatusRequest {
+            tournament_uuid: status.tournament_uuid,
+            daemon_instance_uuid: status.daemon_instance_uuid,
+            generation: status.generation,
+        };
+        assert_eq!(
+            speculation_rpc_at::<SpeculationStatusResponse>(
+                &socket,
+                SpeculationRequest::Status(request),
+            ),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        ));
+    }
+
+    #[test]
+    fn speculation_transport_collapses_malformed_oversized_and_attacker_errors() {
+        let marker = "SOCKET=/private/attacker.sock ARGV=secret parser=raw";
+        let cases = [
+            (
+                b"not-json".to_vec(),
+                SpeculationClientError::ResponseInvalid,
+            ),
+            (
+                serde_json::to_vec(&serde_json::json!({
+                    "ok": true,
+                    "error": null,
+                    "result": {},
+                    "attacker": marker
+                }))
+                .unwrap(),
+                SpeculationClientError::ResponseInvalid,
+            ),
+            (
+                serde_json::to_vec(&serde_json::json!({"ok": true, "error": marker, "result": {}}))
+                    .unwrap(),
+                SpeculationClientError::ResponseInvalid,
+            ),
+            (
+                serde_json::to_vec(
+                    &serde_json::json!({"ok": false, "error": marker, "result": null}),
+                )
+                .unwrap(),
+                SpeculationClientError::DaemonRejected,
+            ),
+            (
+                vec![b'x'; super::MAX_SPECULATION_RESPONSE_BYTES as usize + 1],
+                SpeculationClientError::TransportProtocol,
+            ),
+        ];
+        for (response, expected) in cases {
+            let (_directory, socket, server) = fake_speculation_socket(vec![response]);
+            let error = strict_rpc_at::<serde_json::Value>(&socket, &Request::Ping).unwrap_err();
+            assert_eq!(error, expected);
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert!(
+                !display.contains(marker)
+                    && !debug.contains(marker)
+                    && !serialized.contains(marker)
+            );
+            assert!(display.starts_with("speculation_"));
+            server.join().unwrap();
+        }
+
+        let missing = PathBuf::from("/tmp/speculation-io-marker-does-not-exist.sock");
+        let error = strict_rpc_at::<serde_json::Value>(&missing, &Request::Ping).unwrap_err();
+        assert_eq!(error, SpeculationClientError::Transport);
+        assert!(!error.to_string().contains("io-marker"));
+    }
+
+    #[test]
+    fn speculation_prepare_preserves_exact_non_utf8_argv_without_shell() {
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let (_directory, socket, server) =
+            fake_speculation_socket(vec![speculation_response(&status)]);
+        let source = PathBuf::from(OsString::from_vec(b"/tmp/source-\xff".to_vec()));
+        let argument = OsString::from_vec(b"arg-\xfe".to_vec());
+        let path = crate::protocol::SpeculationUnixPath::from_path(&source).unwrap();
+        let request = SpeculationPrepareRequest::new(
+            path.clone(),
+            [path.clone(), path.clone()],
+            path.clone(),
+            path,
+            1_000,
+            crate::protocol::SpeculationArgv::from_os_strings(vec![argument.clone()]).unwrap(),
+        )
+        .unwrap();
+        let _: SpeculationPrepareResponse =
+            speculation_rpc_at(&socket, SpeculationRequest::Prepare(request)).unwrap();
+        let captured = server.join().unwrap().pop().unwrap();
+        let Request::Speculation(envelope) = serde_json::from_slice(&captured).unwrap() else {
+            panic!("missing speculation envelope");
+        };
+        let SpeculationRequest::Prepare(body) = envelope.into_request() else {
+            panic!("missing prepare body");
+        };
+        assert_eq!(
+            body.source().to_path_buf().as_os_str().as_bytes(),
+            source.as_os_str().as_bytes()
+        );
+        assert_eq!(body.argv().to_os_strings(), vec![argument]);
+    }
+
+    #[test]
+    fn speculation_phase_tables_cover_all_sixteen_phases() {
+        let mut run = [0_usize; 2];
+        let mut finalize = [0_usize; 4];
+        let mut rollback = [0_usize; 3];
+        for phase in SpeculationPhase::ALL {
+            run[match classify_run_phase(phase) {
+                RunObservation::Continue => 0,
+                RunObservation::Stop => 1,
+            }] += 1;
+            finalize[match classify_finalize_phase(phase) {
+                FinalizePhaseAction::Start => 0,
+                FinalizePhaseAction::Poll => 1,
+                FinalizePhaseAction::Return => 2,
+                FinalizePhaseAction::Reject => 3,
+            }] += 1;
+            rollback[match classify_rollback_phase(phase) {
+                RollbackPhaseAction::Start => 0,
+                RollbackPhaseAction::Poll => 1,
+                RollbackPhaseAction::Return => 2,
+            }] += 1;
+        }
+        assert_eq!(run, [10, 6]);
+        assert_eq!(finalize, [1, 4, 4, 7]);
+        assert_eq!(rollback, [10, 4, 2]);
+    }
+
+    #[test]
+    fn requested_action_plan_is_start_recover_or_reject() {
+        use crate::speculation_ledger::LedgerAction;
+
+        assert_eq!(
+            super::requested_action_plan(LedgerAction::Prepared, LedgerAction::RollbackRequested),
+            super::RequestedActionPlan::Start
+        );
+        assert_eq!(
+            super::requested_action_plan(
+                LedgerAction::RollbackRequested,
+                LedgerAction::RollbackRequested,
+            ),
+            super::RequestedActionPlan::RecoverStatusOnly
+        );
+        for current in [LedgerAction::ArmRequested, LedgerAction::FinalizeRequested] {
+            assert_eq!(
+                super::requested_action_plan(current, LedgerAction::RollbackRequested),
+                super::RequestedActionPlan::Reject
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_client_ledger() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::speculation_ledger::ClientLedger,
+        crate::speculation_ledger::ClientLedgerEntry,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger_path = directory.path().join("ledger");
+        std::fs::create_dir(&ledger_path).unwrap();
+        std::fs::set_permissions(&ledger_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let validated = crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap();
+        let identity = validated.identity();
+        let ledger = crate::speculation_ledger::ClientLedger::new(validated);
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let created = ledger
+            .create_prepared(&crate::speculation_ledger::ClientLedgerRecord {
+                schema_version: crate::speculation_ledger::ClientLedgerSchema::V1,
+                tournament_uuid: status.tournament_uuid,
+                daemon_instance_uuid: status.daemon_instance_uuid,
+                generation: status.generation,
+                action: crate::speculation_ledger::LedgerAction::Prepared,
+                roots: crate::speculation_ledger::ClientRootIdentities {
+                    source: identity,
+                    candidates: [identity, identity],
+                    ledger_root: identity,
+                    cgroup_root: identity,
+                },
+                status,
+            })
+            .unwrap();
+        (directory, ledger_path, ledger, created)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_cleanup_only_ledger() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::speculation_ledger::ClientLedger,
+        crate::speculation_ledger::TournamentLedgerEntry,
+    ) {
+        let (directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let mut record = prepared.value;
+        let mut old_boot = uuid::Uuid::new_v4();
+        while old_boot == record.roots.ledger_root.boot_uuid {
+            old_boot = uuid::Uuid::new_v4();
+        }
+        record.roots.source.boot_uuid = old_boot;
+        record.roots.ledger_root.boot_uuid = old_boot;
+        record.roots.cgroup_root.boot_uuid = old_boot;
+        for candidate in &mut record.roots.candidates {
+            candidate.boot_uuid = old_boot;
+        }
+        let leaf = ledger_path.join(format!("{}.json", record.tournament_uuid));
+        std::fs::write(&leaf, serde_json::to_vec(&record).unwrap()).unwrap();
+        let tournament = ledger.read_tournament(record.tournament_uuid).unwrap();
+        assert_eq!(
+            tournament.authority,
+            crate::speculation_ledger::ClientLedgerAuthority::CleanupOnlyAfterBoot
+        );
+        (directory, ledger_path, ledger, tournament)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rollback_never_overwrites_or_sends_after_different_same_generation_request() {
+        use crate::speculation_ledger::LedgerAction;
+
+        for (phase, action) in [
+            (SpeculationPhase::Prepared, LedgerAction::ArmRequested),
+            (
+                SpeculationPhase::PendingFinalize,
+                LedgerAction::FinalizeRequested,
+            ),
+        ] {
+            let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+            let current = if phase == SpeculationPhase::Prepared {
+                prepared
+            } else {
+                let pending = speculation_status(phase, 2);
+                super::observe_and_mirror_newer_status(&ledger, prepared, &pending).unwrap()
+            };
+            let requested = super::write_requested_action(&ledger, &current, action).unwrap();
+            let observed = requested.value.status.clone();
+            let tournament = ledger
+                .read_tournament(requested.value.tournament_uuid)
+                .unwrap();
+            let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+                daemon_status_response(9),
+                speculation_response(&observed),
+            ]);
+
+            assert_eq!(
+                super::speculate_rollback_at(&socket, ledger, tournament),
+                Err(SpeculationClientError::EvidenceUnavailable)
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[0]),
+                Ok(Request::Status)
+            ));
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&requests[1]),
+                Ok(Request::Speculation(envelope))
+                    if matches!(envelope.request(), SpeculationRequest::Status(_))
+            ));
+
+            let reopened = crate::speculation_ledger::ClientLedger::new(
+                crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+            );
+            let exact = reopened
+                .read_verified(
+                    requested.value.tournament_uuid,
+                    requested.value.daemon_instance_uuid,
+                )
+                .unwrap();
+            assert_eq!(exact.identity, requested.identity);
+            assert_eq!(exact.value, requested.value);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn existing_rollback_request_polls_status_only_until_terminal() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let requested =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::RollbackRequested)
+                .unwrap();
+        let tournament = ledger
+            .read_tournament(requested.value.tournament_uuid)
+            .unwrap();
+        let rollback_pending = speculation_status(SpeculationPhase::RollbackPending, 2);
+        let rolled_back = speculation_status(SpeculationPhase::RolledBack, 3);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&rollback_pending),
+            speculation_response(&rollback_pending),
+            speculation_response(&rolled_back),
+        ]);
+
+        let result = super::speculate_rollback_at(&socket, ledger, tournament).unwrap();
+        assert_eq!(result, rolled_back);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(requests[1..].iter().all(|request| matches!(
+            serde_json::from_slice::<Request>(request),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        )));
+
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                requested.value.tournament_uuid,
+                requested.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.value.action, LedgerAction::StatusMirrored);
+        assert_eq!(exact.value.generation, rolled_back.generation);
+        assert_eq!(exact.value.status, rolled_back);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn contradictory_equal_generation_status_is_rejected_before_output_or_journal_change() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let expected_identity = prepared.identity;
+        let expected_record = prepared.value.clone();
+        let tournament = ledger
+            .read_tournament(prepared.value.tournament_uuid)
+            .unwrap();
+        let contradictory = speculation_status(SpeculationPhase::RolledBack, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_rollback_at(&socket, ledger, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[1]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        ));
+
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                expected_record.tournament_uuid,
+                expected_record.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, expected_identity);
+        assert_eq!(exact.value, expected_record);
+        assert_eq!(exact.value.action, LedgerAction::Prepared);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn arm_request_rejects_equal_generation_pending_finalize_without_output_or_mirror() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let requested =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::ArmRequested).unwrap();
+        let tournament = ledger
+            .read_tournament(requested.value.tournament_uuid)
+            .unwrap();
+        let contradictory = speculation_status(SpeculationPhase::PendingFinalize, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_rollback_at(&socket, ledger, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[1]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        ));
+
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                requested.value.tournament_uuid,
+                requested.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, requested.identity);
+        assert_eq!(exact.value, requested.value);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn standalone_status_rejects_equal_generation_contradiction_without_journal_change() {
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let tournament = ledger
+            .read_tournament(prepared.value.tournament_uuid)
+            .unwrap();
+        let contradictory = speculation_status(SpeculationPhase::PendingFinalize, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_status_at(&socket, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                prepared.value.tournament_uuid,
+                prepared.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, prepared.identity);
+        assert_eq!(exact.value, prepared.value);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cleanup_only_rollback_rejects_equal_generation_contradiction_without_journal_change() {
+        let (_directory, ledger_path, ledger, tournament) = linux_cleanup_only_ledger();
+        let expected_identity = tournament.entry.identity;
+        let expected_record = tournament.entry.value.clone();
+        let contradictory = speculation_status(SpeculationPhase::RolledBack, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_rollback_at(&socket, ledger, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_tournament(expected_record.tournament_uuid)
+            .unwrap();
+        assert_eq!(exact.entry.identity, expected_identity);
+        assert_eq!(exact.entry.value, expected_record);
+        assert_eq!(
+            exact.authority,
+            crate::speculation_ledger::ClientLedgerAuthority::CleanupOnlyAfterBoot
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rollback_recovery_rejects_equal_generation_terminal_contradiction_while_polling() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, ledger_path, ledger, prepared) = linux_client_ledger();
+        let requested =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::RollbackRequested)
+                .unwrap();
+        let tournament = ledger
+            .read_tournament(requested.value.tournament_uuid)
+            .unwrap();
+        let contradictory = speculation_status(SpeculationPhase::RolledBack, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&requested.value.status),
+            speculation_response(&contradictory),
+        ]);
+
+        assert_eq!(
+            super::speculate_rollback_at(&socket, ledger, tournament),
+            Err(SpeculationClientError::ResponseInvalid)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[0]),
+            Ok(Request::Status)
+        ));
+        assert!(requests[1..].iter().all(|request| matches!(
+            serde_json::from_slice::<Request>(request),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Status(_))
+        )));
+        let reopened = crate::speculation_ledger::ClientLedger::new(
+            crate::speculation_fs::open_existing_private_dir(&ledger_path).unwrap(),
+        );
+        let exact = reopened
+            .read_verified(
+                requested.value.tournament_uuid,
+                requested.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, requested.identity);
+        assert_eq!(exact.value, requested.value);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_generation_status_never_erases_any_requested_journal_action() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, _path, ledger, prepared) = linux_client_ledger();
+        let arm =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::ArmRequested).unwrap();
+        let same = speculation_status(SpeculationPhase::Prepared, 1);
+        let retained = super::observe_and_mirror_newer_status(&ledger, arm, &same).unwrap();
+        assert_eq!(retained.value.action, LedgerAction::ArmRequested);
+        let armed = speculation_status(SpeculationPhase::Armed, 2);
+        let advanced = super::observe_and_mirror_newer_status(&ledger, retained, &armed).unwrap();
+        assert_eq!(advanced.value.action, LedgerAction::StatusMirrored);
+
+        let pending = speculation_status(SpeculationPhase::PendingFinalize, 3);
+        let pending = super::observe_and_mirror_newer_status(&ledger, advanced, &pending).unwrap();
+        let finalize =
+            super::write_requested_action(&ledger, &pending, LedgerAction::FinalizeRequested)
+                .unwrap();
+        let retained = super::observe_and_mirror_newer_status(
+            &ledger,
+            finalize,
+            &speculation_status(SpeculationPhase::PendingFinalize, 3),
+        )
+        .unwrap();
+        assert_eq!(retained.value.action, LedgerAction::FinalizeRequested);
+
+        let finalizing = speculation_status(SpeculationPhase::FinalizingLoser, 4);
+        let finalizing =
+            super::observe_and_mirror_newer_status(&ledger, retained, &finalizing).unwrap();
+        let rollback =
+            super::write_requested_action(&ledger, &finalizing, LedgerAction::RollbackRequested)
+                .unwrap();
+        let retained = super::observe_and_mirror_newer_status(
+            &ledger,
+            rollback,
+            &speculation_status(SpeculationPhase::FinalizingLoser, 4),
+        )
+        .unwrap();
+        assert_eq!(retained.value.action, LedgerAction::RollbackRequested);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn standalone_status_observes_without_rewriting_requested_intent() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, _path, ledger, prepared) = linux_client_ledger();
+        let requested =
+            super::write_requested_action(&ledger, &prepared, LedgerAction::ArmRequested).unwrap();
+        let tournament = ledger
+            .read_tournament(requested.value.tournament_uuid)
+            .unwrap();
+        let status = speculation_status(SpeculationPhase::Prepared, 1);
+        let (_socket_dir, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&status),
+        ]);
+        let observed = super::speculate_status_at(&socket, tournament).unwrap();
+        assert_eq!(observed, status);
+        let exact = ledger
+            .read_verified(
+                requested.value.tournament_uuid,
+                requested.value.daemon_instance_uuid,
+            )
+            .unwrap();
+        assert_eq!(exact.identity, requested.identity);
+        assert_eq!(exact.value.action, LedgerAction::ArmRequested);
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lost_finalize_and_rollback_responses_retain_intent_until_generation_advances() {
+        use crate::speculation_ledger::LedgerAction;
+
+        let (_directory, _path, ledger, prepared) = linux_client_ledger();
+        let pending = speculation_status(SpeculationPhase::PendingFinalize, 2);
+        let pending_entry =
+            super::observe_and_mirror_newer_status(&ledger, prepared, &pending).unwrap();
+        let (_socket_dir, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&pending),
+            Vec::new(),
+            speculation_response(&pending),
+            speculation_response(&speculation_status(SpeculationPhase::Selected, 3)),
+        ]);
+        let selected = super::speculate_finalize_at(&socket, ledger, pending_entry).unwrap();
+        assert_eq!(selected.phase, SpeculationPhase::Selected);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[2]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Finalize(_))
+        ));
+
+        let (_directory, _path, ledger, prepared) = linux_client_ledger();
+        let prepared_status = prepared.value.status.clone();
+        let (_socket_dir, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&prepared_status),
+            Vec::new(),
+            speculation_response(&prepared_status),
+            speculation_response(&speculation_status(SpeculationPhase::RollbackPending, 2)),
+            speculation_response(&speculation_status(SpeculationPhase::RolledBack, 3)),
+        ]);
+        let tournament = ledger
+            .read_tournament(prepared.value.tournament_uuid)
+            .unwrap();
+        let rolled_back = super::speculate_rollback_at(&socket, ledger, tournament).unwrap();
+        assert_eq!(rolled_back.phase, SpeculationPhase::RolledBack);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(matches!(
+            serde_json::from_slice::<Request>(&requests[2]),
+            Ok(Request::Speculation(envelope))
+                if matches!(envelope.request(), SpeculationRequest::Rollback(_))
+        ));
+        let _ = LedgerAction::RollbackRequested;
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn run_orders_client_ledger_before_arm_and_uses_fresh_poll_connections() {
+        let Some(cgroup_root) = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let candidates = [
+            directory.path().join("candidate-0"),
+            directory.path().join("candidate-1"),
+        ];
+        let ledger_root = directory.path().join("ledger");
+        for path in [&source, &candidates[0], &candidates[1], &ledger_root] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket_directory = tempfile::tempdir().unwrap();
+        let socket = socket_directory.path().join("fake.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let ledger_for_server = ledger_root.clone();
+        let prepared = speculation_status(SpeculationPhase::Prepared, 1);
+        let prepared_for_server = prepared.clone();
+        let server = thread::spawn(move || {
+            let responses = [
+                daemon_status_response(9),
+                speculation_response(&prepared_for_server),
+                speculation_response(&speculation_status(SpeculationPhase::Armed, 2)),
+                speculation_response(&speculation_status(SpeculationPhase::PendingFinalize, 3)),
+            ];
+            let mut requests = Vec::new();
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                if index == 2 {
+                    let ledger_bytes = std::fs::read(
+                        ledger_for_server
+                            .join(format!("{}.json", prepared_for_server.tournament_uuid)),
+                    )
+                    .unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&ledger_bytes).unwrap();
+                    assert_eq!(value["action"], "arm_requested");
+                }
+                requests.push(request);
+                stream.write_all(&response).unwrap();
+            }
+            requests
+        });
+        let argument = OsString::from_vec(b"arg-\xfe".to_vec());
+        let result = super::speculate_run_at(
+            &socket,
+            source.clone(),
+            candidates.clone(),
+            ledger_root,
+            PathBuf::from(cgroup_root),
+            Duration::from_secs(1),
+            vec![argument.clone()],
+        )
+        .unwrap();
+        assert_eq!(result.phase, SpeculationPhase::PendingFinalize);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        let Request::Speculation(prepare) = serde_json::from_slice(&requests[1]).unwrap() else {
+            panic!("missing prepare request");
+        };
+        let SpeculationRequest::Prepare(body) = prepare.into_request() else {
+            panic!("wrong prepare request");
+        };
+        assert_eq!(body.source().to_path_buf(), source);
+        assert_eq!(body.candidates()[0].to_path_buf(), candidates[0]);
+        assert_eq!(body.candidates()[1].to_path_buf(), candidates[1]);
+        assert_eq!(body.argv().to_os_strings(), vec![argument]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn lost_arm_response_polls_without_resend_and_advances_only_on_new_generation() {
+        let Some(cgroup_root) = std::env::var_os("LTERM_SPECULATION_CGROUP_ROOT") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let candidates = [
+            directory.path().join("candidate-0"),
+            directory.path().join("candidate-1"),
+        ];
+        let ledger_root = directory.path().join("ledger");
+        for path in [&source, &candidates[0], &candidates[1], &ledger_root] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let prepared = speculation_status(SpeculationPhase::Prepared, 1);
+        let (_socket_directory, socket, server) = fake_speculation_socket(vec![
+            daemon_status_response(9),
+            speculation_response(&prepared),
+            Vec::new(),
+            speculation_response(&prepared),
+            speculation_response(&speculation_status(SpeculationPhase::PendingFinalize, 2)),
+        ]);
+        let result = super::speculate_run_at(
+            &socket,
+            source,
+            candidates,
+            ledger_root,
+            PathBuf::from(cgroup_root),
+            Duration::from_secs(1),
+            vec![OsString::from("/bin/true")],
+        )
+        .unwrap();
+        assert_eq!(result.phase, SpeculationPhase::PendingFinalize);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        let actions = requests[1..]
+            .iter()
+            .map(
+                |request| match serde_json::from_slice::<Request>(request).unwrap() {
+                    Request::Speculation(envelope) => match envelope.into_request() {
+                        SpeculationRequest::Prepare(_) => "prepare",
+                        SpeculationRequest::Arm(_) => "arm",
+                        SpeculationRequest::Status(_) => "status",
+                        SpeculationRequest::Finalize(_) => "finalize",
+                        SpeculationRequest::Rollback(_) => "rollback",
+                    },
+                    _ => "ordinary",
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(actions, ["prepare", "arm", "status", "status"]);
+    }
+
+    #[test]
+    fn terminal_size_normalization_preserves_nonzero_sizes() {
+        assert_eq!(normalize_terminal_size(Some((80, 24))), (80, 24));
+        assert_eq!(normalize_terminal_size(Some((132, 43))), (132, 43));
+    }
+
+    #[test]
+    fn terminal_size_normalization_falls_back_for_missing_or_zero_components() {
+        for size in [None, Some((0, 0)), Some((0, 24)), Some((80, 0))] {
+            assert_eq!(normalize_terminal_size(size), (80, 24), "size={size:?}");
+        }
+    }
 
     #[test]
     fn capability_file_is_exclusive_private_and_exact_format_only() {

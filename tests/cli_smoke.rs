@@ -1492,7 +1492,7 @@ fn codex_home_reaches_fake_omx_launcher_through_prestarted_daemon() -> TestResul
     std::fs::create_dir(&fake_bin)?;
     write_executable(
         &fake_bin.join("omx"),
-        "#!/bin/sh\nprintf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"\n",
+        "#!/bin/sh\nprintf 'CODEX_HOME:%s\\n' \"${CODEX_HOME-}\"\nsleep 2\n",
     )?;
     let path = path_with_prepended(&fake_bin)?;
     let sentinel = env.temp.path().join("mat-session").join("CODEX_HOME");
@@ -1508,6 +1508,53 @@ fn codex_home_reaches_fake_omx_launcher_through_prestarted_daemon() -> TestResul
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = format!("CODEX_HOME:{}", sentinel.display());
     assert!(stdout.contains(&expected), "{stdout:?}");
+    Ok(())
+}
+
+#[test]
+fn agent_launch_scrubs_stale_daemon_claudecode_and_preserves_arguments() -> TestResult {
+    let env = TestEnv::new()?;
+    let mut daemon = env.cmd();
+    daemon
+        .arg("daemon")
+        .env("CLAUDECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _daemon = ChildCleanup::new(daemon.spawn()?);
+    env.wait_for_reachable_daemon()?;
+
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omc"),
+        "#!/bin/sh\n\
+         printf 'CLAUDECODE:<%s>\\n' \"${CLAUDECODE-}\"\n\
+         printf 'ARGC:%s\\n' \"$#\"\n\
+         printf 'ARG1:<%s>\\n' \"${1-}\"\n\
+         printf 'ARG2:<%s>\\n' \"${2-unset}\"\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = env
+        .cmd()
+        .env_remove("CLAUDECODE")
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .args(["omc", "--madmax"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    for expected in ["CLAUDECODE:<>", "ARGC:1", "ARG1:<--madmax>", "ARG2:<unset>"] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?}: {stdout:?}"
+        );
+    }
     Ok(())
 }
 
@@ -4408,7 +4455,14 @@ fn exits_json_uses_protocol_v8_bounded_raw_free_request_and_response() -> TestRe
         .args(["exits", "opaque-id", "--limit", "1", "--all", "--json"])
         .output()?;
     assert!(output.status.success(), "exits failed: {output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr.clone())?,
+        format!(
+            "warning: lterm client {} (protocol 9) is talking to daemon {} (protocol 8); run `lterm shutdown` and retry after upgrades\n",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(rows[0]["session_id"], "opaque-id");
     assert_eq!(rows[0]["trigger"]["type"], "leader_exited");
@@ -14910,13 +14964,15 @@ fn run_exports_session_identity_env_to_child_process() -> TestResult {
         .output()?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // PTY setup/teardown may share a line with the first child marker, so
+    // locate the bounded marker rather than requiring it at byte zero.
     let session = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("SESSION:"))
+        .find_map(|line| line.split_once("SESSION:").map(|(_, value)| value))
         .ok_or_else(|| format!("run output missing session identity: {stdout:?}"))?;
     let pane = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("PANE:"))
+        .find_map(|line| line.split_once("PANE:").map(|(_, value)| value))
         .ok_or_else(|| format!("run output missing pane identity: {stdout:?}"))?;
     assert!(!session.trim().is_empty(), "{stdout:?}");
     assert!(pane.starts_with('%'), "{stdout:?}");
@@ -15350,7 +15406,11 @@ tmux list-panes -t "$TMUX_PANE" -F '#{pane_id}'
     assert!(stdout.contains("ARG2:gpt 5"), "{stdout:?}");
     assert!(stdout.contains("ARG3:semi;colon"), "{stdout:?}");
     assert!(stdout.contains("ARG4:--flag"), "{stdout:?}");
-    assert!(stdout.contains("PANE_LIST:%0"), "{stdout:?}");
+    let pane_list = stdout
+        .split_once("PANE_LIST:")
+        .map(|(_, value)| value)
+        .ok_or_else(|| format!("agent output missing pane-list marker: {stdout:?}"))?;
+    assert!(pane_list.contains("%0"), "{stdout:?}");
     assert!(
         !stdout.contains("FAKE_TMUX_SHOULD_NOT_RUN"),
         "fake tmux won PATH precedence: {stdout:?}"
@@ -15906,8 +15966,8 @@ sleep 1
     assert!(
         output
             .stdout
-            .windows(b"\x1b[31mCOLOR_OK\x1b[0m".len())
-            .any(|window| window == b"\x1b[31mCOLOR_OK\x1b[0m"),
+            .windows(b"\x1b[31mCOLOR_OK".len())
+            .any(|window| window == b"\x1b[31mCOLOR_OK"),
         "agent TUI should still be able to emit color SGR when parent lterm has NO_COLOR: {:?}",
         stdout
     );
@@ -16293,6 +16353,70 @@ fn agent_alias_force_status_repaints_after_alt_screen_startup_clear() -> TestRes
         contains_subsequence(after_alt_enter, status_indicator),
         "--status/ForceRow should repaint the lterm status row after an agent alt-screen startup clear: {:?}",
         String::from_utf8_lossy(after_alt_enter)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn zero_size_pty_plain_launch_reaches_the_session_command() -> TestResult {
+    let env = TestEnv::new()?;
+    let path = std::env::var_os("PATH").ok_or("PATH should be set for the test")?;
+
+    let output = run_cli_on_pty_until_exit_at_size(
+        &env,
+        &path,
+        &[
+            "start",
+            "--no-status",
+            "--",
+            "sh",
+            "-c",
+            "printf 'PLAIN_ZERO_SIZE_READY\\n'",
+        ],
+        "plain launch on a zero-size PTY",
+        0,
+        0,
+    )?;
+    assert!(
+        contains_subsequence(&output, b"PLAIN_ZERO_SIZE_READY"),
+        "plain session command should start despite an initial zero-size PTY: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn zero_size_pty_omc_madmax_launches_and_preserves_forwarded_argument() -> TestResult {
+    let env = TestEnv::new()?;
+    let fake_bin = env.temp.path().join("fake-bin");
+    std::fs::create_dir(&fake_bin)?;
+    write_executable(
+        &fake_bin.join("omc"),
+        "#!/bin/sh\nprintf 'OMC_ARGS:%s\\n' \"$*\"\nprintf 'OMC_ZERO_SIZE_READY\\n'\n",
+    )?;
+    let path = path_with_prepended(&fake_bin)?;
+
+    let output = run_cli_on_pty_until_exit_at_size(
+        &env,
+        &path,
+        &["omc", "--madmax"],
+        "omc --madmax on a zero-size PTY",
+        0,
+        0,
+    )?;
+    assert!(
+        contains_subsequence(&output, b"OMC_ARGS:--madmax"),
+        "--madmax should be forwarded unchanged to omc: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_subsequence(&output, b"OMC_ZERO_SIZE_READY"),
+        "omc should start despite an initial zero-size PTY: {:?}",
+        String::from_utf8_lossy(&output)
     );
 
     Ok(())
@@ -17928,8 +18052,20 @@ fn run_agent_alias_on_pty_until_exit(
     args: &[&str],
     label: &str,
 ) -> TestResult<Vec<u8>> {
+    run_cli_on_pty_until_exit_at_size(env, path, args, label, 24, 80)
+}
+
+#[cfg(unix)]
+fn run_cli_on_pty_until_exit_at_size(
+    env: &TestEnv,
+    path: &OsString,
+    args: &[&str],
+    label: &str,
+    rows: u16,
+    cols: u16,
+) -> TestResult<Vec<u8>> {
     let (mut master, slave) = open_pty_pair()?;
-    set_pty_window_size(&slave, 24, 80)?;
+    set_pty_window_size(&slave, rows, cols)?;
     let stdin = Stdio::from(slave.try_clone()?);
     let stdout = Stdio::from(slave.try_clone()?);
     let stderr = Stdio::from(slave.try_clone()?);

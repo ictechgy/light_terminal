@@ -56,6 +56,18 @@ pub(crate) fn process_registry_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("speculation").join("process-registry-v1"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn tournament_registry_dir() -> Result<PathBuf> {
+    Ok(data_dir()?
+        .join("speculation")
+        .join("tournament-registry-v1"))
+}
+
+#[allow(dead_code)]
+pub(crate) fn speculation_control_dir() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("speculation").join("control-v1"))
+}
+
 pub fn socket_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("LTERM_SOCKET") {
         let path = PathBuf::from(path);

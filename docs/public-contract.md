@@ -148,6 +148,7 @@ or raw output stream.
 | `lterm exits` | none | `stable` | `stable` bounded raw-free recent-exit rows | `stable` | `sanitized-output-only` |
 | `lterm instrument` | none | `stable` | none | `stable` raw-free measurement snapshot; `--json` is required | `sanitized-output-only` |
 | `lterm capability` | none | `stable` | none | none | `not-applicable` |
+| `lterm speculate` | none | `internal` | none | none | `not-applicable` |
 | `lterm metadata` | none | `stable` | none except JSON objects from undo/redo/purge | `stable` for `history --json` | `sanitized-output-only` |
 | `lterm processes` | `lterm ps` | `stable` | `stable` tab-separated rows | `stable` | `sanitized-output-only` |
 | `lterm rename` | none | `stable` | `stable` updated `name\tpane` row | none | `sanitized-output-only` |
@@ -169,6 +170,10 @@ or raw output stream.
 | `lterm inspect --json` | none | `best-effort` | none | `best-effort` alias for the redacted local diagnostic bundle; requires `--json` | `sanitized-output-only` |
 | `lterm daemon` | none | `internal` | none | none | `not-applicable` |
 | `lterm shutdown` | none | `stable` | none | none | `not-applicable` |
+
+During Phase 1, `lterm speculate` exposes nested syntax only for internal
+contract testing and fails closed with `speculation_unsupported_phase1` before
+daemon or candidate work; it does not promote a stable output schema.
 
 ### `lterm instrument` stable raw-free snapshot semantics
 
