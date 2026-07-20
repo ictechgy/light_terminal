@@ -3557,6 +3557,14 @@ fn agent_command_argv(
     Ok(cmd)
 }
 
+fn agent_session_env(profile: &AgentProfile) -> HashMap<String, String> {
+    let mut env = HashMap::from([("LTERM_AGENT".to_string(), profile.name.clone())]);
+    if is_built_in_agent_profile(&profile.name) {
+        env.insert("CLAUDECODE".to_string(), String::new());
+    }
+    env
+}
+
 fn run_agent_profile(
     profile: AgentProfile,
     launch: AgentLaunchOptions,
@@ -3623,7 +3631,7 @@ fn run_agent_profile(
             Some(name) => name.clone(),
             None => next_agent_session_name(&profile.session_base)?,
         };
-        let env = HashMap::from([("LTERM_AGENT".to_string(), profile.name.to_string())]);
+        let env = agent_session_env(&profile);
         let created = client::new_session(
             Some(session_name),
             Some(command.clone()),
@@ -4814,6 +4822,28 @@ mod tests {
             assert_eq!(profile.show_status, show_status, "{name}");
             assert_eq!(profile.mat_cli.as_deref(), mat_cli, "{name}");
         }
+    }
+
+    #[test]
+    fn agent_session_env_clears_claudecode_only_for_built_in_profiles() {
+        let built_in = AgentProfile::known("omc");
+        let built_in_env = agent_session_env(&built_in);
+        assert_eq!(
+            built_in_env.get("LTERM_AGENT").map(String::as_str),
+            Some("omc")
+        );
+        assert_eq!(built_in_env.get("CLAUDECODE").map(String::as_str), Some(""));
+
+        let custom = AgentProfile::resolve("my-agent").expect("custom profile");
+        let custom_env = agent_session_env(&custom);
+        assert_eq!(
+            custom_env.get("LTERM_AGENT").map(String::as_str),
+            Some("my-agent")
+        );
+        assert!(
+            !custom_env.contains_key("CLAUDECODE"),
+            "custom profiles retain their prior environment semantics"
+        );
     }
 
     #[test]
