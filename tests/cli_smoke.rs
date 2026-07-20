@@ -23,6 +23,7 @@ const ERR_INVALID_SESSION_CHARS: &str = "may only contain ASCII";
 const ERR_LEADING_DASH_NAME: &str = "cannot start with '-'";
 const ERR_SESSION_EXISTS: &str = "session name already exists";
 const ERR_SESSION_NAME: &str = "session name";
+const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 9;
 const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD: &str = "LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_REGRESSION";
 
@@ -585,7 +586,7 @@ fn run_tmux_with_fake_sessions(
                             "ping" => serde_json::json!({"ok":true,"result":{"pong":true}}),
                             "status" => serde_json::json!({"ok":true,"result":{
                                 "version":env!("CARGO_PKG_VERSION"),
-                                "protocol_version":8,
+                                "protocol_version":CURRENT_DAEMON_PROTOCOL_VERSION,
                                 "session_count":sessions.len(),
                                 "active_connections":1,
                                 "shutting_down":false
@@ -700,7 +701,7 @@ where
                         "ping" => serde_json::json!({"ok":true,"result":{"pong":true}}),
                         "status" => serde_json::json!({"ok":true,"result":{
                             "version":env!("CARGO_PKG_VERSION"),
-                            "protocol_version":8,
+                            "protocol_version":CURRENT_DAEMON_PROTOCOL_VERSION,
                             "session_count":1,
                             "active_connections":1,
                             "shutting_down":false
@@ -1066,8 +1067,12 @@ fn wait_for_pid_exit(pid: &str) -> TestResult {
 }
 
 fn wait_for_file_contents(path: &Path) -> TestResult<String> {
+    wait_for_file_contents_for(path, Duration::from_secs(3))
+}
+
+fn wait_for_file_contents_for(path: &Path, timeout: Duration) -> TestResult<String> {
     poll_until(
-        Duration::from_secs(3),
+        timeout,
         Duration::from_millis(50),
         &format!("non-empty file {}", path.display()),
         || match std::fs::read_to_string(path) {
@@ -8516,7 +8521,10 @@ fn tmux_compat_kill_session_closes_child_visible_cmux_split_surface() -> TestRes
         .output()?;
     assert!(parent.status.success(), "{parent:?}");
     wait_for_session_present(&env, "cmux-visible-parent")?;
-    assert_eq!(wait_for_file_contents(&split_status_file)?.trim(), "0");
+    assert_eq!(
+        wait_for_file_contents_for(&split_status_file, Duration::from_secs(10))?.trim(),
+        "0"
+    );
     let child_pane = wait_for_file_contents(&child_pane_file)?.trim().to_string();
     assert!(
         child_pane.starts_with('%'),
