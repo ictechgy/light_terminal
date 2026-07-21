@@ -38,9 +38,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -1661,20 +1663,16 @@ fn current_parent_request() -> Option<ParentRequest> {
 /// pair. A real tmux socket is never accepted, and a missing/invalid pane stays
 /// unparented rather than being inferred from names, cwd, or process state.
 fn current_verified_lterm_tmux_parent() -> Option<String> {
-    let tmux_env = std::env::var("TMUX").ok()?;
-    let tmux_socket = tmux_env.split(',').next().unwrap_or("");
-    let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
-    let lterm_socket_path = paths::socket_path()
-        .ok()
-        .map(|path| path.display().to_string());
-    let tmux_compat_socket_path = paths::tmux_compat_socket_path()
-        .ok()
-        .map(|path| path.display().to_string());
+    let tmux_env = std::env::var_os("TMUX")?;
+    let tmux_socket = tmux_socket_field(&tmux_env);
+    let lterm_socket_env = std::env::var_os("LTERM_SOCKET");
+    let lterm_socket_path = paths::socket_path().ok();
+    let tmux_compat_socket_path = paths::tmux_compat_socket_path().ok();
     if !is_self_provided_tmux(
         tmux_socket,
         lterm_socket_env.as_deref(),
-        lterm_socket_path.as_deref(),
-        tmux_compat_socket_path.as_deref(),
+        lterm_socket_path.as_deref().map(Path::as_os_str),
+        tmux_compat_socket_path.as_deref().map(Path::as_os_str),
     ) {
         return None;
     }
@@ -7023,6 +7021,15 @@ fn compute_sink_enabled(
         && !explicit_no_status
 }
 
+fn tmux_socket_field(tmux: &OsStr) -> &OsStr {
+    let bytes = tmux.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == b',')
+        .unwrap_or(bytes.len());
+    OsStr::from_bytes(&bytes[..end])
+}
+
 /// `$TMUX`의 socket 필드가 lterm self-provided TMUX인지 판정한다(순수, env 비의존).
 ///
 /// lterm은 tmux-compat 호스트로서 자식에 `TMUX={compat_socket},{pid},0`
@@ -7033,17 +7040,17 @@ fn compute_sink_enabled(
 /// # 인자
 /// - `tmux_socket_field`: `$TMUX`를 `,`로 가른 첫 필드(socket 경로).
 /// - `lterm_socket_env`: legacy self-detection용 `LTERM_SOCKET` 값(있으면).
-/// - `lterm_socket_path`: legacy self-detection용 `paths::socket_path()` 결과 문자열(있으면).
-/// - `tmux_compat_socket_path`: 최신 self-detection용 compat-only socket 문자열(있으면).
+/// - `lterm_socket_path`: legacy self-detection용 `paths::socket_path()` 결과(있으면).
+/// - `tmux_compat_socket_path`: 최신 self-detection용 compat-only socket 경로(있으면).
 ///
 /// # 반환
 /// socket 필드가 lterm live socket(legacy) 또는 compat socket(현재)과 일치하면 `true`.
 /// 빈 필드는 판정 불가로 `false`.
 fn is_self_provided_tmux(
-    tmux_socket_field: &str,
-    lterm_socket_env: Option<&str>,
-    lterm_socket_path: Option<&str>,
-    tmux_compat_socket_path: Option<&str>,
+    tmux_socket_field: &OsStr,
+    lterm_socket_env: Option<&OsStr>,
+    lterm_socket_path: Option<&OsStr>,
+    tmux_compat_socket_path: Option<&OsStr>,
 ) -> bool {
     if tmux_socket_field.is_empty() {
         return false;
@@ -7061,21 +7068,18 @@ fn detect_real_tmux() -> bool {
     let Some(tmux) = std::env::var_os("TMUX") else {
         return false;
     };
-    let tmux = tmux.to_string_lossy();
-    let socket_field = tmux.split(',').next().unwrap_or("");
+    let socket_field = tmux_socket_field(&tmux);
     if socket_field.is_empty() {
         return false;
     }
-    let lterm_socket_env = std::env::var("LTERM_SOCKET").ok();
-    let lterm_socket_path = paths::socket_path().ok().map(|p| p.display().to_string());
-    let tmux_compat_socket_path = paths::tmux_compat_socket_path()
-        .ok()
-        .map(|p| p.display().to_string());
+    let lterm_socket_env = std::env::var_os("LTERM_SOCKET");
+    let lterm_socket_path = paths::socket_path().ok();
+    let tmux_compat_socket_path = paths::tmux_compat_socket_path().ok();
     !is_self_provided_tmux(
         socket_field,
         lterm_socket_env.as_deref(),
-        lterm_socket_path.as_deref(),
-        tmux_compat_socket_path.as_deref(),
+        lterm_socket_path.as_deref().map(Path::as_os_str),
+        tmux_compat_socket_path.as_deref().map(Path::as_os_str),
     )
 }
 
@@ -8584,10 +8588,11 @@ mod tests {
         rpc_parse_error_preview, run_nested_agent_detection_loop, run_status_command,
         select_status_backend, should_mobile_transcript_auto, speculation_rpc_at,
         status_sgr_stack_supported, status_theme_protocol_error, strict_rpc_at,
-        tmux_parent_pane_protocol_error, trace_file_summary, trace_output_open_context,
-        trace_summary_text, unlink_capability_path_if_identity_matches, validate_trace_replay,
-        write_lterm_agent_presence_banner, write_lterm_title_cue, write_mobile_transcript_update,
-        write_mobile_transcript_urls, write_numbered_search_matches,
+        tmux_parent_pane_protocol_error, tmux_socket_field, trace_file_summary,
+        trace_output_open_context, trace_summary_text, unlink_capability_path_if_identity_matches,
+        validate_trace_replay, write_lterm_agent_presence_banner, write_lterm_title_cue,
+        write_mobile_transcript_update, write_mobile_transcript_urls,
+        write_numbered_search_matches,
     };
     use crate::protocol::{
         ExitEvidenceState, ExitOutcomeState, RecentSessionExit, Request, SessionExitTrigger,
@@ -8597,6 +8602,7 @@ mod tests {
         SpeculationRollbackRequest, SpeculationRollbackResponse, SpeculationStatus,
         SpeculationStatusRequest, SpeculationStatusResponse,
     };
+    use std::ffi::OsStr;
     use std::ffi::OsString;
     use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -12928,22 +12934,22 @@ mod tests {
     /// lterm self-provided TMUX(`$TMUX` socket 필드 == LTERM_SOCKET)는 self로 식별된다.
     #[test]
     fn self_provided_tmux_matches_lterm_socket_env() {
-        let sock = "/run/user/501/lterm.sock";
+        let sock = OsStr::new("/run/user/501/lterm.sock");
         assert!(is_self_provided_tmux(sock, Some(sock), None, None));
     }
 
     /// `$TMUX` socket 필드가 paths::socket_path()와 일치해도 self로 식별된다(LTERM_SOCKET 미설정 폴백).
     #[test]
     fn self_provided_tmux_matches_socket_path_fallback() {
-        let sock = "/tmp/lterm-runtime/lterm.sock";
+        let sock = OsStr::new("/tmp/lterm-runtime/lterm.sock");
         assert!(is_self_provided_tmux(sock, None, Some(sock), None));
     }
 
     /// 최신 lterm의 `$TMUX` socket 필드는 live daemon이 아닌 compat-only fast-fail 경로다.
     #[test]
     fn self_provided_tmux_matches_compat_socket_path() {
-        let live_sock = "/run/user/501/lterm.sock";
-        let compat_sock = "/run/user/501/.lterm.sock.tmux-compat";
+        let live_sock = OsStr::new("/run/user/501/lterm.sock");
+        let compat_sock = OsStr::new("/run/user/501/.lterm.sock.tmux-compat");
         assert!(is_self_provided_tmux(
             compat_sock,
             Some(live_sock),
@@ -12955,13 +12961,13 @@ mod tests {
     /// 진짜 외부 tmux(소켓 경로가 lterm과 다름)는 self가 아니다 → real_tmux로 분류되어야 한다.
     #[test]
     fn external_tmux_is_not_self_provided() {
-        let real_tmux_sock = "/private/tmp/tmux-501/default";
-        let lterm_sock = "/run/user/501/lterm.sock";
+        let real_tmux_sock = OsStr::new("/private/tmp/tmux-501/default");
+        let lterm_sock = OsStr::new("/run/user/501/lterm.sock");
         assert!(!is_self_provided_tmux(
             real_tmux_sock,
             Some(lterm_sock),
             Some(lterm_sock),
-            Some("/run/user/501/.lterm.sock.tmux-compat")
+            Some(OsStr::new("/run/user/501/.lterm.sock.tmux-compat"))
         ));
         // lterm 마커가 전혀 없어도(둘 다 None) 외부 tmux는 self가 아니다.
         assert!(!is_self_provided_tmux(real_tmux_sock, None, None, None));
@@ -12971,12 +12977,30 @@ mod tests {
     #[test]
     fn empty_tmux_socket_field_is_not_self() {
         assert!(!is_self_provided_tmux(
-            "",
-            Some("/x"),
-            Some("/y"),
-            Some("/z")
+            OsStr::new(""),
+            Some(OsStr::new("/x")),
+            Some(OsStr::new("/y")),
+            Some(OsStr::new("/z"))
         ));
-        assert!(!is_self_provided_tmux("", None, None, None));
+        assert!(!is_self_provided_tmux(OsStr::new(""), None, None, None));
+    }
+
+    #[test]
+    fn self_provided_tmux_preserves_non_utf8_socket_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let socket = std::ffi::OsString::from_vec(b"/tmp/lterm-\xff.sock".to_vec());
+        let mut tmux = socket.clone().into_vec();
+        tmux.extend_from_slice(b",123,0");
+        let tmux = std::ffi::OsString::from_vec(tmux);
+
+        assert_eq!(tmux_socket_field(&tmux), socket.as_os_str());
+        assert!(is_self_provided_tmux(
+            tmux_socket_field(&tmux),
+            Some(socket.as_os_str()),
+            None,
+            None
+        ));
     }
 
     // ── select_status_backend 라우팅 매트릭스 (PoC1) ──

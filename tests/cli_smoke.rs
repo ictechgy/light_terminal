@@ -6174,14 +6174,14 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
     write_executable(
         &indirect_launcher,
         &format!(
-            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {indirect_name} -- sleep 30\n"
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {indirect_name} -- sleep 3600\n"
         ),
     )?;
     let direct_launcher = env.temp.path().join("nested-provenance-direct.sh");
     write_executable(
         &direct_launcher,
         &format!(
-            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {direct_name} -- sleep 30\n{}\nsleep 30\n",
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {direct_name} -- sleep 3600\n{}\nsleep 3600\n",
             shlex::try_quote(&indirect_launcher.display().to_string())?
         ),
     )?;
@@ -6229,7 +6229,7 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
             "--",
             "sh",
             "-lc",
-            "sleep 30",
+            "sleep 3600",
         ])
         .output()?;
     assert!(outside.status.success(), "{outside:?}");
@@ -6240,6 +6240,14 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
         .iter()
         .find(|row| row.name == "nested-provenance-parent")
         .ok_or_else(|| format!("parent missing from all sessions: {all:?}"))?;
+    let outside = all
+        .iter()
+        .find(|row| row.name == outside_name)
+        .ok_or_else(|| format!("outside control missing from all sessions: {all:?}"))?;
+    assert_eq!(
+        outside.parent_pane_id, None,
+        "external tmux control must remain a root session: {all:?}"
+    );
     for child_name in [direct_name, indirect_name] {
         let child = all
             .iter()
@@ -8525,7 +8533,9 @@ fn tmux_compat_kill_session_closes_child_visible_cmux_split_surface() -> TestRes
         wait_for_file_contents_for(&split_status_file, Duration::from_secs(10))?.trim(),
         "0"
     );
-    let child_pane = wait_for_file_contents(&child_pane_file)?.trim().to_string();
+    let child_pane = wait_for_file_contents_for(&child_pane_file, Duration::from_secs(10))?
+        .trim()
+        .to_string();
     assert!(
         child_pane.starts_with('%'),
         "expected child pane id, got {child_pane:?}"
@@ -11174,6 +11184,11 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
             "value\u{13430}",
         ),
     ] {
+        let expected_error = match label {
+            "oversized name" | "invalid name alphabet" => "invalid tmux user-option name",
+            "oversized value" => "tmux user-option value exceeds 4096 bytes",
+            _ => "tmux user-option value contains a control or format character",
+        };
         let output = env
             .cmd()
             .args([
@@ -11186,9 +11201,11 @@ fn tmux_compat_user_option_contract_enforces_exact_name_value_and_output_bounds(
                 value,
             ])
             .output()?;
-        if output.status.success() || !output.stdout.is_empty() || output.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() || !output.stdout.is_empty() || !stderr.contains(expected_error)
+        {
             failures.push(format!(
-                "{label} accepted for name_bytes={} value_bytes={}: {output:?}",
+                "{label} returned the wrong rejection for name_bytes={} value_bytes={} expected={expected_error:?}: {output:?}",
                 name.len(),
                 value.len()
             ));
@@ -11437,18 +11454,22 @@ fn tmux_compat_user_option_contract_combines_scope_cap_and_persists_immutable_ro
             .get(child["id"].as_str().unwrap())
             .is_none()
     );
-    let encoded = final_store.to_string();
-    for mutable_identity in [
-        "%0",
-        "%1",
-        "fake-session-0",
-        "fake-session-1",
-        "renamed-root",
-    ] {
-        assert!(
-            !encoded.contains(mutable_identity),
-            "store used mutable identity {mutable_identity}"
-        );
+    for scope in ["pane_user_options", "session_user_options"] {
+        let keys = final_store[scope]
+            .as_object()
+            .ok_or_else(|| format!("{scope} is not an object: {final_store}"))?;
+        for mutable_identity in [
+            "%0",
+            "%1",
+            "fake-session-0",
+            "fake-session-1",
+            "renamed-root",
+        ] {
+            assert!(
+                !keys.contains_key(mutable_identity),
+                "{scope} used mutable identity {mutable_identity}: {final_store}"
+            );
+        }
     }
     Ok(())
 }
@@ -11504,7 +11525,7 @@ fn tmux_compat_user_option_contract_enforces_exact_512_combined_identity_cap_ato
         sessions,
     )?;
     assert!(!rejected.status.success(), "{rejected:?}");
-    assert_stderr_contains(&rejected, "identity limit reached");
+    assert_stderr_contains(&rejected, "tmux user-option identity limit reached");
     assert_eq!(std::fs::read(data_store_path(&env))?, at_cap);
     Ok(())
 }
@@ -11566,8 +11587,20 @@ fn tmux_compat_user_option_contract_enforces_4096_entries_and_16mib_store_atomic
 
     const STORE_LIMIT: usize = 16 * 1024 * 1024;
     let large_env = TestEnv::new()?;
+    let mut baseline_generations = serde_json::Map::new();
+    baseline_generations.insert(String::new(), serde_json::json!(1));
+    let baseline_len = write_user_option_store(
+        &large_env,
+        serde_json::Map::new(),
+        serde_json::Map::new(),
+        baseline_generations,
+    )?
+    .len();
+    let seed_key_len = STORE_LIMIT
+        .checked_sub(baseline_len + 1)
+        .ok_or("serialized store baseline exceeds its configured limit")?;
     let mut wait_generations = serde_json::Map::new();
-    wait_generations.insert("x".repeat(STORE_LIMIT - 2_048), serde_json::json!(1));
+    wait_generations.insert("x".repeat(seed_key_len), serde_json::json!(1));
     let before = write_user_option_store(
         &large_env,
         serde_json::Map::new(),
@@ -11575,8 +11608,9 @@ fn tmux_compat_user_option_contract_enforces_4096_entries_and_16mib_store_atomic
         wait_generations,
     )?;
     assert!(
-        before.len() < STORE_LIMIT,
-        "seed store unexpectedly oversized"
+        before.len() < STORE_LIMIT && STORE_LIMIT - before.len() == 1,
+        "seed store should be exactly one byte below the configured limit: baseline={baseline_len} actual={}",
+        before.len()
     );
     let value = "v".repeat(4_096);
     let oversized = run_tmux_with_fake_sessions(
@@ -11811,10 +11845,6 @@ fn tmux_compat_g003_kill_pane_cleanup_is_generation_safe_after_pane_id_reuse() -
     let old = fake_live_session(0);
     let old_id = old["id"].as_str().ok_or("old id missing")?.to_string();
     let new_id = "00000000-0000-4000-8000-ffffffffffff";
-    let store_path = data_store_path(&env);
-    let store_parent = store_path.parent().ok_or("store path has no parent")?;
-    std::fs::create_dir_all(store_parent)?;
-    std::fs::set_permissions(store_parent, std::fs::Permissions::from_mode(0o700))?;
     let initial_store = serde_json::json!({
         "panes": {
             "%0": {
@@ -11838,19 +11868,8 @@ fn tmux_compat_g003_kill_pane_cleanup_is_generation_safe_after_pane_id_reuse() -
         "wait_generation_touched_secs": {},
         "managed_attaches": {}
     });
-    std::fs::write(&store_path, serde_json::to_vec(&initial_store)?)?;
-
-    let fake_bin = env.temp.path().join("fake-cmux-generation-bin");
-    std::fs::create_dir(&fake_bin)?;
-    let cmux_log = env.temp.path().join("cmux-generation-kill.log");
-    write_executable(
-        &fake_bin.join("cmux"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
-            shlex::try_quote(&cmux_log.display().to_string())?
-        ),
-    )?;
-    let path = path_with_prepended(&fake_bin)?;
+    let store_path = write_tmux_compat_store_bytes(&env, &serde_json::to_vec(&initial_store)?)?;
+    let (path, cmux_log) = precreated_cmux_call_log(&env)?;
     let store_path_for_server = store_path.clone();
     let old_for_server = old.clone();
     let old_id_for_server = old_id.clone();
@@ -11892,7 +11911,8 @@ fn tmux_compat_g003_kill_pane_cleanup_is_generation_safe_after_pane_id_reuse() -
             .iter()
             .find(|request| request["type"] == "kill")
             .and_then(|request| request["target"].as_str()),
-        Some(old_id.as_str())
+        Some(old_id.as_str()),
+        "kill request used an unexpected generation: {requests:?}"
     );
 
     let cmux_calls = std::fs::read_to_string(&cmux_log)?;
@@ -12215,7 +12235,12 @@ fn tmux_compat_g010_kill_pane_rejects_reused_surface_between_info_and_store_capt
                 .map_err(|err| err.to_string())?;
                 Ok(serde_json::json!({"ok":true,"result":old_for_server.clone()}))
             }
-            Some("kill") if request["target"] == old_id_for_server => {
+            Some("kill") => {
+                if request["target"] != old_id_for_server {
+                    return Err(format!(
+                        "kill used wrong captured generation: expected={old_id_for_server} request={request}"
+                    ));
+                }
                 Ok(serde_json::json!({"ok":true,"result":null}))
             }
             other => Err(format!("unexpected scripted request: {other:?}: {request}")),
@@ -12442,7 +12467,7 @@ fn tmux_compat_g010_kill_pane_preserves_same_generation_row_changed_after_captur
     let old_id_for_server = old_id.clone();
     let store_path_for_server = store_path.clone();
     let changed_row_for_server = changed_row.clone();
-    let (killed, _) = run_tmux_with_scripted_daemon_and_path(
+    let (killed, requests) = run_tmux_with_scripted_daemon_and_path(
         &env,
         &["tmux-compat", "kill-pane", "-t", "%80"],
         Some(path.as_os_str()),
@@ -12465,6 +12490,12 @@ fn tmux_compat_g010_kill_pane_preserves_same_generation_row_changed_after_captur
         },
     )?;
     assert!(killed.status.success(), "{killed:?}");
+    assert!(
+        requests.iter().any(|request| {
+            request["type"] == "kill" && request["target"].as_str() == Some(old_id.as_str())
+        }),
+        "same-generation mutation path did not execute the intended kill: {requests:?}"
+    );
     let store: serde_json::Value = serde_json::from_slice(&std::fs::read(&store_path)?)?;
     assert_eq!(store["panes"], serde_json::json!({"%80":changed_row}));
     assert_eq!(store["pane_user_options"], serde_json::json!({}));
@@ -12530,7 +12561,11 @@ fn tmux_compat_g010_failed_pane_kill_preserves_store_and_closes_no_surface() -> 
         "{requests:?}"
     );
     assert_eq!(std::fs::read(&store_path)?, before);
-    assert!(std::fs::read_to_string(&cmux_log)?.is_empty());
+    let cmux_calls = std::fs::read_to_string(&cmux_log)?;
+    assert!(
+        cmux_calls.trim().is_empty(),
+        "failed pane kill unexpectedly closed a surface: {cmux_calls:?}"
+    );
     Ok(())
 }
 
@@ -12706,6 +12741,14 @@ fn tmux_compat_g003_successful_session_kill_removes_root_and_descendant_immutabl
         store["session_user_options"][survivor_id]["@owner"], "survivor-session-value",
         "session cleanup removed unrelated session identity: {store}"
     );
+    let cleanup = env
+        .cmd()
+        .args(["tmux-compat", "kill-session", "-t", "g003-session-survivor"])
+        .output()?;
+    assert!(
+        cleanup.status.success(),
+        "survivor cleanup failed: {cleanup:?}"
+    );
     Ok(())
 }
 
@@ -12743,9 +12786,15 @@ fn tmux_compat_g003_kill_session_fails_closed_on_incomplete_or_invalid_snapshot(
         let mut values = serde_json::Map::new();
         values.insert("@owner".to_string(), serde_json::json!(case));
         let mut pane_options = serde_json::Map::new();
-        pane_options.insert(target_id.clone(), serde_json::Value::Object(values.clone()));
         let mut session_options = serde_json::Map::new();
-        session_options.insert(target_id, serde_json::Value::Object(values));
+        for session in &sessions {
+            let identity = session["id"]
+                .as_str()
+                .ok_or("snapshot identity missing")?
+                .to_string();
+            pane_options.insert(identity.clone(), serde_json::Value::Object(values.clone()));
+            session_options.insert(identity, serde_json::Value::Object(values.clone()));
+        }
         let before =
             write_user_option_store(&env, pane_options, session_options, serde_json::Map::new())?;
         let target_for_server = target.clone();
@@ -13183,6 +13232,53 @@ fn omx_pane_first_binds(
     }
 }
 
+#[cfg(unix)]
+fn omx_pane_first_binds_via_tmux_compat(
+    env: &TestEnv,
+    sessions: &[serde_json::Value],
+    pane_target: &str,
+    session_target: &str,
+    candidate: &str,
+) -> TestResult<bool> {
+    let pane = run_tmux_with_fake_sessions(
+        env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-p",
+            "-t",
+            pane_target,
+            "@omx_pane_instance_id",
+        ],
+        sessions.to_vec(),
+    )?;
+    if !pane.status.success() {
+        return Ok(false);
+    }
+    let pane = String::from_utf8(pane.stdout)?.trim().to_string();
+    if !pane.is_empty() {
+        return Ok(pane == candidate);
+    }
+
+    let session = run_tmux_with_fake_sessions(
+        env,
+        &[
+            "tmux-compat",
+            "show-option",
+            "-qv",
+            "-t",
+            session_target,
+            "@omx_instance_id",
+        ],
+        sessions.to_vec(),
+    )?;
+    if !session.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8(session.stdout)?.trim() == candidate)
+}
+
 #[test]
 fn tmux_compat_user_option_contract_pins_omx_pane_first_classification_matrix() {
     let candidate = "omx-instance-a";
@@ -13216,6 +13312,65 @@ fn tmux_compat_user_option_contract_pins_omx_pane_first_classification_matrix() 
             "{name}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn tmux_compat_user_option_contract_enforces_omx_pane_first_reads_end_to_end() -> TestResult {
+    let candidate = "omx-instance-a";
+    let session = fake_live_session(0);
+    let identity = session["id"]
+        .as_str()
+        .ok_or("fake session identity missing")?
+        .to_string();
+    let sessions = vec![session];
+
+    let mismatch_env = TestEnv::new()?;
+    let mut mismatch_pane = serde_json::Map::new();
+    mismatch_pane.insert(
+        identity.clone(),
+        serde_json::json!({"@omx_pane_instance_id":"omx-instance-b"}),
+    );
+    let mut matching_session = serde_json::Map::new();
+    matching_session.insert(
+        identity.clone(),
+        serde_json::json!({"@omx_instance_id":candidate}),
+    );
+    write_user_option_store(
+        &mismatch_env,
+        mismatch_pane,
+        matching_session.clone(),
+        serde_json::Map::new(),
+    )?;
+    assert!(
+        !omx_pane_first_binds_via_tmux_compat(&mismatch_env, &sessions, "%0", "%0", candidate)?,
+        "a mismatched pane owner must not fall back to a matching session owner"
+    );
+
+    let unreadable_env = TestEnv::new()?;
+    write_user_option_store(
+        &unreadable_env,
+        serde_json::Map::new(),
+        matching_session.clone(),
+        serde_json::Map::new(),
+    )?;
+    assert!(
+        !omx_pane_first_binds_via_tmux_compat(&unreadable_env, &sessions, "%404", "%0", candidate)?,
+        "an unreadable pane owner must fail closed instead of using the session owner"
+    );
+
+    let absent_env = TestEnv::new()?;
+    write_user_option_store(
+        &absent_env,
+        serde_json::Map::new(),
+        matching_session,
+        serde_json::Map::new(),
+    )?;
+    assert!(
+        omx_pane_first_binds_via_tmux_compat(&absent_env, &sessions, "%0", "%0", candidate)?,
+        "an absent pane owner should permit the documented session fallback"
+    );
+    Ok(())
 }
 
 #[test]
@@ -15434,7 +15589,7 @@ fn agent_launcher_persists_agent_name_metadata() -> TestResult {
     std::fs::create_dir(&fake_bin)?;
     write_executable(
         &fake_bin.join("codex"),
-        "#!/bin/sh\nprintf 'READY\\n'\nsleep 5\n",
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 20 ]; do printf 'READY\\n'; i=$((i + 1)); sleep 0.05; done\nsleep 5\n",
     )?;
     std::fs::write(
         &config_path,
