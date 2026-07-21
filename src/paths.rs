@@ -385,11 +385,14 @@ mod tests {
         APP_DIR_NAME, data_dir, ensure_private_dir, record_default_socket_path, runtime_dir,
         socket_path, tmux_compat_socket_path, validate_socket_parent,
     };
+    use std::any::type_name_of_val;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const PATH_ENV_NAMES: [&str; 6] = [
         "LTERM_RUNTIME_DIR",
@@ -449,11 +452,19 @@ mod tests {
 
     /// PATH 관련 env를 격리하기 위해 자기 자신을 `--exact <test_name>`으로 재실행한다.
     ///
-    /// `test_name`은 반드시 libtest 전체 경로(예: `paths::tests::...`)를 명시적으로
-    /// 받는다. 왜: 스레드 이름에서 유도하면 `--test-threads=1`(스레드 "main")에서
-    /// 자식이 0개 테스트를 매칭해 본문이 조용히 건너뛰어지기 때문이다. 자식이
-    /// 정확히 1개 테스트를 실행했는지도 stdout으로 검증한다.
-    fn in_isolated_path_env(body: impl FnOnce(), test_name: &str) {
+    /// 테스트 이름은 호출부 closure의 타입 경로에서 유도한다. 하드코딩된 libtest 경로가
+    /// 함수 rename 뒤 조용히 0개 테스트를 실행하는 회귀를 막는다. 자식은 성공 시 명시적
+    /// sentinel을 출력하며, 부모는 bounded wait 뒤 sentinel까지 검증한다.
+    fn in_isolated_path_env(body: impl FnOnce()) {
+        let closure_type = type_name_of_val(&body);
+        let qualified_name = closure_type
+            .strip_suffix("::{{closure}}")
+            .expect("isolated path body must be a direct test closure");
+        let test_name = qualified_name
+            .split_once("::")
+            .map(|(_, name)| name)
+            .expect("isolated path closure must include its crate name");
+        let sentinel = format!("LTERM_PATH_TEST_OK:{test_name}");
         let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
         match std::env::var_os(PATH_ENV_SELF_REEXEC) {
             Some(marker) => {
@@ -464,16 +475,45 @@ mod tests {
                 );
                 let _env = reset_path_env();
                 body();
+                println!("{sentinel}");
             }
             None => {
                 let before = path_env_snapshot();
-                let output = Command::new(std::env::current_exe().expect("current test binary"))
+                let mut child = Command::new(std::env::current_exe().expect("current test binary"))
                     .args(["--exact", test_name, "--nocapture"])
                     .env(PATH_ENV_SELF_REEXEC, test_name)
-                    .output();
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn exact path-test self-reexec child");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if child
+                        .try_wait()
+                        .expect("poll exact path-test self-reexec child")
+                        .is_some()
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let output = child
+                            .wait_with_output()
+                            .expect("collect timed-out path-test self-reexec child");
+                        panic!(
+                            "exact path-test self-reexec child timed out: test={test_name:?} stdout={} stderr={}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let output = child
+                    .wait_with_output()
+                    .expect("collect exact path-test self-reexec child");
                 let after = path_env_snapshot();
                 assert_eq!(after, before, "self-reexec parent path environment changed");
-                let output = output.expect("spawn exact path-test self-reexec child");
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(
                     output.status.success(),
@@ -483,8 +523,8 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(
-                    stdout.contains("test result: ok. 1 passed"),
-                    "self-reexec child must run exactly one test (zero-match silent pass is forbidden): test={test_name:?} stdout={stdout}"
+                    stdout.lines().any(|line| line.trim() == sentinel),
+                    "self-reexec child must execute the intended test body: test={test_name:?} sentinel={sentinel:?} stdout={stdout}"
                 );
             }
         }
@@ -505,10 +545,7 @@ mod tests {
                 "unexpected error: {err:#}"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::runtime_dir_rejects_relative_lterm_runtime_dir",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -526,10 +563,7 @@ mod tests {
                 "unexpected error: {err:#}"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::data_dir_rejects_relative_lterm_data_dir",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -558,10 +592,7 @@ mod tests {
                 & 0o777;
             assert_eq!(mode & 0o077, 0, "fallback data dir must be private");
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::data_dir_without_home_falls_back_to_tmp_runtime_data_dir",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -584,10 +615,7 @@ mod tests {
                 & 0o777;
             assert_eq!(mode & 0o077, 0, "runtime child must be private");
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::runtime_dir_uses_xdg_runtime_dir_child_and_preserves_private_base",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -605,10 +633,7 @@ mod tests {
                 "unexpected error: {err:#}"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::socket_path_rejects_relative_lterm_socket",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -651,10 +676,7 @@ mod tests {
                 Some(".lterm.sock.tmux-compat")
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::tmux_compat_socket_is_private_sibling_not_live_socket",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -678,7 +700,7 @@ mod tests {
                 "unexpected error: {err:#}"
             );
         };
-        in_isolated_path_env(body, "paths::tests::socket_path_rejects_symlink_leaf");
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -712,10 +734,7 @@ mod tests {
                 "default clients should rejoin the active daemon even if TMPDIR changes"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::socket_path_reuses_recorded_default_socket_when_tmpdir_changes",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -738,10 +757,7 @@ mod tests {
                 Some("lterm.sock")
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::socket_path_without_home_skips_default_marker_and_uses_tmp_runtime",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -762,10 +778,7 @@ mod tests {
                 "unexpected error: {err:#}"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::explicit_data_dir_errors_remain_strict_for_default_marker_lookup",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
@@ -796,10 +809,7 @@ mod tests {
                 "explicit runtime overrides must not be hijacked by the default marker"
             );
         };
-        in_isolated_path_env(
-            body,
-            "paths::tests::explicit_runtime_dir_ignores_recorded_default_socket",
-        );
+        in_isolated_path_env(body);
     }
 
     #[test]
