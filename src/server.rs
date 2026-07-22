@@ -2,6 +2,9 @@
 mod session_lifecycle;
 
 use crate::paths;
+use crate::process_identity::{
+    ProcessIdentity, ProcessInspector, ProcessSnapshot, SystemProcessInspector,
+};
 use crate::protocol::{
     CAPABILITY_PROTOCOL_VERSION, CHILD_COLOR_POLICY_ENV, CMUX_CONTEXT_ENV, CapabilityAction,
     CapabilityToken, DaemonStatus, InstrumentSnapshot, IssueInputCapabilityResult,
@@ -71,6 +74,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SENSITIVE_CAPABILITY_FRAME_BYTES: usize = 128 * 1024;
 const MAX_INPUT_CAPABILITIES: usize = 1024;
 const MAX_INPUT_CAPABILITIES_PER_SESSION: usize = 64;
+const MAX_PROCESS_ANCESTRY_HOPS: usize = 64;
 
 type OutputChunk = Arc<[u8]>;
 type BackpressureHook = Arc<dyn Fn() + Send + Sync>;
@@ -322,6 +326,7 @@ struct Session {
     cwd: String,
     created_unix_ms: u128,
     process_id: Option<u32>,
+    leader_identity: Option<ProcessIdentity>,
     process_group_id: Option<i32>,
     agent_name: Option<String>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -1497,7 +1502,7 @@ fn forward_attach_output(mut output: UnixStream, rx: Receiver<OutputChunk>) -> b
 }
 
 fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
-    verify_peer_owner(&stream)?;
+    let peer_identity = verify_peer_owner(&stream)?;
     let frame = read_request_frame_with_timeout(&mut stream, REQUEST_READ_TIMEOUT)?;
     stream.set_read_timeout(None).ok();
     let line = frame.line;
@@ -1518,7 +1523,7 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     }
 
     let shutdown = matches!(request, Request::Shutdown);
-    let response = match handle_request(&state, request) {
+    let response = match handle_request(&state, request, peer_identity.process.as_ref()) {
         Ok(response) => response,
         Err(err) => Response::err(format!("{err:#}")),
     };
@@ -1783,7 +1788,11 @@ fn sanitized_preview(value: &str) -> String {
     preview
 }
 
-fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
+fn handle_request(
+    state: &Arc<State>,
+    request: Request,
+    peer_process: Option<&ProcessIdentity>,
+) -> Result<Response> {
     match request {
         Request::Ping => Ok(Response::ok(serde_json::json!({ "pong": true }))),
         Request::Status => {
@@ -1831,6 +1840,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     status_theme,
                     tmux,
                 },
+                peer_process,
             )?;
             Ok(Response::ok(session.info()))
         }
@@ -1866,6 +1876,7 @@ fn handle_request(state: &Arc<State>, request: Request) -> Result<Response> {
                     status_theme,
                     tmux: false,
                 },
+                peer_process,
             )?;
             Ok(Response::ok(session.info()))
         }
@@ -2085,6 +2096,7 @@ fn handle_speculation_request(
     result.unwrap_or_else(|error| Response::err(error.public_code()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ParentSession {
     id: String,
     pane_id: String,
@@ -2100,10 +2112,106 @@ enum ParentRequest {
     TmuxTarget { pane_id: String },
 }
 
+struct LiveSessionLeader {
+    parent: ParentSession,
+    identity: ProcessIdentity,
+}
+
+struct ImplicitParentProof {
+    parent: ParentSession,
+    leader_identity: ProcessIdentity,
+    chain: Vec<ProcessSnapshot>,
+}
+
+enum ParentSelection {
+    Explicit(ParentRequest),
+    Implicit(ImplicitParentProof),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentProvenanceReason {
+    ExplicitCapability,
+    VerifiedTmux,
+    PeerAncestry,
+    UnavailableNoCandidate,
+    UnavailableInspection,
+    RejectedCycle,
+    RejectedDepth,
+    RejectedStale,
+    RejectedUnsupported,
+}
+
+impl ParentProvenanceReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ExplicitCapability => "explicit_capability",
+            Self::VerifiedTmux => "verified_tmux",
+            Self::PeerAncestry => "peer_ancestry",
+            Self::UnavailableNoCandidate => "unavailable_no_candidate",
+            Self::UnavailableInspection => "unavailable_inspection",
+            Self::RejectedCycle => "rejected_cycle",
+            Self::RejectedDepth => "rejected_depth",
+            Self::RejectedStale => "rejected_stale",
+            Self::RejectedUnsupported => "rejected_unsupported",
+        }
+    }
+}
+
+enum ImplicitParentResolution {
+    Selected(ImplicitParentProof),
+    Root(ParentProvenanceReason),
+}
+
+impl ImplicitParentResolution {
+    fn provenance_reason(&self) -> ParentProvenanceReason {
+        match self {
+            Self::Selected(_) => ParentProvenanceReason::PeerAncestry,
+            Self::Root(reason) => *reason,
+        }
+    }
+}
+
+fn parent_provenance_debug_enabled() -> bool {
+    std::env::var("LTERM_DEBUG_PROVENANCE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn emit_parent_provenance(reason: ParentProvenanceReason) {
+    if parent_provenance_debug_enabled() {
+        eprintln!("{}", parent_provenance_event(reason));
+    }
+}
+
+fn parent_provenance_event(reason: ParentProvenanceReason) -> String {
+    format!("lterm parent_provenance reason={}", reason.code())
+}
+
+fn emit_parent_provenance_error<T>(result: Result<T>, reason: ParentProvenanceReason) -> Result<T> {
+    if result.is_err() {
+        emit_parent_provenance(reason);
+    }
+    result
+}
+
+fn missing_peer_provenance_reason(platform_supported: bool) -> ParentProvenanceReason {
+    if platform_supported {
+        ParentProvenanceReason::UnavailableInspection
+    } else {
+        ParentProvenanceReason::RejectedUnsupported
+    }
+}
+
 impl ParentRequest {
     fn pane_id(&self) -> &str {
         match self {
             Self::Capability { pane_id, .. } | Self::TmuxTarget { pane_id } => pane_id,
+        }
+    }
+
+    fn provenance_reason(&self) -> ParentProvenanceReason {
+        match self {
+            Self::Capability { .. } => ParentProvenanceReason::ExplicitCapability,
+            Self::TmuxTarget { .. } => ParentProvenanceReason::VerifiedTmux,
         }
     }
 }
@@ -2126,20 +2234,151 @@ fn parent_request(
         return Ok(Some(ParentRequest::TmuxTarget { pane_id }));
     }
 
-    let Some(parent_pane_id) = parent_pane_id else {
-        return Ok(None);
-    };
-    let parent_pane_id = normalize_target(&parent_pane_id);
-    if !parent_pane_id.starts_with('%') {
-        return Ok(None);
+    match (parent_pane_id, parent_token) {
+        (None, None) => Ok(None),
+        (Some(parent_pane_id), Some(token)) => {
+            let pane_id = normalize_target(&parent_pane_id);
+            if !pane_id.strip_prefix('%').is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+            }) {
+                bail!("parent capability pane must be a pane id");
+            }
+            if token.is_empty() {
+                bail!("parent capability token must not be empty");
+            }
+            Ok(Some(ParentRequest::Capability { pane_id, token }))
+        }
+        (Some(_), None) => bail!("parent capability token is required with parent pane"),
+        (None, Some(_)) => bail!("parent capability pane is required with parent token"),
     }
-    let Some(token) = parent_token.filter(|token| !token.is_empty()) else {
-        return Ok(None);
+}
+
+fn live_session_leaders(state: &Arc<State>) -> Vec<LiveSessionLeader> {
+    let sessions = lock(&state.sessions);
+    sessions
+        .by_id
+        .values()
+        .filter(|session| session.alive.load(Ordering::SeqCst))
+        .filter_map(|session| {
+            Some(LiveSessionLeader {
+                parent: ParentSession {
+                    id: session.id.clone(),
+                    pane_id: session.pane_id.clone(),
+                },
+                identity: session.leader_identity.clone()?,
+            })
+        })
+        .collect()
+}
+
+fn resolve_peer_ancestry<I: ProcessInspector>(
+    peer: &ProcessIdentity,
+    leaders: &[LiveSessionLeader],
+    inspector: &I,
+) -> ImplicitParentResolution {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pid = peer.pid;
+
+    for _ in 0..MAX_PROCESS_ANCESTRY_HOPS {
+        if pid == 0 {
+            return ImplicitParentResolution::Root(ParentProvenanceReason::UnavailableNoCandidate);
+        }
+        if !seen.insert(pid) {
+            return ImplicitParentResolution::Root(ParentProvenanceReason::RejectedCycle);
+        }
+        let Some(snapshot) = inspector.snapshot(pid) else {
+            let reason = if pid <= 1 {
+                ParentProvenanceReason::UnavailableNoCandidate
+            } else {
+                ParentProvenanceReason::UnavailableInspection
+            };
+            return ImplicitParentResolution::Root(reason);
+        };
+        if chain.is_empty() && snapshot.identity != *peer {
+            return ImplicitParentResolution::Root(ParentProvenanceReason::RejectedStale);
+        }
+        if seen.contains(&snapshot.parent_pid) {
+            return ImplicitParentResolution::Root(ParentProvenanceReason::RejectedCycle);
+        }
+        pid = snapshot.parent_pid;
+        let matched = leaders.iter().find(|leader| {
+            leader.identity.pid == snapshot.identity.pid && leader.identity == snapshot.identity
+        });
+        if matched.is_none()
+            && leaders
+                .iter()
+                .any(|leader| leader.identity.pid == snapshot.identity.pid)
+        {
+            return ImplicitParentResolution::Root(ParentProvenanceReason::RejectedStale);
+        }
+        chain.push(snapshot);
+        if let Some(leader) = matched {
+            return ImplicitParentResolution::Selected(ImplicitParentProof {
+                parent: leader.parent.clone(),
+                leader_identity: leader.identity.clone(),
+                chain,
+            });
+        }
+    }
+    ImplicitParentResolution::Root(ParentProvenanceReason::RejectedDepth)
+}
+
+fn resolve_implicit_parent<I: ProcessInspector>(
+    state: &Arc<State>,
+    peer: Option<&ProcessIdentity>,
+    inspector: &I,
+) -> ImplicitParentResolution {
+    let Some(peer) = peer else {
+        let reason =
+            missing_peer_provenance_reason(cfg!(any(target_os = "macos", target_os = "linux")));
+        return ImplicitParentResolution::Root(reason);
     };
-    Ok(Some(ParentRequest::Capability {
-        pane_id: parent_pane_id,
-        token,
-    }))
+    let leaders = live_session_leaders(state);
+    resolve_peer_ancestry(peer, &leaders, inspector)
+}
+
+fn validate_implicit_parent_chain<I: ProcessInspector>(
+    proof: &ImplicitParentProof,
+    inspector: &I,
+) -> Result<()> {
+    if proof.chain.is_empty() || proof.chain.len() > MAX_PROCESS_ANCESTRY_HOPS {
+        bail!("selected parent ancestry proof is invalid");
+    }
+    for (index, expected) in proof.chain.iter().enumerate() {
+        let current = inspector
+            .snapshot(expected.identity.pid)
+            .context("selected parent ancestry changed before commit")?;
+        if current != *expected {
+            bail!("selected parent ancestry changed before commit");
+        }
+        if let Some(next) = proof.chain.get(index + 1)
+            && current.parent_pid != next.identity.pid
+        {
+            bail!("selected parent ancestry chain changed before commit");
+        }
+    }
+    if proof.chain.last().map(|snapshot| &snapshot.identity) != Some(&proof.leader_identity) {
+        bail!("selected parent leader identity changed before commit");
+    }
+    Ok(())
+}
+
+fn resolve_implicit_parent_locked(
+    sessions: &SessionMaps,
+    proof: &ImplicitParentProof,
+) -> Result<ParentSession> {
+    let candidate = sessions
+        .by_id
+        .get(&proof.parent.id)
+        .context("selected parent session no longer available")?;
+    if !candidate.alive.load(Ordering::SeqCst)
+        || candidate.pane_id != proof.parent.pane_id
+        || candidate.leader_identity.as_ref() != Some(&proof.leader_identity)
+    {
+        bail!("selected parent session identity changed before commit");
+    }
+    Ok(proof.parent.clone())
 }
 
 fn resolve_parent_session_locked(
@@ -2181,15 +2420,42 @@ struct NewSessionParams {
     tmux: bool,
 }
 
-fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Session>> {
+fn create_session(
+    state: &Arc<State>,
+    params: NewSessionParams,
+    peer_process: Option<&ProcessIdentity>,
+) -> Result<Arc<Session>> {
+    create_session_with_inspector(state, params, peer_process, &SystemProcessInspector)
+}
+
+fn create_session_with_inspector<I: ProcessInspector>(
+    state: &Arc<State>,
+    params: NewSessionParams,
+    peer_process: Option<&ProcessIdentity>,
+    inspector: &I,
+) -> Result<Arc<Session>> {
     let parent_request = parent_request(
         params.parent_pane_id,
         params.parent_token,
         params.tmux_parent_pane_id,
     )?;
-    if let Some(parent_request) = parent_request.as_ref() {
-        validate_parent_request(state, parent_request)?;
-    }
+    let (parent_selection, provenance_reason) = match parent_request {
+        Some(parent_request) => {
+            validate_parent_request(state, &parent_request)?;
+            let reason = parent_request.provenance_reason();
+            (Some(ParentSelection::Explicit(parent_request)), reason)
+        }
+        None => {
+            let resolution = resolve_implicit_parent(state, peer_process, inspector);
+            let reason = resolution.provenance_reason();
+            match resolution {
+                ImplicitParentResolution::Selected(proof) => {
+                    (Some(ParentSelection::Implicit(proof)), reason)
+                }
+                ImplicitParentResolution::Root(_) => (None, reason),
+            }
+        }
+    };
     let reservation = reserve_session_identity(state, params.name)?;
     let pty_system = native_pty_system();
     let (rows, cols) = initial_pty_size(params.rows, params.cols)?;
@@ -2264,8 +2530,17 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         .child_ref()
         .process_id()
         .context("spawned child did not report a process id")?;
+    let leader_identity = inspector
+        .snapshot(process_id)
+        .map(|snapshot| snapshot.identity);
     let process_group_id =
         verified_process_group_id(pair.master.process_group_leader(), Some(process_id), &name);
+    if let Some(ParentSelection::Implicit(proof)) = parent_selection.as_ref() {
+        emit_parent_provenance_error(
+            validate_implicit_parent_chain(proof, inspector),
+            ParentProvenanceReason::RejectedStale,
+        )?;
+    }
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
@@ -2283,6 +2558,7 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cwd,
         created_unix_ms: now_unix_ms(),
         process_id: Some(process_id),
+        leader_identity,
         process_group_id,
         agent_name,
         child: Mutex::new(child),
@@ -2334,10 +2610,17 @@ fn create_session(state: &Arc<State>, params: NewSessionParams) -> Result<Arc<Se
         cols: Mutex::new(cols),
     });
 
-    if let Err(err) = reservation.commit(Arc::clone(&session), parent_request.as_ref()) {
+    let commit_result = reservation.commit(Arc::clone(&session), parent_selection.as_ref());
+    let commit_result = if matches!(parent_selection, Some(ParentSelection::Implicit(_))) {
+        emit_parent_provenance_error(commit_result, ParentProvenanceReason::RejectedStale)
+    } else {
+        commit_result
+    };
+    if let Err(err) = commit_result {
         cleanup_uncommitted_session(&session);
         return Err(err);
     }
+    emit_parent_provenance(provenance_reason);
 
     let session_for_reader = Arc::clone(&session);
     thread::spawn(move || {
@@ -2514,7 +2797,7 @@ impl SessionReservation {
     fn commit(
         mut self,
         session: Arc<Session>,
-        parent_request: Option<&ParentRequest>,
+        parent_selection: Option<&ParentSelection>,
     ) -> Result<()> {
         let mut sessions = lock(&self.state.sessions);
         if !sessions.reserved_names.contains(&self.name)
@@ -2528,12 +2811,15 @@ impl SessionReservation {
         {
             bail!("internal session id collision");
         }
-        let parent_session = match parent_request {
-            Some(request) => Some(
+        let parent_session = match parent_selection {
+            Some(ParentSelection::Explicit(request)) => Some(
                 resolve_parent_session_locked(&sessions, request).with_context(|| {
                     format!("parent session no longer available: {}", request.pane_id())
                 })?,
             ),
+            Some(ParentSelection::Implicit(proof)) => {
+                Some(resolve_implicit_parent_locked(&sessions, proof)?)
+            }
             None => None,
         };
         *lock(&session.parent_pane_id) =
@@ -4535,7 +4821,7 @@ fn verify_linux_peercred_len(actual_len: usize, expected_len: usize) -> Result<(
     target_os = "openbsd",
     target_os = "netbsd"
 ))]
-fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
+fn verify_peer_owner(stream: &UnixStream) -> Result<PeerIdentity> {
     let mut uid = 0_u32;
     let mut gid = 0_u32;
     // SAFETY: getpeereid(3) takes a valid socket fd from a live UnixStream and
@@ -4547,11 +4833,14 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     }
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
-    verify_peer_uid(uid, expected)
+    verify_peer_uid(uid, expected)?;
+    Ok(PeerIdentity {
+        process: peer_process_identity(stream),
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
+fn verify_peer_owner(stream: &UnixStream) -> Result<PeerIdentity> {
     #[repr(C)]
     struct UCred {
         pid: i32,
@@ -4584,7 +4873,12 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     verify_linux_peercred_len(len as usize, std::mem::size_of::<UCred>())?;
     // SAFETY: geteuid(2) is POSIX-required thread-safe and infallible.
     let expected = unsafe { geteuid() };
-    verify_peer_uid(cred.uid, expected)
+    verify_peer_uid(cred.uid, expected)?;
+    let process = u32::try_from(cred.pid)
+        .ok()
+        .and_then(|pid| SystemProcessInspector.snapshot(pid))
+        .map(|snapshot| snapshot.identity);
+    Ok(PeerIdentity { process })
 }
 
 #[cfg(not(any(
@@ -4595,8 +4889,44 @@ fn verify_peer_owner(stream: &UnixStream) -> Result<()> {
     target_os = "netbsd",
     target_os = "linux"
 )))]
-fn verify_peer_owner(_stream: &UnixStream) -> Result<()> {
+fn verify_peer_owner(_stream: &UnixStream) -> Result<PeerIdentity> {
     bail!("peer credential verification is not implemented for this platform")
+}
+
+struct PeerIdentity {
+    process: Option<ProcessIdentity>,
+}
+
+#[cfg(target_os = "macos")]
+fn peer_process_identity(stream: &UnixStream) -> Option<ProcessIdentity> {
+    let mut pid = 0_i32;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len as usize != std::mem::size_of::<i32>() {
+        return None;
+    }
+    u32::try_from(pid)
+        .ok()
+        .and_then(|pid| SystemProcessInspector.snapshot(pid))
+        .map(|snapshot| snapshot.identity)
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn peer_process_identity(_stream: &UnixStream) -> Option<ProcessIdentity> {
+    None
 }
 
 #[cfg(any(
@@ -4628,8 +4958,8 @@ mod tests {
     use super::{
         ALT_SCREEN_ENTER, AttachSubscriptionGuard, BACKPRESSURE_SEND_TIMEOUT, InputCapabilityGrant,
         MAX_INPUT_CAPABILITIES, MAX_INPUT_CAPABILITIES_PER_SESSION, MAX_TERMINAL_COLS,
-        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, SUBSCRIBER_QUEUE_LIMIT, Session,
-        SessionMetadata, State, Subscriber, TerminalPrefixTracker, WaitContainsScanner,
+        MAX_TERMINAL_ROWS, OutputChunk, OutputProgress, ProcessInspector, SUBSCRIBER_QUEUE_LIMIT,
+        Session, SessionMetadata, State, Subscriber, TerminalPrefixTracker, WaitContainsScanner,
         apply_capability_input, broadcast_chunk, clamp_to_smallest, evict_disconnected_subscribers,
         forward_attach_output, handle_capability_channel, initial_pty_size, issue_input_capability,
         metadata_history, metadata_purge_history, metadata_step, os_key_is_private_multiplexer_env,
@@ -4695,6 +5025,508 @@ mod tests {
         assert!(
             err.to_string().contains("short credential length"),
             "unexpected short credential error: {err:#}"
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeProcessInspector {
+        snapshots: Mutex<HashMap<u32, crate::process_identity::ProcessSnapshot>>,
+        reads: AtomicUsize,
+        requested_pids: Mutex<Vec<u32>>,
+    }
+
+    impl FakeProcessInspector {
+        fn insert(&self, pid: u32, parent_pid: u32, marker: &str) {
+            self.snapshots.lock().expect("fake snapshots").insert(
+                pid,
+                crate::process_identity::ProcessSnapshot {
+                    identity: process_identity(pid, marker),
+                    parent_pid,
+                },
+            );
+        }
+    }
+
+    impl ProcessInspector for FakeProcessInspector {
+        fn snapshot(&self, pid: u32) -> Option<crate::process_identity::ProcessSnapshot> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.requested_pids
+                .lock()
+                .expect("fake requested pids")
+                .push(pid);
+            self.snapshots
+                .lock()
+                .expect("fake snapshots")
+                .get(&pid)
+                .cloned()
+        }
+    }
+
+    fn process_identity(pid: u32, marker: &str) -> crate::process_identity::ProcessIdentity {
+        crate::process_identity::ProcessIdentity {
+            pid,
+            start_marker: marker.to_string(),
+        }
+    }
+
+    fn live_leader(pid: u32, marker: &str, id: &str, pane_id: &str) -> super::LiveSessionLeader {
+        super::LiveSessionLeader {
+            parent: super::ParentSession {
+                id: id.to_string(),
+                pane_id: pane_id.to_string(),
+            },
+            identity: process_identity(pid, marker),
+        }
+    }
+
+    fn selected_proof(resolution: super::ImplicitParentResolution) -> super::ImplicitParentProof {
+        match resolution {
+            super::ImplicitParentResolution::Selected(proof) => proof,
+            super::ImplicitParentResolution::Root(reason) => {
+                panic!("expected selected ancestry, got {}", reason.code())
+            }
+        }
+    }
+
+    fn root_reason(resolution: super::ImplicitParentResolution) -> super::ParentProvenanceReason {
+        match resolution {
+            super::ImplicitParentResolution::Selected(_) => panic!("expected root resolution"),
+            super::ImplicitParentResolution::Root(reason) => reason,
+        }
+    }
+
+    #[test]
+    fn parent_provenance_codes_are_fixed_and_sanitized() {
+        use super::ParentProvenanceReason::*;
+
+        let codes = [
+            (ExplicitCapability, "explicit_capability"),
+            (VerifiedTmux, "verified_tmux"),
+            (PeerAncestry, "peer_ancestry"),
+            (UnavailableNoCandidate, "unavailable_no_candidate"),
+            (UnavailableInspection, "unavailable_inspection"),
+            (RejectedCycle, "rejected_cycle"),
+            (RejectedDepth, "rejected_depth"),
+            (RejectedStale, "rejected_stale"),
+            (RejectedUnsupported, "rejected_unsupported"),
+        ];
+
+        for (reason, expected) in codes {
+            assert_eq!(reason.code(), expected);
+            assert_eq!(
+                super::parent_provenance_event(reason),
+                format!("lterm parent_provenance reason={expected}")
+            );
+            assert!(
+                reason
+                    .code()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "reason codes must remain bounded identifiers"
+            );
+            assert!(reason.code().len() <= 32);
+        }
+    }
+
+    #[test]
+    fn explicit_parent_kinds_select_their_fixed_provenance_codes() {
+        let capability = super::ParentRequest::Capability {
+            pane_id: "%1".to_string(),
+            token: "must-never-be-logged".to_string(),
+        };
+        let tmux = super::ParentRequest::TmuxTarget {
+            pane_id: "%2".to_string(),
+        };
+
+        assert_eq!(
+            capability.provenance_reason(),
+            super::ParentProvenanceReason::ExplicitCapability
+        );
+        assert_eq!(
+            tmux.provenance_reason(),
+            super::ParentProvenanceReason::VerifiedTmux
+        );
+        for request in [capability, tmux] {
+            let event = super::parent_provenance_event(request.provenance_reason());
+            assert!(!event.contains(request.pane_id()));
+            assert!(!event.contains("must-never-be-logged"));
+        }
+    }
+
+    #[test]
+    fn missing_peer_distinguishes_unavailable_from_unsupported() {
+        assert_eq!(
+            super::missing_peer_provenance_reason(true),
+            super::ParentProvenanceReason::UnavailableInspection
+        );
+        assert_eq!(
+            super::missing_peer_provenance_reason(false),
+            super::ParentProvenanceReason::RejectedUnsupported
+        );
+    }
+
+    #[test]
+    fn peer_ancestry_selects_nearest_exact_live_leader_across_wrappers() {
+        let inspector = FakeProcessInspector::default();
+        inspector.insert(40, 30, "peer");
+        inspector.insert(30, 20, "wrapper");
+        inspector.insert(20, 10, "nearest");
+        inspector.insert(10, 1, "outer");
+        let leaders = vec![
+            live_leader(10, "outer", "outer-id", "%1"),
+            live_leader(20, "nearest", "nearest-id", "%2"),
+        ];
+
+        let resolution =
+            super::resolve_peer_ancestry(&process_identity(40, "peer"), &leaders, &inspector);
+        assert_eq!(
+            resolution.provenance_reason(),
+            super::ParentProvenanceReason::PeerAncestry
+        );
+        let proof = selected_proof(resolution);
+
+        assert_eq!(proof.parent.id, "nearest-id");
+        assert_eq!(proof.parent.pane_id, "%2");
+        assert_eq!(
+            proof
+                .chain
+                .iter()
+                .map(|snapshot| snapshot.identity.pid)
+                .collect::<Vec<_>>(),
+            vec![40, 30, 20]
+        );
+    }
+
+    #[test]
+    fn peer_ancestry_fails_closed_for_cycle_depth_and_pid_reuse() {
+        let cycle = FakeProcessInspector::default();
+        cycle.insert(4, 3, "peer");
+        cycle.insert(3, 4, "wrapper");
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(4, "peer"),
+                &[],
+                &cycle,
+            )),
+            super::ParentProvenanceReason::RejectedCycle
+        );
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(4, "peer"),
+                &[live_leader(3, "wrapper", "cycle-leader", "%3")],
+                &cycle,
+            )),
+            super::ParentProvenanceReason::RejectedCycle,
+            "a matching leader inside a cycle must not be selected",
+        );
+
+        let depth = FakeProcessInspector::default();
+        for pid in 2..=66 {
+            depth.insert(pid, pid - 1, &format!("marker-{pid}"));
+        }
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(66, "marker-66"),
+                &[],
+                &depth,
+            )),
+            super::ParentProvenanceReason::RejectedDepth,
+        );
+        assert_eq!(
+            depth.reads.load(Ordering::SeqCst),
+            super::MAX_PROCESS_ANCESTRY_HOPS
+        );
+
+        let reused = FakeProcessInspector::default();
+        reused.insert(4, 3, "peer-now");
+        reused.insert(3, 1, "leader-now");
+        let leaders = vec![live_leader(3, "leader-at-birth", "leader", "%3")];
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(4, "peer-now"),
+                &leaders,
+                &reused,
+            )),
+            super::ParentProvenanceReason::RejectedStale,
+        );
+    }
+
+    #[test]
+    fn peer_ancestry_returns_no_parent_for_no_candidate_or_inaccessible_hop() {
+        let no_candidate = FakeProcessInspector::default();
+        no_candidate.insert(4, 3, "peer");
+        no_candidate.insert(3, 1, "wrapper");
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(4, "peer"),
+                &[live_leader(2, "leader", "leader-id", "%2")],
+                &no_candidate,
+            )),
+            super::ParentProvenanceReason::UnavailableNoCandidate,
+        );
+
+        let inaccessible = FakeProcessInspector::default();
+        inaccessible.insert(4, 3, "peer");
+        assert_eq!(
+            root_reason(super::resolve_peer_ancestry(
+                &process_identity(4, "peer"),
+                &[live_leader(2, "leader", "leader-id", "%2")],
+                &inaccessible,
+            )),
+            super::ParentProvenanceReason::UnavailableInspection,
+        );
+    }
+
+    #[test]
+    fn selected_ancestry_requires_unchanged_second_pass() {
+        let inspector = FakeProcessInspector::default();
+        inspector.insert(4, 3, "peer");
+        inspector.insert(3, 2, "wrapper");
+        inspector.insert(2, 1, "leader");
+        let leaders = vec![live_leader(2, "leader", "leader-id", "%2")];
+        let proof = selected_proof(super::resolve_peer_ancestry(
+            &process_identity(4, "peer"),
+            &leaders,
+            &inspector,
+        ));
+        super::validate_implicit_parent_chain(&proof, &inspector)
+            .expect("unchanged chain should validate");
+        assert_eq!(
+            inspector.reads.load(Ordering::SeqCst),
+            6,
+            "initial selection and second pass must each read the full three-hop chain"
+        );
+
+        inspector.insert(3, 2, "wrapper-reused");
+        let err = super::emit_parent_provenance_error(
+            super::validate_implicit_parent_chain(&proof, &inspector),
+            super::ParentProvenanceReason::RejectedStale,
+        )
+        .expect_err("changed intermediate marker must abort");
+        assert!(err.to_string().contains("changed before commit"));
+
+        inspector.insert(3, 99, "wrapper");
+        let err = super::validate_implicit_parent_chain(&proof, &inspector)
+            .expect_err("changed parent link must abort");
+        assert!(err.to_string().contains("changed before commit"));
+
+        inspector.insert(3, 2, "wrapper");
+        inspector.insert(4, 3, "peer-reused");
+        let err = super::validate_implicit_parent_chain(&proof, &inspector)
+            .expect_err("changed peer marker must abort");
+        assert!(err.to_string().contains("changed before commit"));
+    }
+
+    #[test]
+    fn selected_ancestry_requires_same_live_session_identity_under_lock() {
+        let identity = process_identity(20, "leader-birth");
+        let mut session = build_test_session("implicit-parent");
+        Arc::get_mut(&mut session)
+            .expect("unshared test session")
+            .leader_identity = Some(identity.clone());
+        let proof = super::ImplicitParentProof {
+            parent: super::ParentSession {
+                id: session.id.clone(),
+                pane_id: session.pane_id.clone(),
+            },
+            leader_identity: identity,
+            chain: vec![],
+        };
+        let session_id = session.id.clone();
+        let mut sessions = super::SessionMaps::default();
+        sessions.by_id.insert(session_id.clone(), session);
+        super::resolve_implicit_parent_locked(&sessions, &proof)
+            .expect("same live identity should commit");
+
+        Arc::get_mut(
+            sessions
+                .by_id
+                .get_mut(&session_id)
+                .expect("candidate present"),
+        )
+        .expect("map owns the only remaining candidate reference")
+        .leader_identity = Some(process_identity(20, "leader-reused"));
+        let err = super::resolve_implicit_parent_locked(&sessions, &proof)
+            .expect_err("changed stored birth identity must abort");
+        assert!(err.to_string().contains("identity changed"));
+
+        sessions.by_id.clear();
+        let err = super::resolve_implicit_parent_locked(&sessions, &proof)
+            .expect_err("removed session must abort");
+        assert!(err.to_string().contains("no longer available"));
+    }
+
+    #[test]
+    fn raw_explicit_parent_fields_fail_instead_of_enabling_ancestry() {
+        assert!(super::parent_request(None, None, None).unwrap().is_none());
+        assert!(matches!(
+            super::parent_request(Some("%1".to_string()), Some("token".to_string()), None)
+                .expect("valid capability pair"),
+            Some(super::ParentRequest::Capability { .. })
+        ));
+        assert!(matches!(
+            super::parent_request(None, None, Some("%2".to_string())).expect("valid tmux parent"),
+            Some(super::ParentRequest::TmuxTarget { .. })
+        ));
+        for result in [
+            super::parent_request(Some("%1".to_string()), None, None),
+            super::parent_request(None, Some("token".to_string()), None),
+            super::parent_request(Some("%1".to_string()), Some(String::new()), None),
+            super::parent_request(
+                Some("not-a-pane".to_string()),
+                Some("token".to_string()),
+                None,
+            ),
+            super::parent_request(
+                Some("%1".to_string()),
+                Some("token".to_string()),
+                Some("%2".to_string()),
+            ),
+            super::parent_request(None, None, Some(String::new())),
+        ] {
+            assert!(result.is_err(), "raw explicit input must fail closed");
+        }
+    }
+
+    #[test]
+    fn explicit_parent_precedence_performs_zero_ancestry_reads() {
+        let state = Arc::new(State::default());
+        let mut parent = build_test_session("explicit-parent");
+        let parent_mut = Arc::get_mut(&mut parent).expect("unshared explicit parent");
+        parent_mut.pane_id = "%1".to_string();
+        parent_mut.parent_token = "explicit-token".to_string();
+        let parent_id = parent.id.clone();
+        register_test_session(&state, &parent);
+
+        let inspector = FakeProcessInspector::default();
+        inspector.insert(40, 30, "peer");
+        inspector.insert(30, 20, "nearer-wrapper");
+        inspector.insert(20, 1, "nearer-leader");
+        let child = super::create_session_with_inspector(
+            &state,
+            super::NewSessionParams {
+                name: Some("explicit-precedence-child".to_string()),
+                command: Some("true".to_string()),
+                cwd: None,
+                rows: None,
+                cols: None,
+                parent_pane_id: Some("%1".to_string()),
+                parent_token: Some("explicit-token".to_string()),
+                tmux_parent_pane_id: None,
+                env: HashMap::new(),
+                status_theme: None,
+                tmux: false,
+            },
+            Some(&process_identity(40, "peer")),
+            &inspector,
+        )
+        .expect("valid explicit parent should win");
+
+        assert_eq!(super::lock(&child.parent_pane_id).as_deref(), Some("%1"));
+        assert_eq!(
+            super::lock(&child.parent_session_id).as_deref(),
+            Some(parent_id.as_str())
+        );
+        let requested = inspector
+            .requested_pids
+            .lock()
+            .expect("requested pids")
+            .clone();
+        assert!(
+            !requested.iter().any(|pid| [40, 30, 20].contains(pid)),
+            "explicit provenance must skip ancestry reads: {requested:?}"
+        );
+    }
+
+    struct StalePeerAfterSpawnInspector {
+        inner: FakeProcessInspector,
+        peer_pid: u32,
+        pid_file: std::path::PathBuf,
+    }
+
+    impl ProcessInspector for StalePeerAfterSpawnInspector {
+        fn snapshot(&self, pid: u32) -> Option<crate::process_identity::ProcessSnapshot> {
+            let mut snapshot = self.inner.snapshot(pid)?;
+            let reads = self.inner.reads.load(Ordering::SeqCst);
+            if pid == self.peer_pid && reads > 4 {
+                for _ in 0..100 {
+                    if self.pid_file.is_file() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                snapshot.identity.start_marker = "peer-reused-after-spawn".to_string();
+            }
+            Some(snapshot)
+        }
+    }
+
+    #[test]
+    fn stale_selected_parent_after_spawn_cleans_child_and_reservation() {
+        let state = Arc::new(State::default());
+        let mut parent = build_test_session("implicit-race-parent");
+        Arc::get_mut(&mut parent)
+            .expect("unshared implicit parent")
+            .leader_identity = Some(process_identity(20, "leader"));
+        register_test_session(&state, &parent);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("spawned-child.pid");
+        let inspector = StalePeerAfterSpawnInspector {
+            inner: FakeProcessInspector::default(),
+            peer_pid: 40,
+            pid_file: pid_file.clone(),
+        };
+        inspector.inner.insert(40, 30, "peer");
+        inspector.inner.insert(30, 20, "wrapper");
+        inspector.inner.insert(20, 1, "leader");
+        let command = format!(
+            "echo $$ > {}; sleep 30",
+            shlex::try_quote(&pid_file.display().to_string()).expect("quote pid file")
+        );
+
+        let result = super::create_session_with_inspector(
+            &state,
+            super::NewSessionParams {
+                name: Some("implicit-race-child".to_string()),
+                command: Some(command),
+                cwd: None,
+                rows: None,
+                cols: None,
+                parent_pane_id: None,
+                parent_token: None,
+                tmux_parent_pane_id: None,
+                env: HashMap::new(),
+                status_theme: None,
+                tmux: false,
+            },
+            Some(&process_identity(40, "peer")),
+            &inspector,
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("stale selected proof must abort instead of creating a root"),
+        };
+        assert!(err.to_string().contains("changed before commit"));
+
+        let spawned_pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("spawned child pid file")
+            .trim()
+            .parse()
+            .expect("spawned child pid");
+        let rc = unsafe { libc::kill(spawned_pid, 0) };
+        assert_eq!(rc, -1, "stale-proof child must be reaped before return");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let sessions = super::lock(&state.sessions);
+        assert!(!sessions.reserved_names.contains("implicit-race-child"));
+        assert!(!sessions.by_name.contains_key("implicit-race-child"));
+        assert_eq!(
+            sessions.by_id.len(),
+            1,
+            "failed implicit child must not downgrade to an unparented root"
         );
     }
 
@@ -5196,6 +6028,11 @@ mod tests {
             agent_name: None,
             created_unix_ms: 0,
             process_id,
+            leader_identity: process_id.and_then(|pid| {
+                super::SystemProcessInspector
+                    .snapshot(pid)
+                    .map(|snapshot| snapshot.identity)
+            }),
             process_group_id,
             child: Mutex::new(child),
             killer: Mutex::new(killer),
@@ -6797,6 +7634,7 @@ mod tests {
                     limit,
                     scope: ExitListScope::All,
                 },
+                None,
             )
             .expect_err("invalid raw limit must fail");
             assert!(err.to_string().contains("recent exit limit"));
@@ -6849,6 +7687,7 @@ mod tests {
             let response = super::handle_request(
                 &state,
                 Request::Speculation(SpeculationRequestEnvelope::new(request)),
+                None,
             )
             .expect("unsupported speculation request should receive a bounded response");
             assert!(!response.ok);
@@ -7059,6 +7898,7 @@ mod tests {
                 cols: 120,
                 subscriber_id: Some(subscriber_id),
             },
+            None,
         )
         .expect_err("stale subscriber resize must be rejected");
 

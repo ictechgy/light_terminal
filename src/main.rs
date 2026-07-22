@@ -2,6 +2,7 @@ mod client;
 #[allow(dead_code)]
 mod launch_registry;
 mod paths;
+mod process_identity;
 mod protocol;
 mod sanitize;
 mod server;

@@ -2786,43 +2786,8 @@ fn process_is_live(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(target_os = "macos")]
 fn process_start_identity(pid: u32) -> Option<String> {
-    let pid = libc::c_int::try_from(pid).ok()?;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    let size_i32 = libc::c_int::try_from(size).ok()?;
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size_i32,
-        )
-    };
-    if usize::try_from(read).ok()? != size {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    Some(format!(
-        "macos:{}:{}:{}",
-        info.pbi_pid, info.pbi_start_tvsec, info.pbi_start_tvusec
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn process_start_identity(pid: u32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    let mut fields = after_comm.split_whitespace();
-    let start_ticks = fields.nth(19)?;
-    Some(format!("linux:{pid}:{start_ticks}"))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_identity(_pid: u32) -> Option<String> {
-    None
+    crate::process_identity::process_start_identity(pid)
 }
 
 fn close_duplicate_cmux_surface(surface: &CmuxSurfaceContext) -> Result<()> {

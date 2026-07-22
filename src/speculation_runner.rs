@@ -2080,8 +2080,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    fn matching_open_fd_count(file: &File) -> usize {
+        let expected = file.metadata().unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .filter(|metadata| metadata.dev() == expected.dev() && metadata.ino() == expected.ino())
+            .count()
     }
 
     #[cfg(target_os = "linux")]
@@ -2102,37 +2108,38 @@ mod tests {
     fn ancillary_rejections_close_missing_extra_malformed_and_truncated_descriptors() {
         let frame = ControlFrame::new(identity(), 0, ControlMessage::Hello);
         let encoded = encode_frame(&frame).unwrap();
-        let transferred = File::open("/dev/null").unwrap();
+        let transferred = tempfile::tempfile().unwrap();
 
         let (sender, receiver) = seqpacket_pair();
-        let before = open_fd_count();
+        let before = matching_open_fd_count(&transferred);
+        assert_eq!(before, 1);
         send_frame_packet(&sender, &frame).unwrap();
         assert!(matches!(
             receive_frame_with_one_fd(&receiver),
             Err(RunnerProtocolError::DescriptorViolation)
         ));
-        assert_eq!(open_fd_count(), before);
+        assert_eq!(matching_open_fd_count(&transferred), before);
 
         let (sender, receiver) = seqpacket_pair();
-        let before = open_fd_count();
+        let before = matching_open_fd_count(&transferred);
         raw_send_with_fds(&sender, &encoded, &[&transferred, &transferred]);
         assert!(matches!(
             receive_frame_with_one_fd(&receiver),
             Err(RunnerProtocolError::DescriptorViolation)
         ));
-        assert_eq!(open_fd_count(), before);
+        assert_eq!(matching_open_fd_count(&transferred), before);
 
         let (sender, receiver) = seqpacket_pair();
-        let before = open_fd_count();
+        let before = matching_open_fd_count(&transferred);
         raw_send_with_fds(&sender, b"{", &[&transferred]);
         assert!(matches!(
             receive_frame_with_one_fd(&receiver),
             Err(RunnerProtocolError::InvalidFrame)
         ));
-        assert_eq!(open_fd_count(), before);
+        assert_eq!(matching_open_fd_count(&transferred), before);
 
         let (sender, receiver) = seqpacket_pair();
-        let before = open_fd_count();
+        let before = matching_open_fd_count(&transferred);
         raw_send_with_fds(
             &sender,
             &vec![b'x'; MAX_CONTROL_FRAME_BYTES + 1],
@@ -2142,6 +2149,6 @@ mod tests {
             receive_frame_with_one_fd(&receiver),
             Err(RunnerProtocolError::DescriptorViolation)
         ));
-        assert_eq!(open_fd_count(), before);
+        assert_eq!(matching_open_fd_count(&transferred), before);
     }
 }

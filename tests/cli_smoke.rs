@@ -458,9 +458,11 @@ fn session_names_json(env: &TestEnv) -> TestResult<BTreeSet<String>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRowJson {
+    id: String,
     name: String,
     pane_id: String,
     parent_pane_id: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 fn session_rows_json(env: &TestEnv, all: bool) -> TestResult<Vec<SessionRowJson>> {
@@ -475,6 +477,11 @@ fn session_rows_json(env: &TestEnv, all: bool) -> TestResult<Vec<SessionRowJson>
     let mut rows = Vec::new();
     for session in sessions {
         rows.push(SessionRowJson {
+            id: session
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("session row missing id: {session:?}"))?
+                .to_string(),
             name: session
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -487,6 +494,10 @@ fn session_rows_json(env: &TestEnv, all: bool) -> TestResult<Vec<SessionRowJson>
                 .to_string(),
             parent_pane_id: session
                 .get("parent_pane_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            parent_session_id: session
+                .get("parent_session_id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned),
         });
@@ -6165,7 +6176,7 @@ fn child_sessions_are_hidden_from_default_list() -> TestResult {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() -> TestResult {
     let env = TestEnv::new()?;
     let direct_name = "nested-provenance-direct";
@@ -6174,14 +6185,14 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
     write_executable(
         &indirect_launcher,
         &format!(
-            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {indirect_name} -- sleep 3600\n"
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN -u LTERM_SOCKET -u TMUX -u TMUX_PANE \"$LTERM_BIN\" start --tmux --detach -n {indirect_name} -- sleep 3600\n"
         ),
     )?;
     let direct_launcher = env.temp.path().join("nested-provenance-direct.sh");
     write_executable(
         &direct_launcher,
         &format!(
-            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" start --tmux --detach -n {direct_name} -- sleep 3600\n{}\nsleep 3600\n",
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN -u LTERM_SOCKET -u TMUX -u TMUX_PANE \"$LTERM_BIN\" start --tmux --detach -n {direct_name} -- sleep 3600\n{}\nsleep 3600\n",
             shlex::try_quote(&indirect_launcher.display().to_string())?
         ),
     )?;
@@ -6235,6 +6246,28 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
     assert!(outside.status.success(), "{outside:?}");
     wait_for_session_present(&env, outside_name)?;
 
+    let stripped_outside_name = "nested-provenance-fully-stripped-outside";
+    let stripped_outside = env
+        .cmd()
+        .env_remove("LTERM_PANE")
+        .env_remove("LTERM_PARENT_TOKEN")
+        .env_remove("LTERM_SOCKET")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .args([
+            "start",
+            "--tmux",
+            "--detach",
+            "-n",
+            stripped_outside_name,
+            "--",
+            "sleep",
+            "3600",
+        ])
+        .output()?;
+    assert!(stripped_outside.status.success(), "{stripped_outside:?}");
+    wait_for_session_present(&env, stripped_outside_name)?;
+
     let all = session_rows_json(&env, true)?;
     let parent = all
         .iter()
@@ -6248,6 +6281,13 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
         outside.parent_pane_id, None,
         "external tmux control must remain a root session: {all:?}"
     );
+    assert_eq!(outside.parent_session_id, None);
+    let stripped_outside = all
+        .iter()
+        .find(|row| row.name == stripped_outside_name)
+        .ok_or_else(|| format!("fully stripped outside control missing: {all:?}"))?;
+    assert_eq!(stripped_outside.parent_pane_id, None);
+    assert_eq!(stripped_outside.parent_session_id, None);
     for child_name in [direct_name, indirect_name] {
         let child = all
             .iter()
@@ -6258,6 +6298,11 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
             Some(parent.pane_id.as_str()),
             "named nested launch lost explicit tmux parent provenance: {all:?}"
         );
+        assert_eq!(
+            child.parent_session_id.as_deref(),
+            Some(parent.id.as_str()),
+            "named nested launch lost parent session identity: {all:?}"
+        );
     }
 
     let roots = session_row_names(&session_rows_json(&env, false)?);
@@ -6266,6 +6311,7 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
         BTreeSet::from([
             "nested-provenance-parent".to_string(),
             outside_name.to_string(),
+            stripped_outside_name.to_string(),
         ]),
         "default listing leaked nested named sessions"
     );
@@ -6285,7 +6331,7 @@ fn tmux_nested_named_sessions_keep_parent_provenance_across_launch_wrappers() ->
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn non_tmux_nested_named_session_keeps_parent_provenance_when_capability_env_is_stripped()
 -> TestResult {
     let env = TestEnv::new()?;
@@ -6294,7 +6340,7 @@ fn non_tmux_nested_named_session_keeps_parent_provenance_when_capability_env_is_
     write_executable(
         &launcher,
         &format!(
-            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN \"$LTERM_BIN\" new --detach -n {nested_name} -- sleep 30\nsleep 30\n"
+            "#!/bin/sh\nenv -u LTERM_PANE -u LTERM_PARENT_TOKEN -u LTERM_SOCKET -u TMUX -u TMUX_PANE \"$LTERM_BIN\" new --detach -n {nested_name} -- sleep 30\nsleep 30\n"
         ),
     )?;
 
@@ -6358,6 +6404,7 @@ fn non_tmux_nested_named_session_keeps_parent_provenance_when_capability_env_is_
         Some(parent.pane_id.as_str()),
         "non-tmux nested launch lost verified self-lterm parent provenance: {all:?}"
     );
+    assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
     let outside = all
         .iter()
         .find(|row| row.name == outside_name)
@@ -6366,6 +6413,7 @@ fn non_tmux_nested_named_session_keeps_parent_provenance_when_capability_env_is_
         outside.parent_pane_id, None,
         "external tmux root must stay unparented: {all:?}"
     );
+    assert_eq!(outside.parent_session_id, None);
 
     let roots = session_row_names(&session_rows_json(&env, false)?);
     assert_eq!(
