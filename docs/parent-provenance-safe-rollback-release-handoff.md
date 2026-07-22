@@ -6,7 +6,7 @@ The release provenance reviewed by this handoff is:
 
 | Component | Version | Reviewed source | Artifact SHA-256 |
 |---|---:|---|---|
-| `light-terminal` / `@ictechgy/lterm` | `1.0.32` | last code-bearing commit `cd3c5545ce963d8fff48817b1be8e2c068b67c8c` | `3cd4d9cb29a68fdd05491e84c46932c89eae56b4e2ec76af8acf42bc5d5009c9` |
+| `light-terminal` / `@ictechgy/lterm` | `1.0.33` | last code-bearing commit `e3c8892831e2559c15f63acf70793056bd957dbb` | Deferred: no authorized `v1.0.33` tag archive exists yet; generate and verify this value only after tagging. |
 | `oh-my-codex` | `0.20.3` | reviewed upstream HEAD `49073f8ae5a65f4d5036427993f3cc81e8ac525a`; last production-code fix `1010dda0f56a92dae7c163bc0684ad4e13a25143` | A locally generated pre-release artifact `oh-my-codex-0.20.3.tgz` (`5071529` bytes), SHA-256 `e27babaa7e0dd44a73e991364b6095e10b9b8e8218d766d582a76524617f823e`; not published or deployed. |
 
 The local package evidence is recorded in
@@ -22,12 +22,18 @@ is superseded for this fix. It does not contain the G007 successful-startup
 commit-boundary change and must not be represented or deployed as the fixed G007
 artifact.
 
-The reviewed `light-terminal` bundle head before this documentation edit was
-`b26416f4c83caf6725d9dcfbb2ade81c312df6f3`.
+The reviewed `light-terminal` code-bearing release head before this metadata
+edit was `e3c8892831e2559c15f63acf70793056bd957dbb`.
+
+The Homebrew formula intentionally remains a complete, valid `v1.0.32`
+formula in this pre-tag metadata commit. Its URL, version assertion, and SHA-256
+must be updated together only after an authorized `v1.0.33` tag exists and the
+exact downloaded archive's SHA-256 has been verified. Until that follow-up
+commit, the release version-alignment gate is expected to block publication.
 
 ## Final verification evidence
 
-Verification ran on 2026-07-22 with Node `v26.5.0` and npm `11.17.0`.
+Verification ran on 2026-07-23 with Node `v26.5.0` and npm `11.17.0`.
 
 ### OMX
 
@@ -62,7 +68,7 @@ The final serial full suite passed:
 
 | Gate | Result |
 |---|---|
-| Unit tests | PASS: `661` |
+| Unit tests | PASS: `664` |
 | CLI smoke tests | PASS: `268` |
 | Lifecycle tests | PASS: `11` |
 | Short soak | PASS: `1` |
@@ -70,6 +76,7 @@ The final serial full suite passed:
 | Clippy | PASS |
 | Release build | PASS |
 | Audit | PASS: zero vulnerabilities; allowed warning `RUSTSEC-2026-0190` for `anyhow 1.0.102` |
+| Pre-tag release version alignment | EXPECTED BLOCK: Cargo/npm/docs are `1.0.33`, while the complete Homebrew formula remains `1.0.32` until the tagged archive SHA-256 can be measured. |
 
 ### `RUSTSEC-2026-0190` assessment
 
@@ -143,8 +150,11 @@ also passed. The matrix recorded `production_contact=false` and
    OMX package first.
 3. Confirm the installed OMX artifact matches the reviewed source and repeat the
    rollback-specific gate on a disposable private tmux server.
-4. Only after fixed OMX is present, roll out fixed lterm (`1.0.32`, with last
-   code-bearing commit `cd3c5545...`).
+4. Only after fixed OMX is present, roll out fixed lterm (`1.0.33`, with last
+   code-bearing commit `e3c8892831e2...`). After the authorized release tag is
+   created, download that exact archive, verify its SHA-256, and update the
+   Homebrew formula URL, version assertion, and SHA-256 together in a separate
+   follow-up commit before publishing it.
 5. Run the independent fixed-lterm/fixed-OMX incident matrix with isolated lterm
    state and an explicit private tmux socket. Do not contact default or live
    sockets.
