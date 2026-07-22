@@ -26,10 +26,11 @@ The reviewed `light-terminal` code-bearing release head before this metadata
 edit was `e3c8892831e2559c15f63acf70793056bd957dbb`.
 
 The Homebrew formula intentionally remains a complete, valid `v1.0.32`
-formula in this pre-tag metadata commit. Its URL, version assertion, and SHA-256
-must be updated together only after an authorized `v1.0.33` tag exists and the
-exact downloaded archive's SHA-256 has been verified. Until that follow-up
-commit, the release version-alignment gate is expected to block publication.
+formula in this pre-tag metadata commit. The
+`packaging/homebrew/PENDING_RELEASE` marker records the intentional `1.0.33`
+deferral. Its URL, version assertion, and SHA-256 must be updated together only
+after an authorized `v1.0.33` tag exists and the exact downloaded archive's
+SHA-256 has been verified; remove the marker in that same follow-up commit.
 
 ## Final verification evidence
 
