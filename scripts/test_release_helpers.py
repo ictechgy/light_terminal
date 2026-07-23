@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -411,14 +412,31 @@ PY
             path = REPO_ROOT / rel_path
             self.assertTrue(path.exists(), f"package files entry is missing: {rel_path}")
 
-    def test_homebrew_formula_version_matches_package_manifests(self) -> None:
+    def test_homebrew_formula_version_is_consistent_or_explicitly_deferred(self) -> None:
         version = cargo_package_version((REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["version"], version)
 
         formula = (REPO_ROOT / "packaging" / "homebrew" / "lterm.rb").read_text(encoding="utf-8")
-        self.assertIn(f"/refs/tags/v{version}.tar.gz", formula)
-        self.assertIn(f'assert_match "lterm {version}"', formula)
+        url_match = re.search(r"/refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz", formula)
+        test_match = re.search(r'assert_match "lterm ([0-9]+\.[0-9]+\.[0-9]+)"', formula)
+        sha_match = re.search(r'^\s*sha256 "([0-9a-f]{64})"\s*$', formula, re.MULTILINE)
+        self.assertIsNotNone(url_match, "Homebrew formula must pin a semantic-version tag archive")
+        self.assertIsNotNone(test_match, "Homebrew formula test must assert the pinned lterm version")
+        self.assertIsNotNone(sha_match, "Homebrew formula must contain a syntactically valid SHA-256")
+
+        formula_version = url_match.group(1)
+        self.assertEqual(test_match.group(1), formula_version)
+        pending_path = REPO_ROOT / "packaging" / "homebrew" / "PENDING_RELEASE"
+        if formula_version == version:
+            self.assertFalse(pending_path.exists(), "remove PENDING_RELEASE after finalizing the formula")
+        else:
+            self.assertTrue(
+                pending_path.exists(),
+                "a lagging formula requires an explicit PENDING_RELEASE marker",
+            )
+            pending_version = pending_path.read_text(encoding="utf-8").splitlines()[0].strip()
+            self.assertEqual(pending_version, version)
 
 
 if __name__ == "__main__":

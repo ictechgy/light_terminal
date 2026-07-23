@@ -17,15 +17,15 @@
 > See [SECURITY.md](SECURITY.md) for the full trust-boundary and audit policy details.
 > Non-goals: see [docs/non-goals.md](docs/non-goals.md).
 
-## Current release: 1.0.32
+## Current release: 1.0.33
 
-The 1.0.32 release hardens session exit and cleanup lifecycle behavior while preserving the public PTY and metadata contracts:
+The 1.0.33 release restores nested session provenance across environment-stripping wrappers while preserving explicit authority, raw PTY behavior, and tmux window semantics:
 
-- **Authoritative exit evidence** — lifecycle triggers are published before teardown and persisted in a bounded private journal, so exit facts survive blocked writers and daemon recovery.
-- **Non-blocking cleanup** — close and shutdown paths keep making progress without joining stalled lifecycle writers, while process-group and session cleanup remain observable.
-- **Race-safe final identity** — rename, undo, and redo commits serialize against the `Ending` claim so reaping cannot publish a stale or conflicting session identity.
-- **Bounded recovery and diagnostics** — corrupted or partial journal state is recovered conservatively, and recent-exit diagnostics preserve the evidence needed to explain cleanup outcomes.
-- **Regression coverage** — unit, daemon lifecycle, and CLI smoke tests lock the TOCTOU barrier, waitid fallback, recovery, and managed-attach cleanup contracts.
+- **Verified peer ancestry** — when every explicit parent variable is absent, lterm derives the nearest exact live lterm ancestor from the same-UID Unix peer PID and process-birth identity.
+- **Explicit provenance stays authoritative** — a valid capability or self-referential `TMUX` identity wins, while malformed or stale explicit provenance fails closed instead of falling through to inference.
+- **Race-safe commit** — the selected ancestry chain is revalidated after spawn and again under the session lock; stale selections abort and clean up rather than silently becoming roots.
+- **Compatibility preserved** — whole-window tmux behavior and raw attach streams remain unchanged, and unsupported platforms safely retain root behavior instead of guessing.
+- **Regression coverage** — focused unit, CLI smoke, and isolated rollback-matrix tests lock parent/root/child relations and the OMX-first rollout policy.
 
 ## Why lterm instead of plain tmux?
 
@@ -91,7 +91,7 @@ With Cargo from GitHub, pin a release tag. The example below uses the current
 README release; check the Releases page for newer tags:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.32
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.33
 ```
 
 Building from this checkout requires Rust 1.85 or newer:

@@ -17,15 +17,15 @@
 > 전체 trust boundary와 audit policy는 [SECURITY.md](SECURITY.md)를 참고하세요.
 > Non-goals(의도적으로 지원하지 않는 항목)는 [docs/non-goals.md](docs/non-goals.md)를 참고하세요.
 
-## 현재 릴리스: 1.0.32
+## 현재 릴리스: 1.0.33
 
-1.0.32 릴리스는 public PTY 및 metadata contract를 유지하면서 session exit와 cleanup lifecycle을 강화합니다.
+1.0.33 릴리스는 명시적 권한, raw PTY 동작, tmux window semantics를 유지하면서 환경 변수를 제거하는 wrapper 너머의 중첩 session provenance를 복구합니다.
 
-- **권위 있는 exit evidence** — teardown 전에 lifecycle trigger를 게시하고 상한이 있는 private journal에 기록하여 writer가 막히거나 daemon이 복구되어도 exit 사실을 보존합니다.
-- **막히지 않는 cleanup** — close 및 shutdown 경로가 정지한 lifecycle writer를 join하지 않고 계속 진행하며, process group과 session cleanup 결과도 관측할 수 있습니다.
-- **경쟁에 안전한 최종 identity** — rename, undo, redo commit이 `Ending` claim과 직렬화되어 reap이 오래되거나 충돌하는 session identity를 게시하지 못합니다.
-- **상한이 있는 복구와 진단** — 손상되거나 부분적인 journal state를 보수적으로 복구하고, recent-exit 진단에 cleanup 결과를 설명할 evidence를 남깁니다.
-- **회귀 테스트 강화** — unit, daemon lifecycle, CLI smoke test가 TOCTOU barrier, waitid fallback, recovery, managed-attach cleanup contract를 고정합니다.
+- **검증된 peer ancestry** — 모든 명시적 parent 변수가 없을 때 same-UID Unix peer PID와 process-birth identity를 사용해 가장 가까운 정확한 live lterm ancestor를 찾습니다.
+- **명시적 provenance 우선** — 유효한 capability나 self-referential `TMUX` identity가 항상 우선하며, 잘못되거나 stale한 명시적 provenance는 추론으로 우회하지 않고 fail closed합니다.
+- **경쟁에 안전한 commit** — 선택한 ancestry chain을 spawn 뒤와 session lock 안에서 다시 검증하고, stale selection은 root로 조용히 강등하지 않고 중단·정리합니다.
+- **호환성 유지** — whole-window tmux 동작과 raw attach stream은 바꾸지 않으며, 미지원 플랫폼에서는 추측 대신 안전하게 root 동작을 유지합니다.
+- **회귀 테스트 강화** — focused unit, CLI smoke, isolated rollback-matrix test가 parent/root/child 관계와 OMX-first rollout policy를 고정합니다.
 
 ## 왜 tmux 대신 lterm인가요?
 
@@ -88,7 +88,7 @@ GitHub에서 Cargo로 설치할 때는 release tag를 고정하세요. 아래 �
 README 릴리스 기준이며, 더 최신 tag가 있는지는 Releases 페이지에서 확인하세요:
 
 ```bash
-cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.32
+cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.33
 ```
 
 저장소를 클론한 뒤 직접 빌드하려면 Rust 1.85 이상이 필요합니다.

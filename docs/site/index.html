@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Light Terminal (lterm) — Browser Guide / 한국어 가이드</title>
-  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.32, a hardened lightweight tmux-compatible session daemon for persistent AI agent workflows, mobile reconnect, and sanitized reports. AI 에이전트 세션 유지, 모바일 재접속, 정제된 리포트를 위한 lterm 1.0.32 가이드입니다.">
+  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.33, a hardened lightweight tmux-compatible session daemon with verified nested-session provenance for persistent AI agent workflows. 검증된 중첩 session provenance와 AI 에이전트 세션 유지를 위한 lterm 1.0.33 가이드입니다.">
   <style>
     :root {
       --bg: #08111f;
@@ -337,17 +337,17 @@
     <section class="hero">
       <div class="wrap hero-grid">
         <div>
-          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.32 current</span>
-          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.32 current</span>
+          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.33 prepared</span>
+          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.33 준비</span>
           <h1 data-lang="en"><span class="gradient-text">lterm</span> keeps agents running.</h1>
           <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
           <p class="lead" data-lang="en">
             A lightweight tmux-compatible session daemon for Claude Code, Codex CLI,
-            Gemini CLI, OpenCode, Grok Build CLI through custom profiles, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, now current in 1.0.32 with authoritative exit evidence, bounded recovery, and race-safe session identity finalization.
+            Gemini CLI, OpenCode, Grok Build CLI through custom profiles, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, prepared for 1.0.33 with verified peer ancestry and race-safe nested-session provenance.
           </p>
           <p class="lead" data-lang="ko">
             Claude Code, Codex CLI, Gemini CLI, OpenCode, custom profile로 실행하는 Grok Build CLI 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
-            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.32 현재 릴리스는 권위 있는 exit evidence, 상한이 있는 recovery, 경쟁에 안전한 session identity finalization을 포함합니다.
+            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.33은 검증된 peer ancestry와 경쟁에 안전한 nested-session provenance를 포함하도록 준비했습니다.
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#install" data-lang="en">Install lterm</a>
@@ -356,8 +356,8 @@
             <a class="button" href="https://github.com/ictechgy/light_terminal/blob/main/README.ko.md" data-lang="ko">전체 README 보기</a>
           </div>
           <div class="callout release-callout">
-            <p data-lang="en"><strong>Now live: v1.0.32.</strong> Authoritative exit triggers, crash-recoverable lifecycle journals, non-blocking cleanup, and Ending-state identity serialization keep teardown observable and race-safe.</p>
-            <p data-lang="ko"><strong>v1.0.32 배포 완료.</strong> 권위 있는 exit trigger, crash-recoverable lifecycle journal, 막히지 않는 cleanup, Ending-state identity 직렬화로 teardown을 관측 가능하고 경쟁에 안전하게 유지합니다.</p>
+            <p data-lang="en"><strong>Prepared for v1.0.33.</strong> Verified same-UID peer ancestry restores stripped nested-session provenance while explicit authority and fail-closed rollback remain intact.</p>
+            <p data-lang="ko"><strong>v1.0.33 준비 완료.</strong> 검증된 same-UID peer ancestry가 제거된 nested-session provenance를 복구하며, 명시적 권한과 fail-closed rollback은 그대로 유지합니다.</p>
           </div>
         </div>
         <div class="terminal-card" aria-label="lterm terminal example">
@@ -412,11 +412,11 @@
             <p data-lang="ko">TUI가 깨지지 않도록 PTY 연결에서는 바이트를 raw로 전달합니다. 대신 리포트 출력은 터미널 제어 코드를 제거하고 UTF-8 텍스트는 그대로 보존합니다.</p>
           </article>
           <article class="card">
-            <span class="badge">1.0.32</span>
-            <h3 data-lang="en">Resilient release path</h3>
-            <h3 data-lang="ko">복원력 중심 릴리스</h3>
-            <p data-lang="en">The current release is backed by release preflight, contract checks, upgrade-matrix coverage, and Linux crash-window and managed-process lifecycle tests.</p>
-            <p data-lang="ko">현재 릴리스는 release preflight, contract check, upgrade-matrix coverage, Linux crash-window 및 managed-process lifecycle 테스트로 검증했습니다.</p>
+            <span class="badge">1.0.33</span>
+            <h3 data-lang="en">Verified nested provenance</h3>
+            <h3 data-lang="ko">검증된 중첩 provenance</h3>
+            <p data-lang="en">Focused unit, CLI smoke, and isolated rollback-matrix tests cover parent recovery, explicit-authority precedence, race revalidation, and safe fallback behavior.</p>
+            <p data-lang="ko">focused unit, CLI smoke, isolated rollback-matrix test가 parent 복구, 명시적 권한 우선순위, 경쟁 재검증, 안전한 fallback 동작을 검증합니다.</p>
           </article>
         </div>
       </div>
@@ -449,7 +449,7 @@
             <h3>Cargo</h3>
             <p data-lang="en">Pin the release tag when installing from source; check GitHub Releases for newer tags.</p>
             <p data-lang="ko">소스에서 설치할 때는 릴리스 태그를 고정하세요. 최신 태그는 GitHub Releases에서 확인할 수 있습니다.</p>
-            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.32</pre>
+            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.33</pre>
           </article>
         </div>
       </div>
