@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Light Terminal (lterm) — Browser Guide / 한국어 가이드</title>
+  <meta name="description" content="A browser-friendly English and Korean guide for lterm 1.0.33, a hardened lightweight tmux-compatible session daemon with verified nested-session provenance for persistent AI agent workflows. 검증된 중첩 session provenance와 AI 에이전트 세션 유지를 위한 lterm 1.0.33 가이드입니다.">
+  <style>
+    :root {
+      --bg: #08111f;
+      --bg-soft: #101b2d;
+      --panel: rgba(17, 29, 48, 0.82);
+      --panel-strong: rgba(21, 35, 57, 0.95);
+      --text: #eef5ff;
+      --muted: #aebdd2;
+      --subtle: #7f90a8;
+      --line: rgba(174, 189, 210, 0.22);
+      --brand: #7dd3fc;
+      --brand-2: #a78bfa;
+      --good: #86efac;
+      --warn: #facc15;
+      --danger: #fda4af;
+      --code-bg: #020617;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.36);
+      --radius: 22px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(125, 211, 252, 0.22), transparent 28rem),
+        radial-gradient(circle at 86% 12%, rgba(167, 139, 250, 0.20), transparent 25rem),
+        linear-gradient(180deg, var(--bg) 0%, #0b1220 54%, #080b13 100%);
+      color: var(--text);
+      line-height: 1.65;
+      min-height: 100vh;
+    }
+
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    code {
+      background: rgba(125, 211, 252, 0.12);
+      border: 1px solid rgba(125, 211, 252, 0.16);
+      border-radius: 0.45rem;
+      padding: 0.12rem 0.35rem;
+      color: #dff7ff;
+    }
+    pre {
+      margin: 0;
+      padding: 1rem;
+      overflow-x: auto;
+      background: var(--code-bg);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 16px;
+      color: #d9f99d;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+
+    .wrap { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(18px);
+      background: rgba(8, 17, 31, 0.78);
+      border-bottom: 1px solid var(--line);
+    }
+    .topbar .wrap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.8rem 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+    .logo {
+      display: grid;
+      place-items: center;
+      width: 2.2rem;
+      height: 2.2rem;
+      border-radius: 0.75rem;
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      color: #03101d;
+      box-shadow: 0 12px 32px rgba(125, 211, 252, 0.25);
+    }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 0.9rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      font-size: 0.95rem;
+    }
+    .nav a { color: var(--muted); }
+    .lang-toggle {
+      display: inline-flex;
+      background: rgba(15, 23, 42, 0.72);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0.2rem;
+      gap: 0.15rem;
+    }
+    .lang-toggle button {
+      border: 0;
+      border-radius: 999px;
+      padding: 0.45rem 0.72rem;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .lang-toggle button[aria-pressed="true"] {
+      color: #06111f;
+      background: var(--brand);
+    }
+
+    .hero { padding: 5.6rem 0 3.2rem; }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.18fr) minmax(310px, 0.82fr);
+      gap: 2rem;
+      align-items: center;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.35rem 0.65rem;
+      border: 1px solid rgba(125, 211, 252, 0.32);
+      border-radius: 999px;
+      color: #c7f3ff;
+      background: rgba(125, 211, 252, 0.10);
+      font-weight: 750;
+      font-size: 0.88rem;
+    }
+    h1 {
+      margin: 1rem 0 1rem;
+      max-width: 12ch;
+      font-size: clamp(3rem, 8vw, 6.8rem);
+      line-height: 0.9;
+      letter-spacing: -0.075em;
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, #e0f2fe 0%, var(--brand) 45%, var(--brand-2) 100%);
+      color: transparent;
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
+    .lead {
+      max-width: 66ch;
+      color: var(--muted);
+      font-size: clamp(1.08rem, 2vw, 1.32rem);
+      margin: 0 0 1.5rem;
+    }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 0.8rem; margin-top: 1.5rem; }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.55rem;
+      min-height: 2.85rem;
+      padding: 0.75rem 1rem;
+      border-radius: 999px;
+      border: 1px solid rgba(125, 211, 252, 0.28);
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--text);
+      font-weight: 800;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.16);
+    }
+    .button.primary {
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      color: #04111f;
+      border-color: transparent;
+    }
+    .button:hover { text-decoration: none; transform: translateY(-1px); }
+
+    .terminal-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(2, 6, 23, 0.76);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .term-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      background: rgba(15, 23, 42, 0.88);
+      color: var(--subtle);
+      font-size: 0.85rem;
+    }
+    .dots { display: inline-flex; gap: 0.4rem; }
+    .dots span { width: 0.72rem; height: 0.72rem; border-radius: 999px; display: block; }
+    .dots span:nth-child(1) { background: #fb7185; }
+    .dots span:nth-child(2) { background: #facc15; }
+    .dots span:nth-child(3) { background: #4ade80; }
+    .term-body { padding: 1rem; }
+    .term-body pre { border: 0; background: transparent; padding: 0; white-space: pre-wrap; }
+    .prompt { color: #67e8f9; }
+    .ok { color: var(--good); }
+    .muted { color: var(--muted); }
+
+    section { padding: 3.2rem 0; }
+    .section-title {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1.25rem;
+    }
+    h2 { margin: 0; font-size: clamp(1.8rem, 4vw, 3rem); line-height: 1.05; letter-spacing: -0.045em; }
+    h3 { margin: 0 0 0.55rem; font-size: 1.1rem; letter-spacing: -0.015em; }
+    .section-kicker { margin: 0; color: var(--muted); max-width: 70ch; }
+    .grid { display: grid; gap: 1rem; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.15rem;
+      background: var(--panel);
+      box-shadow: 0 18px 48px rgba(0,0,0,0.18);
+    }
+    .card p { color: var(--muted); margin: 0; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(125, 211, 252, 0.25);
+      border-radius: 999px;
+      padding: 0.22rem 0.55rem;
+      color: #d7f7ff;
+      background: rgba(125, 211, 252, 0.08);
+      font-size: 0.82rem;
+      font-weight: 750;
+      margin-bottom: 0.8rem;
+    }
+    .install-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+    .install-card pre { margin-top: 0.8rem; }
+    .steps { counter-reset: step; display: grid; gap: 0.9rem; }
+    .step {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.85rem;
+      align-items: start;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(15, 23, 42, 0.52);
+    }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      display: grid;
+      place-items: center;
+      width: 2rem;
+      height: 2rem;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--brand-2));
+      color: #06111f;
+      font-weight: 900;
+    }
+    .step p { margin: 0.2rem 0 0; color: var(--muted); }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(15, 23, 42, 0.54); }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 0.85rem 1rem; text-align: left; border-bottom: 1px solid rgba(148, 163, 184, 0.16); vertical-align: top; }
+    th { color: #dff7ff; background: rgba(15, 23, 42, 0.78); font-size: 0.9rem; }
+    td { color: var(--muted); }
+    tr:last-child td { border-bottom: 0; }
+
+    .callout {
+      border: 1px solid rgba(250, 204, 21, 0.28);
+      background: linear-gradient(135deg, rgba(250, 204, 21, 0.10), rgba(251, 113, 133, 0.08));
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+    }
+    .callout strong { color: #fef3c7; }
+    .callout p { margin: 0; color: #f8e9b6; }
+    .release-callout { margin-top: 1.1rem; }
+    .footer { padding: 2.2rem 0 3.2rem; color: var(--subtle); border-top: 1px solid var(--line); }
+    .footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+
+    [data-lang="ko"] { display: none; }
+    body.lang-ko [data-lang="en"] { display: none !important; }
+    body.lang-ko [data-lang="ko"] { display: block; }
+    body.lang-ko span[data-lang="ko"] { display: inline; }
+    body.lang-ko .eyebrow[data-lang="ko"],
+    body.lang-ko a.button[data-lang="ko"] { display: inline-flex; }
+    body.lang-ko tr[data-lang="ko"] { display: table-row; }
+
+    @media (max-width: 880px) {
+      .hero-grid, .grid.three, .grid.two, .install-grid { grid-template-columns: 1fr; }
+      .hero { padding-top: 3rem; }
+      .topbar { position: static; }
+      .topbar .wrap { align-items: flex-start; flex-direction: column; }
+      .nav { justify-content: flex-start; }
+      h1 { max-width: 11ch; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="#page-top" aria-label="Light Terminal home">
+        <span class="logo" aria-hidden="true">▻</span>
+        <span>Light Terminal</span>
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="#install"><span data-lang="en">Install</span><span data-lang="ko">설치</span></a>
+        <a href="#quickstart"><span data-lang="en">Quick start</span><span data-lang="ko">빠른 시작</span></a>
+        <a href="#commands"><span data-lang="en">Commands</span><span data-lang="ko">명령어</span></a>
+        <a href="#security"><span data-lang="en">Security</span><span data-lang="ko">보안</span></a>
+        <a href="https://github.com/ictechgy/light_terminal">GitHub</a>
+        <span class="lang-toggle" aria-label="Language">
+          <button type="button" data-set-lang="en" aria-pressed="true">EN</button>
+          <button type="button" data-set-lang="ko" aria-pressed="false">한국어</button>
+        </span>
+      </nav>
+    </div>
+  </header>
+
+  <main id="page-top">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <span class="eyebrow" data-lang="en">Persistent terminals for AI agents · v1.0.33 prepared</span>
+          <span class="eyebrow" data-lang="ko">AI 에이전트 작업을 오래 유지하는 터미널 · v1.0.33 준비</span>
+          <h1 data-lang="en"><span class="gradient-text">lterm</span> keeps agents running.</h1>
+          <h1 data-lang="ko" aria-hidden="true"><span class="gradient-text">lterm</span>은 에이전트 작업을 끊기지 않게 유지합니다.</h1>
+          <p class="lead" data-lang="en">
+            A lightweight tmux-compatible session daemon for Claude Code, Codex CLI,
+            Gemini CLI, OpenCode, Grok Build CLI through custom profiles, and other terminal-first agent workflows — including mobile SSH reconnects and cmux panes, prepared for 1.0.33 with verified peer ancestry and race-safe nested-session provenance.
+          </p>
+          <p class="lead" data-lang="ko">
+            Claude Code, Codex CLI, Gemini CLI, OpenCode, custom profile로 실행하는 Grok Build CLI 같은 터미널 기반 AI 에이전트 워크플로를 위해 만든
+            가벼운 tmux 호환 세션 데몬입니다. 모바일 SSH 재접속과 cmux pane도 함께 고려했고, 1.0.33은 검증된 peer ancestry와 경쟁에 안전한 nested-session provenance를 포함하도록 준비했습니다.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#install" data-lang="en">Install lterm</a>
+            <a class="button primary" href="#install" data-lang="ko">설치하기</a>
+            <a class="button" href="https://github.com/ictechgy/light_terminal#readme" data-lang="en">Read full README</a>
+            <a class="button" href="https://github.com/ictechgy/light_terminal/blob/main/README.ko.md" data-lang="ko">전체 README 보기</a>
+          </div>
+          <div class="callout release-callout">
+            <p data-lang="en"><strong>Prepared for v1.0.33.</strong> Verified same-UID peer ancestry restores stripped nested-session provenance while explicit authority and fail-closed rollback remain intact.</p>
+            <p data-lang="ko"><strong>v1.0.33 준비 완료.</strong> 검증된 same-UID peer ancestry가 제거된 nested-session provenance를 복구하며, 명시적 권한과 fail-closed rollback은 그대로 유지합니다.</p>
+          </div>
+        </div>
+        <div class="terminal-card" aria-label="lterm terminal example">
+          <div class="term-header">
+            <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+            <span>agent session</span>
+          </div>
+          <div class="term-body">
+            <pre><span class="prompt">$</span> lterm start -d -n codex -- codex
+<span class="ok">created</span> codex  %0
+
+<span class="prompt">$</span> lterm logs codex --start=-20
+<span class="muted">sanitized scrollback for review</span>
+
+<span class="prompt">$</span> lterm resume codex
+<span class="ok">reattached</span> without restarting the agent</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="why">
+      <div class="wrap">
+        <div class="section-title">
+          <div>
+            <h2 data-lang="en">Why it exists</h2>
+            <h2 data-lang="ko">왜 쓰나요?</h2>
+            <p class="section-kicker" data-lang="en">Use tmux for a full multiplexer. Use lterm when agents need a smaller, scriptable persistence layer.</p>
+            <p class="section-kicker" data-lang="ko">완전한 멀티플렉서가 필요하면 tmux를 쓰면 됩니다. lterm은 에이전트 작업에 필요한 가벼운 세션 유지와 스크립트 자동화에 집중합니다.</p>
+          </div>
+        </div>
+        <div class="grid three">
+          <article class="card">
+            <span class="badge">01</span>
+            <h3 data-lang="en">Agent-first persistence</h3>
+            <h3 data-lang="ko">에이전트 작업이 끊기지 않습니다</h3>
+            <p data-lang="en">Named PTY sessions keep running after clients detach, so long agent tasks survive terminal churn.</p>
+            <p data-lang="ko">이름을 붙인 PTY 세션은 클라이언트가 접속을 끊어도 계속 실행됩니다. 오래 걸리는 에이전트 작업은 터미널을 닫았다 다시 열어도 중단되지 않습니다.</p>
+          </article>
+          <article class="card">
+            <span class="badge">02</span>
+            <h3 data-lang="en">tmux-compatible where agents expect it</h3>
+            <h3 data-lang="ko">에이전트 도구가 필요로 하는 tmux 호환성</h3>
+            <p data-lang="en">A focused <code>tmux-compat</code> shim covers the commands common orchestration tools rely on.</p>
+            <p data-lang="ko">오케스트레이션 도구가 자주 쓰는 명령을 <code>tmux-compat</code> shim으로 지원합니다.</p>
+          </article>
+          <article class="card">
+            <span class="badge">03</span>
+            <h3 data-lang="en">Raw attach, safe reports</h3>
+            <h3 data-lang="ko">Raw 연결과 정제된 리포트</h3>
+            <p data-lang="en">Attached PTY bytes stay raw for TUIs. Report surfaces strip terminal controls while preserving UTF-8 text.</p>
+            <p data-lang="ko">TUI가 깨지지 않도록 PTY 연결에서는 바이트를 raw로 전달합니다. 대신 리포트 출력은 터미널 제어 코드를 제거하고 UTF-8 텍스트는 그대로 보존합니다.</p>
+          </article>
+          <article class="card">
+            <span class="badge">1.0.33</span>
+            <h3 data-lang="en">Verified nested provenance</h3>
+            <h3 data-lang="ko">검증된 중첩 provenance</h3>
+            <p data-lang="en">Focused unit, CLI smoke, and isolated rollback-matrix tests cover parent recovery, explicit-authority precedence, race revalidation, and safe fallback behavior.</p>
+            <p data-lang="ko">focused unit, CLI smoke, isolated rollback-matrix test가 parent 복구, 명시적 권한 우선순위, 경쟁 재검증, 안전한 fallback 동작을 검증합니다.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="install">
+      <div class="wrap">
+        <div class="section-title">
+          <div>
+            <h2 data-lang="en">Install</h2>
+            <h2 data-lang="ko">설치</h2>
+            <p class="section-kicker" data-lang="en">Homebrew and npm are the easiest paths. Cargo from GitHub is useful for source-pinned installs.</p>
+            <p class="section-kicker" data-lang="ko">Homebrew와 npm이 가장 간편합니다. 소스에서 특정 버전을 고정해 설치하려면 Cargo를 쓰세요.</p>
+          </div>
+        </div>
+        <div class="install-grid">
+          <article class="card install-card">
+            <h3>Homebrew</h3>
+            <p data-lang="en">Recommended on macOS when Homebrew is already your package manager.</p>
+            <p data-lang="ko">macOS에서 Homebrew를 쓰고 있다면 가장 무난한 설치 방법입니다.</p>
+            <pre>brew install ictechgy/tap/lterm</pre>
+          </article>
+          <article class="card install-card">
+            <h3>npm</h3>
+            <p data-lang="en">Installs a wrapper plus native platform package on supported macOS/Linux targets.</p>
+            <p data-lang="ko">지원되는 macOS/Linux 환경에서는 래퍼와 네이티브 패키지를 한 번에 설치합니다.</p>
+            <pre>npm install -g @ictechgy/lterm</pre>
+          </article>
+          <article class="card install-card">
+            <h3>Cargo</h3>
+            <p data-lang="en">Pin the release tag when installing from source; check GitHub Releases for newer tags.</p>
+            <p data-lang="ko">소스에서 설치할 때는 릴리스 태그를 고정하세요. 최신 태그는 GitHub Releases에서 확인할 수 있습니다.</p>
+            <pre>cargo install --locked --git https://github.com/ictechgy/light_terminal --tag v1.0.33</pre>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="wrap">
+        <div class="section-title">
+          <div>
+            <h2 data-lang="en">Quick start</h2>
+            <h2 data-lang="ko">빠른 시작</h2>
+            <p class="section-kicker" data-lang="en">Create a named session, detach safely, inspect it, then resume when you need the live terminal.</p>
+            <p class="section-kicker" data-lang="ko">이름을 붙인 세션을 시작하고, 안전하게 분리한 뒤, 필요할 때 다시 실시간 터미널에 연결합니다.</p>
+          </div>
+        </div>
+        <div class="steps">
+          <div class="step">
+            <div>
+              <h3 data-lang="en">Start a persistent process</h3>
+              <h3 data-lang="ko">계속 실행할 프로세스 시작</h3>
+              <pre>lterm start -d -n api -- npm run dev</pre>
+              <p data-lang="en">The process keeps running after your current terminal exits.</p>
+              <p data-lang="ko">현재 터미널을 닫아도 프로세스는 계속 실행됩니다.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div>
+              <h3 data-lang="en">Read sanitized scrollback</h3>
+              <h3 data-lang="ko">정제된 scrollback 확인</h3>
+              <pre>lterm logs api --start=-80 --end=-1</pre>
+              <p data-lang="en">Good for agents and scripts because terminal controls are stripped from report output.</p>
+              <p data-lang="ko">리포트 출력에서는 터미널 제어 코드를 제거하므로 에이전트와 스크립트가 읽기 쉽습니다.</p>
+            </div>
+          </div>
+          <div class="step">
+            <div>
+              <h3 data-lang="en">Resume the live terminal</h3>
+              <h3 data-lang="ko">실시간 터미널에 다시 연결하기</h3>
+              <pre>lterm resume api</pre>
+              <p data-lang="en">Compatibility names such as <code>attach</code>, <code>a</code>, and <code>-a</code> remain available.</p>
+              <p data-lang="ko"><code>attach</code>, <code>a</code>, <code>-a</code> 같은 호환 이름도 그대로 쓸 수 있습니다.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="commands">
+      <div class="wrap">
+        <div class="section-title">
+          <div>
+            <h2 data-lang="en">Command map</h2>
+            <h2 data-lang="ko">명령어 목록</h2>
+            <p class="section-kicker" data-lang="en">These are the product CLI commands people and agents usually need first.</p>
+            <p class="section-kicker" data-lang="ko">사람과 에이전트 모두 먼저 알아두면 좋은 주요 CLI 명령어입니다.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr data-lang="en"><th>Task</th><th>Command</th><th>Compatibility names</th></tr>
+              <tr data-lang="ko"><th>작업</th><th>명령</th><th>호환 이름</th></tr>
+            </thead>
+            <tbody>
+              <tr data-lang="en"><td>Start a persistent process</td><td><code>lterm start -n api -- npm run dev</code></td><td><code>new</code></td></tr>
+              <tr data-lang="ko"><td>계속 실행할 프로세스 시작</td><td><code>lterm start -n api -- npm run dev</code></td><td><code>new</code></td></tr>
+              <tr data-lang="en"><td>Open or create a session</td><td><code>lterm open main</code></td><td><code>attach-or-new</code></td></tr>
+              <tr data-lang="ko"><td>세션 열기 또는 생성</td><td><code>lterm open main</code></td><td><code>attach-or-new</code></td></tr>
+              <tr data-lang="en"><td>Resume a session</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
+              <tr data-lang="ko"><td>기존 세션에 다시 연결</td><td><code>lterm resume api</code></td><td><code>attach</code>, <code>a</code>, <code>-a</code></td></tr>
+              <tr data-lang="en"><td>Reconnect to the last selected session</td><td><code>lterm reconnect --mobile</code></td><td>none</td></tr>
+              <tr data-lang="ko"><td>마지막으로 선택한 세션에 재접속</td><td><code>lterm reconnect --mobile</code></td><td>없음</td></tr>
+              <tr data-lang="en"><td>Review an agent session in mobile scrollback</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td>Force with <code>--mobile</code>; force raw with <code>--raw</code></td></tr>
+              <tr data-lang="ko"><td>모바일 scrollback에서 agent 세션 확인</td><td><code>LTERM_MOBILE=1 lterm resume codex-lterm</code></td><td><code>--mobile</code>로 강제; 기존 raw attach는 <code>--raw</code></td></tr>
+              <tr data-lang="en"><td>Read sanitized scrollback</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="ko"><td>정제된 scrollback 확인</td><td><code>lterm logs api --start=-80 --end=-1</code></td><td><code>capture</code></td></tr>
+              <tr data-lang="en"><td>Extract recent URLs</td><td><code>lterm urls api --last</code></td><td>none</td></tr>
+              <tr data-lang="ko"><td>최근 URL 추출</td><td><code>lterm urls api --last</code></td><td>없음</td></tr>
+              <tr data-lang="en"><td>Search sanitized scrollback</td><td><code>lterm search api 'build failed'</code></td><td>Use <code>/grep QUERY</code> in mobile transcript mode</td></tr>
+              <tr data-lang="ko"><td>정제된 scrollback 검색</td><td><code>lterm search api 'build failed'</code></td><td>모바일 transcript에서는 <code>/grep QUERY</code></td></tr>
+              <tr data-lang="en"><td>Wait for a marker or exit</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>none</td></tr>
+              <tr data-lang="ko"><td>마커가 나오거나 종료될 때까지 대기</td><td><code>lterm wait api --contains READY --timeout 30s --json</code></td><td>없음</td></tr>
+              <tr data-lang="en"><td>Notify on completion</td><td><code>lterm watch api --exit --notify</code></td><td>none</td></tr>
+              <tr data-lang="ko"><td>완료 시 알림</td><td><code>lterm watch api --exit --notify</code></td><td>없음</td></tr>
+              <tr data-lang="en"><td>Launch an agent profile</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
+              <tr data-lang="ko"><td>agent profile 실행</td><td><code>lterm codex --name codex-main</code></td><td><code>agent</code> profiles</td></tr>
+              <tr data-lang="en"><td>Launch a custom PATH agent</td><td><code>lterm agent grok -- -p 'summarize'</code></td><td>Grok is custom, not a built-in shortcut</td></tr>
+              <tr data-lang="ko"><td>custom PATH agent 실행</td><td><code>lterm agent grok -- -p '요약해줘'</code></td><td>Grok은 built-in shortcut이 아닌 custom profile</td></tr>
+              <tr data-lang="en"><td>Diagnose local state</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
+              <tr data-lang="ko"><td>로컬 상태 진단</td><td><code>lterm doctor --json</code></td><td><code>status</code></td></tr>
+              <tr data-lang="en"><td>Inspect redacted diagnostics</td><td><code>lterm inspect --json</code></td><td>same bundle as <code>diagnose --bundle</code></td></tr>
+              <tr data-lang="ko"><td>redacted 진단 확인</td><td><code>lterm inspect --json</code></td><td><code>diagnose --bundle</code>과 같은 bundle</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="security">
+      <div class="wrap">
+        <div class="section-title">
+          <div>
+            <h2 data-lang="en">Security model in plain language</h2>
+            <h2 data-lang="ko">보안 모델을 쉽게 말하면</h2>
+            <p class="section-kicker" data-lang="en">lterm is a same-user convenience daemon. It is not a sandbox.</p>
+            <p class="section-kicker" data-lang="ko">lterm은 같은 OS 사용자 범위 안에서 쓰는 편의 목적의 데몬입니다. 샌드박스가 아닙니다.</p>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="callout">
+            <p data-lang="en"><strong>Attached terminals are raw.</strong> Full-screen apps, shells, and remote PTY streams can emit terminal escape sequences just like they can under tmux or screen.</p>
+            <p data-lang="ko"><strong>연결된 터미널은 raw 모드입니다.</strong> 전체화면 앱, 셸, 원격 PTY 스트림은 tmux/screen에서와 마찬가지로 터미널 이스케이프 시퀀스를 출력할 수 있습니다.</p>
+          </div>
+          <div class="callout">
+            <p data-lang="en"><strong>Mobile reconnect is explicit.</strong> <code>lterm reconnect --mobile</code> resumes the last selected local lterm session from a private minimal pointer, falling back to <code>main</code> when the pointer is missing, corrupt, or stale. Preview the reversible SSH-login snippet with <code>lterm init --mobile-reconnect --shell zsh</code>, or omit <code>--shell</code> to detect from <code>$SHELL</code>; lterm never edits shell startup files automatically, and <code>LTERM_RECONNECT_DISABLE=1</code> skips a copied snippet.</p>
+            <p data-lang="ko"><strong>모바일 재접속은 명시적입니다.</strong> <code>lterm reconnect --mobile</code>은 비공개 최소 pointer로 마지막으로 선택한 로컬 lterm 세션을 다시 열고, pointer가 없거나 손상됐거나 오래되어 더 이상 맞지 않으면 <code>main</code>으로 fallback합니다. 되돌릴 수 있는 SSH 로그인 snippet은 <code>lterm init --mobile-reconnect --shell zsh</code>로 미리 볼 수 있고, <code>--shell</code>을 생략하면 <code>$SHELL</code>에서 감지합니다. lterm은 shell startup file을 자동 수정하지 않으며, 복사한 snippet은 <code>LTERM_RECONNECT_DISABLE=1</code>로 건너뜁니다.</p>
+          </div>
+          <div class="callout">
+            <p data-lang="en"><strong>Reports are sanitized.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, <code>urls</code>, diagnostics, and notification fallback paths strip terminal controls while preserving valid UTF-8 text.</p>
+            <p data-lang="ko"><strong>리포트 출력은 정제됩니다.</strong> <code>logs</code>, <code>capture</code>, <code>compose</code>, <code>search</code>, <code>urls</code>, 진단, 알림 폴백 경로에서는 터미널 제어 코드를 제거하고 유효한 UTF-8 텍스트를 보존합니다.</p>
+          </div>
+          <div class="callout">
+            <p data-lang="en"><strong>Extracted URLs are untrusted.</strong> <code>lterm urls</code> helps copy terminal links on small screens, but extracted URLs may include phishing links or short-lived auth/login credentials. It reports at most 256 unique ASCII URL tokens and skips raw candidates over 4096 bytes; in mobile transcript mode, <code>/links</code> and <code>/urls</code> stay local-only. <code>--last</code> prints only the newest valid link, so use it only when you know that link is the one you want.</p>
+            <p data-lang="ko"><strong>추출된 URL은 신뢰할 수 없습니다.</strong> <code>lterm urls</code>는 작은 화면에서 터미널 링크를 복사할 때 유용하지만, 추출된 URL에는 phishing link나 짧게 살아 있는 인증/login credential이 포함될 수 있습니다. 최대 256개의 unique ASCII URL token만 보고하고, 4096 byte를 넘는 raw candidate는 건너뛰며, mobile transcript의 <code>/links</code> / <code>/urls</code>는 로컬에서만 처리됩니다. <code>--last</code>는 최신 유효 link 하나만 출력하므로, 그 링크가 원하는 링크임을 알 때만 사용하세요.</p>
+          </div>
+          <div class="callout">
+            <p data-lang="en"><strong>Agent TUI colors stay independent.</strong> Agent launchers do not forward ambient <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, or <code>CLICOLOR_FORCE</code> from the client or daemon, while ordinary sessions preserve those variables.</p>
+            <p data-lang="ko"><strong>Agent TUI 색상은 분리해 다룹니다.</strong> agent launcher는 클라이언트나 데몬에 설정된 <code>NO_COLOR</code>, <code>FORCE_COLOR</code>, <code>CLICOLOR</code>, <code>CLICOLOR_FORCE</code> 환경값을 agent child process에 전달하지 않고, 일반 세션은 이 변수들을 그대로 보존합니다.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- GitHub Pages scope: this is a project page under /light_terminal/ and does not replace or modify the account-level ictechgy.github.io blog repository. -->
+  </main>
+
+  <footer class="footer">
+    <div class="wrap">
+      <span data-lang="en">Light Terminal is dual-licensed under MIT or Apache-2.0.</span>
+      <span data-lang="ko">Light Terminal은 MIT 또는 Apache-2.0 라이선스로 이용할 수 있습니다.</span>
+      <span><a href="https://github.com/ictechgy/light_terminal">GitHub</a> · <a href="https://www.npmjs.com/package/@ictechgy/lterm">npm</a></span>
+    </div>
+  </footer>
+
+  <script>
+    const buttons = document.querySelectorAll('[data-set-lang]');
+    function readStoredLang() {
+      try {
+        const value = localStorage.getItem('lterm-guide-lang');
+        return value === 'ko' || value === 'en' ? value : null;
+      } catch (_error) {
+        return null;
+      }
+    }
+    function writeStoredLang(lang) {
+      try {
+        localStorage.setItem('lterm-guide-lang', lang);
+      } catch (_error) {
+        // Storage can be disabled in hardened browsers; the toggle still works for this page load.
+      }
+    }
+    const browserLang = (navigator.language || '').toLowerCase();
+    const preferred = readStoredLang() || (browserLang.startsWith('ko') ? 'ko' : 'en');
+    function setLang(lang) {
+      const next = lang === 'ko' ? 'ko' : 'en';
+      document.body.classList.toggle('lang-ko', next === 'ko');
+      document.documentElement.lang = next;
+      document.title = next === 'ko'
+        ? 'Light Terminal (lterm) — 한국어 가이드'
+        : 'Light Terminal (lterm) — Browser Guide';
+      document.querySelectorAll('[data-lang]').forEach((node) => {
+        node.setAttribute('aria-hidden', String(node.dataset.lang !== next));
+      });
+      buttons.forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.setLang === next)));
+      writeStoredLang(next);
+    }
+    buttons.forEach((button) => button.addEventListener('click', () => setLang(button.dataset.setLang)));
+    setLang(preferred);
+  </script>
+</body>
+</html>
