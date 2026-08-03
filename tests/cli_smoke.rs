@@ -23,7 +23,7 @@ const ERR_INVALID_SESSION_CHARS: &str = "may only contain ASCII";
 const ERR_LEADING_DASH_NAME: &str = "cannot start with '-'";
 const ERR_SESSION_EXISTS: &str = "session name already exists";
 const ERR_SESSION_NAME: &str = "session name";
-const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 9;
+const CURRENT_DAEMON_PROTOCOL_VERSION: u32 = 10;
 const MAX_TRACE_REPLAY_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const CLIENT_ONLY_ENV_SHOULD_NOT_FORWARD: &str = "LTERM_SHOULD_NOT_FORWARD_CODEX_HOME_REGRESSION";
 
@@ -4474,7 +4474,7 @@ fn exits_json_uses_protocol_v8_bounded_raw_free_request_and_response() -> TestRe
     assert_eq!(
         String::from_utf8(output.stderr.clone())?,
         format!(
-            "warning: lterm client {} (protocol 9) is talking to daemon {} (protocol 8); run `lterm shutdown` and retry after upgrades\n",
+            "warning: lterm client {} (protocol 10) is talking to daemon {} (protocol 8); run `lterm shutdown` and retry after upgrades\n",
             env!("CARGO_PKG_VERSION"),
             env!("CARGO_PKG_VERSION")
         )

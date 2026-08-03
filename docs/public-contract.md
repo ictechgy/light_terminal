@@ -493,6 +493,29 @@ executable non-lterm `tmux` appears before the lterm shim. `doctor` and
 `inspect` do not run arbitrary real `tmux` commands for this summary, and do not
 include raw PTY bytes or scrollback.
 
+## Styled-screen daemon RPC
+
+Protocol 10 daemons advertise `lterm.styled-screen.v1` in the additive
+`styled_screen_schema_versions` status field. A local same-user RPC client can
+request a full, daemon-owned vt100 screen snapshot with `type: "styled_screen"`,
+the target pane/session, and that schema version. This is intentionally not a
+CLI report surface and does not attach, resize, send input, read scrollback, or
+rewrite the raw PTY stream.
+
+Snapshots contain a stable session incarnation ID, non-wrapping decimal screen
+revision, geometry, active screen, a style table, run-length encoded physical
+rows, and cursor state. Wide-cell continuations are explicit. A client may send
+the prior `(session_id, screen_revision)` as `if_snapshot`; an exact match gets
+the compact `not_modified` result, while an unknown incarnation, malformed
+revision, or future revision is rejected as stale. The daemon only emits full
+snapshots—there are no delta patches in v1.
+
+The response is bounded to 128 rows, 192 columns, 24,576 cells, 2,048 styles,
+and 8 MiB, with an aggregate in-flight reservation across connections. Parser
+failure or revision exhaustion quarantines this optional snapshot capability for
+that session without interrupting raw PTY output. The normative JSON shape is
+[`docs/schemas/styled-screen-v1.schema.json`](schemas/styled-screen-v1.schema.json).
+
 ## Non-blocking P1 surfaces
 
 Agent workflow cookbook recipes are useful follow-up work, but they are not 1.0

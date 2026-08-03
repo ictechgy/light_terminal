@@ -14,9 +14,16 @@ pub const MAX_SEND_DATA_BYTES: usize = 700 * 1024;
 pub const MAX_CAPABILITY_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_INPUT_CAPABILITY_BUDGET: u64 = 1024 * 1024;
 pub const CAPABILITY_PROTOCOL_VERSION: u32 = 5;
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
+pub const STYLED_SCREEN_SCHEMA_V1: &str = "lterm.styled-screen.v1";
+pub const STYLED_SCREEN_MAX_REQUEST_BYTES: usize = 8 * 1024;
+pub const STYLED_SCREEN_MAX_ROWS: u16 = 128;
+pub const STYLED_SCREEN_MAX_COLS: u16 = 192;
+pub const STYLED_SCREEN_MAX_CELLS: usize = 24_576;
+pub const STYLED_SCREEN_MAX_STYLES: usize = 2_048;
+pub const STYLED_SCREEN_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[allow(dead_code)]
-pub const SPECULATION_PROTOCOL_VERSION: u32 = 9;
+pub const SPECULATION_PROTOCOL_VERSION: u32 = 10;
 #[allow(dead_code)]
 pub const SPECULATION_UNSUPPORTED_ERROR_CODE: &str = "speculation_unsupported";
 #[allow(dead_code)]
@@ -960,6 +967,11 @@ pub struct DaemonStatus {
     // started_at_unix_secs: 데몬 시작 시각(UNIX epoch seconds). uptime 계산용.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix_secs: Option<u64>,
+    /// Additive styled-screen schema advertisement. Older daemons omit this
+    /// field, which deserializes as an empty list and therefore cannot enable
+    /// the feature accidentally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styled_screen_schema_versions: Vec<String>,
 }
 
 /// Raw-free, read-only measurements for one live or recently exited session.
@@ -1158,6 +1170,93 @@ pub struct WaitContainsResult {
     pub exited: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledScreenPrecondition {
+    pub session_id: String,
+    pub screen_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StyledScreenColor {
+    Default,
+    Indexed { index: u8 },
+    Rgb { red: u8, green: u8, blue: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StyledScreenStyle {
+    pub foreground: StyledScreenColor,
+    pub background: StyledScreenColor,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StyledScreenCell {
+    Text { text: String, width: u8 },
+    Continuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StyledScreenRun {
+    Blank {
+        style_id: u16,
+        columns: u16,
+    },
+    Cells {
+        style_id: u16,
+        cells: Vec<StyledScreenCell>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledScreenRow {
+    pub wrapped: bool,
+    pub runs: Vec<StyledScreenRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledScreenCursor {
+    pub visible: bool,
+    pub row: u16,
+    pub column: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledScreenSnapshot {
+    pub schema_version: String,
+    pub variant: String,
+    pub session_id: String,
+    pub screen_revision: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub active_screen: String,
+    pub styles: Vec<StyledScreenStyle>,
+    pub screen_rows: Vec<StyledScreenRow>,
+    pub cursor: StyledScreenCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledScreenNotModified {
+    pub schema_version: String,
+    pub variant: String,
+    pub session_id: String,
+    pub screen_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StyledScreenResult {
+    Snapshot(StyledScreenSnapshot),
+    NotModified(StyledScreenNotModified),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -1234,6 +1333,12 @@ pub enum Request {
         start: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<i32>,
+    },
+    StyledScreen {
+        target: String,
+        schema_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_snapshot: Option<StyledScreenPrecondition>,
     },
     WaitExit {
         target: String,
@@ -1684,7 +1789,7 @@ mod tests {
         let status = sample_speculation_status();
 
         assert_eq!(PROTOCOL_VERSION, SPECULATION_PROTOCOL_VERSION);
-        assert_eq!(SPECULATION_PROTOCOL_VERSION, 9);
+        assert_eq!(SPECULATION_PROTOCOL_VERSION, 10);
         let value = serde_json::to_value(&status).expect("serialize speculation status");
         let object = value.as_object().expect("status is an object");
         assert_eq!(object["phase"], "pending_finalize");
@@ -2543,5 +2648,43 @@ mod tests {
         .expect("deserialize capture request without end");
 
         assert!(matches!(legacy_request, Request::Capture { end: None, .. }));
+    }
+
+    #[test]
+    fn styled_screen_request_round_trips_selected_schema_and_precondition() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "type": "styled_screen",
+            "target": "%0",
+            "schema_version": "lterm.styled-screen.v1",
+            "if_snapshot": {
+                "session_id": "123e4567-e89b-42d3-a456-426614174000",
+                "screen_revision": "42"
+            }
+        }))
+        .expect("styled-screen request should deserialize");
+
+        let value = serde_json::to_value(request).expect("serialize styled-screen request");
+        assert_eq!(value["type"], "styled_screen");
+        assert_eq!(value["schema_version"], "lterm.styled-screen.v1");
+        assert_eq!(value["if_snapshot"]["screen_revision"], "42");
+    }
+
+    #[test]
+    fn daemon_status_round_trips_styled_screen_capability_advertisement() {
+        let status: super::DaemonStatus = serde_json::from_value(serde_json::json!({
+            "version": "1.0.33",
+            "protocol_version": 10,
+            "session_count": 0,
+            "active_connections": 0,
+            "shutting_down": false,
+            "styled_screen_schema_versions": ["lterm.styled-screen.v1"]
+        }))
+        .expect("status with styled-screen capability should deserialize");
+
+        let value = serde_json::to_value(status).expect("serialize daemon status");
+        assert_eq!(
+            value["styled_screen_schema_versions"],
+            serde_json::json!(["lterm.styled-screen.v1"])
+        );
     }
 }

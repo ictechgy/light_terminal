@@ -438,6 +438,8 @@ struct StrictDaemonStatus {
     _daemon_uid: Option<u32>,
     #[serde(default, rename = "started_at_unix_secs")]
     _started_at_unix_secs: Option<u64>,
+    #[serde(default, rename = "styled_screen_schema_versions")]
+    _styled_screen_schema_versions: Vec<String>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -8905,7 +8907,7 @@ mod tests {
     }
 
     #[test]
-    fn speculation_protocol_guard_rejects_v8_without_speculation_frame_and_accepts_v9() {
+    fn speculation_protocol_guard_rejects_v8_without_speculation_frame_and_accepts_v10() {
         let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(8)]);
         assert_eq!(
             require_speculation_protocol_at(&socket),
@@ -8918,7 +8920,9 @@ mod tests {
             Ok(Request::Status)
         ));
 
-        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(9)]);
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(
+            crate::protocol::SPECULATION_PROTOCOL_VERSION,
+        )]);
         assert_eq!(require_speculation_protocol_at(&socket), Ok(()));
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -8988,7 +8992,7 @@ mod tests {
 
     #[test]
     fn strict_transport_rejects_original_duplicate_protocol_and_status_fields() {
-        for protocol_version in [8, 9] {
+        for protocol_version in [8, 10] {
             let response = format!(
                 concat!(
                     r#"{{"ok":true,"error":null,"result":{{"version":"test","protocol_version":{0},"protocol_version":{0},"session_count":0,"active_connections":1,"shutting_down":false}}}}"#
@@ -10498,6 +10502,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let message = recent_exits_protocol_error(&old).expect("protocol 7 must be rejected");
         assert!(message.contains("upgrade/restart is required"), "{message}");
@@ -15049,6 +15054,7 @@ mod tests {
             // 옛 데몬은 doctor 신규 필드를 보내지 않는다. backward-compat 시뮬레이션.
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::STATUS_THEME_PROTOCOL_VERSION,
@@ -15073,6 +15079,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::INSTRUMENT_PROTOCOL_VERSION,
@@ -15095,6 +15102,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::TMUX_PARENT_PANE_PROTOCOL_VERSION,

@@ -12,9 +12,13 @@ use crate::protocol::{
     MAX_RECENT_EXITS_LIMIT, MetadataHistoryResult, MetadataJournalEntry, MetadataOperation,
     MetadataPurgeAggregate, MetadataPurgeResult, MetadataStepDirection, MetadataStepResult,
     MetadataValue, PROTOCOL_VERSION, Request, Response, SPECULATION_PROTOCOL_VERSION,
-    SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo, SessionLifecycleState,
-    SpeculationRequest, SpeculationRequestEnvelope, StatusTheme, WaitContainsResult,
-    WaitExitResult,
+    STYLED_SCREEN_MAX_CELLS, STYLED_SCREEN_MAX_COLS, STYLED_SCREEN_MAX_REQUEST_BYTES,
+    STYLED_SCREEN_MAX_RESPONSE_BYTES, STYLED_SCREEN_MAX_ROWS, STYLED_SCREEN_MAX_STYLES,
+    STYLED_SCREEN_SCHEMA_V1, SensitiveCapabilityRequest, SessionExitTrigger, SessionInfo,
+    SessionLifecycleState, SpeculationRequest, SpeculationRequestEnvelope, StatusTheme,
+    StyledScreenCell, StyledScreenColor, StyledScreenCursor, StyledScreenNotModified,
+    StyledScreenPrecondition, StyledScreenResult, StyledScreenRow, StyledScreenRun,
+    StyledScreenSnapshot, StyledScreenStyle, WaitContainsResult, WaitExitResult,
 };
 use crate::sanitize;
 use crate::speculation_service::SpeculationService;
@@ -71,6 +75,11 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 /// `BACKPRESSURE_SEND_TIMEOUT` 하나로 묶인다.
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const STYLED_SCREEN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const STYLED_SCREEN_FIXED_RESERVATION_BYTES: usize = 256 * 1024;
+const STYLED_SCREEN_RESERVATION_PER_CELL_BYTES: usize = 288;
+const STYLED_SCREEN_MAX_RESERVATION_BYTES: usize = 16 * 1024 * 1024;
+const STYLED_SCREEN_DAEMON_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SENSITIVE_CAPABILITY_FRAME_BYTES: usize = 128 * 1024;
 const MAX_INPUT_CAPABILITIES: usize = 1024;
 const MAX_INPUT_CAPABILITIES_PER_SESSION: usize = 64;
@@ -166,6 +175,7 @@ struct State {
     shutting_down: AtomicBool,
     active_connections: AtomicUsize,
     active_blocking_waits: AtomicUsize,
+    styled_screen_reserved_bytes: AtomicUsize,
     // 데몬 시작 시각(UNIX epoch seconds). doctor의 uptime 계산용. None이면
     // SystemTime::now()가 시스템 clock 이슈로 실패한 경우. wire에서 그대로 None을
     // 보내 client가 uptime을 omit하게 한다.
@@ -356,6 +366,7 @@ struct Session {
     /// this flag quarantines the session-local emulator state so the PTY reader
     /// keeps appending raw bytes, broadcasting live output, and accepting input.
     terminal_parser_degraded: AtomicBool,
+    styled_screen_revision: AtomicU64,
     #[cfg(test)]
     terminal_parser_panic_on_next_update: AtomicBool,
     #[cfg(test)]
@@ -575,6 +586,9 @@ impl Session {
             // The section ends before `broadcast_chunk`, so slow subscriber
             // sends/backpressure waits do not block attach snapshots or resize.
             self.update_terminal_snapshot_state(bytes);
+            if !bytes.is_empty() && !self.terminal_parser_degraded() {
+                self.advance_styled_screen_revision();
+            }
             self.mark_output_changed(bytes.len());
 
             let subscribers = lock(&self.subscribers).clone();
@@ -653,6 +667,19 @@ impl Session {
                 "terminal parser degraded for pane {}: {reason}; raw PTY output will continue without screen-state snapshots",
                 self.pane_id
             );
+        }
+    }
+
+    fn advance_styled_screen_revision(&self) {
+        if self
+            .styled_screen_revision
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |revision| {
+                revision.checked_add(1)
+            })
+            .is_err()
+        {
+            self.mark_terminal_parser_degraded("styled-screen revision exhausted");
+            self.clear_terminal_pending_prefix();
         }
     }
 
@@ -966,6 +993,8 @@ impl Session {
         if result.is_err() {
             self.mark_terminal_parser_degraded("terminal parser panicked while resizing");
             self.clear_terminal_pending_prefix();
+        } else {
+            self.advance_styled_screen_revision();
         }
     }
 
@@ -1511,6 +1540,12 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     }
     let request = parse_request_line(&line)?;
 
+    if matches!(&request, Request::StyledScreen { .. })
+        && line.len() > STYLED_SCREEN_MAX_REQUEST_BYTES
+    {
+        return write_styled_screen_error(&mut stream, "styled_screen_request_too_large");
+    }
+
     if let Request::Attach { target, rows, cols } = request {
         return handle_attach(state, stream, &target, rows, cols, frame.buffered);
     }
@@ -1520,6 +1555,25 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
             bail!("capability channel sent sensitive bytes before ready");
         }
         return handle_capability_channel(state, stream, action);
+    }
+
+    if let Request::StyledScreen {
+        target,
+        schema_version,
+        if_snapshot,
+    } = request
+    {
+        return match styled_screen_capture(&state, &target, &schema_version, if_snapshot.as_ref()) {
+            Ok(capture) => {
+                stream
+                    .set_write_timeout(Some(STYLED_SCREEN_WRITE_TIMEOUT))
+                    .ok();
+                let write_result = write_styled_screen_result(&mut stream, &capture.result);
+                stream.set_write_timeout(None).ok();
+                write_result
+            }
+            Err(error) => write_styled_screen_error(&mut stream, styled_screen_error_code(&error)),
+        };
     }
 
     let shutdown = matches!(request, Request::Shutdown);
@@ -1536,6 +1590,110 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
         std::process::exit(0);
     }
     Ok(())
+}
+
+struct CappedResponseWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl CappedResponseWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for CappedResponseWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("styled response size overflow"))?;
+        if next_len > self.limit {
+            return Err(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "styled response exceeds configured limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StyledScreenSuccessEnvelope<'a> {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    result: &'a StyledScreenResult,
+}
+
+#[derive(serde::Serialize)]
+struct StyledScreenErrorEnvelope<'a> {
+    ok: bool,
+    error: &'a str,
+}
+
+fn write_styled_screen_result(stream: &mut UnixStream, result: &StyledScreenResult) -> Result<()> {
+    let envelope = StyledScreenSuccessEnvelope {
+        ok: true,
+        error: None,
+        result,
+    };
+    let mut writer = CappedResponseWriter::new(STYLED_SCREEN_MAX_RESPONSE_BYTES);
+    if serde_json::to_writer(&mut writer, &envelope).is_err() {
+        return write_styled_screen_error(stream, "styled_screen_response_too_large");
+    }
+    let bytes = writer.into_bytes();
+    stream
+        .write_all(&bytes)
+        .context("write styled-screen response")?;
+    stream
+        .write_all(b"\n")
+        .context("write styled-screen response newline")?;
+    stream.flush().ok();
+    Ok(())
+}
+
+fn write_styled_screen_error(stream: &mut UnixStream, code: &str) -> Result<()> {
+    serde_json::to_writer(
+        &mut *stream,
+        &StyledScreenErrorEnvelope {
+            ok: false,
+            error: code,
+        },
+    )
+    .context("write styled-screen error")?;
+    stream
+        .write_all(b"\n")
+        .context("write styled-screen error newline")?;
+    stream.flush().ok();
+    Ok(())
+}
+
+fn styled_screen_error_code(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "styled_screen_unsupported_schema" => "styled_screen_unsupported_schema",
+        "styled_screen_target_not_found" => "styled_screen_target_not_found",
+        "styled_screen_stale" => "styled_screen_stale",
+        "styled_screen_too_large" => "styled_screen_too_large",
+        "styled_screen_degraded" => "styled_screen_degraded",
+        "styled_screen_response_too_large" => "styled_screen_response_too_large",
+        "styled_screen_invalid_state" => "styled_screen_invalid_state",
+        _ => "styled_screen_invalid_state",
+    }
 }
 
 fn parse_request_line(line: &str) -> Result<Request> {
@@ -1809,9 +1967,17 @@ fn handle_request(
                 // state.started_at_unix_secs는 이미 Option<u64> — clock 실패 시 None을
                 // 그대로 wire에 전송해 client uptime이 sentinel 0으로 misreport되는 것을 방지.
                 started_at_unix_secs: state.started_at_unix_secs,
+                styled_screen_schema_versions: vec![STYLED_SCREEN_SCHEMA_V1.to_string()],
             }))
         }
         Request::Speculation(envelope) => Ok(handle_speculation_request(state, envelope)),
+        Request::StyledScreen {
+            target,
+            schema_version,
+            if_snapshot,
+        } => Ok(Response::ok(
+            styled_screen_capture(state, &target, &schema_version, if_snapshot.as_ref())?.result,
+        )),
         Request::New {
             name,
             command,
@@ -2570,6 +2736,7 @@ fn create_session_with_inspector<I: ProcessInspector>(
         terminal_normal_screen: Mutex::new(vt100::Parser::new(rows, cols, 0).screen().clone()),
         terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
         terminal_parser_degraded: AtomicBool::new(false),
+        styled_screen_revision: AtomicU64::new(0),
         #[cfg(test)]
         terminal_parser_panic_on_next_update: AtomicBool::new(false),
         #[cfg(test)]
@@ -4292,6 +4459,268 @@ fn apply_capability_input(
 
 fn revoke_input_capability(state: &Arc<State>, token: &CapabilityToken) {
     lock(&state.input_capabilities).grants.remove(token);
+}
+
+struct StyledScreenReservation {
+    state: Arc<State>,
+    bytes: usize,
+}
+
+impl Drop for StyledScreenReservation {
+    fn drop(&mut self) {
+        self.state
+            .styled_screen_reserved_bytes
+            .fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+struct StyledScreenCapture {
+    result: StyledScreenResult,
+    _reservation: Option<StyledScreenReservation>,
+}
+
+fn styled_screen_capture(
+    state: &Arc<State>,
+    target: &str,
+    schema_version: &str,
+    precondition: Option<&StyledScreenPrecondition>,
+) -> Result<StyledScreenCapture> {
+    if schema_version != STYLED_SCREEN_SCHEMA_V1 {
+        bail!("styled_screen_unsupported_schema");
+    }
+    if precondition.is_some_and(|value| !is_canonical_styled_revision(&value.screen_revision)) {
+        bail!("styled_screen_stale");
+    }
+    let session =
+        resolve_session(state, target).map_err(|_| anyhow!("styled_screen_target_not_found"))?;
+    let (screen, revision, reservation) = {
+        let _output_guard = lock(&session.output_state);
+        if session.terminal_parser_degraded() {
+            bail!("styled_screen_degraded");
+        }
+        let revision = session.styled_screen_revision.load(Ordering::SeqCst);
+        if let Some(precondition) = precondition {
+            if precondition.session_id != session.id {
+                bail!("styled_screen_stale");
+            }
+            let requested = precondition
+                .screen_revision
+                .parse::<u64>()
+                .map_err(|_| anyhow!("styled_screen_stale"))?;
+            if requested > revision {
+                bail!("styled_screen_stale");
+            }
+            if requested == revision {
+                return Ok(StyledScreenCapture {
+                    result: StyledScreenResult::NotModified(StyledScreenNotModified {
+                        schema_version: STYLED_SCREEN_SCHEMA_V1.to_string(),
+                        variant: "not_modified".to_string(),
+                        session_id: session.id.clone(),
+                        screen_revision: revision.to_string(),
+                    }),
+                    _reservation: None,
+                });
+            }
+        }
+        let parser = lock(&session.terminal_screen);
+        let (rows, cols) = parser.screen().size();
+        validate_styled_screen_geometry(rows, cols)?;
+        let reservation = reserve_styled_screen_bytes(state, rows, cols)?;
+        (parser.screen().clone(), revision, reservation)
+    };
+    let result = styled_snapshot_from_screen(&session.id, revision, &screen)?;
+    Ok(StyledScreenCapture {
+        result,
+        _reservation: Some(reservation),
+    })
+}
+
+fn reserve_styled_screen_bytes(
+    state: &Arc<State>,
+    rows: u16,
+    cols: u16,
+) -> Result<StyledScreenReservation> {
+    let cells = usize::from(rows)
+        .checked_mul(usize::from(cols))
+        .ok_or_else(|| anyhow!("styled_screen_too_large"))?;
+    let reservation = STYLED_SCREEN_FIXED_RESERVATION_BYTES
+        .checked_add(
+            cells
+                .checked_mul(STYLED_SCREEN_RESERVATION_PER_CELL_BYTES)
+                .ok_or_else(|| anyhow!("styled_screen_too_large"))?,
+        )
+        .ok_or_else(|| anyhow!("styled_screen_too_large"))?;
+    if reservation > STYLED_SCREEN_MAX_RESERVATION_BYTES {
+        bail!("styled_screen_too_large");
+    }
+    let mut current = state.styled_screen_reserved_bytes.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_add(reservation) else {
+            bail!("styled_screen_too_large");
+        };
+        if next > STYLED_SCREEN_DAEMON_BUDGET_BYTES {
+            bail!("styled_screen_too_large");
+        }
+        match state.styled_screen_reserved_bytes.compare_exchange(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                return Ok(StyledScreenReservation {
+                    state: Arc::clone(state),
+                    bytes: reservation,
+                });
+            }
+            Err(next_current) => current = next_current,
+        }
+    }
+}
+
+fn is_canonical_styled_revision(value: &str) -> bool {
+    value == "0"
+        || value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit() && byte != b'0')
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn validate_styled_screen_geometry(rows: u16, cols: u16) -> Result<()> {
+    let cells = usize::from(rows)
+        .checked_mul(usize::from(cols))
+        .ok_or_else(|| anyhow!("styled_screen_too_large"))?;
+    if rows == 0
+        || cols == 0
+        || rows > STYLED_SCREEN_MAX_ROWS
+        || cols > STYLED_SCREEN_MAX_COLS
+        || cells > STYLED_SCREEN_MAX_CELLS
+    {
+        bail!("styled_screen_too_large");
+    }
+    Ok(())
+}
+
+fn styled_snapshot_from_screen(
+    session_id: &str,
+    revision: u64,
+    screen: &vt100::Screen,
+) -> Result<StyledScreenResult> {
+    let (rows, cols) = screen.size();
+    validate_styled_screen_geometry(rows, cols)?;
+    let (cursor_row, cursor_column) = screen.cursor_position();
+    if cursor_row >= rows || cursor_column > cols {
+        bail!("styled_screen_invalid_state");
+    }
+
+    let mut styles = Vec::new();
+    let mut style_ids = HashMap::new();
+    let mut screen_rows = Vec::with_capacity(usize::from(rows));
+    for row in 0..rows {
+        let mut runs = Vec::new();
+        for column in 0..cols {
+            let cell = screen
+                .cell(row, column)
+                .ok_or_else(|| anyhow!("styled_screen_invalid_state"))?;
+            let style_id = styled_style_id(cell, &mut styles, &mut style_ids)?;
+            if !cell.has_contents() && !cell.is_wide_continuation() {
+                match runs.last_mut() {
+                    Some(StyledScreenRun::Blank {
+                        style_id: previous_style,
+                        columns,
+                    }) if *previous_style == style_id => {
+                        *columns = columns
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("styled_screen_invalid_state"))?;
+                    }
+                    _ => runs.push(StyledScreenRun::Blank {
+                        style_id,
+                        columns: 1,
+                    }),
+                }
+                continue;
+            }
+
+            let styled_cell = if cell.is_wide_continuation() {
+                StyledScreenCell::Continuation
+            } else {
+                StyledScreenCell::Text {
+                    text: cell.contents().to_string(),
+                    width: if cell.is_wide() { 2 } else { 1 },
+                }
+            };
+            match runs.last_mut() {
+                Some(StyledScreenRun::Cells {
+                    style_id: previous_style,
+                    cells,
+                }) if *previous_style == style_id => cells.push(styled_cell),
+                _ => runs.push(StyledScreenRun::Cells {
+                    style_id,
+                    cells: vec![styled_cell],
+                }),
+            }
+        }
+        screen_rows.push(StyledScreenRow {
+            wrapped: screen.row_wrapped(row),
+            runs,
+        });
+    }
+    Ok(StyledScreenResult::Snapshot(StyledScreenSnapshot {
+        schema_version: STYLED_SCREEN_SCHEMA_V1.to_string(),
+        variant: "snapshot".to_string(),
+        session_id: session_id.to_string(),
+        screen_revision: revision.to_string(),
+        rows,
+        cols,
+        active_screen: if screen.alternate_screen() {
+            "alternate".to_string()
+        } else {
+            "normal".to_string()
+        },
+        styles,
+        screen_rows,
+        cursor: StyledScreenCursor {
+            visible: !screen.hide_cursor(),
+            row: cursor_row,
+            column: cursor_column,
+        },
+    }))
+}
+
+fn styled_style_id(
+    cell: &vt100::Cell,
+    styles: &mut Vec<StyledScreenStyle>,
+    style_ids: &mut HashMap<StyledScreenStyle, u16>,
+) -> Result<u16> {
+    let style = StyledScreenStyle {
+        foreground: styled_color(cell.fgcolor()),
+        background: styled_color(cell.bgcolor()),
+        bold: cell.bold(),
+        dim: cell.dim(),
+        italic: cell.italic(),
+        underline: cell.underline(),
+        inverse: cell.inverse(),
+    };
+    if let Some(style_id) = style_ids.get(&style) {
+        return Ok(*style_id);
+    }
+    if styles.len() >= STYLED_SCREEN_MAX_STYLES {
+        bail!("styled_screen_response_too_large");
+    }
+    let style_id =
+        u16::try_from(styles.len()).map_err(|_| anyhow!("styled_screen_response_too_large"))?;
+    styles.push(style.clone());
+    style_ids.insert(style, style_id);
+    Ok(style_id)
+}
+
+fn styled_color(color: vt100::Color) -> StyledScreenColor {
+    match color {
+        vt100::Color::Default => StyledScreenColor::Default,
+        vt100::Color::Idx(index) => StyledScreenColor::Indexed { index },
+        vt100::Color::Rgb(red, green, blue) => StyledScreenColor::Rgb { red, green, blue },
+    }
 }
 
 fn resolve_session(state: &Arc<State>, target: &str) -> Result<Arc<Session>> {
@@ -6043,6 +6472,7 @@ mod tests {
             terminal_pending: Mutex::new(TerminalPrefixTracker::default()),
             terminal_normal_screen: Mutex::new(vt100::Parser::new(24, 80, 0).screen().clone()),
             terminal_parser_degraded: AtomicBool::new(false),
+            styled_screen_revision: AtomicU64::new(0),
             terminal_parser_panic_on_next_update: AtomicBool::new(false),
             terminal_parser_panic_on_next_snapshot: AtomicBool::new(false),
             terminal_parser_panic_on_next_resize: AtomicBool::new(false),
@@ -7642,7 +8072,7 @@ mod tests {
     }
 
     #[test]
-    fn all_speculation_v9_arms_are_bounded_and_have_no_session_side_effects() {
+    fn all_speculation_v10_arms_are_bounded_and_have_no_session_side_effects() {
         let state = Arc::new(State::default());
         let identity = |generation| SpeculationStatusRequest {
             tournament_uuid: Uuid::from_u128(1),
@@ -7705,7 +8135,7 @@ mod tests {
         let marker = "raw-secret-path-and-argv";
         let request = serde_json::json!({
             "type": "speculation",
-            "protocol_version": 9,
+            "protocol_version": crate::protocol::SPECULATION_PROTOCOL_VERSION,
             "request": {
                 "action": "prepare",
                 "body": {
@@ -8975,5 +9405,134 @@ mod tests {
             elapsed >= Duration::from_millis(50),
             "broadcast_chunk waits the full timeout for the laggy sub; took {elapsed:?}",
         );
+    }
+
+    #[test]
+    fn styled_screen_returns_parser_derived_cells_and_revision() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen");
+        register_test_session(&state, &session);
+        session.append_output(b"\x1b[31mA");
+
+        let response = super::handle_request(
+            &state,
+            crate::protocol::Request::StyledScreen {
+                target: session.pane_id.clone(),
+                schema_version: crate::protocol::STYLED_SCREEN_SCHEMA_V1.to_string(),
+                if_snapshot: None,
+            },
+            None,
+        )
+        .expect("styled-screen request should be handled");
+
+        assert!(response.ok, "styled-screen response: {response:?}");
+        let result = response.result.expect("styled-screen result");
+        assert_eq!(result["variant"], "snapshot");
+        assert_eq!(result["session_id"], session.id);
+        assert_eq!(result["screen_revision"], "1");
+        assert_eq!(result["screen_rows"][0]["runs"][0]["cells"][0]["text"], "A");
+        assert_eq!(result["styles"][0]["foreground"]["index"], 1);
+    }
+
+    #[test]
+    fn styled_screen_returns_not_modified_for_matching_incarnation_and_revision() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-not-modified");
+        register_test_session(&state, &session);
+        session.append_output(b"A");
+
+        let response = super::handle_request(
+            &state,
+            crate::protocol::Request::StyledScreen {
+                target: session.pane_id.clone(),
+                schema_version: crate::protocol::STYLED_SCREEN_SCHEMA_V1.to_string(),
+                if_snapshot: Some(crate::protocol::StyledScreenPrecondition {
+                    session_id: session.id.clone(),
+                    screen_revision: "1".to_string(),
+                }),
+            },
+            None,
+        )
+        .expect("matching styled-screen precondition should be handled");
+
+        let result = response.result.expect("not-modified result");
+        assert_eq!(result["variant"], "not_modified");
+        assert!(result.get("screen_rows").is_none());
+    }
+
+    #[test]
+    fn styled_screen_rejects_stale_incarnation_and_noncanonical_revision() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-stale");
+        register_test_session(&state, &session);
+
+        for precondition in [
+            crate::protocol::StyledScreenPrecondition {
+                session_id: "different-incarnation".to_string(),
+                screen_revision: "0".to_string(),
+            },
+            crate::protocol::StyledScreenPrecondition {
+                session_id: session.id.clone(),
+                screen_revision: "00".to_string(),
+            },
+        ] {
+            let error = match super::styled_screen_capture(
+                &state,
+                &session.pane_id,
+                crate::protocol::STYLED_SCREEN_SCHEMA_V1,
+                Some(&precondition),
+            ) {
+                Ok(_) => panic!("stale precondition must not yield a snapshot"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), "styled_screen_stale");
+        }
+    }
+
+    #[test]
+    fn styled_screen_revision_exhaustion_degrades_without_wrapping() {
+        let session = build_test_session("styled-screen-revision-exhaustion");
+        session
+            .styled_screen_revision
+            .store(u64::MAX, Ordering::SeqCst);
+
+        session.append_output(b"x");
+
+        assert!(session.terminal_parser_degraded());
+        assert_eq!(
+            session.styled_screen_revision.load(Ordering::SeqCst),
+            u64::MAX,
+            "revision must never wrap to a stale lower value"
+        );
+    }
+
+    #[test]
+    fn styled_screen_socket_response_uses_the_bounded_typed_envelope() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-socket");
+        register_test_session(&state, &session);
+        session.append_output(b"A");
+        let request = serde_json::json!({
+            "type": "styled_screen",
+            "target": session.pane_id,
+            "schema_version": crate::protocol::STYLED_SCREEN_SCHEMA_V1,
+        });
+        let (server_stream, mut client_stream) =
+            UnixStream::pair().expect("create styled-screen socket pair");
+        client_stream
+            .write_all(format!("{request}\n").as_bytes())
+            .expect("write styled-screen request");
+
+        super::handle_connection(state, server_stream).expect("serve styled-screen request");
+
+        let mut response = String::new();
+        client_stream
+            .read_to_string(&mut response)
+            .expect("read styled-screen response");
+        let response: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("decode styled-screen response");
+        assert_eq!(response["ok"], true);
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["variant"], "snapshot");
     }
 }

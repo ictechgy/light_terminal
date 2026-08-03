@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ictechgy/light_terminal/docs/schemas/styled-screen-v1.schema.json",
+  "title": "lterm styled screen v1 result",
+  "oneOf": [
+    { "$ref": "#/$defs/snapshot" },
+    { "$ref": "#/$defs/not_modified" }
+  ],
+  "$defs": {
+    "snapshot": {
+      "type": "object",
+      "required": ["schema_version", "variant", "session_id", "screen_revision", "rows", "cols", "active_screen", "styles", "screen_rows", "cursor"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": "lterm.styled-screen.v1" },
+        "variant": { "const": "snapshot" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "screen_revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+        "rows": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "cols": { "type": "integer", "minimum": 1, "maximum": 192 },
+        "active_screen": { "enum": ["normal", "alternate"] },
+        "styles": { "type": "array", "maxItems": 2048, "items": { "$ref": "#/$defs/style" } },
+        "screen_rows": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/row" } },
+        "cursor": {
+          "type": "object",
+          "required": ["visible", "row", "column"],
+          "additionalProperties": false,
+          "properties": {
+            "visible": { "type": "boolean" },
+            "row": { "type": "integer", "minimum": 0 },
+            "column": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "color": {
+      "oneOf": [
+        { "type": "object", "required": ["kind"], "additionalProperties": false, "properties": { "kind": { "const": "default" } } },
+        { "type": "object", "required": ["kind", "index"], "additionalProperties": false, "properties": { "kind": { "const": "indexed" }, "index": { "type": "integer", "minimum": 0, "maximum": 255 } } },
+        { "type": "object", "required": ["kind", "red", "green", "blue"], "additionalProperties": false, "properties": { "kind": { "const": "rgb" }, "red": { "type": "integer", "minimum": 0, "maximum": 255 }, "green": { "type": "integer", "minimum": 0, "maximum": 255 }, "blue": { "type": "integer", "minimum": 0, "maximum": 255 } } }
+      ]
+    },
+    "style": {
+      "type": "object",
+      "required": ["foreground", "background", "bold", "dim", "italic", "underline", "inverse"],
+      "additionalProperties": false,
+      "properties": {
+        "foreground": { "$ref": "#/$defs/color" }, "background": { "$ref": "#/$defs/color" },
+        "bold": { "type": "boolean" }, "dim": { "type": "boolean" }, "italic": { "type": "boolean" }, "underline": { "type": "boolean" }, "inverse": { "type": "boolean" }
+      }
+    },
+    "cell": {
+      "oneOf": [
+        { "type": "object", "required": ["kind", "text", "width"], "additionalProperties": false, "properties": { "kind": { "const": "text" }, "text": { "type": "string" }, "width": { "enum": [1, 2] } } },
+        { "type": "object", "required": ["kind"], "additionalProperties": false, "properties": { "kind": { "const": "continuation" } } }
+      ]
+    },
+    "run": {
+      "oneOf": [
+        { "type": "object", "required": ["kind", "style_id", "columns"], "additionalProperties": false, "properties": { "kind": { "const": "blank" }, "style_id": { "type": "integer", "minimum": 0, "maximum": 2047 }, "columns": { "type": "integer", "minimum": 1, "maximum": 192 } } },
+        { "type": "object", "required": ["kind", "style_id", "cells"], "additionalProperties": false, "properties": { "kind": { "const": "cells" }, "style_id": { "type": "integer", "minimum": 0, "maximum": 2047 }, "cells": { "type": "array", "maxItems": 192, "items": { "$ref": "#/$defs/cell" } } } }
+      ]
+    },
+    "row": {
+      "type": "object",
+      "required": ["wrapped", "runs"],
+      "additionalProperties": false,
+      "properties": { "wrapped": { "type": "boolean" }, "runs": { "type": "array", "items": { "$ref": "#/$defs/run" } } }
+    },
+    "not_modified": {
+      "type": "object",
+      "required": ["schema_version", "variant", "session_id", "screen_revision"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": "lterm.styled-screen.v1" },
+        "variant": { "const": "not_modified" },
+        "session_id": { "type": "string", "format": "uuid" },
+        "screen_revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" }
+      }
+    }
+  }
+}
