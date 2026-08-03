@@ -1562,15 +1562,12 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     } = request
     {
         return match styled_screen_capture(&state, &target, &schema_version, if_snapshot.as_ref()) {
-            Ok(capture) => {
-                stream
-                    .set_write_timeout(Some(STYLED_SCREEN_WRITE_TIMEOUT))
-                    .ok();
-                let write_result = write_styled_screen_result(&mut stream, &capture.result);
-                stream.set_write_timeout(None).ok();
-                write_result
-            }
-            Err(error) => write_styled_screen_error(&mut stream, styled_screen_error_code(&error)),
+            Ok(capture) => with_styled_screen_write_timeout(&mut stream, |stream| {
+                write_styled_screen_result(stream, &capture.result)
+            }),
+            Err(error) => with_styled_screen_write_timeout(&mut stream, |stream| {
+                write_styled_screen_error(stream, styled_screen_error_code(&error))
+            }),
         };
     }
 
@@ -1593,6 +1590,35 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
 struct CappedResponseWriter {
     bytes: Vec<u8>,
     limit: usize,
+}
+
+trait StyledScreenTimeout {
+    fn set_styled_screen_write_timeout(&mut self, timeout: Option<Duration>)
+    -> std::io::Result<()>;
+}
+
+impl StyledScreenTimeout for UnixStream {
+    fn set_styled_screen_write_timeout(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+}
+
+fn with_styled_screen_write_timeout<T, F>(stream: &mut T, write: F) -> Result<()>
+where
+    T: StyledScreenTimeout,
+    F: FnOnce(&mut T) -> Result<()>,
+{
+    stream
+        .set_styled_screen_write_timeout(Some(STYLED_SCREEN_WRITE_TIMEOUT))
+        .context("configure styled-screen write timeout")?;
+    let write_result = write(stream);
+    let clear_result = stream
+        .set_styled_screen_write_timeout(None)
+        .context("clear styled-screen write timeout");
+    write_result.and(clear_result)
 }
 
 impl CappedResponseWriter {
@@ -5407,6 +5433,17 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
+
+    struct TimeoutSetupFailure;
+
+    impl super::StyledScreenTimeout for TimeoutSetupFailure {
+        fn set_styled_screen_write_timeout(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("test timeout configuration failure"))
+        }
+    }
 
     #[test]
     fn process_group_check_requires_current_child_group_match() {
@@ -9425,6 +9462,102 @@ mod tests {
     }
 
     #[test]
+    fn styled_screen_exposes_rgb_attributes_hidden_cursor_and_wide_continuation() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-terminal-contract");
+        register_test_session(&state, &session);
+        session.append_output(b"\x1b[1;3;4;7;38;2;1;2;3mA\x1b[0m\x1b[?25l\x1b[2;3H\xE7\x95\x8C");
+
+        let response = super::handle_request(
+            &state,
+            crate::protocol::Request::StyledScreen {
+                target: session.pane_id.clone(),
+                schema_version: crate::protocol::STYLED_SCREEN_SCHEMA_V1.to_string(),
+                if_snapshot: None,
+            },
+            None,
+        )
+        .expect("styled-screen request should be handled");
+        let result = response.result.expect("styled-screen result");
+
+        let rgb_style = result["styles"]
+            .as_array()
+            .expect("style table")
+            .iter()
+            .find(|style| {
+                style["foreground"]["kind"] == "rgb"
+                    && style["foreground"]["red"] == 1
+                    && style["foreground"]["green"] == 2
+                    && style["foreground"]["blue"] == 3
+            })
+            .expect("rgb style")
+            .clone();
+        assert_eq!(rgb_style["bold"], true);
+        assert_eq!(rgb_style["italic"], true);
+        assert_eq!(rgb_style["underline"], true);
+        assert_eq!(rgb_style["inverse"], true);
+        assert_eq!(result["cursor"]["visible"], false);
+        assert_eq!(result["cursor"]["row"], 1);
+        assert_eq!(result["cursor"]["column"], 4);
+
+        let runs = result["screen_rows"][1]["runs"]
+            .as_array()
+            .expect("second row runs");
+        let cells = runs
+            .iter()
+            .find_map(|run| run.get("cells").and_then(serde_json::Value::as_array))
+            .expect("wide-cell run");
+        assert_eq!(cells[0]["text"], "界");
+        assert_eq!(cells[0]["width"], 2);
+        assert_eq!(cells[1]["kind"], "continuation");
+    }
+
+    #[test]
+    fn styled_screen_reflects_resize_and_sgr_reset_in_api_response() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-resize-reset");
+        register_test_session(&state, &session);
+        session.resize_terminal_screen(10, 20);
+        session.append_output(b"\x1b[31mX\x1b[0mY");
+
+        let response = super::handle_request(
+            &state,
+            crate::protocol::Request::StyledScreen {
+                target: session.pane_id.clone(),
+                schema_version: crate::protocol::STYLED_SCREEN_SCHEMA_V1.to_string(),
+                if_snapshot: None,
+            },
+            None,
+        )
+        .expect("styled-screen request should be handled");
+        let result = response.result.expect("styled-screen result");
+
+        assert_eq!(result["rows"], 10);
+        assert_eq!(result["cols"], 20);
+        assert_eq!(result["screen_revision"], "2");
+
+        let runs = result["screen_rows"][0]["runs"]
+            .as_array()
+            .expect("first row runs");
+        let x_run = runs
+            .iter()
+            .find(|run| run["cells"][0]["text"] == "X")
+            .expect("red X run");
+        let y_run = runs
+            .iter()
+            .find(|run| run["cells"][0]["text"] == "Y")
+            .expect("reset Y run");
+        let x_style = x_run["style_id"].as_u64().expect("X style id") as usize;
+        let y_style = y_run["style_id"].as_u64().expect("Y style id") as usize;
+        assert_eq!(result["styles"][x_style]["foreground"]["index"], 1);
+        assert_eq!(result["styles"][y_style]["foreground"]["kind"], "default");
+        assert_eq!(result["styles"][y_style]["bold"], false);
+        assert_eq!(result["styles"][y_style]["italic"], false);
+        assert_eq!(result["styles"][y_style]["underline"], false);
+        assert_eq!(result["styles"][y_style]["inverse"], false);
+    }
+
+    #[test]
     fn styled_screen_returns_not_modified_for_matching_incarnation_and_revision() {
         let state = Arc::new(super::State::default());
         let session = build_test_session("styled-screen-not-modified");
@@ -9527,6 +9660,42 @@ mod tests {
         assert_eq!(error.to_string(), "styled_screen_too_large");
 
         drop((first, second));
+        assert_eq!(state.styled_screen_reserved_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn styled_screen_timeout_setup_failure_releases_capture_reservation() {
+        let state = Arc::new(super::State::default());
+        let session = build_test_session("styled-screen-timeout-setup-failure");
+        register_test_session(&state, &session);
+        session.append_output(b"A");
+        let mut stream = TimeoutSetupFailure;
+        let mut write_attempted = false;
+
+        let result = {
+            let capture = super::styled_screen_capture(
+                &state,
+                &session.pane_id,
+                crate::protocol::STYLED_SCREEN_SCHEMA_V1,
+                None,
+            )
+            .expect("capture should reserve memory before writing");
+            assert_eq!(
+                state.styled_screen_reserved_bytes.load(Ordering::SeqCst),
+                super::STYLED_SCREEN_MAX_RESERVATION_BYTES
+            );
+            super::with_styled_screen_write_timeout(&mut stream, |_| {
+                write_attempted = true;
+                let _ = &capture;
+                Ok(())
+            })
+        };
+
+        assert!(result.is_err(), "timeout configuration must fail closed");
+        assert!(
+            !write_attempted,
+            "a timeout setup failure must not attempt a success or error response write"
+        );
         assert_eq!(state.styled_screen_reserved_bytes.load(Ordering::SeqCst), 0);
     }
 

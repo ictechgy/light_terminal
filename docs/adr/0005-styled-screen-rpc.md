@@ -22,5 +22,7 @@ conservative per-request estimate before cloning the parser screen. Individual
 responses are limited to 8 MiB. Geometry and style counts are bounded. A write
 timeout prevents a stalled peer from indefinitely holding a reservation.
 
-Parser failure or revision exhaustion degrades only this optional capability;
-the raw PTY reader and attached streams continue operating.
+Parser failure or revision exhaustion quarantines the session-local terminal
+screen-state subsystem, including styled snapshots and attach-screen
+reconstruction. The raw PTY reader and attached live streams continue
+operating.
