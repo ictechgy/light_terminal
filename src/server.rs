@@ -76,8 +76,6 @@ const SUBSCRIBER_QUEUE_LIMIT: usize = 256;
 const BACKPRESSURE_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const STYLED_SCREEN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const STYLED_SCREEN_FIXED_RESERVATION_BYTES: usize = 256 * 1024;
-const STYLED_SCREEN_RESERVATION_PER_CELL_BYTES: usize = 288;
 const STYLED_SCREEN_MAX_RESERVATION_BYTES: usize = 16 * 1024 * 1024;
 const STYLED_SCREEN_DAEMON_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SENSITIVE_CAPABILITY_FRAME_BYTES: usize = 128 * 1024;
@@ -4540,19 +4538,11 @@ fn reserve_styled_screen_bytes(
     rows: u16,
     cols: u16,
 ) -> Result<StyledScreenReservation> {
-    let cells = usize::from(rows)
-        .checked_mul(usize::from(cols))
-        .ok_or_else(|| anyhow!("styled_screen_too_large"))?;
-    let reservation = STYLED_SCREEN_FIXED_RESERVATION_BYTES
-        .checked_add(
-            cells
-                .checked_mul(STYLED_SCREEN_RESERVATION_PER_CELL_BYTES)
-                .ok_or_else(|| anyhow!("styled_screen_too_large"))?,
-        )
-        .ok_or_else(|| anyhow!("styled_screen_too_large"))?;
-    if reservation > STYLED_SCREEN_MAX_RESERVATION_BYTES {
-        bail!("styled_screen_too_large");
-    }
+    validate_styled_screen_geometry(rows, cols)?;
+    // This reservation intentionally covers the full serialized-response cap
+    // plus the cloned parser screen and DTO tree. It is a strict upper-bound
+    // admission unit, not an average per-cell estimate.
+    let reservation = STYLED_SCREEN_MAX_RESERVATION_BYTES;
     let mut current = state.styled_screen_reserved_bytes.load(Ordering::SeqCst);
     loop {
         let Some(next) = current.checked_add(reservation) else {
@@ -9504,6 +9494,40 @@ mod tests {
             u64::MAX,
             "revision must never wrap to a stale lower value"
         );
+    }
+
+    #[test]
+    fn styled_screen_reservation_caps_daemon_to_two_maximum_snapshots() {
+        let state = Arc::new(super::State::default());
+        let first = super::reserve_styled_screen_bytes(
+            &state,
+            crate::protocol::STYLED_SCREEN_MAX_ROWS,
+            crate::protocol::STYLED_SCREEN_MAX_COLS,
+        )
+        .expect("first maximum snapshot should fit");
+        let second = super::reserve_styled_screen_bytes(
+            &state,
+            crate::protocol::STYLED_SCREEN_MAX_ROWS,
+            crate::protocol::STYLED_SCREEN_MAX_COLS,
+        )
+        .expect("second maximum snapshot should fit");
+
+        assert_eq!(
+            state.styled_screen_reserved_bytes.load(Ordering::SeqCst),
+            super::STYLED_SCREEN_DAEMON_BUDGET_BYTES
+        );
+        let error = match super::reserve_styled_screen_bytes(
+            &state,
+            crate::protocol::STYLED_SCREEN_MAX_ROWS,
+            crate::protocol::STYLED_SCREEN_MAX_COLS,
+        ) {
+            Ok(_) => panic!("third maximum snapshot must be rejected while reservations are live"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "styled_screen_too_large");
+
+        drop((first, second));
+        assert_eq!(state.styled_screen_reserved_bytes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
