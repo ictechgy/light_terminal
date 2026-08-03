@@ -8072,7 +8072,7 @@ mod tests {
     }
 
     #[test]
-    fn all_speculation_v10_arms_are_bounded_and_have_no_session_side_effects() {
+    fn all_speculation_v9_arms_are_bounded_and_have_no_session_side_effects() {
         let state = Arc::new(State::default());
         let identity = |generation| SpeculationStatusRequest {
             tournament_uuid: Uuid::from_u128(1),
@@ -8135,7 +8135,7 @@ mod tests {
         let marker = "raw-secret-path-and-argv";
         let request = serde_json::json!({
             "type": "speculation",
-            "protocol_version": crate::protocol::SPECULATION_PROTOCOL_VERSION,
+            "protocol_version": 9,
             "request": {
                 "action": "prepare",
                 "body": {

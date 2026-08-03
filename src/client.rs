@@ -8907,7 +8907,7 @@ mod tests {
     }
 
     #[test]
-    fn speculation_protocol_guard_rejects_v8_without_speculation_frame_and_accepts_v10() {
+    fn speculation_protocol_guard_rejects_v8_without_speculation_frame_and_accepts_v9() {
         let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(8)]);
         assert_eq!(
             require_speculation_protocol_at(&socket),
@@ -8920,9 +8920,7 @@ mod tests {
             Ok(Request::Status)
         ));
 
-        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(
-            crate::protocol::SPECULATION_PROTOCOL_VERSION,
-        )]);
+        let (_directory, socket, server) = fake_speculation_socket(vec![daemon_status_response(9)]);
         assert_eq!(require_speculation_protocol_at(&socket), Ok(()));
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -8992,7 +8990,7 @@ mod tests {
 
     #[test]
     fn strict_transport_rejects_original_duplicate_protocol_and_status_fields() {
-        for protocol_version in [8, 10] {
+        for protocol_version in [8, 9] {
             let response = format!(
                 concat!(
                     r#"{{"ok":true,"error":null,"result":{{"version":"test","protocol_version":{0},"protocol_version":{0},"session_count":0,"active_connections":1,"shutting_down":false}}}}"#

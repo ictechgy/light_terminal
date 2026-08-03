@@ -23,7 +23,9 @@ pub const STYLED_SCREEN_MAX_CELLS: usize = 24_576;
 pub const STYLED_SCREEN_MAX_STYLES: usize = 2_048;
 pub const STYLED_SCREEN_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[allow(dead_code)]
-pub const SPECULATION_PROTOCOL_VERSION: u32 = 10;
+/// Speculation has its own versioned envelope. Styled-screen is a separate
+/// daemon RPC, so it must not invalidate an already deployed speculation peer.
+pub const SPECULATION_PROTOCOL_VERSION: u32 = 9;
 #[allow(dead_code)]
 pub const SPECULATION_UNSUPPORTED_ERROR_CODE: &str = "speculation_unsupported";
 #[allow(dead_code)]
@@ -1788,8 +1790,8 @@ mod tests {
     fn speculation_status_is_strict_raw_free_and_has_exact_keys() {
         let status = sample_speculation_status();
 
-        assert_eq!(PROTOCOL_VERSION, SPECULATION_PROTOCOL_VERSION);
-        assert_eq!(SPECULATION_PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(SPECULATION_PROTOCOL_VERSION, 9);
         let value = serde_json::to_value(&status).expect("serialize speculation status");
         let object = value.as_object().expect("status is an object");
         assert_eq!(object["phase"], "pending_finalize");
