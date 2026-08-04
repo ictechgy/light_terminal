@@ -16399,6 +16399,7 @@ fn named_agent_alias_uses_profile_environment() -> TestResult {
 printf 'LTERM_AGENT:%s\n' "$LTERM_AGENT"
 printf 'LTERM_SESSION:%s\n' "$LTERM_SESSION"
 printf 'ARG1:%s\n' "$1"
+sleep 1
 "#;
     for binary in [
         "claude",
