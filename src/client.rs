@@ -438,6 +438,8 @@ struct StrictDaemonStatus {
     _daemon_uid: Option<u32>,
     #[serde(default, rename = "started_at_unix_secs")]
     _started_at_unix_secs: Option<u64>,
+    #[serde(default, rename = "styled_screen_schema_versions")]
+    _styled_screen_schema_versions: Vec<String>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -10498,6 +10500,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let message = recent_exits_protocol_error(&old).expect("protocol 7 must be rejected");
         assert!(message.contains("upgrade/restart is required"), "{message}");
@@ -15049,6 +15052,7 @@ mod tests {
             // 옛 데몬은 doctor 신규 필드를 보내지 않는다. backward-compat 시뮬레이션.
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::STATUS_THEME_PROTOCOL_VERSION,
@@ -15073,6 +15077,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::INSTRUMENT_PROTOCOL_VERSION,
@@ -15095,6 +15100,7 @@ mod tests {
             shutting_down: false,
             daemon_uid: None,
             started_at_unix_secs: None,
+            styled_screen_schema_versions: Vec::new(),
         };
         let current = DaemonStatus {
             protocol_version: super::TMUX_PARENT_PANE_PROTOCOL_VERSION,
