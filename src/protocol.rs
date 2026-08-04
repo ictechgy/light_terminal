@@ -969,9 +969,10 @@ pub struct DaemonStatus {
     // started_at_unix_secs: 데몬 시작 시각(UNIX epoch seconds). uptime 계산용.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix_secs: Option<u64>,
-    /// Additive styled-screen schema advertisement. Older daemons omit this
-    /// field, which deserializes as an empty list and therefore cannot enable
-    /// the feature accidentally.
+    /// Reserved optional capability field for decoding compatible daemon
+    /// status payloads. Current protocol-10 daemons deliberately omit it so
+    /// deployed strict protocol-9 clients can still decode `status`; styled
+    /// clients select v1 directly after checking `protocol_version >= 10`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub styled_screen_schema_versions: Vec<String>,
 }
@@ -2672,7 +2673,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_round_trips_styled_screen_capability_advertisement() {
+    fn daemon_status_round_trips_optional_styled_screen_capability_field() {
         let status: super::DaemonStatus = serde_json::from_value(serde_json::json!({
             "version": "1.0.33",
             "protocol_version": 10,

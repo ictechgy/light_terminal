@@ -495,14 +495,14 @@ include raw PTY bytes or scrollback.
 
 ## Styled-screen daemon RPC
 
-Protocol 10 daemons advertise `lterm.styled-screen.v1` in the additive
-Protocol 10 clients select the supported v1 schema directly in a local
-same-user `styled_screen` request; the legacy `status` response keeps its
-protocol-9-compatible wire shape. A local same-user RPC client can request a
-full, daemon-owned vt100 screen snapshot with `type: "styled_screen"`,
-the target pane/session, and that schema version. This is intentionally not a
-CLI report surface and does not attach, resize, send input, read scrollback, or
-rewrite the raw PTY stream.
+Protocol 10 clients discover this capability from `protocol_version >= 10` and
+select `lterm.styled-screen.v1` directly in a local same-user `styled_screen`
+request. The legacy `status` response deliberately retains its
+protocol-9-compatible wire shape and does not advertise styled-screen schemas.
+A local same-user RPC client can request a full, daemon-owned vt100 screen
+snapshot with `type: "styled_screen"`, the target pane/session, and that schema
+version. This is intentionally not a CLI report surface and does not attach,
+resize, send input, read scrollback, or rewrite the raw PTY stream.
 
 Snapshots contain a stable session incarnation ID, non-wrapping decimal screen
 revision, geometry, active screen, a style table, run-length encoded physical

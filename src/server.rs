@@ -9530,9 +9530,13 @@ mod tests {
         let state = Arc::new(super::State::default());
         let response = super::handle_request(&state, crate::protocol::Request::Status, None)
             .expect("status request should be handled");
-        let status: LegacyDaemonStatus =
-            serde_json::from_value(response.result.expect("status result"))
-                .expect("legacy speculation client must decode a new daemon status");
+        let result = response.result.expect("status result");
+        assert!(
+            result.get("styled_screen_schema_versions").is_none(),
+            "protocol-10 styled-screen discovery must not extend the legacy status wire shape"
+        );
+        let status: LegacyDaemonStatus = serde_json::from_value(result)
+            .expect("legacy speculation client must decode a new daemon status");
         assert_eq!(status.protocol_version, crate::protocol::PROTOCOL_VERSION);
         assert!(!status.version.is_empty());
         assert_eq!(status.session_count, 0);

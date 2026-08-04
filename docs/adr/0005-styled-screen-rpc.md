@@ -15,6 +15,11 @@ Each session has an immutable UUID incarnation and a non-wrapping decimal screen
 revision. A matching pair returns `not_modified`; a different incarnation,
 malformed revision, or future revision returns `styled_screen_stale`.
 
+Clients discover v1 from `protocol_version >= 10` and request
+`lterm.styled-screen.v1` directly. The legacy `status` response intentionally
+does not advertise styled-screen schemas because deployed protocol-9 clients
+decode that response with a strict field set.
+
 ## Safety limits
 
 The daemon admits at most 32 MiB of concurrent snapshot work, reserving a
