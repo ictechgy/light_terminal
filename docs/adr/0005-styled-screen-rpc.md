@@ -19,8 +19,9 @@ malformed revision, or future revision returns `styled_screen_stale`.
 
 The daemon admits at most 32 MiB of concurrent snapshot work, reserving a
 conservative per-request estimate before cloning the parser screen. Individual
-responses are limited to 8 MiB. Geometry and style counts are bounded. A write
-timeout prevents a stalled peer from indefinitely holding a reservation.
+responses are limited to 8 MiB. Geometry and style counts are bounded. An
+absolute write deadline prevents a stalled or slowly draining peer from
+indefinitely holding a reservation.
 
 Parser failure or revision exhaustion quarantines the session-local terminal
 screen-state subsystem, including styled snapshots and attach-screen

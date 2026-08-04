@@ -1565,8 +1565,8 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     } = request
     {
         return match styled_screen_capture(&state, &target, &schema_version, if_snapshot.as_ref()) {
-            Ok(capture) => with_styled_screen_write_timeout(&mut stream, |stream| {
-                write_styled_screen_result(stream, &capture.result)
+            Ok(capture) => with_styled_screen_write_timeout(&mut stream, |stream, deadline| {
+                write_styled_screen_result(stream, &capture.result, deadline)
             }),
             Err(error) => write_styled_screen_error_with_timeout(
                 &mut stream,
@@ -1613,12 +1613,13 @@ impl StyledScreenTimeout for UnixStream {
 fn with_styled_screen_write_timeout<T, F>(stream: &mut T, write: F) -> Result<()>
 where
     T: StyledScreenTimeout,
-    F: FnOnce(&mut T) -> Result<()>,
+    F: FnOnce(&mut T, Instant) -> Result<()>,
 {
     stream
         .set_styled_screen_write_timeout(Some(STYLED_SCREEN_WRITE_TIMEOUT))
         .context("configure styled-screen write timeout")?;
-    let write_result = write(stream);
+    let deadline = Instant::now() + STYLED_SCREEN_WRITE_TIMEOUT;
+    let write_result = write(stream, deadline);
     let clear_result = stream
         .set_styled_screen_write_timeout(None)
         .context("clear styled-screen write timeout");
@@ -1628,13 +1629,17 @@ where
 fn with_styled_screen_error_timeout<T, F>(stream: &mut T, code: &str, write_error: F) -> Result<()>
 where
     T: StyledScreenTimeout,
-    F: FnOnce(&mut T, &str) -> Result<()>,
+    F: FnOnce(&mut T, &str, Instant) -> Result<()>,
 {
-    with_styled_screen_write_timeout(stream, |stream| write_error(stream, code))
+    with_styled_screen_write_timeout(stream, |stream, deadline| {
+        write_error(stream, code, deadline)
+    })
 }
 
 fn write_styled_screen_error_with_timeout(stream: &mut UnixStream, code: &str) -> Result<()> {
-    with_styled_screen_error_timeout(stream, code, write_styled_screen_error)
+    with_styled_screen_error_timeout(stream, code, |stream, code, deadline| {
+        write_styled_screen_error(stream, code, deadline)
+    })
 }
 
 impl CappedResponseWriter {
@@ -1686,7 +1691,11 @@ struct StyledScreenErrorEnvelope<'a> {
     error: &'a str,
 }
 
-fn write_styled_screen_result(stream: &mut UnixStream, result: &StyledScreenResult) -> Result<()> {
+fn write_styled_screen_result(
+    stream: &mut UnixStream,
+    result: &StyledScreenResult,
+    deadline: Instant,
+) -> Result<()> {
     let envelope = StyledScreenSuccessEnvelope {
         ok: true,
         error: None,
@@ -1694,32 +1703,53 @@ fn write_styled_screen_result(stream: &mut UnixStream, result: &StyledScreenResu
     };
     let mut writer = CappedResponseWriter::new(STYLED_SCREEN_MAX_RESPONSE_BYTES);
     if serde_json::to_writer(&mut writer, &envelope).is_err() {
-        return write_styled_screen_error(stream, "styled_screen_response_too_large");
+        return write_styled_screen_error(stream, "styled_screen_response_too_large", deadline);
     }
     let bytes = writer.into_bytes();
-    stream
-        .write_all(&bytes)
-        .context("write styled-screen response")?;
-    stream
-        .write_all(b"\n")
-        .context("write styled-screen response newline")?;
+    write_styled_screen_bytes(stream, &bytes, deadline, "write styled-screen response")?;
+    write_styled_screen_bytes(
+        stream,
+        b"\n",
+        deadline,
+        "write styled-screen response newline",
+    )?;
     stream.flush().ok();
     Ok(())
 }
 
-fn write_styled_screen_error(stream: &mut UnixStream, code: &str) -> Result<()> {
-    serde_json::to_writer(
-        &mut *stream,
-        &StyledScreenErrorEnvelope {
-            ok: false,
-            error: code,
-        },
-    )
-    .context("write styled-screen error")?;
-    stream
-        .write_all(b"\n")
-        .context("write styled-screen error newline")?;
+fn write_styled_screen_error(stream: &mut UnixStream, code: &str, deadline: Instant) -> Result<()> {
+    let bytes = serde_json::to_vec(&StyledScreenErrorEnvelope {
+        ok: false,
+        error: code,
+    })
+    .context("serialize styled-screen error")?;
+    write_styled_screen_bytes(stream, &bytes, deadline, "write styled-screen error")?;
+    write_styled_screen_bytes(stream, b"\n", deadline, "write styled-screen error newline")?;
     stream.flush().ok();
+    Ok(())
+}
+
+fn write_styled_screen_bytes(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+    context: &'static str,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("styled-screen write deadline elapsed"))?;
+        stream
+            .set_write_timeout(Some(remaining))
+            .context("configure styled-screen write deadline")?;
+        let written = stream.write(&bytes[offset..]).context(context)?;
+        if written == 0 {
+            bail!("styled-screen peer closed during write");
+        }
+        offset += written;
+    }
     Ok(())
 }
 
@@ -2007,7 +2037,11 @@ fn handle_request(
                 // state.started_at_unix_secs는 이미 Option<u64> — clock 실패 시 None을
                 // 그대로 wire에 전송해 client uptime이 sentinel 0으로 misreport되는 것을 방지.
                 started_at_unix_secs: state.started_at_unix_secs,
-                styled_screen_schema_versions: vec![STYLED_SCREEN_SCHEMA_V1.to_string()],
+                // `status` is decoded with `deny_unknown_fields` by deployed
+                // protocol-v9 speculation clients. Keep its wire shape stable;
+                // protocol-v10 styled-screen clients select the v1 schema in
+                // their request instead of relying on status advertisement.
+                styled_screen_schema_versions: Vec::new(),
             }))
         }
         Request::Speculation(envelope) => Ok(handle_speculation_request(state, envelope)),
@@ -9478,6 +9512,37 @@ mod tests {
     }
 
     #[test]
+    fn status_response_remains_decodable_by_legacy_speculation_clients() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDaemonStatus {
+            protocol_version: u32,
+            version: String,
+            session_count: u64,
+            active_connections: u64,
+            shutting_down: bool,
+            #[serde(default)]
+            daemon_uid: Option<u32>,
+            #[serde(default)]
+            started_at_unix_secs: Option<u64>,
+        }
+
+        let state = Arc::new(super::State::default());
+        let response = super::handle_request(&state, crate::protocol::Request::Status, None)
+            .expect("status request should be handled");
+        let status: LegacyDaemonStatus =
+            serde_json::from_value(response.result.expect("status result"))
+                .expect("legacy speculation client must decode a new daemon status");
+        assert_eq!(status.protocol_version, crate::protocol::PROTOCOL_VERSION);
+        assert!(!status.version.is_empty());
+        assert_eq!(status.session_count, 0);
+        assert_eq!(status.active_connections, 0);
+        assert!(!status.shutting_down);
+        assert!(status.daemon_uid.is_some());
+        assert!(status.started_at_unix_secs.is_none());
+    }
+
+    #[test]
     fn styled_screen_exposes_rgb_attributes_hidden_cursor_and_wide_continuation() {
         let state = Arc::new(super::State::default());
         let session = build_test_session("styled-screen-terminal-contract");
@@ -9700,7 +9765,7 @@ mod tests {
                 state.styled_screen_reserved_bytes.load(Ordering::SeqCst),
                 super::STYLED_SCREEN_MAX_RESERVATION_BYTES
             );
-            super::with_styled_screen_write_timeout(&mut stream, |_| {
+            super::with_styled_screen_write_timeout(&mut stream, |_, _| {
                 write_attempted = true;
                 let _ = &capture;
                 Ok(())
@@ -9723,7 +9788,7 @@ mod tests {
         let result = super::with_styled_screen_error_timeout(
             &mut stream,
             "styled_screen_request_too_large",
-            |_, code| {
+            |_, code, _| {
                 write_attempted = true;
                 assert_eq!(code, "styled_screen_request_too_large");
                 Ok(())
