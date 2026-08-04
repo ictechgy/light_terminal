@@ -1541,7 +1541,10 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
     if matches!(&request, Request::StyledScreen { .. })
         && line.len() > STYLED_SCREEN_MAX_REQUEST_BYTES
     {
-        return write_styled_screen_error(&mut stream, "styled_screen_request_too_large");
+        return write_styled_screen_error_with_timeout(
+            &mut stream,
+            "styled_screen_request_too_large",
+        );
     }
 
     if let Request::Attach { target, rows, cols } = request {
@@ -1565,9 +1568,10 @@ fn handle_connection(state: Arc<State>, mut stream: UnixStream) -> Result<()> {
             Ok(capture) => with_styled_screen_write_timeout(&mut stream, |stream| {
                 write_styled_screen_result(stream, &capture.result)
             }),
-            Err(error) => with_styled_screen_write_timeout(&mut stream, |stream| {
-                write_styled_screen_error(stream, styled_screen_error_code(&error))
-            }),
+            Err(error) => write_styled_screen_error_with_timeout(
+                &mut stream,
+                styled_screen_error_code(&error),
+            ),
         };
     }
 
@@ -1619,6 +1623,18 @@ where
         .set_styled_screen_write_timeout(None)
         .context("clear styled-screen write timeout");
     write_result.and(clear_result)
+}
+
+fn with_styled_screen_error_timeout<T, F>(stream: &mut T, code: &str, write_error: F) -> Result<()>
+where
+    T: StyledScreenTimeout,
+    F: FnOnce(&mut T, &str) -> Result<()>,
+{
+    with_styled_screen_write_timeout(stream, |stream| write_error(stream, code))
+}
+
+fn write_styled_screen_error_with_timeout(stream: &mut UnixStream, code: &str) -> Result<()> {
+    with_styled_screen_error_timeout(stream, code, write_styled_screen_error)
 }
 
 impl CappedResponseWriter {
@@ -9697,6 +9713,65 @@ mod tests {
             "a timeout setup failure must not attempt a success or error response write"
         );
         assert_eq!(state.styled_screen_reserved_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn styled_screen_error_timeout_setup_failure_does_not_write_error() {
+        let mut stream = TimeoutSetupFailure;
+        let mut write_attempted = false;
+
+        let result = super::with_styled_screen_error_timeout(
+            &mut stream,
+            "styled_screen_request_too_large",
+            |_, code| {
+                write_attempted = true;
+                assert_eq!(code, "styled_screen_request_too_large");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "timeout configuration must fail closed");
+        assert!(
+            !write_attempted,
+            "a timeout setup failure must not attempt an error response write"
+        );
+    }
+
+    #[test]
+    fn styled_screen_oversized_socket_request_returns_typed_error() {
+        let request = serde_json::json!({
+            "type": "styled_screen",
+            "target": "x".repeat(crate::protocol::STYLED_SCREEN_MAX_REQUEST_BYTES),
+            "schema_version": crate::protocol::STYLED_SCREEN_SCHEMA_V1,
+        });
+        let request = format!("{request}\n");
+        assert!(
+            request.len() > crate::protocol::STYLED_SCREEN_MAX_REQUEST_BYTES,
+            "fixture must exercise the styled-screen request limit"
+        );
+        let (server_stream, mut client_stream) =
+            UnixStream::pair().expect("create styled-screen socket pair");
+        let mut request_stream = client_stream
+            .try_clone()
+            .expect("clone styled-screen request stream");
+        let write_request = thread::spawn(move || {
+            request_stream
+                .write_all(request.as_bytes())
+                .expect("write oversized styled-screen request");
+        });
+
+        super::handle_connection(Arc::new(super::State::default()), server_stream)
+            .expect("serve oversized styled-screen request");
+        write_request.join().expect("oversized request writer");
+
+        let mut response = String::new();
+        client_stream
+            .read_to_string(&mut response)
+            .expect("read oversized styled-screen response");
+        let response: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("decode styled-screen response");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "styled_screen_request_too_large");
     }
 
     #[test]
